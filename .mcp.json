@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "tavily-remote": {
+      "type": "remote",
+      "url": "${TAVILY_MCP_URL}",
+      "headers": {}
+    },
+    "firecrawl-remote": {
+      "type": "remote",
+      "url": "${FIRECRAWL_MCP_URL}",
+      "headers": {}
+    }
+  }
+}

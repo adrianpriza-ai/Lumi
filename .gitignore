@@ -49,6 +49,7 @@ coverage.xml
 *.py.cover
 .hypothesis/
 .pytest_cache/
+.ruff_cache/
 cover/
 
 # Translations
@@ -156,6 +157,16 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+
+# --- Lumi -------------------------------------------------------------------
+# Runtime state: transcripts, logs, and the sandboxed working directory the
+# shell tool runs in. All of it is regenerated; none of it belongs in git.
+data/
+workspace/
+# config.toml IS tracked (no secrets). config.local.toml, if you use it, is not.
+config.local.toml
+# Remote MCP servers embed API keys in their URLs. This file is tracked with
+# ${VAR} placeholders only; if you inline a real key, keep it out of git.
 
 # Spyder project settings
 .spyderproject

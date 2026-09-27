@@ -1,0 +1,107 @@
+# Lumi configuration.
+#
+# This file is committed on purpose: it holds no secrets, only behaviour.
+# Clone the repo, drop your tokens into .env, and it runs. Every key here can
+# also be overridden with an environment variable named LUMI__<SECTION>__<KEY>,
+# e.g. LUMI__LLM__MODEL=claude-sonnet-4-5  or  LUMI__TOOLS__SHELL__TIMEOUT_SECONDS=10
+
+[bot]
+# Chat the bot greets you in. Optional, purely cosmetic.
+startup_chat_id = ""
+# Refuse to boot if TELEGRAM_OWNER_ID is missing. Keep this true: the shell
+# and file tools are only ever exposed to that user id.
+require_owner = true
+# Prefix used when writing files to the log stream. Cosmetic.
+log_prefix = "lumi"
+
+[llm]
+# Any OpenAI-compatible endpoint: OpenAI, Ollama, LM Studio, vLLM, Groq,
+# OpenRouter, Together, ... Point base_url at it and set api_key_env.
+provider = "openai"
+model = "gpt-4.1-mini"
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+# null = let the provider pick its default (needed for some reasoning models).
+temperature = 0.7
+max_tokens = 2000
+# How many tool-call round trips the agent may take for one message.
+max_tool_iterations = 8
+# Prior turns replayed from data/history/<chat_id>.jsonl into the prompt.
+history_turns = 20
+# MEMORY.md is truncated to this many characters when injected.
+max_memory_chars = 6000
+
+[tools]
+# Remove any tool from this list to disable it everywhere.
+enabled = ["shell", "files", "memory", "web"]
+
+[tools.shell]
+enabled = true
+# Working directory, relative to the project root. Use "." for the repo itself.
+cwd = "workspace"
+timeout_seconds = 60
+max_output_chars = 6000
+# Set false to hard-block anything that is not plainly safe (no prompts).
+ask_before_risky = true
+# "project" pins HOME to the project root so nothing writes into your real
+# home directory. "inherit" passes your real HOME through.
+home = "project"
+extra_deny = []
+# Regexes matched against the raw command; a hit means DENY.
+extra_confirm = []
+
+[tools.files]
+enabled = true
+# Only these directories are writable, relative to the project root.
+writable = ["workspace"]
+# Readable from the whole project (so the bot can read its own source).
+readable_from_project = true
+max_read_chars = 20000
+max_write_chars = 200000
+
+[tools.memory]
+enabled = true
+# Let the model call remember() on its own. It can never delete memories;
+# erasing is a human action via /forget.
+auto_remember = true
+
+[tools.web]
+enabled = true
+# Providers are tried in this order; the first available one answers.
+# "mcp" reads .mcp.json from the project root, so you can drive any MCP
+# server (tavily, firecrawl, or your own) with zero extra code.
+provider_order = ["tavily", "firecrawl", "mcp"]
+max_results = 5
+max_content_chars = 6000
+# Seconds to wait on any single provider call.
+timeout_seconds = 90
+
+[tools.web.providers.tavily]
+enabled = true
+api_key_env = "TAVILY_API_KEY"
+search_depth = "basic"      # basic | advanced | fast | ultra-fast
+topic = "general"           # general | news | finance
+include_answer = true
+include_raw_content = true
+base_url = "https://api.tavily.com"
+
+[tools.web.providers.firecrawl]
+enabled = true
+api_key_env = "FIRECRAWL_API_KEY"
+base_url = "https://api.firecrawl.dev"
+only_main_content = true
+# When search results carry no body text, scrape this many hits to fill them in.
+auto_scrape_top_n = 3
+
+[tools.web.providers.mcp]
+enabled = true
+config_file = ".mcp.json"
+timeout_seconds = 60
+# Tool name patterns matched against each server's advertised tool list.
+# First match wins; the list is just a preference order.
+search_tools = ["tavily_search", "firecrawl_search", "search"]
+fetch_tools = ["tavily_extract", "firecrawl_scrape", "scrape", "extract"]
+
+[logging]
+level = "INFO"
+file = "data/logs/lumi.log"
