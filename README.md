@@ -68,6 +68,11 @@ In Telegram: `/help` `/run` `/search` `/fetch` `/memory` `/remember` `/forget`
 `/personality` `/tools` `/status` `/doctor` `/reload` `/reset`, plus `/approve`
 and `/deny`. Anything that is not a command is just a message to the agent.
 
+In group chats the bot only answers when **mentioned** (`@Lumi_a_bot ...`),
+**replied to**, or sent a slash command targeting it (`/help@Lumi_a_bot`). See
+[Group chats](#group-chats) for the full rule and the `bot.group_reply_mode`
+config knob.
+
 ## Configuration
 
 `config.toml` is committed and holds no secrets. `.env` holds the secrets and is
@@ -219,6 +224,36 @@ hallucination or a careless prompt produces — cannot run by accident.
 If you need a hard boundary, run Lumi in a container or under a dedicated
 unprivileged user. Owner gating is by Telegram user id and is enforced twice: as
 a handler filter, and as an explicit check in every privileged handler.
+
+## Group chats
+
+In a private chat the bot replies to every owner message. In a group or
+supergroup it follows `bot.group_reply_mode` (default `mention`):
+
+- **`mention`** — the bot only responds when it is **mentioned**
+  (`@Lumi_a_bot`), **replied to**, or sent a **slash command that targets it**
+  (`/help@Lumi_a_bot`). Plain `/help` in a group is left alone because Telegram
+  routes commands without `@botname` to whichever bot claims them first.
+- **`always`** — replies to every owner message regardless of chat type.
+- **`off`** — never replies in groups; private chats still work as normal.
+
+The detection covers three signals:
+
+1. **Slash command with `@botname`** — `cmd.split("@", 1)[1]` must equal the
+   bot's username (case-insensitive).
+2. **Reply to a message from the bot** — `reply.from_user.is_bot` and the
+   usernames match.
+3. **`@botname` mention in entities** — `MessageEntity.MENTION` with the
+   bot's username, or `MessageEntity.TEXT_MENTION` pointing at the bot.
+
+Add chat ids to `bot.always_reply_chats` to override the mode for one
+specific group (e.g. a private "Lumi lab"):
+
+```toml
+[bot]
+group_reply_mode = "mention"
+always_reply_chats = ["-1001234567890"]
+```
 
 ## Web providers
 

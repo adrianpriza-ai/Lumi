@@ -13,6 +13,19 @@ startup_chat_id = ""
 require_owner = true
 # Prefix used when writing files to the log stream. Cosmetic.
 log_prefix = "lumi"
+# How the bot behaves in group / supergroup chats. Private chats are
+# unaffected — the bot always replies 1:1.
+#   mention  (default) - reply only when the bot is mentioned (@Lumi_a_bot),
+#                        replied to, or sent a slash command targeting it
+#                        specifically (e.g. /help@Lumi_a_bot).
+#   always             - reply to every owner message regardless of chat type.
+#   off                - never reply in groups; private chats still work.
+group_reply_mode = "mention"
+# Chat ids where the bot always replies, regardless of `group_reply_mode`.
+# Useful for a dedicated "Lumi lab" group where you want it to chat freely
+# without lifting the global rule. Telegram chat ids are negative for
+# supergroups; quotes keep them as strings.
+#   always_reply_chats = ["-1001234567890"]
 
 [llm]
 # Any OpenAI-compatible endpoint: OpenAI, Ollama, LM Studio, vLLM, Groq,

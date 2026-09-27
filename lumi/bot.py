@@ -19,7 +19,7 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Chat, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, Update
 from telegram.constants import ChatAction, ParseMode
 from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
@@ -74,6 +74,106 @@ dangerous commands ask for confirmation first. i can't delete that, on purpose.
 """
 
 NOT_AUTHORISED = "this bot is private. your id is not the owner."
+
+
+# --------------------------------------------------------------------------- #
+# Group / private chat routing
+# --------------------------------------------------------------------------- #
+
+
+def _should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, config: Config) -> bool:
+    """Whether the bot should respond to this update.
+
+    Private chats always respond — same as a normal 1:1 chat. Group and
+    supergroup chats follow ``bot.group_reply_mode``:
+
+    - ``"mention"`` (default): only respond when the bot is mentioned
+      (``@Lumi_a_bot``), replied to, or sent a slash command targeting this bot
+      (``/help@Lumi_a_bot``). Plain ``/help`` in a group is left alone because
+      Telegram routes commands without ``@botname`` to whichever bot claims
+      them first.
+    - ``"always"``: respond to every owner message regardless of chat type.
+    - ``"off"``: never respond in groups; private chats are unaffected.
+
+    ``bot.always_reply_chats`` is consulted first and overrides the mode, so a
+    dedicated "Lumi lab" group can opt in by id without flipping the global
+    setting.
+    """
+    chat = update.effective_chat
+    if chat is None:
+        return True
+    if str(chat.id) in config.bot.always_reply_chats:
+        return True
+    if chat.type == Chat.PRIVATE:
+        return True
+    if chat.type not in (Chat.GROUP, Chat.SUPERGROUP):
+        # Channels are a corner case; stay quiet by default — there is no
+        # good way to address a bot in a channel without an inline query.
+        return False
+
+    mode = (config.bot.group_reply_mode or "mention").strip().lower()
+    if mode == "off":
+        return False
+    if mode == "always":
+        return True
+    return _is_addressed(update, context)
+
+
+def _is_addressed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Whether this message is aimed at *this* bot in a group context.
+
+    Three positive signals, any one of which is enough:
+
+    1. The text starts with a slash command that names this bot
+       (e.g. ``/help@Lumi_a_bot``). Plain ``/help`` is *not* enough — Telegram
+       routes that to whichever bot owns the command, so acting on it would
+       be presumptuous.
+    2. The message is a reply to a message sent by this bot.
+    3. The message text contains a ``@Lumi_a_bot`` mention, either as a plain
+       ``mention`` entity or as a ``text_mention`` entity pointing at the bot.
+    """
+    message = update.effective_message
+    if message is None:
+        return False
+    bot_username = (context.bot.username or "").lower()
+    if not bot_username:
+        # The bot has no username (rare) — fall back to "always reply" rather
+        # than silently swallowing everything.
+        return True
+
+    text = message.text or message.caption or ""
+
+    # 1. Slash command targeting this bot.
+    if text.startswith("/"):
+        cmd = text.split(maxsplit=1)[0]
+        if "@" in cmd:
+            target = cmd.split("@", 1)[1].lower().rstrip(",.;:!?")
+            if target == bot_username:
+                return True
+        return False  # command in a group with no @botname: assume different bot
+
+    # 2. Reply to a message from this bot.
+    reply = message.reply_to_message
+    if (
+        reply is not None
+        and reply.from_user is not None
+        and reply.from_user.is_bot
+        and (reply.from_user.username or "").lower() == bot_username
+    ):
+        return True
+
+    # 3. Mention entity anywhere in the message (text or caption).
+    entities = list(message.entities or []) + list(message.caption_entities or [])
+    for entity in entities:
+        if entity.type == MessageEntity.MENTION:
+            snippet = text[entity.offset : entity.offset + entity.length].lower().lstrip("@")
+            if snippet == bot_username:
+                return True
+        elif entity.type == MessageEntity.TEXT_MENTION and entity.user is not None:
+            if (entity.user.username or "").lower() == bot_username:
+                return True
+
+    return False
 
 
 # --------------------------------------------------------------------------- #
@@ -229,6 +329,23 @@ def build_handlers(config: Config) -> list[Any]:
         await reply(update, NOT_AUTHORISED)
         log.warning("rejected %s from user %s", update.effective_message and "message", user and user.id)
         return False
+
+    def gated(handler):
+        """Apply the group/mention gating to a command handler.
+
+        Each command is wrapped so a group-chat message that is not addressed
+        to the bot is dropped before the handler runs. Private chats and
+        whitelisted chats bypass the gate.
+        """
+
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            if not await authorised(update):
+                return
+            if not _should_reply(update, context, config):
+                return
+            await handler(update, context)
+
+        return wrapper
 
     def agent_of(context: ContextTypes.DEFAULT_TYPE) -> Agent:
         agent: Agent = context.application.bot_data["agent"]
@@ -433,15 +550,21 @@ def build_handlers(config: Config) -> list[Any]:
             return
         if not await authorised(update):
             return
+        if not _should_reply(update, context, config):
+            return
         await run_agent(update, context, message.text)
 
     async def on_non_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await authorised(update):
             return
+        if not _should_reply(update, context, config):
+            return
         await reply(update, "i read text only right now — send a message instead.")
 
     async def on_unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await authorised(update):
+            return
+        if not _should_reply(update, context, config):
             return
         message = update.effective_message
         text = (message.text if message else "") or ""
@@ -525,23 +648,25 @@ def build_handlers(config: Config) -> list[Any]:
 
     return [
         # Owner-gated commands, all before the catch-all text handler.
-        CommandHandler("start", start, filters=owner_filter),
-        CommandHandler("help", help_command, filters=owner_filter),
-        CommandHandler("ask", ask, filters=owner_filter),
-        CommandHandler("run", run_command, filters=owner_filter),
-        CommandHandler("search", search_command, filters=owner_filter),
-        CommandHandler("fetch", fetch_command, filters=owner_filter),
-        CommandHandler("memory", memory_command, filters=owner_filter),
-        CommandHandler("remember", remember_command, filters=owner_filter),
-        CommandHandler("forget", forget_command, filters=owner_filter),
-        CommandHandler("personality", personality_command, filters=owner_filter),
-        CommandHandler("tools", tools_command, filters=owner_filter),
-        CommandHandler("status", status_command, filters=owner_filter),
-        CommandHandler("doctor", doctor_command, filters=owner_filter),
-        CommandHandler("reload", reload_command, filters=owner_filter),
-        CommandHandler("reset", reset_command, filters=owner_filter),
-        CommandHandler(["approve", "yes", "y"], approve, filters=owner_filter),
-        CommandHandler(["deny", "no", "n"], deny, filters=owner_filter),
+        # Every command is wrapped in ``gated`` so the group/mention rule
+        # applies uniformly: in a group, only addressed commands run.
+        CommandHandler("start", gated(start), filters=owner_filter),
+        CommandHandler("help", gated(help_command), filters=owner_filter),
+        CommandHandler("ask", gated(ask), filters=owner_filter),
+        CommandHandler("run", gated(run_command), filters=owner_filter),
+        CommandHandler("search", gated(search_command), filters=owner_filter),
+        CommandHandler("fetch", gated(fetch_command), filters=owner_filter),
+        CommandHandler("memory", gated(memory_command), filters=owner_filter),
+        CommandHandler("remember", gated(remember_command), filters=owner_filter),
+        CommandHandler("forget", gated(forget_command), filters=owner_filter),
+        CommandHandler("personality", gated(personality_command), filters=owner_filter),
+        CommandHandler("tools", gated(tools_command), filters=owner_filter),
+        CommandHandler("status", gated(status_command), filters=owner_filter),
+        CommandHandler("doctor", gated(doctor_command), filters=owner_filter),
+        CommandHandler("reload", gated(reload_command), filters=owner_filter),
+        CommandHandler("reset", gated(reset_command), filters=owner_filter),
+        CommandHandler(["approve", "yes", "y"], gated(approve), filters=owner_filter),
+        CommandHandler(["deny", "no", "n"], gated(deny), filters=owner_filter),
         # Keyword arguments on purpose: MessageHandler's parameter order changed
         # between python-telegram-bot v20 and v22, and the keyword form is stable.
         MessageHandler(

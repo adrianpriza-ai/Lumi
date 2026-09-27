@@ -47,6 +47,15 @@ class BotConfig:
     startup_chat_id: str = ""
     require_owner: bool = True
     log_prefix: str = "lumi"
+    #: How the bot behaves in group chats. ``"mention"`` (default) only replies
+    #: when the bot is mentioned, replied to, or sent a slash command targeting
+    #: it specifically (e.g. ``/help@Lumi_a_bot``). ``"always"`` replies to every
+    #: owner message regardless of chat type. ``"off"`` ignores group chats
+    #: entirely (commands still work in private chats).
+    group_reply_mode: str = "mention"
+    #: Chat ids where the bot always replies, regardless of ``group_reply_mode``.
+    #: Strings to accommodate the negative supergroup ids Telegram hands out.
+    always_reply_chats: list[str] = field(default_factory=list)
 
 
 OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
@@ -627,6 +636,11 @@ def validate(config: Config) -> list[str]:
         )
     if config.telegram_token is None:
         problems.append("TELEGRAM_BOT_TOKEN is unset — the Telegram bot cannot start.")
+    if config.bot.group_reply_mode.strip().lower() not in {"mention", "always", "off"}:
+        problems.append(
+            f"unknown bot.group_reply_mode {config.bot.group_reply_mode!r}. "
+            "Known: mention, always, off"
+        )
     if config.bot.require_owner and config.owner_id is None:
         problems.append(
             "TELEGRAM_OWNER_ID is unset. The shell and file tools are locked to the owner, "

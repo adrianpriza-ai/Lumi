@@ -183,6 +183,17 @@ def test_validate_accepts_every_documented_strategy(config, strategy: str) -> No
     assert not [p for p in validate(config) if "key_strategy" in p]
 
 
+@pytest.mark.parametrize("mode", ["mention", "always", "off"])
+def test_validate_accepts_every_documented_group_reply_mode(config, mode: str) -> None:
+    config.bot.group_reply_mode = mode
+    assert not [p for p in validate(config) if "group_reply_mode" in p]
+
+
+def test_validate_flags_an_unknown_group_reply_mode(config) -> None:
+    config.bot.group_reply_mode = "loud"  # not a real value
+    assert any("group_reply_mode" in p for p in validate(config))
+
+
 # --------------------------------------------------------------------------- #
 # coercion internals
 # --------------------------------------------------------------------------- #

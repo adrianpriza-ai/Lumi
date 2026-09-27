@@ -66,11 +66,14 @@ class FakeBot(Bot):
 
 
 def make_update(bot: Bot, text: str | None = None, *, chat_id: int = CHAT, user_id: int = OWNER,
-                message_id: int = 1) -> Update:
+                message_id: int = 1, chat_type: str = "private",
+                chat_username: str = "lab_group",
+                entities: list[dict[str, Any]] | None = None,
+                reply_to_message: dict[str, Any] | None = None) -> Update:
     message: dict[str, Any] = {
         "message_id": message_id,
         "date": int(time.time()),
-        "chat": {"id": chat_id, "type": "private", "first_name": "Chat"},
+        "chat": {"id": chat_id, "type": chat_type, "title": "Lab"},
         "from": {"id": user_id, "is_bot": False, "first_name": "Owner", "username": "owner"},
     }
     if text is not None:
@@ -78,11 +81,15 @@ def make_update(bot: Bot, text: str | None = None, *, chat_id: int = CHAT, user_
         # Real Telegram always sends a bot_command entity alongside the text, and
         # filters.COMMAND keys off the entity, not off the leading slash. Without
         # it every command would fall through to the catch-all text handler.
-        if text.startswith("/"):
+        if text.startswith("/") and entities is None:
             command = text.split(maxsplit=1)[0]
             message["entities"] = [
                 {"type": "bot_command", "offset": 0, "length": len(command)}
             ]
+        if entities is not None:
+            message["entities"] = entities
+    if reply_to_message is not None:
+        message["reply_to_message"] = reply_to_message
     return Update.de_json({"update_id": message_id, "message": message}, bot)
 
 
@@ -451,3 +458,232 @@ def test_builder_needs_a_token(config, monkeypatch) -> None:
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN")
     with pytest.raises(ConfigError, match="TELEGRAM_BOT_TOKEN"):
         build_application(config)
+
+
+# --------------------------------------------------------------------------- #
+# group vs private chat routing
+# --------------------------------------------------------------------------- #
+#
+# The bot username comes from ``FakeBot.get_me``: "lumi_test_bot". All the
+# group tests use a supergroup with chat id GROUP_CHAT and check whether the
+# owner message reaches the agent (or stays silent under mention mode).
+GROUP_CHAT = -1001
+
+
+def _group_text_update(bot: Bot, text: str, **kwargs: Any) -> Update:
+    return make_update(bot, text, chat_id=GROUP_CHAT, chat_type="supergroup", **kwargs)
+
+
+async def test_private_chat_replies_to_every_message(config) -> None:
+    """Private chats are unaffected — current behaviour."""
+    bot, _ = await send(config, [make_reply("hi back")], "hi")
+    assert "hi back" in texts(bot)
+
+
+async def test_group_chat_silent_without_mention(config) -> None:
+    """Group chat, plain text, no mention → the bot does not reply at all."""
+    bot, agent = await send(
+        config,
+        [make_reply("this should never be sent")],
+        "hello group",
+        chat_id=GROUP_CHAT,
+        chat_type="supergroup",
+    )
+    assert bot.sent == []
+    # The model was never called — gating happens before the agent loop.
+    assert agent.llm.calls == []
+
+
+async def test_group_chat_replies_when_mentioned(config) -> None:
+    """An @botname mention in the text opens the gate."""
+    mention_text = "hi @lumi_test_bot what's the weather"
+    entities = [
+        {"type": "mention", "offset": 3, "length": len("@lumi_test_bot")},
+    ]
+    bot, agent = await send(
+        config,
+        [make_reply("sunny")],
+        mention_text,
+        chat_id=GROUP_CHAT,
+        chat_type="supergroup",
+        entities=entities,
+    )
+    assert "sunny" in texts(bot)
+    assert agent.llm.calls
+
+
+async def test_group_chat_replies_to_a_reply_to_the_bot(config) -> None:
+    """Replying to a message from the bot is treated as addressing it."""
+    reply_to_bot = {
+        "message_id": 99,
+        "date": int(time.time()),
+        "chat": {"id": GROUP_CHAT, "type": "supergroup", "title": "Lab"},
+        "from": {
+            "id": 12345,
+            "is_bot": True,
+            "first_name": "Lumi",
+            "username": "lumi_test_bot",
+        },
+        "text": "an earlier bot message",
+    }
+    bot, _ = await send(
+        config,
+        [make_reply("got it")],
+        "thanks!",
+        chat_id=GROUP_CHAT,
+        chat_type="supergroup",
+        reply_to_message=reply_to_bot,
+    )
+    assert "got it" in texts(bot)
+
+
+async def test_group_chat_does_not_reply_to_a_reply_to_a_human(config) -> None:
+    """Replying to a non-bot message is not enough — the bot would spam the group."""
+    reply_to_human = {
+        "message_id": 99,
+        "date": int(time.time()),
+        "chat": {"id": GROUP_CHAT, "type": "supergroup", "title": "Lab"},
+        "from": {"id": 777, "is_bot": False, "first_name": "Other", "username": "other"},
+        "text": "an earlier human message",
+    }
+    bot, _ = await send(
+        config,
+        [make_reply("should never fire")],
+        "ok",
+        chat_id=GROUP_CHAT,
+        chat_type="supergroup",
+        reply_to_message=reply_to_human,
+    )
+    assert bot.sent == []
+
+
+async def test_group_chat_slash_command_targeting_the_bot(config) -> None:
+    """/help@lumi_test_bot in a group runs the command — it names the bot."""
+    bot, _ = await send(config, [], "/help@lumi_test_bot", chat_id=GROUP_CHAT, chat_type="supergroup")
+    assert "confirmation" in texts(bot).lower()
+
+
+async def test_group_chat_plain_slash_command_is_silent(config) -> None:
+    """Plain /help in a group is dropped — Telegram routes that elsewhere."""
+    bot, _ = await send(config, [], "/help", chat_id=GROUP_CHAT, chat_type="supergroup")
+    assert bot.sent == []
+
+
+async def test_group_chat_slash_command_targeting_another_bot_is_silent(config) -> None:
+    """/help@some_other_bot must not fire this bot's handlers."""
+    bot, _ = await send(config, [], "/help@some_other_bot", chat_id=GROUP_CHAT, chat_type="supergroup")
+    assert bot.sent == []
+
+
+async def test_group_chat_unknown_command_without_address_is_silent(config) -> None:
+    """Unknown slash commands in a group are dropped too."""
+    bot, _ = await send(config, [], "/random_typo", chat_id=GROUP_CHAT, chat_type="supergroup")
+    assert bot.sent == []
+
+
+async def test_group_chat_always_mode_replies_without_mention(config) -> None:
+    """With ``group_reply_mode = \"always\"`` every owner message goes through."""
+    config.bot.group_reply_mode = "always"
+    bot, _ = await send(
+        config,
+        [make_reply("always on")],
+        "hi group",
+        chat_id=GROUP_CHAT,
+        chat_type="supergroup",
+    )
+    assert "always on" in texts(bot)
+
+
+async def test_group_chat_off_mode_is_silent_even_with_mention(config) -> None:
+    """With ``group_reply_mode = \"off\"`` nothing reaches the bot, ever."""
+    config.bot.group_reply_mode = "off"
+    mention_text = "hi @lumi_test_bot"
+    entities = [{"type": "mention", "offset": 3, "length": len("@lumi_test_bot")}]
+    bot, _ = await send(
+        config,
+        [make_reply("should not fire")],
+        mention_text,
+        chat_id=GROUP_CHAT,
+        chat_type="supergroup",
+        entities=entities,
+    )
+    assert bot.sent == []
+
+
+async def test_always_reply_chats_overrides_the_mode(config) -> None:
+    """A chat listed in ``always_reply_chats`` answers even under ``off`` mode."""
+    config.bot.group_reply_mode = "off"
+    config.bot.always_reply_chats = [str(GROUP_CHAT)]
+    bot, _ = await send(
+        config,
+        [make_reply("lab here")],
+        "hi",
+        chat_id=GROUP_CHAT,
+        chat_type="supergroup",
+    )
+    assert "lab here" in texts(bot)
+
+
+async def test_private_chat_ignores_always_reply_chats(config) -> None:
+    """Private chats always reply, with or without the whitelist."""
+    config.bot.group_reply_mode = "off"
+    config.bot.always_reply_chats = ["-1009999"]  # not this chat
+    bot, _ = await send(config, [make_reply("private reply")], "hi")
+    assert "private reply" in texts(bot)
+
+
+async def test_unknown_command_in_private_chat_still_works(config) -> None:
+    """The gating must not break existing behaviour in private chats."""
+    bot, _ = await send(config, [], "/typo_here")
+    assert "i don't know" in texts(bot).lower()
+
+
+async def test_non_text_in_group_is_silent(config) -> None:
+    """A photo in a group without a mention does not even trigger 'i read text only'."""
+    bot, _ = await send_photo_in_group(config)
+    assert bot.sent == []
+
+
+async def test_non_text_in_group_with_mention_replies(config) -> None:
+    bot, _ = await send_photo_in_group(config, mention_text="@lumi_test_bot")
+    assert "read text only" in texts(bot).lower()
+
+
+# --------------------------------------------------------------------------- #
+# helpers
+# --------------------------------------------------------------------------- #
+
+
+async def send_photo_in_group(config, *, mention_text: str | None = None) -> tuple[Any, Agent]:
+    """Send a non-text (photo) message into the group chat.
+
+    ``mention_text`` is set as the photo's caption and a matching ``mention``
+    entity is added — that is how a real photo-with-caption arrives when
+    someone tags the bot.
+    """
+    application, bot, agent = build(config, [])
+    await application.initialize()
+    caption = mention_text or ""
+    caption_entities = (
+        [{"type": "mention", "offset": 0, "length": len(caption)}] if caption else None
+    )
+    update = Update.de_json(
+        {
+            "update_id": 1,
+            "message": {
+                "message_id": 1,
+                "date": int(time.time()),
+                "chat": {"id": GROUP_CHAT, "type": "supergroup", "title": "Lab"},
+                "from": {"id": OWNER, "is_bot": False, "first_name": "Owner", "username": "owner"},
+                "photo": [{"file_id": "p1", "file_unique_id": "u1", "width": 1, "height": 1}],
+                "caption": caption or None,
+                "caption_entities": caption_entities,
+            },
+        },
+        bot,
+    )
+    try:
+        await application.process_update(update)
+    finally:
+        await application.shutdown()
+    return bot, agent
