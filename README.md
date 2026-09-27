@@ -9,11 +9,26 @@ reach is a file you can read before you trust it.
 ```bash
 git clone <this repo> lumi && cd lumi
 cp .env.example .env          # fill in TELEGRAM_BOT_TOKEN and TELEGRAM_OWNER_ID
-uv sync                        # or: python -m venv .venv && ./.venv/bin/pip install -e ".[dev]"
-uv run lumi doctor             # tells you exactly what is missing
-uv run lumi chat               # talk to it in your terminal, no token needed
-uv run lumi run                # start the Telegram bot
+
+# plain venv — no extra tooling needed
+python3 -m venv .venv
+./.venv/bin/pip install -U pip
+./.venv/bin/pip install -e ".[dev]"
+
+./.venv/bin/lumi doctor       # tells you exactly what is missing
+./.venv/bin/lumi chat         # talk to it in your terminal, no token needed
+./.venv/bin/lumi run          # start the Telegram bot
 ```
+
+If you prefer `uv`, it does the same in one step:
+
+```bash
+uv sync
+uv run lumi doctor
+```
+
+Either way `.venv/` is gitignored, so a fresh clone starts empty — that is
+expected, and it is why the two steps above are always both needed.
 
 ## Why it is built this way
 
@@ -260,6 +275,27 @@ already turns that into a Confirm/Cancel pair.
 ./.venv/bin/pytest
 ./.venv/bin/ruff check lumi tests
 ```
+
+## Want `lumi` on your PATH
+
+`./.venv/bin/lumi` always works. To get a bare `lumi` command in any directory,
+either activate the venv per shell:
+
+```bash
+source .venv/bin/activate
+```
+
+or install it once with `pipx`, which gives you its own environment and does not
+touch the project's `.venv`:
+
+```bash
+pipx install .
+lumi doctor
+```
+
+Note that a `pipx` install is a *copy*, not an editable link: changes to the
+source are not picked up until you reinstall with `pipx install --force .`. For
+development, prefer the editable venv above.
 
 ## Licence
 
