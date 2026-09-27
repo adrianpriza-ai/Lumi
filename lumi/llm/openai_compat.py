@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from ..config import LLMConfig
+from ..config import OPENAI_DEFAULT_BASE_URL, LLMConfig
 from ..util.log import get_logger
 from ..util.text import format_error
 from .base import LLMClient, LLMError, LLMReply, ToolCall
@@ -50,11 +50,16 @@ class OpenAICompatClient(LLMClient):
             # Local servers ignore the key but the SDK insists on one being set.
             self._client = AsyncOpenAI(
                 api_key=api_key,
-                base_url=self.config.base_url,
+                base_url=self.config.base_url_of(),
                 max_retries=2,
                 timeout=120.0,
             )
-            log.info("llm client ready: model=%s base_url=%s", self.config.model, self.config.base_url)
+            log.info(
+                "llm ready: model=%s endpoint=%s (from %s)",
+                self.config.model_of(),
+                self.config.base_url_of(),
+                self.config.where_from(),
+            )
         return self._client
 
     async def complete(
@@ -64,8 +69,9 @@ class OpenAICompatClient(LLMClient):
         tools: list[dict[str, Any]] | None = None,
     ) -> LLMReply:
         client = self._get_client()
+        endpoint = self.config.base_url_of()
 
-        params: dict[str, Any] = {"model": self.config.model, "messages": messages}
+        params: dict[str, Any] = {"model": self.config.model_of(), "messages": messages}
         if self.config.temperature is not None:
             params["temperature"] = self.config.temperature
         if self.config.max_tokens:
@@ -77,8 +83,21 @@ class OpenAICompatClient(LLMClient):
         try:
             completion = await client.chat.completions.create(**params)
         except Exception as exc:  # noqa: BLE001 - normalised for the owner
-            log.error("llm call failed: %s", format_error(exc))
-            raise LLMError(format_error(exc)) from exc
+            log.error("llm call to %s failed: %s", endpoint, format_error(exc))
+            # Always name the endpoint. "401 invalid_api_key" against the wrong
+            # host is the most confusing failure this program can produce.
+            hint = ""
+            if endpoint == OPENAI_DEFAULT_BASE_URL:
+                hint = (
+                    "\n\nThat is OpenAI itself. If you meant a different provider, set "
+                    "OPENAI_BASE_URL in .env, or base_url in the [llm] block of config.toml."
+                )
+            raise LLMError(
+                f"{format_error(exc)}\n\n"
+                f"Endpoint: {endpoint} (from {self.config.where_from()})\n"
+                f"Model: {self.config.model_of()}\n"
+                f"Key: {self.config.api_key_env}{hint}"
+            ) from exc
 
         return self._parse(completion)
 
@@ -118,7 +137,7 @@ class OpenAICompatClient(LLMClient):
         )
 
     def describe(self) -> str:
-        return f"{self.config.model} via {self.config.base_url}"
+        return f"{self.config.model_of()} via {self.config.base_url_of()}"
 
 
 __all__ = ["OpenAICompatClient"]

@@ -2,7 +2,7 @@
 
 **Last updated: September 27, 2026**
 
-Lumi (@Lumi_a_bot) is a private AI assistant available only to its owner and designated Telegram group.
+Lumi `(@Lumi_a_bot)` is a AI assistant for telegram.
 
 ### Information Lumi Processes
 

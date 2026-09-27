@@ -219,3 +219,58 @@ def test_unknown_provider_is_rejected(config) -> None:
 
 def test_describe_names_the_model_and_endpoint(config) -> None:
     assert "test-model" in OpenAICompatClient(config.llm).describe()
+
+
+# --------------------------------------------------------------------------- #
+# endpoint resolution
+# --------------------------------------------------------------------------- #
+
+
+async def test_the_request_goes_to_the_resolved_endpoint(config, monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:20128/v1")
+    completions = StubCompletions(reply("hi"))
+    await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+    # The stub bypasses the SDK, so assert on what the client was told to use.
+    assert config.llm.base_url_of() == "http://localhost:20128/v1"
+
+
+async def test_the_resolved_model_is_sent(config, monkeypatch) -> None:
+    config.llm.model = "gpt-4.1-mini"  # the shipped default, so the env can win
+    monkeypatch.setenv("OPENAI_MODEL", "nemotron-3-nano-reasoning")
+    completions = StubCompletions(reply("hi"))
+    await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+    assert completions.requests[0]["model"] == "nemotron-3-nano-reasoning"
+
+
+async def test_sdk_errors_name_the_endpoint(config, monkeypatch) -> None:
+    """A 401 from the wrong host must say which host it actually hit."""
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:20128/v1")
+    completions = StubCompletions(error=RuntimeError("401 invalid_api_key"))
+    with pytest.raises(LLMError) as caught:
+        await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+
+    message = str(caught.value)
+    assert "http://localhost:20128/v1" in message
+    assert "OPENAI_BASE_URL" in message  # where it came from
+    assert "test-model" in message
+    assert "OPENAI_API_KEY" in message
+
+
+async def test_an_openai_endpoint_failure_suggests_the_fix(config, monkeypatch) -> None:
+    for name in ("OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_API_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    completions = StubCompletions(error=RuntimeError("401 invalid_api_key"))
+    with pytest.raises(LLMError) as caught:
+        await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+
+    message = str(caught.value)
+    assert "That is OpenAI itself" in message
+    assert "OPENAI_BASE_URL" in message
+
+
+async def test_a_custom_endpoint_does_not_get_the_openai_hint(config, monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:20128/v1")
+    completions = StubCompletions(error=RuntimeError("500 boom"))
+    with pytest.raises(LLMError) as caught:
+        await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+    assert "That is OpenAI itself" not in str(caught.value)

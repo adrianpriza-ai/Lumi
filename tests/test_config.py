@@ -182,3 +182,79 @@ def test_type_hints_resolve_under_postponed_annotations() -> None:
     from lumi.config import _build
 
     assert _build(LLMConfig, {"temperature": None}).temperature is None
+
+
+# --------------------------------------------------------------------------- #
+# endpoint resolution
+# --------------------------------------------------------------------------- #
+
+
+def test_base_url_falls_back_to_the_openai_default(config, monkeypatch) -> None:
+    for name in ("OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_API_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    assert config.llm.base_url_of() == "https://api.openai.com/v1"
+    assert config.llm.where_from() == "default"
+
+
+def test_openai_base_url_env_is_honoured(config, monkeypatch) -> None:
+    """The bug this guards: OPENAI_BASE_URL documented but never read."""
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
+    assert config.llm.base_url_of() == "http://localhost:11434/v1"
+    assert config.llm.where_from() == "OPENAI_BASE_URL"
+
+
+def test_openai_api_base_alias_is_honoured(config, monkeypatch) -> None:
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.setenv("OPENAI_API_BASE", "https://api.groq.com/openai/v1")
+    assert config.llm.base_url_of() == "https://api.groq.com/openai/v1"
+
+
+def test_empty_env_var_is_treated_as_unset(config, monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_BASE_URL", "   ")
+    assert config.llm.base_url_of() == "https://api.openai.com/v1"
+
+
+def test_explicit_config_beats_the_env(config, monkeypatch) -> None:
+    """A project-level setting must win over a machine-wide one."""
+    config.llm.base_url = "http://localhost:1234/v1"
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
+    assert config.llm.base_url_of() == "http://localhost:1234/v1"
+    assert config.llm.where_from() == "config"
+
+
+def test_lum_env_override_beats_openai_base_url(project, monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
+    monkeypatch.setenv("LUMI__LLM__BASE_URL", "http://localhost:9999/v1")
+    assert load_config(project).llm.base_url_of() == "http://localhost:9999/v1"
+
+
+def test_config_toml_base_url_wins_over_env(project, monkeypatch) -> None:
+    (project / "config.toml").write_text(
+        "[llm]\nmodel = 'm'\nbase_url = 'http://127.0.0.1:8000/v1'\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
+    assert load_config(project).llm.base_url_of() == "http://127.0.0.1:8000/v1"
+
+
+def test_model_falls_back_to_openai_model(config, monkeypatch) -> None:
+    """config.toml ships the default model, so the env must still win over it."""
+    config.llm.model = "gpt-4.1-mini"  # the shipped default
+    monkeypatch.setenv("OPENAI_MODEL", "nemotron-3-nano-reasoning")
+    assert config.llm.model_of() == "nemotron-3-nano-reasoning"
+
+
+def test_explicit_model_beats_openai_model(config, monkeypatch) -> None:
+    config.llm.model = "qwen3:8b"
+    monkeypatch.setenv("OPENAI_MODEL", "nemotron-3-nano-reasoning")
+    assert config.llm.model_of() == "qwen3:8b"
+
+
+def test_api_key_env_is_configurable(config, monkeypatch) -> None:
+    """A provider with its own key name should need no code change."""
+    monkeypatch.setenv("GROQ_API_KEY", "gsk-123")
+    config.llm.api_key_env = "GROQ_API_KEY"
+    assert config.llm.api_key() == "gsk-123"
+
+    config.llm.api_key_env = "DEFINITELY_NOT_SET"
+    assert config.llm.api_key() is None
+    assert any("DEFINITELY_NOT_SET" in p for p in validate(config))

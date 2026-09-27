@@ -48,11 +48,22 @@ class BotConfig:
     log_prefix: str = "lumi"
 
 
+OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
+OPENAI_DEFAULT_MODEL = "gpt-4.1-mini"
+
+#: Environment variables honoured as a fallback for the endpoint, in order.
+#: These are the names every OpenAI-compatible client already understands, so
+#: an existing .env or shell profile keeps working.
+BASE_URL_ENV_VARS = ("OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_API_BASE_URL")
+MODEL_ENV_VARS = ("OPENAI_MODEL",)
+
+
 @dataclass(slots=True)
 class LLMConfig:
     provider: str = "openai"
-    model: str = "gpt-4.1-mini"
-    base_url: str = "https://api.openai.com/v1"
+    model: str = OPENAI_DEFAULT_MODEL
+    #: Empty means "ask the environment". See :meth:`base_url_of`.
+    base_url: str = ""
     api_key_env: str = "OPENAI_API_KEY"
     temperature: float | None = 0.7
     max_tokens: int = 2000
@@ -62,6 +73,41 @@ class LLMConfig:
 
     def api_key(self) -> str | None:
         return os.environ.get(self.api_key_env) or None
+
+    def base_url_of(self) -> str:
+        """The endpoint to actually call.
+
+        Precedence: an explicit ``llm.base_url`` (from config.toml or
+        ``LUMI__LLM__BASE_URL``) wins, then ``OPENAI_BASE_URL`` and its aliases,
+        then the OpenAI default. That ordering means a project-level setting can
+        override a machine-wide one, which is the direction you want.
+        """
+        if self.base_url.strip():
+            return self.base_url.strip()
+        for name in BASE_URL_ENV_VARS:
+            value = (os.environ.get(name) or "").strip()
+            if value:
+                return value
+        return OPENAI_DEFAULT_BASE_URL
+
+    def model_of(self) -> str:
+        """The model id to send, with the same precedence as :meth:`base_url_of`."""
+        if self.model.strip() and self.model.strip() != OPENAI_DEFAULT_MODEL:
+            return self.model.strip()
+        for name in MODEL_ENV_VARS:
+            value = (os.environ.get(name) or "").strip()
+            if value:
+                return value
+        return self.model.strip() or OPENAI_DEFAULT_MODEL
+
+    def where_from(self) -> str:
+        """Where the endpoint came from, for /status, /doctor and error messages."""
+        if self.base_url.strip():
+            return "config"
+        for name in BASE_URL_ENV_VARS:
+            if (os.environ.get(name) or "").strip():
+                return name
+        return "default"
 
 
 @dataclass(slots=True)
@@ -417,7 +463,8 @@ def validate(config: Config) -> list[str]:
     if not config.llm.api_key():
         problems.append(
             f"{config.llm.api_key_env} is unset — the bot cannot talk to a model. "
-            "Add it to .env, or point llm.base_url at a local server."
+            "Add it to .env, or point llm.base_url at a local server "
+            f"(currently {config.llm.base_url_of()})."
         )
     if config.telegram_token is None:
         problems.append("TELEGRAM_BOT_TOKEN is unset — the Telegram bot cannot start.")

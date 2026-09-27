@@ -249,7 +249,7 @@ def build_handlers(config: Config) -> list[Any]:
         await reply(
             update,
             f"hey {name}. i'm up.\n\n{HELP_TEXT}\n\n"
-            f"model: `{config.llm.model}`\n"
+            f"model: `{config.llm.model_of()}` via {config.llm.base_url_of()}\n"
             f"tools: {', '.join(agent_of(context).registry.names()) or 'none'}",
         )
 
@@ -362,7 +362,8 @@ def build_handlers(config: Config) -> list[Any]:
         lines = [
             "*status*",
             f"uptime: {uptime:.0f}s",
-            f"model: `{config.llm.model}` via {config.llm.base_url}",
+            f"model: `{config.llm.model_of()}`",
+            f"endpoint: {config.llm.base_url_of()} (from {config.llm.where_from()})",
             f"tools: {', '.join(agent.registry.names()) or 'none'}",
         ]
         for tool in agent.registry.all():
@@ -607,7 +608,7 @@ async def _post_init(application: Application) -> None:
     agent: Agent = application.bot_data["agent"]
     me = await application.bot.get_me()
     log.info("telegram: @%s (%s) ready", me.username, me.id)
-    log.info("model: %s", config.llm.model)
+    log.info("model: %s via %s", config.llm.model_of(), config.llm.base_url_of())
     log.info("tools: %s", ", ".join(agent.registry.names()) or "none")
     log.info("memory: %s", agent.memory.stats())
     if config.bot.startup_chat_id:

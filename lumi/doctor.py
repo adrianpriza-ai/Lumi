@@ -126,7 +126,11 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
         )
     )
     checks.append(
-        Check("llm", OK, f"{config.llm.model} via {config.llm.base_url}")
+        Check(
+            "llm",
+            OK,
+            f"{config.llm.model_of()} via {config.llm.base_url_of()} (from {config.llm.where_from()})",
+        )
     )
 
     # -- shell ------------------------------------------------------------- #

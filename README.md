@@ -70,23 +70,43 @@ Precedence: dataclass defaults < `config.toml` < `config.local.toml` (gitignored
 
 ### The LLM
 
-Any OpenAI-compatible endpoint. Point `base_url` at it and it works:
+Any OpenAI-compatible endpoint: OpenAI, Ollama, LM Studio, vLLM, llama.cpp,
+Groq, OpenRouter, Together, Nous. Put the key in `.env`, and the endpoint
+wherever suits you:
+
+```bash
+# .env — per machine. This is the usual place.
+OPENAI_API_KEY=sk-or-whatever
+OPENAI_BASE_URL=http://localhost:20128/v1
+OPENAI_MODEL=nemotron-3-nano-reasoning
+```
 
 ```toml
+# config.toml — per project, overrides the environment
 [llm]
-model = "gpt-4.1-mini"
-base_url = "https://api.openai.com/v1"
-api_key_env = "OPENAI_API_KEY"
+base_url = "https://openrouter.ai/api/v1"
+model = "anthropic/claude-sonnet-4.5"
+api_key_env = "OPENROUTER_API_KEY"   # this provider's own key variable
 ```
 
-```toml
-# Ollama, fully local
-model = "qwen3:8b"
-base_url = "http://localhost:11434/v1"
-api_key_env = "OLLAMA_API_KEY"   # any non-empty value; Ollama ignores it
+Resolution order, most specific wins:
+
+1. `base_url` / `model` / `api_key_env` in `config.toml`
+2. `LUMI__LLM__BASE_URL`, `LUMI__LLM__MODEL`, `LUMI__LLM__API_KEY_ENV`
+3. `OPENAI_BASE_URL` (or `OPENAI_API_BASE`), `OPENAI_MODEL`, and the key named by `api_key_env`
+4. OpenAI and `gpt-4.1-mini`
+
+Always check what actually took effect:
+
+```bash
+lumi config --key llm.base_url   # -> http://localhost:20128/v1
+lumi config --key llm.model      # -> nemotron-3-nano-reasoning
+lumi doctor | grep llm           # -> model via endpoint (from OPENAI_BASE_URL)
 ```
 
-`temperature = null` omits the parameter, which some reasoning models require.
+If a call fails, the error names the endpoint, model and key variable it used, so
+a key rejected by the wrong host is obvious immediately. `temperature = null`
+omits the parameter, which some reasoning models require.
 
 ## Tools
 

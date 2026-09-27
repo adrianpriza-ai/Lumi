@@ -158,7 +158,7 @@ ENV/
 env.bak/
 venv.bak/
 
-# --- Lumi -------------------------------------------------------------------
+# Lumi
 # Runtime state: transcripts, logs, and the sandboxed working directory the
 # shell tool runs in. All of it is regenerated; none of it belongs in git.
 data/

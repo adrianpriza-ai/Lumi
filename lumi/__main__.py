@@ -118,7 +118,7 @@ async def _prompt(message: str) -> str:
 async def _chat(config: Config) -> int:
     agent = _build_agent(config)
     print(BANNER)
-    print(f"model: {config.llm.model} via {config.llm.base_url}")
+    print(f"model: {config.llm.model_of()} via {config.llm.base_url_of()}")
     print(f"tools: {', '.join(agent.registry.names()) or 'none'}\n")
 
     while True:
@@ -291,7 +291,13 @@ def cmd_config(args: argparse.Namespace) -> int:
             if node is None:
                 print(f"no such config key: {args.key}", file=sys.stderr)
                 return 2
-        print(node)
+        # Some keys are derived from the environment; print what is actually in
+        # effect rather than the raw field, which is often empty.
+        resolved = {
+            "llm.base_url": config.llm.base_url_of,
+            "llm.model": config.llm.model_of,
+        }.get(args.key)
+        print(resolved() if resolved else node)
         return 0
 
     print(json.dumps(encode(config), indent=2, default=str))

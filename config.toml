@@ -18,8 +18,20 @@ log_prefix = "lumi"
 # Any OpenAI-compatible endpoint: OpenAI, Ollama, LM Studio, vLLM, Groq,
 # OpenRouter, Together, ... Point base_url at it and set api_key_env.
 provider = "openai"
+# Leave `base_url` empty to take the endpoint from the environment. Resolution
+# order: this value, then OPENAI_BASE_URL / OPENAI_API_BASE from .env, then
+# OpenAI. So you can set the endpoint per machine in .env and still override it
+# per project here.
+#
+#   base_url = "https://api.openai.com/v1"
+#   base_url = "http://localhost:11434/v1"          # Ollama
+#   base_url = "http://localhost:1234/v1"           # LM Studio / vLLM
+#   base_url = "https://openrouter.ai/api/v1"
+base_url = ""
+# Same deal for the model: this value, then OPENAI_MODEL, then the default.
 model = "gpt-4.1-mini"
-base_url = "https://api.openai.com/v1"
+# Which environment variable holds the key. Point this at your provider's own
+# name if it differs, e.g. "GROQ_API_KEY" or "OPENROUTER_API_KEY".
 api_key_env = "OPENAI_API_KEY"
 # null = let the provider pick its default (needed for some reasoning models).
 temperature = 0.7
