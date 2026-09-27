@@ -32,7 +32,17 @@ base_url = ""
 model = "gpt-4.1-mini"
 # Which environment variable holds the key. Point this at your provider's own
 # name if it differs, e.g. "GROQ_API_KEY" or "OPENROUTER_API_KEY".
+# A comma-separated list is a rotation pool: "sk-...90, sk-...91".
 api_key_env = "OPENAI_API_KEY"
+# How to spend several keys, so one exhausted key cannot stop the bot.
+#   fallback     - use the first key, move on only when a call fails in a way
+#                  another key would survive (401/403/429/5xx, dropped
+#                  connection). A 400 fails at once. Right for backup keys.
+#   round_robin  - one call each, in turn. Right for keys on separate accounts.
+#   random       - pick at random; same balance as round_robin.
+# A key that fails is skipped for a minute, then tried again, so a rate limit
+# that clears itself recovers on its own.
+key_strategy = "fallback"
 # null = let the provider pick its default (needed for some reasoning models).
 temperature = 0.7
 max_tokens = 2000
@@ -45,7 +55,7 @@ max_memory_chars = 6000
 
 [tools]
 # Remove any tool from this list to disable it everywhere.
-enabled = ["shell", "files", "memory", "web"]
+enabled = ["shell", "files", "memory", "web", "context7"]
 
 [tools.shell]
 enabled = true
@@ -96,6 +106,15 @@ topic = "general"           # general | news | finance
 include_answer = true
 include_raw_content = true
 base_url = "https://api.tavily.com"
+# Comma-separated values make a rotation pool, identical to the LLM section.
+# Tavily also accepts keyless use: leave TAVILY_API_KEY unset and the SDK
+# falls back to its free tier (lower rate limit; search and extract only).
+#   TAVILY_API_KEY=tvly-...90, tvly-...91
+# Strategies (only meaningful when there is more than one key):
+#   fallback     - first key, move on only on 401/403/429/5xx.
+#   round_robin  - one each in turn.
+#   random       - pick at random.
+key_strategy = "fallback"
 
 [tools.web.providers.firecrawl]
 enabled = true
@@ -104,6 +123,9 @@ base_url = "https://api.firecrawl.dev"
 only_main_content = true
 # When search results carry no body text, scrape this many hits to fill them in.
 auto_scrape_top_n = 3
+# Same rotation rules as Tavily and the LLM client. Firecrawl has no keyless
+# tier, so unset means the provider is unavailable — not a fallback option.
+key_strategy = "fallback"
 
 [tools.web.providers.mcp]
 enabled = true
@@ -113,6 +135,25 @@ timeout_seconds = 60
 # First match wins; the list is just a preference order.
 search_tools = ["tavily_search", "firecrawl_search", "search"]
 fetch_tools = ["tavily_extract", "firecrawl_scrape", "scrape", "extract"]
+
+[tools.context7]
+# The `context7` tool fetches up-to-date library docs and code examples from
+# https://context7.com. It auto-enables the moment CONTEXT7_API_KEY is set;
+# leave the variable unset to keep it disabled and hidden from the model.
+enabled = true
+# Which env var holds the key. A comma-separated list is a rotation pool:
+# "ctx7sk-...91, ctx7sk-...92". Identical shape to OPENAI_API_KEY.
+api_key_env = "CONTEXT7_API_KEY"
+# Root of the Context7 API. The v2 prefix is part of the URL on purpose.
+base_url = "https://context7.com/api/v2"
+# Per-call HTTP timeout.
+timeout_seconds = 30
+# How to spend several keys.
+#   fallback     - first key, move on only on 401/403/429/5xx.
+#   round_robin  - one each in turn.
+#   random       - pick at random.
+# A key that fails is parked for a minute before it is retried.
+key_strategy = "fallback"
 
 [logging]
 level = "INFO"

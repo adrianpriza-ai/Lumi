@@ -90,7 +90,7 @@ def test_defaults_apply_with_no_config_file(project) -> None:
     config = load_config(project)
     assert isinstance(config, Config)
     assert config.llm.provider == "openai"
-    assert config.tools.enabled == ["shell", "files", "memory", "web"]
+    assert config.tools.enabled == ["shell", "files", "memory", "web", "context7"]
 
 
 def test_dotenv_is_read_from_the_project_root(project) -> None:
@@ -152,6 +152,35 @@ def test_validate_flags_unknown_tools(config) -> None:
 def test_validate_flags_unknown_providers(config) -> None:
     config.tools.web.provider_order = ["tavily", "askjeeves"]
     assert any("askjeeves" in p for p in validate(config))
+
+
+def test_validate_accepts_context7_in_tools_enabled(config) -> None:
+    """The context7 tool joins the known list without a validator complaint."""
+    config.tools.enabled = ["shell", "files", "memory", "web", "context7"]
+    assert not [p for p in validate(config) if "context7" in p and "unknown" in p]
+
+
+def test_validate_flags_an_unknown_context7_strategy(config, monkeypatch) -> None:
+    monkeypatch.setenv("CONTEXT7_API_KEY", "ctx7sk-91")
+    config.tools.context7.key_strategy = "telepathy"
+    assert any("key_strategy" in p and "context7" in p for p in validate(config))
+
+
+def test_validate_flags_an_unknown_tavily_strategy(config) -> None:
+    config.tools.web.tavily.key_strategy = "telepathy"
+    assert any("tavily" in p and "key_strategy" in p for p in validate(config))
+
+
+def test_validate_flags_an_unknown_firecrawl_strategy(config) -> None:
+    config.tools.web.firecrawl.key_strategy = "telepathy"
+    assert any("firecrawl" in p and "key_strategy" in p for p in validate(config))
+
+
+@pytest.mark.parametrize("strategy", ["fallback", "round_robin", "random"])
+def test_validate_accepts_every_documented_strategy(config, strategy: str) -> None:
+    config.tools.web.tavily.key_strategy = strategy
+    config.tools.web.firecrawl.key_strategy = strategy
+    assert not [p for p in validate(config) if "key_strategy" in p]
 
 
 # --------------------------------------------------------------------------- #
@@ -258,3 +287,69 @@ def test_api_key_env_is_configurable(config, monkeypatch) -> None:
     config.llm.api_key_env = "DEFINITELY_NOT_SET"
     assert config.llm.api_key() is None
     assert any("DEFINITELY_NOT_SET" in p for p in validate(config))
+
+
+# --------------------------------------------------------------------------- #
+# key pools
+# --------------------------------------------------------------------------- #
+
+
+def test_a_single_key_is_still_a_single_key(config) -> None:
+    assert config.llm.api_keys() == ["test-key"]
+
+
+def test_a_comma_separated_list_is_a_pool(config, monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-...90, sk-...91 ,sk-...92")
+    assert config.llm.api_keys() == ["sk-...90", "sk-...91", "sk-...92"]
+    # api_key() stays the primary key, so every existing caller keeps working.
+    assert config.llm.api_key() == "sk-...90"
+
+
+@pytest.mark.parametrize("separator", [",", ";", "\n"])
+def test_several_separators_are_accepted(config, monkeypatch, separator: str) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", f"sk-90{separator}sk-91")
+    assert config.llm.api_keys() == ["sk-90", "sk-91"]
+
+
+def test_a_trailing_separator_is_not_a_broken_key(config, monkeypatch) -> None:
+    """Stray punctuation in a hand-edited .env must not become a key."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-90, sk-91,")
+    assert config.llm.api_keys() == ["sk-90", "sk-91"]
+
+
+def test_duplicate_keys_collapse(config, monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-90,sk-90,sk-91")
+    assert config.llm.api_keys() == ["sk-90", "sk-91"]
+
+
+def test_quotes_around_a_key_are_stripped(config, monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", '"sk-90", \'sk-91\'')
+    assert config.llm.api_keys() == ["sk-90", "sk-91"]
+
+
+def test_an_empty_variable_has_no_keys(config, monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "   ")
+    assert config.llm.api_keys() == []
+    assert config.llm.api_key() is None
+
+
+def test_the_key_strategy_defaults_to_fallback(config) -> None:
+    assert config.llm.strategy_of() == "fallback"
+
+
+@pytest.mark.parametrize("strategy", ["fallback", "round_robin", "random"])
+def test_every_documented_strategy_is_accepted(config, strategy: str) -> None:
+    config.llm.key_strategy = strategy
+    assert config.llm.strategy_of() == strategy
+    assert not [p for p in validate(config) if "key_strategy" in p]
+
+
+def test_an_unknown_strategy_is_reported(config) -> None:
+    config.llm.key_strategy = "roundrobin"
+    assert config.llm.strategy_of() == "fallback"
+    assert any("key_strategy" in p for p in validate(config))
+
+
+def test_the_strategy_can_come_from_the_environment(config, monkeypatch) -> None:
+    monkeypatch.setenv("LUMI__LLM__KEY_STRATEGY", "round_robin")
+    assert load_config(config.root).llm.strategy_of() == "round_robin"

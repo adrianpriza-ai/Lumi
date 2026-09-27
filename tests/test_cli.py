@@ -86,6 +86,14 @@ def test_config_key_prints_one_value(config, capsys) -> None:
     assert capsys.readouterr().out.strip() == "test-model"
 
 
+def test_config_key_reports_the_effective_key_strategy(config, capsys, monkeypatch) -> None:
+    """The raw field is empty when the environment supplied the value."""
+    config.llm.key_strategy = ""
+    monkeypatch.setenv("LUMI__LLM__KEY_STRATEGY", "round_robin")
+    assert main(["config", "--key", "llm.key_strategy"]) == 0
+    assert capsys.readouterr().out.strip() == "round_robin"
+
+
 def test_config_key_rejects_nonsense(config, capsys) -> None:
     assert main(["config", "--key", "llm.nonexistent"]) == 2
 
@@ -136,6 +144,13 @@ def test_ask_without_a_question_is_rejected_by_argparse(config) -> None:
     assert exit_info.value.code == 2
 
 
-def test_search_reports_when_no_provider_is_configured(config, capsys) -> None:
+def test_search_reports_when_no_provider_is_configured(config, monkeypatch, capsys) -> None:
+    """With every provider disabled, ``lumi search`` reports unavailability.
+
+    Tavily supports a keyless tier, so just unsetting the keys is no longer
+    enough to make the provider unavailable — the test clears the provider
+    order through the env override the CLI actually reads.
+    """
+    monkeypatch.setenv("LUMI__TOOLS__WEB__PROVIDER_ORDER", "")
     assert main(["search", "anything"]) == 2
     assert "unavailable" in capsys.readouterr().err

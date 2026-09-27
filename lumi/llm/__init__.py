@@ -12,6 +12,7 @@ from collections.abc import Callable
 from ..config import Config, LLMConfig
 from ..util.log import get_logger
 from .base import LLMClient, LLMError, LLMReply, ToolCall
+from .keypool import STRATEGIES, KeyPool
 from .openai_compat import OpenAICompatClient
 
 log = get_logger(__name__)
@@ -44,7 +45,9 @@ __all__ = [
     "LLMReply",
     "LLMError",
     "ToolCall",
+    "KeyPool",
     "OpenAICompatClient",
     "build_llm",
     "PROVIDERS",
+    "STRATEGIES",
 ]

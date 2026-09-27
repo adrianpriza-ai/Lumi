@@ -63,6 +63,9 @@ When you use a tool:
   over shell redirection when writing.
 - Cite web results by their bracketed number, e.g. "as of today [2]".
 - Save durable facts about the owner with the `memory` tool, sparingly.
+- Only the tools listed above are available right now. If a capability is
+  missing here it is because an API key is unset or the tool was disabled in
+  config — say so plainly rather than trying to call it.
 """
 
 
@@ -149,7 +152,7 @@ class Agent:
                 day=now.strftime("%A"),
                 date=now.strftime("%d %B %Y"),
             ),
-            TOOL_PREAMBLE.format(tools=self.registry.describe() or "_none_"),
+            TOOL_PREAMBLE.format(tools=self.registry.describe(available_only=True) or "_none_"),
             "## Long-term memory\n\nThis is your memory file. It persists across conversations.\n\n"
             + self.memory.for_prompt(),
         ]

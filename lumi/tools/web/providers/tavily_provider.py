@@ -1,9 +1,18 @@
 """Tavily, through the official Python SDK.
 
 Tavily is the best fit for agentic search: it returns cleaned, LLM-ready
-snippets rather than raw HTML, and can bundle an answer with the results. Keyless
-usage is supported by the API with a much lower rate limit, so a missing key is
-reported as "degraded" rather than fatal.
+snippets rather than raw HTML, and can bundle an answer with the results.
+
+Keyless mode is supported — if ``TAVILY_API_KEY`` is unset, the SDK runs in
+its free tier (low rate limit; ``search`` and ``extract`` only). The provider
+is therefore *available* without a key, so the web tool can fall through to
+Tavily on a fresh clone and try something before giving up.
+
+Several keys are supported. A comma-separated list is a rotation pool — the
+same shape ``OPENAI_API_KEY`` already uses — and a failed key is parked for a
+minute before it is retried, so a 429 that clears itself recovers without a
+restart. The rotation lives in :class:`lumi.llm.keypool.KeyPool`; this module
+just describes which keys are ``available`` and which client to build per key.
 """
 
 from __future__ import annotations
@@ -11,6 +20,7 @@ from __future__ import annotations
 from typing import Any
 
 from ....config import TavilyConfig
+from ....llm.keypool import KeyPool, mask
 from ....util.log import get_logger
 from .base import Page, SearchHit, SearchResult, WebProvider
 
@@ -22,34 +32,102 @@ class TavilyProvider(WebProvider):
 
     def __init__(self, config: TavilyConfig) -> None:
         self.config = config
-        self._client: Any = None
+        self._pool = KeyPool(config.api_keys(), config.key_strategy_of())
+        #: one ``AsyncTavilyClient`` per key, so a parked key keeps its own session
+        self._auth_clients: dict[str, Any] = {}
+        #: a single keyless client when the env var is empty
+        self._keyless_client: Any = None
 
     def available(self) -> tuple[bool, str]:
         if not self.config.enabled:
             return False, "disabled in config"
-        if not self.config.api_key():
-            return False, f"{self.config.api_key_env} is not set"
         try:
             import tavily  # noqa: F401
         except ImportError:
             return False, "tavily-python is not installed"
+        # Note: Tavily's SDK supports a keyless tier; the provider stays
+        # available when no key is set so the web tool can try it before
+        # reporting failure.
         return True, ""
 
-    def _get_client(self) -> Any:
-        if self._client is None:
+    def _get_client(self, key: str | None) -> Any:
+        """Build (and cache) the right SDK client for *key*.
+
+        ``key=None`` means keyless mode; ``AsyncTavilyClient`` reads its own
+        env var when ``api_key=None``, so the only way to opt into keyless is
+        to pass ``None`` explicitly when ``TAVILY_API_KEY`` is unset.
+        """
+        if key is None:
+            if self._keyless_client is None:
+                from tavily import AsyncTavilyClient
+
+                self._keyless_client = AsyncTavilyClient(
+                    api_key=None,
+                    api_base_url=self.config.base_url,
+                )
+                log.debug("tavily keyless client created")
+            return self._keyless_client
+
+        client = self._auth_clients.get(key)
+        if client is None:
             from tavily import AsyncTavilyClient
 
-            self._client = AsyncTavilyClient(
-                api_key=self.config.api_key(),
+            client = AsyncTavilyClient(
+                api_key=key,
                 api_base_url=self.config.base_url,
             )
-            log.debug("tavily client created")
-        return self._client
+            self._auth_clients[key] = client
+            log.debug("tavily auth client created for %s", mask(key))
+        return client
+
+    # -- public surface ---------------------------------------------------- #
 
     async def search(self, query: str, max_results: int) -> SearchResult:
+        if not self._pool:
+            # Keyless mode: single attempt, no rotation. The SDK's keyless
+            # path returns 429 quickly when the rate limit trips, and there
+            # is nothing else to fall back to — surface the error plainly.
+            return await self._search_with(None, query, max_results)
+
+        tried: list[str] = []
+        last_error = ""
+        while (key := self._pool.pick(exclude=tried)) is not None:
+            tried.append(key)
+            result = await self._search_with(key, query, max_results)
+            if result.ok:
+                # The call itself succeeded — even an empty result is the
+                # query's fault, not the key's. Mark healthy and return.
+                self._pool.report(key, ok=True)
+                return result
+            last_error = result.error
+            self._pool.report(key, ok=False, retryable=True)
+        return SearchResult(
+            query=query, provider=self.name, error=last_error or "every key failed"
+        )
+
+    async def fetch(self, url: str) -> Page:
+        if not self._pool:
+            return await self._fetch_with(None, url)
+
+        tried: list[str] = []
+        last_error = ""
+        while (key := self._pool.pick(exclude=tried)) is not None:
+            tried.append(key)
+            page = await self._fetch_with(key, url)
+            if page.markdown.strip() and not page.markdown.startswith("extract failed"):
+                self._pool.report(key, ok=True)
+                return page
+            last_error = page.markdown
+            self._pool.report(key, ok=False, retryable=bool(page.markdown))
+        return Page(url=url, markdown=last_error or "every tavily key failed")
+
+    # -- single-call helpers ---------------------------------------------- #
+
+    async def _search_with(self, key: str | None, query: str, max_results: int) -> SearchResult:
         result = SearchResult(query=query, provider=self.name)
         try:
-            raw = await self._get_client().search(
+            client = self._get_client(key)
+            raw = await client.search(
                 query,
                 search_depth=self.config.search_depth,
                 topic=self.config.topic,
@@ -57,7 +135,7 @@ class TavilyProvider(WebProvider):
                 include_answer=self.config.include_answer,
                 include_raw_content="markdown" if self.config.include_raw_content else None,
             )
-        except Exception as exc:  # noqa: BLE001 - surfaced to the model as text
+        except Exception as exc:  # noqa: BLE001 - surfaced as a failed result
             log.warning("tavily search failed: %s", exc)
             result.error = f"{type(exc).__name__}: {exc}"
             return result
@@ -82,11 +160,10 @@ class TavilyProvider(WebProvider):
         log.info("tavily returned %d result(s) for %r", len(result.hits), query)
         return result
 
-    async def fetch(self, url: str) -> Page:
+    async def _fetch_with(self, key: str | None, url: str) -> Page:
         try:
-            raw = await self._get_client().extract(
-                [url], extract_depth="basic", format="markdown"
-            )
+            client = self._get_client(key)
+            raw = await client.extract([url], extract_depth="basic", format="markdown")
         except Exception as exc:  # noqa: BLE001
             log.warning("tavily extract failed for %s: %s", url, exc)
             return Page(url=url, markdown=f"extract failed: {type(exc).__name__}: {exc}")

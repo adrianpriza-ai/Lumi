@@ -58,6 +58,33 @@ async def test_system_prompt_carries_personality_and_memory(config) -> None:
     assert "run_shell" in system["content"]  # tool list
 
 
+async def test_system_prompt_hides_tools_without_a_key(config, monkeypatch) -> None:
+    """An API-key-gated tool is invisible to the model when its key is unset.
+
+    ``CONTEXT7_API_KEY`` is missing here; the tool is registered but
+    ``available()`` says no, so the system prompt must not advertise it.
+    """
+    monkeypatch.delenv("CONTEXT7_API_KEY", raising=False)
+    agent = make_agent(config, [make_reply("ok")])
+    await agent.handle(CHAT, "hi")
+
+    system = agent.llm.calls[0][0]["content"]
+    assert "context7" not in system.lower() or "_unavailable_" not in system
+    # And it should not appear as a callable tool spec either.
+    tools = [s for s in agent.registry.specs() if s["function"]["name"] == "context7"]
+    assert tools == []
+
+
+async def test_system_prompt_mentions_context7_when_the_key_is_set(config, monkeypatch) -> None:
+    monkeypatch.setenv("CONTEXT7_API_KEY", "ctx7sk-91")
+    agent = make_agent(config, [make_reply("ok")])
+    await agent.handle(CHAT, "hi")
+
+    system = agent.llm.calls[0][0]["content"]
+    assert "`context7`" in system
+    assert any(s["function"]["name"] == "context7" for s in agent.registry.specs())
+
+
 async def test_history_is_replayed(config) -> None:
     history = History(config.history_dir)
     history.append(CHAT, "user", "earlier question")

@@ -16,6 +16,7 @@ from ..config import Config
 from ..memory import MemoryFile
 from ..util.log import get_logger
 from .base import NeedsApproval, Tool, ToolContext, ToolError, ToolResult
+from .context7 import Context7Tool
 from .files import FilesTool
 from .memory_tool import MemoryTool
 from .registry import ToolRegistry
@@ -26,13 +27,22 @@ log = get_logger(__name__)
 
 
 def build_registry(config: Config, memory: MemoryFile) -> ToolRegistry:
-    """Construct the registry, honouring ``tools.enabled`` and the per-tool flags."""
+    """Construct the registry, honouring ``tools.enabled`` and the per-tool flags.
+
+    Tools that fail ``available()`` (e.g. ``context7`` without an API key) are
+    still registered, so introspection commands like ``/tools`` and ``/doctor``
+    can show why they are off — but ``ToolRegistry.specs()`` excludes them, so
+    the model never sees a tool it cannot actually call. The system prompt
+    follows the same rule via :meth:`ToolRegistry.describe` with
+    ``available_only=True``.
+    """
     registry = ToolRegistry()
     candidates = {
         "shell": lambda: ShellTool(config),
         "files": lambda: FilesTool(config),
         "memory": lambda: MemoryTool(config, memory),
         "web": lambda: WebTool(config),
+        "context7": lambda: Context7Tool(config),
     }
 
     for name, factory in candidates.items():
@@ -64,5 +74,6 @@ __all__ = [
     "FilesTool",
     "MemoryTool",
     "WebTool",
+    "Context7Tool",
     "build_registry",
 ]

@@ -335,6 +335,22 @@ async def test_doctor_command_runs_checks(config) -> None:
     assert "shell policy" in body
 
 
+async def test_doctor_reports_unset_context7_key(config, monkeypatch) -> None:
+    monkeypatch.delenv("CONTEXT7_API_KEY", raising=False)
+    bot, _ = await send(config, [], "/doctor")
+    body = texts(bot)
+    # The env-var line for context7 should be present and flagged as unset.
+    assert "CONTEXT7_API_KEY" in body
+
+
+async def test_doctor_reports_a_set_context7_key(config, monkeypatch) -> None:
+    monkeypatch.setenv("CONTEXT7_API_KEY", "ctx7sk-91")
+    bot, _ = await send(config, [], "/doctor")
+    body = texts(bot)
+    assert "CONTEXT7_API_KEY" in body
+    assert "set" in body.lower()
+
+
 async def test_reload_command(config) -> None:
     (config.personality_file).write_text("You are a lighthouse keeper.\n", encoding="utf-8")
     bot, _ = await send(config, [], "/reload")

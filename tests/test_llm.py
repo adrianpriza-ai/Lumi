@@ -14,6 +14,7 @@ import pytest
 
 from lumi.llm import build_llm
 from lumi.llm.base import LLMError
+from lumi.llm.keypool import mask
 from lumi.llm.openai_compat import OpenAICompatClient
 
 
@@ -25,7 +26,10 @@ class StubCompletions:
 
     async def create(self, **params):
         self.requests.append(params)
-        if self.error:
+        if isinstance(self.error, list) and self.error:
+            # One error per attempt, so a retry can be scripted.
+            raise self.error.pop(0)
+        if self.error and not isinstance(self.error, list):
             raise self.error
         return self.reply
 
@@ -36,8 +40,20 @@ class StubClient:
 
 
 def client_with(config, completions: StubCompletions) -> OpenAICompatClient:
+    """A client wired to a stub instead of the SDK.
+
+    ``used_keys`` records which key each attempt went out with, which is how the
+    rotation tests below see the pool at work without a network.
+    """
     client = OpenAICompatClient(config.llm)
-    client._client = StubClient(completions)
+    stub = StubClient(completions)
+    client.used_keys: list[str] = []
+
+    def _client_for(key: str) -> StubClient:
+        client.used_keys.append(key)
+        return stub
+
+    client._client_for = _client_for  # type: ignore[method-assign]
     return client
 
 
@@ -195,9 +211,130 @@ async def test_sdk_errors_become_llm_errors(config) -> None:
 async def test_missing_api_key_is_explained(config, monkeypatch) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     client = OpenAICompatClient(config.llm)
-    client._client = None
     with pytest.raises(LLMError, match="OPENAI_API_KEY"):
         await client.complete([{"role": "user", "content": "q"}])
+
+
+# --------------------------------------------------------------------------- #
+# key rotation
+# --------------------------------------------------------------------------- #
+
+
+def pooled(config, monkeypatch, *keys: str, strategy: str = "fallback") -> None:
+    """Point the key variable at a comma-separated pool."""
+    monkeypatch.setenv("OPENAI_API_KEY", ", ".join(keys))
+    config.llm.key_strategy = strategy
+
+
+def status_error(code: int) -> Exception:
+    """An exception shaped like the SDK's: a ``status_code`` and a message."""
+    exc = RuntimeError(f"Error code: {code} - the model refused")
+    exc.status_code = code  # type: ignore[attr-defined]
+    return exc
+
+
+# --------------------------------------------------------------------------- #
+# masking
+# --------------------------------------------------------------------------- #
+
+
+def test_masking_keeps_enough_to_identify_a_key() -> None:
+    assert mask("sk-proj-abcdefghijklmnop90") == "sk-…op90"
+    assert mask("tvly-abc123") == "tvl…c123"
+
+
+def test_masking_never_reveals_a_short_key() -> None:
+    """With fewer than 8 characters, a prefix and a suffix would overlap."""
+    for key in ("abc", "sk-90", "x" * 7):
+        assert key not in mask(key)
+    assert mask("") == "(empty)"
+    assert mask("sk-90") == "(len 5)"
+
+
+async def test_a_single_key_is_the_only_key_tried(config) -> None:
+    completions = StubCompletions(error=[status_error(429)])
+    client = client_with(config, completions)
+    with pytest.raises(LLMError):
+        await client.complete([{"role": "user", "content": "q"}])
+
+    assert client.used_keys == ["test-key"]  # no rotation without a pool
+
+
+async def test_a_failing_key_falls_through_to_the_next(config, monkeypatch) -> None:
+    pooled(config, monkeypatch, "sk-90", "sk-91")
+    # One scripted failure, then the stub succeeds: the second key answers.
+    completions = StubCompletions(reply("answered by the second key"), error=[status_error(429)])
+    client = client_with(config, completions)
+
+    result = await client.complete([{"role": "user", "content": "q"}])
+    assert result.text == "answered by the second key"
+    assert client.used_keys == ["sk-90", "sk-91"]
+
+
+async def test_fallback_keeps_using_the_healthy_key(config, monkeypatch) -> None:
+    """After one failure the parked key is skipped, not retried every turn."""
+    pooled(config, monkeypatch, "sk-90", "sk-91")
+    completions = StubCompletions(reply("hi"), error=[status_error(429)])
+    client = client_with(config, completions)
+
+    await client.complete([{"role": "user", "content": "q"}])
+    await client.complete([{"role": "user", "content": "q again"}])
+
+    assert client.used_keys == ["sk-90", "sk-91", "sk-91"]
+
+
+async def test_a_400_is_not_retried_on_another_key(config, monkeypatch) -> None:
+    """The request is wrong, not the key; burning the pool helps nobody."""
+    pooled(config, monkeypatch, "sk-90", "sk-91")
+    completions = StubCompletions(error=status_error(400))
+    client = client_with(config, completions)
+
+    with pytest.raises(LLMError, match="400"):
+        await client.complete([{"role": "user", "content": "q"}])
+    assert client.used_keys == ["sk-90"]
+
+
+async def test_every_key_failing_reports_the_whole_pool(config, monkeypatch) -> None:
+    pooled(config, monkeypatch, "sk-90", "sk-91")
+    completions = StubCompletions(error=[status_error(401), status_error(403)])
+    client = client_with(config, completions)
+
+    with pytest.raises(LLMError) as caught:
+        await client.complete([{"role": "user", "content": "q"}])
+
+    assert client.used_keys == ["sk-90", "sk-91"]
+    assert "all 2 of OPENAI_API_KEY failed" in str(caught.value)
+
+
+async def test_round_robin_alternates_keys(config, monkeypatch) -> None:
+    pooled(config, monkeypatch, "sk-90", "sk-91", strategy="round_robin")
+    completions = StubCompletions(reply("hi"))
+    client = client_with(config, completions)
+
+    for _ in range(4):
+        await client.complete([{"role": "user", "content": "q"}])
+
+    assert client.used_keys == ["sk-90", "sk-91", "sk-90", "sk-91"]
+
+
+async def test_random_stays_inside_the_pool(config, monkeypatch) -> None:
+    pooled(config, monkeypatch, "sk-90", "sk-91", strategy="random")
+    completions = StubCompletions(reply("hi"))
+    client = client_with(config, completions)
+
+    for _ in range(20):
+        await client.complete([{"role": "user", "content": "q"}])
+
+    assert set(client.used_keys) == {"sk-90", "sk-91"}
+
+
+async def test_an_unknown_strategy_falls_back_instead_of_booting(config, monkeypatch) -> None:
+    pooled(config, monkeypatch, "sk-90", "sk-91", strategy="telepathy")
+    completions = StubCompletions(reply("hi"))
+    client = client_with(config, completions)
+
+    await client.complete([{"role": "user", "content": "q"}])
+    assert client.used_keys == ["sk-90"]  # first key, as fallback means
 
 
 # --------------------------------------------------------------------------- #

@@ -117,19 +117,22 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
             f"{owner} (only this id gets the shell and file tools)" if owner else "missing — see .env.example",
         )
     )
-    key = config.llm.api_key()
-    checks.append(
-        Check(
-            f"{config.llm.api_key_env}",
-            OK if key else FAIL,
-            "set" if key else "missing — the bot cannot answer anything",
+    keys = config.llm.api_keys()
+    if keys:
+        detail = (
+            f"{len(keys)} key(s), {config.llm.strategy_of()} strategy"
+            if len(keys) > 1
+            else "set"
         )
-    )
+    else:
+        detail = "missing — the bot cannot answer anything"
+    checks.append(Check(f"{config.llm.api_key_env}", OK if keys else FAIL, detail))
     checks.append(
         Check(
             "llm",
             OK,
-            f"{config.llm.model_of()} via {config.llm.base_url_of()} (from {config.llm.where_from()})",
+            f"{config.llm.model_of()} via {config.llm.base_url_of()} "
+            f"(from {config.llm.where_from()}), keys: {config.llm.strategy_of()}",
         )
     )
 
@@ -149,17 +152,65 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
     )
 
     # -- web providers ----------------------------------------------------- #
-    for env_name, enabled in (
-        (config.tools.web.tavily.api_key_env, config.tools.web.tavily.enabled),
-        (config.tools.web.firecrawl.api_key_env, config.tools.web.firecrawl.enabled),
+    # Tavily has a keyless tier (provider stays available without a key);
+    # Firecrawl does not. Each provider also takes a key pool, so the doctor
+    # reports the strategy when more than one key is configured.
+    for provider_name, cfg in (
+        ("tavily", config.tools.web.tavily),
+        ("firecrawl", config.tools.web.firecrawl),
     ):
-        if not enabled:
-            checks.append(Check(env_name, WARN, "provider disabled in config"))
+        if not cfg.enabled:
+            checks.append(Check(cfg.api_key_env, WARN, "provider disabled in config"))
+            continue
+
+        keys = cfg.api_keys()
+        if not keys:
+            if provider_name == "tavily":
+                checks.append(
+                    Check(
+                        cfg.api_key_env,
+                        OK,
+                        "unset — using tavily's keyless tier (free, low rate limit)",
+                    )
+                )
+            else:
+                checks.append(
+                    Check(
+                        cfg.api_key_env,
+                        WARN,
+                        "unset — that provider will be skipped",
+                    )
+                )
+        elif len(keys) == 1:
+            checks.append(Check(cfg.api_key_env, OK, "set"))
         else:
-            present = bool(config.env(env_name))
             checks.append(
-                Check(env_name, OK if present else WARN, "set" if present else "unset — that provider will be skipped")
+                Check(
+                    cfg.api_key_env,
+                    OK,
+                    f"{len(keys)} key(s), {cfg.key_strategy_of()} strategy",
+                )
             )
+
+    # -- context7 (a tool, not a web provider, but the env var is the same shape) #
+    ctx7 = config.tools.context7
+    if not ctx7.enabled:
+        checks.append(Check(ctx7.api_key_env, WARN, "tool disabled in config"))
+    elif ctx7.api_keys():
+        detail = (
+            f"{len(ctx7.api_keys())} key(s), {ctx7.key_strategy_of()} strategy"
+            if len(ctx7.api_keys()) > 1
+            else "set"
+        )
+        checks.append(Check(ctx7.api_key_env, OK, detail))
+    else:
+        checks.append(
+            Check(
+                ctx7.api_key_env,
+                WARN,
+                "unset — the context7 tool is hidden from the model until it is set",
+            )
+        )
 
     mcp_path = config.root / config.tools.web.mcp.config_file
     if mcp_path.is_file():

@@ -22,6 +22,7 @@ from types import UnionType
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
 from .paths import project_root, resolve
+from .util.keys import parse_env_var
 from .util.log import get_logger
 
 log = get_logger(__name__)
@@ -57,6 +58,9 @@ OPENAI_DEFAULT_MODEL = "gpt-4.1-mini"
 BASE_URL_ENV_VARS = ("OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_API_BASE_URL")
 MODEL_ENV_VARS = ("OPENAI_MODEL",)
 
+#: How several keys in one env var are spent. See :mod:`lumi.llm.keypool`.
+KEY_STRATEGIES = ("fallback", "round_robin", "random")
+
 
 @dataclass(slots=True)
 class LLMConfig:
@@ -65,14 +69,52 @@ class LLMConfig:
     #: Empty means "ask the environment". See :meth:`base_url_of`.
     base_url: str = ""
     api_key_env: str = "OPENAI_API_KEY"
+    #: How to spend the keys in ``api_key_env``. See :meth:`api_keys`.
+    key_strategy: str = "fallback"
     temperature: float | None = 0.7
     max_tokens: int = 2000
     max_tool_iterations: int = 8
     history_turns: int = 20
     max_memory_chars: int = 6000
 
+    def api_keys(self) -> list[str]:
+        """Every key in ``api_key_env``, in the order they were written.
+
+        One key is the normal case and stays the only one. A comma-separated
+        list is a rotation pool, which is what makes a single ``OPENAI_API_KEY``
+        survive a rate limit or a dead credential:
+
+        .. code-block:: bash
+
+            OPENAI_API_KEY=sk-...90, sk-...91, sk-...92
+
+        Commas, semicolons and newlines all separate, so a long list can be
+        written one per line. Whitespace around a key is stripped, blanks are
+        dropped, and duplicates are collapsed — a trailing comma in ``.env`` is
+        not a broken key. The rules live in :mod:`lumi.util.keys` so every
+        key-bearing variable parses identically.
+        """
+        return parse_env_var(self.api_key_env)
+
     def api_key(self) -> str | None:
-        return os.environ.get(self.api_key_env) or None
+        """The primary key, or None when the variable is unset or empty."""
+        keys = self.api_keys()
+        return keys[0] if keys else None
+
+    def strategy_of(self) -> str:
+        """The rotation strategy, normalised.
+
+        An unknown value is a typo, not a reason to refuse to boot, so it warns
+        and falls back to the safest option rather than raising.
+        """
+        chosen = self.key_strategy.strip().lower() or "fallback"
+        if chosen in KEY_STRATEGIES:
+            return chosen
+        log.warning(
+            "unknown llm.key_strategy %r; falling back to %r. Known: %s",
+            self.key_strategy, "fallback", ", ".join(KEY_STRATEGIES),
+        )
+        return "fallback"
 
     def base_url_of(self) -> str:
         """The endpoint to actually call.
@@ -149,9 +191,35 @@ class TavilyConfig:
     include_answer: bool = True
     include_raw_content: bool = True
     base_url: str = "https://api.tavily.com"
+    #: How to spend several keys in ``api_key_env``. ``fallback`` (default)
+    #: walks to the next key on 401/403/429/5xx; ``round_robin`` and ``random``
+    #: spread the load. See :data:`WEB_KEY_STRATEGIES`.
+    key_strategy: str = "fallback"
+
+    def api_keys(self) -> list[str]:
+        """Every key in ``api_key_env``, in the order they were written.
+
+        An empty list means "run keyless" — Tavily supports a free tier with a
+        low rate limit when no key is configured. See ``provider.available``
+        for the rules.
+        """
+        return parse_env_var(self.api_key_env)
 
     def api_key(self) -> str | None:
-        return os.environ.get(self.api_key_env) or None
+        """The primary key, or None when the variable is unset or empty."""
+        keys = self.api_keys()
+        return keys[0] if keys else None
+
+    def key_strategy_of(self) -> str:
+        """The rotation strategy, normalised. Unknown values fall back to ``fallback``."""
+        chosen = self.key_strategy.strip().lower() or "fallback"
+        if chosen in WEB_KEY_STRATEGIES:
+            return chosen
+        log.warning(
+            "unknown tools.web.tavily.key_strategy %r; falling back to %r. Known: %s",
+            self.key_strategy, "fallback", ", ".join(WEB_KEY_STRATEGIES),
+        )
+        return "fallback"
 
 
 @dataclass(slots=True)
@@ -161,9 +229,28 @@ class FirecrawlConfig:
     base_url: str = "https://api.firecrawl.dev"
     only_main_content: bool = True
     auto_scrape_top_n: int = 3
+    #: How to spend several keys. See :data:`WEB_KEY_STRATEGIES`.
+    key_strategy: str = "fallback"
+
+    def api_keys(self) -> list[str]:
+        """Every key in ``api_key_env``, in the order they were written."""
+        return parse_env_var(self.api_key_env)
 
     def api_key(self) -> str | None:
-        return os.environ.get(self.api_key_env) or None
+        """The primary key, or None when the variable is unset or empty."""
+        keys = self.api_keys()
+        return keys[0] if keys else None
+
+    def key_strategy_of(self) -> str:
+        """The rotation strategy, normalised. Unknown values fall back to ``fallback``."""
+        chosen = self.key_strategy.strip().lower() or "fallback"
+        if chosen in WEB_KEY_STRATEGIES:
+            return chosen
+        log.warning(
+            "unknown tools.web.firecrawl.key_strategy %r; falling back to %r. Known: %s",
+            self.key_strategy, "fallback", ", ".join(WEB_KEY_STRATEGIES),
+        )
+        return "fallback"
 
 
 @dataclass(slots=True)
@@ -177,6 +264,70 @@ class MCPConfig:
     fetch_tools: list[str] = field(
         default_factory=lambda: ["tavily_extract", "firecrawl_scrape", "scrape", "extract"]
     )
+
+
+#: Documented ways of spending several keys in one env var. Mirrors the LLM
+#: section so a config can mix-and-match the same strategy names without
+#: learning a second vocabulary.
+CONTEXT7_KEY_STRATEGIES = ("fallback", "round_robin", "random")
+WEB_KEY_STRATEGIES = ("fallback", "round_robin", "random")
+
+
+@dataclass(slots=True)
+class Context7Config:
+    """Up-to-date library documentation via the Context7 HTTP API.
+
+    The tool is enabled if and only if ``api_keys()`` returns at least one key;
+    ``available()`` on the tool mirrors that check, which is how the system
+    prompt automatically drops the tool when the variable is empty.
+
+    A comma-separated value (``CONTEXT7_API_KEY=ctx7sk-...91, ctx7sk-...92``)
+    is a rotation pool, identical in shape to ``OPENAI_API_KEY``. Same three
+    strategies too: ``fallback`` (the default) walks to the next key on
+    401/403/429/5xx; ``round_robin`` shares the quota evenly; ``random`` is
+    round-robin without the cursor.
+    """
+
+    enabled: bool = True
+    #: Env var holding the key, comma-separated allowed. Default ``CONTEXT7_API_KEY``.
+    api_key_env: str = "CONTEXT7_API_KEY"
+    #: Root of the Context7 API. v2 is the public version at time of writing.
+    base_url: str = "https://context7.com/api/v2"
+    #: Per-call HTTP timeout. ``ctx7sk-…92`` accounts have higher limits, so this
+    #: can be tuned down for personal use.
+    timeout_seconds: float = 30.0
+    #: How to spend several keys. See :data:`CONTEXT7_KEY_STRATEGIES`.
+    key_strategy: str = "fallback"
+
+    def api_keys(self) -> list[str]:
+        """Every key in ``api_key_env``, in the order they were written.
+
+        One key is the normal case and stays the only one. A comma-separated
+        list is a rotation pool — see :mod:`lumi.util.keys` for the parsing
+        rules (separators ``,``/``;``/newline, whitespace and quotes stripped,
+        blanks and duplicates dropped).
+        """
+        return parse_env_var(self.api_key_env)
+
+    def api_key(self) -> str | None:
+        """The primary key, or None when the variable is unset or empty."""
+        keys = self.api_keys()
+        return keys[0] if keys else None
+
+    def key_strategy_of(self) -> str:
+        """The rotation strategy, normalised.
+
+        An unknown value is a typo, not a reason to refuse to boot, so it warns
+        and falls back rather than raising.
+        """
+        chosen = self.key_strategy.strip().lower() or "fallback"
+        if chosen in CONTEXT7_KEY_STRATEGIES:
+            return chosen
+        log.warning(
+            "unknown tools.context7.key_strategy %r; falling back to %r. Known: %s",
+            self.key_strategy, "fallback", ", ".join(CONTEXT7_KEY_STRATEGIES),
+        )
+        return "fallback"
 
 
 @dataclass(slots=True)
@@ -193,11 +344,14 @@ class WebConfig:
 
 @dataclass(slots=True)
 class ToolsConfig:
-    enabled: list[str] = field(default_factory=lambda: ["shell", "files", "memory", "web"])
+    enabled: list[str] = field(
+        default_factory=lambda: ["shell", "files", "memory", "web", "context7"]
+    )
     shell: ShellConfig = field(default_factory=ShellConfig)
     files: FilesConfig = field(default_factory=FilesConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     web: WebConfig = field(default_factory=WebConfig)
+    context7: Context7Config = field(default_factory=Context7Config)
 
     def is_enabled(self, name: str) -> bool:
         return name in self.enabled
@@ -466,6 +620,11 @@ def validate(config: Config) -> list[str]:
             "Add it to .env, or point llm.base_url at a local server "
             f"(currently {config.llm.base_url_of()})."
         )
+    elif config.llm.key_strategy.strip().lower() not in KEY_STRATEGIES:
+        problems.append(
+            f"unknown llm.key_strategy {config.llm.key_strategy!r}. "
+            f"Known: {', '.join(KEY_STRATEGIES)}"
+        )
     if config.telegram_token is None:
         problems.append("TELEGRAM_BOT_TOKEN is unset — the Telegram bot cannot start.")
     if config.bot.require_owner and config.owner_id is None:
@@ -480,11 +639,36 @@ def validate(config: Config) -> list[str]:
         problems.append(f"MEMORY.md not found at {config.memory_file}")
 
     for name in config.tools.enabled:
-        if name not in {"shell", "files", "memory", "web"}:
+        if name not in {"shell", "files", "memory", "web", "context7"}:
             problems.append(f"unknown tool {name!r} in tools.enabled")
 
     providers = [p for p in config.tools.web.provider_order if p not in {"tavily", "firecrawl", "mcp"}]
     if providers:
         problems.append(f"unknown web providers in tools.web.provider_order: {', '.join(providers)}")
+
+    # The context7 tool degrades silently when no key is set, so it never blocks
+    # startup; flag an unknown strategy though, because that one is a typo.
+    if (
+        config.tools.context7.enabled
+        and config.tools.context7.key_strategy.strip().lower() not in CONTEXT7_KEY_STRATEGIES
+    ):
+        problems.append(
+            f"unknown tools.context7.key_strategy {config.tools.context7.key_strategy!r}. "
+            f"Known: {', '.join(CONTEXT7_KEY_STRATEGIES)}"
+        )
+
+    for label, enabled, strategy in (
+        ("tools.web.tavily", config.tools.web.tavily.enabled, config.tools.web.tavily.key_strategy),
+        (
+            "tools.web.firecrawl",
+            config.tools.web.firecrawl.enabled,
+            config.tools.web.firecrawl.key_strategy,
+        ),
+    ):
+        if enabled and strategy.strip().lower() not in WEB_KEY_STRATEGIES:
+            problems.append(
+                f"unknown {label}.key_strategy {strategy!r}. "
+                f"Known: {', '.join(WEB_KEY_STRATEGIES)}"
+            )
 
     return problems

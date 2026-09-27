@@ -296,6 +296,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         resolved = {
             "llm.base_url": config.llm.base_url_of,
             "llm.model": config.llm.model_of,
+            "llm.key_strategy": config.llm.strategy_of,
         }.get(args.key)
         print(resolved() if resolved else node)
         return 0

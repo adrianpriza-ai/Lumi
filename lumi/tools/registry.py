@@ -46,12 +46,21 @@ class ToolRegistry:
     def specs(self) -> list[dict[str, Any]]:
         return [tool.spec() for tool in self.all() if tool.available()[0]]
 
-    def describe(self) -> str:
+    def describe(self, available_only: bool = False) -> str:
+        """A human-readable summary of every registered tool.
+
+        With ``available_only=True`` the list is filtered down to tools that
+        can actually run right now — this is what the system prompt uses, so
+        the model never sees a tool it cannot call. The default (everything)
+        is what ``/tools`` shows, so the owner can see *why* something is off.
+        """
         if not self._tools:
             return "_no tools enabled_"
         lines = []
         for tool in self.all():
             ok, reason = tool.available()
+            if available_only and not ok:
+                continue
             mark = "" if ok else f" _(unavailable: {reason})_"
             first = tool.description.strip().splitlines()[0] if tool.description.strip() else ""
             lines.append(f"- `{tool.name}`{mark} — {first}")
