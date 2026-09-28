@@ -33,6 +33,17 @@ group_reply_mode = "mention"
 # User ids allowed to use the bot alongside the owner. These users can
 # run all commands except whitelist management (owner-only).
 #   whitelisted_users = ["123456789", "987654321"]
+# SOCKS5 or HTTP proxy for the Bot API, if api.telegram.org is slow or blocked
+# from this network. Empty connects directly. Examples:
+#   proxy_url = "socks5://127.0.0.1:9050"
+#   proxy_url = "http://127.0.0.1:7890"
+proxy_url = ""
+# TCP connect timeout in seconds for Bot API calls. Raise it on a slow or
+# lossy network: the stock 5s can abort startup before the bot is up.
+connect_timeout = 15.0
+# Extra startup attempts after a network failure while bootstrapping
+# (initialize, delete/set webhook). 0 means exactly one attempt.
+bootstrap_retries = 3
 
 [llm]
 # Any OpenAI-compatible endpoint: OpenAI, Ollama, LM Studio, vLLM, Groq,
@@ -64,6 +75,7 @@ api_key_env = "OPENAI_API_KEY"
 # that clears itself recovers on its own.
 key_strategy = "fallback"
 # null = let the provider pick its default (needed for some reasoning models).
+# Ignored while `reasoning = true`, which omits it entirely — see below.
 temperature = 0.7
 max_tokens = 2000
 # How many tool-call round trips the agent may take for one message.
@@ -72,6 +84,39 @@ max_tool_iterations = 8
 history_turns = 20
 # MEMORY.md is truncated to this many characters when injected.
 max_memory_chars = 6000
+
+# --- Reasoning models -------------------------------------------------------
+# Turn this on for a model that thinks before it answers (gpt-oss, DeepSeek
+# reasoner, Qwen3, Nemotron, o-series, gpt-5, and friends). It fixes the three
+# things that otherwise make such a model look broken:
+#
+#   - temperature is dropped. These models reject any value but their own
+#     default, and a 400 on every turn is the usual symptom.
+#   - the token limit moves to max_completion_tokens, because the thinking is
+#     billed as output and would otherwise eat the answer.
+#   - reasoning_tokens is reserved on top of max_tokens for the trace.
+#
+# Safe to leave on for a model that does not reason: the extra parameters go
+# unused. If the endpoint rejects one anyway, Lumi drops it and retries
+# automatically, so you do not have to work out which combination it wants.
+#
+# Off by default so a plain model's sampling is untouched. Turn it on when
+# llm.model is a model that thinks — and if a turn ever 400s mentioning
+# temperature or max_tokens, the error will point you straight back here.
+reasoning = false
+# How hard to think. One of: none, minimal, low, medium, high, xhigh, max.
+# Empty sends "medium" while reasoning = true — and that presence matters: on
+# endpoints like Ollama's, reasoning_effort is itself the thinking on/off
+# switch, so omitting it leaves the model's own (usually off) default in
+# charge. "none" actively tells a model to skip thinking.
+reasoning_effort = ""
+# Token headroom for the thinking, on top of max_tokens.
+reasoning_tokens = 2000
+# Post the thinking trace in Telegram as one collapsed line under the answer,
+# with a button to expand it. `/reasoning off` in the chat turns it off for the
+# running process. In `lumi ask` the trace goes to stderr instead, so redirecting
+# stdout still gives you nothing but the answer.
+show_reasoning = true
 
 [tools]
 # Remove any tool from this list to disable it everywhere.
@@ -112,7 +157,7 @@ enabled = true
 # Providers are tried in this order; the first available one answers.
 # "mcp" reads .mcp.json from the project root, so you can drive any MCP
 # server (tavily, firecrawl, or your own) with zero extra code.
-provider_order = ["tavily", "firecrawl", "mcp"]
+provider_order = ["firecrawl", "tavily", "mcp"]
 max_results = 5
 max_content_chars = 6000
 # Seconds to wait on any single provider call.

@@ -8,6 +8,7 @@ the Confirm/Cancel keyboard for a risky command.
 
 from __future__ import annotations
 
+import base64
 import time
 from typing import Any
 
@@ -15,8 +16,8 @@ import pytest
 from conftest import FakeLLM, make_reply
 from telegram import Bot, Update, User
 
-from lumi.agent import Agent
-from lumi.bot import CB_NO, CB_OK, build_application
+from lumi.agent import Agent, TurnResult
+from lumi.bot import CB_NO, CB_OK, CB_THINK, TraceStore, build_application
 from lumi.memory import History, MemoryFile
 from lumi.personality import Personality
 from lumi.tools import build_registry
@@ -24,6 +25,16 @@ from lumi.tools import build_registry
 CHAT = 42
 OWNER = 42
 STRANGER = 999
+
+
+class _FakeFile:
+    """A minimal file object that supports download_as_bytearray."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    async def download_as_bytearray(self, **kwargs: Any) -> bytearray:
+        return bytearray(self._data)
 
 
 class FakeBot(Bot):
@@ -35,12 +46,23 @@ class FakeBot(Bot):
 
     def __init__(self) -> None:
         self._sent: list[dict[str, Any]] = []
+        self._edits: list[dict[str, Any]] = []
+        self._toasts: list[dict[str, Any]] = []
         self._actions: list[tuple[Any, ...]] = []
         super().__init__(token="123456:TESTTOKENFORLUMI")
 
     @property
     def sent(self) -> list[dict[str, Any]]:
         return self._sent
+
+    @property
+    def edits(self) -> list[dict[str, Any]]:
+        return self._edits
+
+    @property
+    def toasts(self) -> list[dict[str, Any]]:
+        """Every callback-query answer, i.e. what the button reported back."""
+        return self._toasts
 
     @property
     def actions(self) -> list[tuple[Any, ...]]:
@@ -60,9 +82,20 @@ class FakeBot(Bot):
         self._sent.append({"chat_id": chat_id, "text": text, **kwargs})
         return None
 
+    async def edit_message_text(self, text: str, **kwargs: Any) -> Any:
+        self._edits.append({"text": text, **kwargs})
+        return None
+
+    async def answer_callback_query(self, *args: Any, **kwargs: Any) -> bool:
+        self._toasts.append({"args": args, **kwargs})
+        return True
+
     async def send_chat_action(self, chat_id: Any, action: Any, **kwargs: Any) -> bool:
         self._actions.append((chat_id, action))
         return True
+
+    async def get_file(self, file_id: str, **kwargs: Any) -> Any:
+        return _FakeFile(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
 
 
 def make_update(bot: Bot, text: str | None = None, *, chat_id: int = CHAT, user_id: int = OWNER,
@@ -91,6 +124,28 @@ def make_update(bot: Bot, text: str | None = None, *, chat_id: int = CHAT, user_
     if reply_to_message is not None:
         message["reply_to_message"] = reply_to_message
     return Update.de_json({"update_id": message_id, "message": message}, bot)
+
+
+def make_callback(bot: Bot, data: str, *, chat_id: int = CHAT, user_id: int = OWNER) -> Update:
+    """An update for a tapped inline button."""
+    return Update.de_json(
+        {
+            "update_id": 1,
+            "callback_query": {
+                "id": "q1",
+                "from": {"id": user_id, "is_bot": False, "first_name": "Owner"},
+                "chat_instance": "ci",
+                "data": data,
+                "message": {
+                    "message_id": 7,
+                    "date": int(time.time()),
+                    "chat": {"id": chat_id, "type": "private"},
+                    "text": "stub",
+                },
+            },
+        },
+        bot,
+    )
 
 
 def build(config, replies) -> tuple[Any, FakeBot, Agent]:
@@ -254,6 +309,55 @@ async def test_approval_button_data_is_well_formed(config) -> None:
     assert len(cancel.callback_data) <= 64
 
 
+async def test_tapping_run_it_actually_runs_the_command(config) -> None:
+    """The whole approval flow, through the button rather than the slash command.
+
+    A handler that is defined but never registered is invisible to every other
+    test here: the keyboard is drawn and the callback data is well formed, and
+    the tap still goes nowhere. Only driving a real callback query catches it.
+
+    Note the script: ``/run`` invokes its tool directly and never calls the
+    model, so the first scripted reply is the model's turn *after* the approval
+    rather than the one that asked for it.
+    """
+    application, bot, agent = build(
+        config,
+        [
+            make_reply("", [("c1", "run_shell", {"command": "echo done"})]),
+            make_reply("it printed approved"),
+        ],
+    )
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "/run rm -rf workspace/tmp"))
+        keyboard = next(m["reply_markup"] for m in bot.sent if m.get("reply_markup"))
+        approve = keyboard.inline_keyboard[0][0]
+        await application.process_update(make_callback(bot, approve.callback_data))
+    finally:
+        await application.shutdown()
+
+    assert "it printed approved" in texts(bot)
+    assert not agent.conversation(42).pending  # the queue was drained
+
+
+async def test_tapping_cancel_declines_the_command(config) -> None:
+    """A refusal runs nothing, so the model's very next turn is its first."""
+    application, bot, agent = build(
+        config, [make_reply("understood, i left it alone")]
+    )
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "/run rm -rf workspace/tmp"))
+        keyboard = next(m["reply_markup"] for m in bot.sent if m.get("reply_markup"))
+        cancel = keyboard.inline_keyboard[0][1]
+        await application.process_update(make_callback(bot, cancel.callback_data))
+    finally:
+        await application.shutdown()
+
+    assert "left it alone" in texts(bot)
+    assert agent.llm.index == 1
+
+
 async def test_model_asks_for_approval_from_plain_text(config) -> None:
     bot, _ = await send(
         config,
@@ -394,7 +498,8 @@ async def test_stranger_gets_one_clear_sentence(config) -> None:
         assert leak not in body, f"{leak!r} leaked to a stranger"
 
 
-async def test_non_text_message_is_explained(config) -> None:
+async def test_unsupported_media_is_explained(config) -> None:
+    """A sticker is neither text nor an image the model can read."""
     application, bot, _ = build(config, [])
     update = Update.de_json(
         {
@@ -404,7 +509,11 @@ async def test_non_text_message_is_explained(config) -> None:
                 "date": int(time.time()),
                 "chat": {"id": CHAT, "type": "private"},
                 "from": {"id": OWNER, "is_bot": False, "first_name": "Owner"},
-                "photo": [{"file_id": "abc", "file_unique_id": "u1", "width": 1, "height": 1}],
+                "sticker": {
+                    "file_id": "abc", "file_unique_id": "u1",
+                    "width": 1, "height": 1, "type": "regular", "is_animated": False,
+                    "is_video": False,
+                },
             },
         },
         bot,
@@ -414,7 +523,7 @@ async def test_non_text_message_is_explained(config) -> None:
         await application.process_update(update)
     finally:
         await application.shutdown()
-    assert "read text only" in texts(bot).lower()
+    assert "read text and images only" in texts(bot).lower()
 
 
 # --------------------------------------------------------------------------- #
@@ -458,6 +567,46 @@ def test_builder_needs_a_token(config, monkeypatch) -> None:
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN")
     with pytest.raises(ConfigError, match="TELEGRAM_BOT_TOKEN"):
         build_application(config)
+
+
+# --------------------------------------------------------------------------- #
+# network settings (connect timeout, proxy, bootstrap retries)
+# --------------------------------------------------------------------------- #
+
+
+def _request_kwargs(application) -> list[dict]:
+    """The httpx kwargs of both request objects.
+
+    Bot._request is (get_updates_request, regular_request); the getUpdates
+    request is what bootstrap and polling go through. Both are configured
+    identically, so the tests do not care about the order.
+    """
+    return [req._client_kwargs for req in application.bot._request]
+
+
+def test_connect_timeout_is_applied_to_both_requests(config) -> None:
+    """PTB's stock 5s connect timeout aborts startup on a slow network."""
+    config.bot.connect_timeout = 20.0
+    for kwargs in _request_kwargs(build_application(config)):
+        assert kwargs["timeout"].connect == 20.0
+
+
+def test_proxy_is_applied_to_both_requests(config) -> None:
+    config.bot.proxy_url = "socks5://127.0.0.1:9050"
+    for kwargs in _request_kwargs(build_application(config)):
+        assert kwargs["proxy"] == "socks5://127.0.0.1:9050"
+
+
+def test_no_proxy_by_default(config) -> None:
+    for kwargs in _request_kwargs(build_application(config)):
+        assert kwargs["proxy"] is None
+
+
+def test_a_test_injected_bot_keeps_its_own_request_objects(config) -> None:
+    """The builder's network settings must not touch an injected Bot."""
+    config.bot.connect_timeout = 20.0
+    for kwargs in _request_kwargs(build_application(config, bot=FakeBot())):
+        assert kwargs["timeout"].connect == 5.0  # PTB default, untouched
 
 
 # --------------------------------------------------------------------------- #
@@ -644,9 +793,10 @@ async def test_non_text_in_group_is_silent(config) -> None:
     assert bot.sent == []
 
 
-async def test_non_text_in_group_with_mention_replies(config) -> None:
-    bot, _ = await send_photo_in_group(config, mention_text="@lumi_test_bot")
-    assert "read text only" in texts(bot).lower()
+async def test_photo_in_group_with_mention_reaches_the_agent(config) -> None:
+    """A captioned photo that mentions the bot is sent to the model."""
+    bot, agent = await send_photo_in_group(config, mention_text="@lumi_test_bot")
+    assert agent.llm.calls, "a mentioned photo in a group should reach the model"
 
 
 # --------------------------------------------------------------------------- #
@@ -661,7 +811,7 @@ async def send_photo_in_group(config, *, mention_text: str | None = None) -> tup
     entity is added — that is how a real photo-with-caption arrives when
     someone tags the bot.
     """
-    application, bot, agent = build(config, [])
+    application, bot, agent = build(config, [make_reply("a photo of something")])
     await application.initialize()
     caption = mention_text or ""
     caption_entities = (
@@ -793,3 +943,498 @@ async def test_whitelist_add_user_rejects_non_integer(config) -> None:
 async def test_whitelist_add_group_rejects_non_integer(config) -> None:
     bot, _ = await send(config, [], "/whitelist_add_group xyz")
     assert "not a valid id" in texts(bot).lower()
+
+
+# --------------------------------------------------------------------------- #
+# vision support
+# --------------------------------------------------------------------------- #
+
+class _FakeFile:
+    """A minimal file object that supports download_as_bytearray."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    async def download_as_bytearray(self, **kwargs: Any) -> bytearray:
+        return bytearray(self._data)
+
+
+class FakePhotoBot(FakeBot):
+    """A FakeBot that can serve a real image for photo downloads."""
+
+    def __init__(self, image_bytes: bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100) -> None:
+        super().__init__()
+        self._image_bytes = image_bytes
+
+    async def get_file(self, file_id: str, **kwargs: Any) -> Any:
+        return _FakeFile(self._image_bytes)
+
+
+def _make_photo_update(bot: Bot, *, caption: str | None = None, chat_id: int = CHAT,
+                       chat_type: str = "private",
+                       user_id: int = OWNER, message_id: int = 1) -> Update:
+    message: dict[str, Any] = {
+        "message_id": message_id,
+        "date": int(time.time()),
+        "chat": {"id": chat_id, "type": chat_type, "title": "Lab"},
+        "from": {"id": user_id, "is_bot": False, "first_name": "Owner", "username": "owner"},
+        "photo": [
+            {"file_id": "small", "file_unique_id": "s1", "width": 90, "height": 90},
+            {"file_id": "large", "file_unique_id": "l1", "width": 800, "height": 600},
+        ],
+    }
+    if caption is not None:
+        message["caption"] = caption
+        # Real Telegram sends a `mention` entity alongside the @handle in the
+        # caption; group routing keys off the entity, not the raw text.
+        if caption.startswith("@"):
+            handle = caption.split(maxsplit=1)[0]
+            message["caption_entities"] = [
+                {"type": "mention", "offset": 0, "length": len(handle)}
+            ]
+    return Update.de_json({"update_id": message_id, "message": message}, bot)
+
+
+async def test_photo_is_sent_to_the_model_as_base64(config) -> None:
+    """A photo message triggers a multimodal LLM call with the image embedded."""
+    image_bytes = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+    )
+    bot = FakePhotoBot(image_bytes)
+    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
+    memory.load()
+    agent = Agent(
+        config=config,
+        personality=Personality.load(config.personality_file),
+        memory=memory,
+        history=History(config.history_dir),
+        registry=build_registry(config, memory),
+        llm=FakeLLM([make_reply("i see a cat")]),
+    )
+    application = build_application(config, agent, bot=bot)
+    await application.initialize()
+    try:
+        await application.process_update(_make_photo_update(bot, caption="what is this?"))
+    finally:
+        await application.shutdown()
+
+    assert "i see a cat" in texts(bot)
+    # The LLM should have received a multimodal message with image content.
+    assert agent.llm.calls, "the model should have been called"
+    user_messages = [m for m in agent.llm.calls[0] if m.get("role") == "user"]
+    assert user_messages, "there should be a user message"
+    last_user = user_messages[-1]
+    content = last_user["content"]
+    assert isinstance(content, list), "content should be a multimodal array"
+    types = [part["type"] for part in content]
+    assert "text" in types
+    assert "image_url" in types
+    image_part = next(p for p in content if p["type"] == "image_url")
+    assert image_part["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
+async def test_photo_without_caption_gets_default_prompt(config) -> None:
+    """A photo with no caption gets a default 'what's in this image?' prompt."""
+    image_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
+    bot = FakePhotoBot(image_bytes)
+    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
+    memory.load()
+    agent = Agent(
+        config=config,
+        personality=Personality.load(config.personality_file),
+        memory=memory,
+        history=History(config.history_dir),
+        registry=build_registry(config, memory),
+        llm=FakeLLM([make_reply("looks like a diagram")]),
+    )
+    application = build_application(config, agent, bot=bot)
+    await application.initialize()
+    try:
+        await application.process_update(_make_photo_update(bot))
+    finally:
+        await application.shutdown()
+
+    assert "looks like a diagram" in texts(bot)
+    user_messages = [m for m in agent.llm.calls[0] if m.get("role") == "user"]
+    last_user = user_messages[-1]
+    content = last_user["content"]
+    text_part = next(p for p in content if p["type"] == "text")
+    assert "what" in text_part["text"].lower()
+
+
+async def test_photo_download_failure_gracefully(config) -> None:
+    """If the photo download fails, the bot says so instead of crashing."""
+
+    class FailingPhotoBot(FakePhotoBot):
+        async def get_file(self, file_id: str, **kwargs: Any) -> Any:
+            from telegram.error import TelegramError
+            raise TelegramError("file unavailable")
+
+    bot = FailingPhotoBot()
+    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
+    memory.load()
+    agent = Agent(
+        config=config,
+        personality=Personality.load(config.personality_file),
+        memory=memory,
+        history=History(config.history_dir),
+        registry=build_registry(config, memory),
+        llm=FakeLLM([make_reply("should never be sent")]),
+    )
+    application = build_application(config, agent, bot=bot)
+    await application.initialize()
+    try:
+        await application.process_update(_make_photo_update(bot, caption="what is this?"))
+    finally:
+        await application.shutdown()
+
+    assert "couldn't download" in texts(bot).lower()
+    assert agent.llm.calls == [], "the model should not have been called"
+
+
+async def test_photo_in_group_with_mention_replies(config) -> None:
+    """A photo with a mention in a group triggers a vision reply."""
+    image_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
+    bot = FakePhotoBot(image_bytes)
+    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
+    memory.load()
+    agent = Agent(
+        config=config,
+        personality=Personality.load(config.personality_file),
+        memory=memory,
+        history=History(config.history_dir),
+        registry=build_registry(config, memory),
+        llm=FakeLLM([make_reply("that's a screenshot of code")]),
+    )
+    application = build_application(config, agent, bot=bot)
+    await application.initialize()
+    try:
+        await application.process_update(
+            _make_photo_update(bot, caption="@lumi_test_bot what is this?",
+                             chat_id=GROUP_CHAT, chat_type="supergroup")
+        )
+    finally:
+        await application.shutdown()
+
+    assert "screenshot" in texts(bot)
+
+
+async def test_photo_in_group_without_mention_is_silent(config) -> None:
+    """A photo without a mention in a group is ignored (mention mode)."""
+    image_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
+    bot = FakePhotoBot(image_bytes)
+    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
+    memory.load()
+    agent = Agent(
+        config=config,
+        personality=Personality.load(config.personality_file),
+        memory=memory,
+        history=History(config.history_dir),
+        registry=build_registry(config, memory),
+        llm=FakeLLM([make_reply("should not fire")]),
+    )
+    application = build_application(config, agent, bot=bot)
+    await application.initialize()
+    try:
+        await application.process_update(
+            _make_photo_update(bot, caption="what is this?",
+                               chat_id=GROUP_CHAT, chat_type="supergroup")
+        )
+    finally:
+        await application.shutdown()
+
+    assert bot.sent == []
+    assert agent.llm.calls == []
+
+
+# --------------------------------------------------------------------------- #
+# reasoning
+# --------------------------------------------------------------------------- #
+
+
+THINKING = "first I checked the spelling, then the plural, so four"
+
+
+async def test_the_trace_is_not_spelled_out_in_the_chat(config) -> None:
+    """The whole point of collapsing it: the answer reads the same whether or
+    not anyone ever opens the trace."""
+    bot, _ = await send(config, [make_reply("four", reasoning=THINKING)], "how many r's?")
+    assert THINKING not in texts(bot)
+    assert "four" in texts(bot)
+
+
+async def test_the_collapsed_line_comes_before_the_answer(config) -> None:
+    """The order it happened in: the model thought, then it spoke."""
+    bot, _ = await send(config, [make_reply("four", reasoning=THINKING)], "how many r's?")
+    assert "🧠" in texts(bot)
+    assert "🧠" in bot.sent[0]["text"]
+    assert bot.sent[1]["text"] == "four"
+
+
+async def test_the_collapsed_line_carries_a_button_that_fits_callback_data(config) -> None:
+    bot, _ = await send(config, [make_reply("four", reasoning=THINKING)], "how many r's?")
+    keyboard = next(m["reply_markup"] for m in bot.sent if m.get("reply_markup"))
+    button = keyboard.inline_keyboard[0][0]
+    assert button.text == "show thinking"
+    assert button.callback_data.startswith(CB_THINK)
+    assert len(button.callback_data) <= 64  # Telegram's hard limit
+
+
+async def test_the_collapsed_line_reports_the_effort(config) -> None:
+    bot, _ = await send(
+        config,
+        [make_reply("four", reasoning=THINKING, reasoning_tokens=1200)],
+        "how many r's?",
+    )
+    assert "1,200 reasoning tokens" in texts(bot)
+
+
+async def test_no_button_when_the_model_did_not_reason(config) -> None:
+    bot, _ = await send(config, [make_reply("four")], "how many r's?")
+    assert "🧠" not in texts(bot)
+    assert not [m for m in bot.sent if m.get("reply_markup")]
+
+
+async def test_traces_can_be_turned_off(config) -> None:
+    config.llm.show_reasoning = False
+    bot, _ = await send(config, [make_reply("four", reasoning=THINKING)], "how many r's?")
+    assert "🧠" not in texts(bot)
+
+
+async def test_tapping_show_edits_the_message_in_place(config) -> None:
+    """In place, not as a new message: a chat scrolled back to an old turn
+    should not gain a second copy of the trace below it."""
+    application, bot, _ = build(config, [make_reply("four", reasoning=THINKING)])
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "how many r's?"))
+        posted = len(bot.sent)  # the answer and the collapsed stub
+        stub = next(m for m in bot.sent if m.get("reply_markup"))
+        token = stub["reply_markup"].inline_keyboard[0][0].callback_data
+        await application.process_update(make_callback(bot, token))
+    finally:
+        await application.shutdown()
+
+    assert len(bot.sent) == posted  # tapping added no new message
+    assert THINKING in bot.edits[0]["text"]
+    assert "thinking" in bot.edits[0]["text"].lower()
+
+
+async def test_the_expanded_trace_offers_a_way_back(config) -> None:
+    application, bot, _ = build(config, [make_reply("four", reasoning=THINKING)])
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "how many r's?"))
+        stub = next(m for m in bot.sent if m.get("reply_markup"))
+        token = stub["reply_markup"].inline_keyboard[0][0].callback_data
+        await application.process_update(make_callback(bot, token))
+        keyboard = bot.edits[0]["reply_markup"]
+        assert keyboard.inline_keyboard[0][0].text == "hide"
+    finally:
+        await application.shutdown()
+
+
+async def test_tapping_hide_collapses_it_again(config) -> None:
+    application, bot, _ = build(config, [make_reply("four", reasoning=THINKING)])
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "how many r's?"))
+        stub = next(m for m in bot.sent if m.get("reply_markup"))
+        token = stub["reply_markup"].inline_keyboard[0][0].callback_data
+        await application.process_update(make_callback(bot, token))
+        await application.process_update(make_callback(bot, f"{CB_THINK}hide:"))
+    finally:
+        await application.shutdown()
+
+    assert THINKING not in bot.edits[-1]["text"]
+
+
+async def test_an_expired_trace_does_not_edit_the_message(config) -> None:
+    """Editing it to something meaningless looks like a broken button; saying so
+    in the toast is honest and leaves the message alone."""
+    application, bot, _ = build(config, [make_reply("four", reasoning=THINKING)])
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "how many r's?"))
+        await application.process_update(make_callback(bot, f"{CB_THINK}show:deadbeef1234"))
+    finally:
+        await application.shutdown()
+
+    assert bot.edits == []
+
+
+async def test_a_stranger_cannot_read_someone_elses_trace(config) -> None:
+    application, bot, _ = build(config, [make_reply("four", reasoning=THINKING)])
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "how many r's?"))
+        stub = next(m for m in bot.sent if m.get("reply_markup"))
+        token = stub["reply_markup"].inline_keyboard[0][0].callback_data
+        await application.process_update(make_callback(bot, token, user_id=STRANGER))
+    finally:
+        await application.shutdown()
+
+    assert THINKING not in texts(bot)
+    assert bot.edits == []
+
+
+async def test_a_malformed_think_button_is_ignored(config) -> None:
+    application, bot, _ = build(config, [])
+    await application.initialize()
+    try:
+        await application.process_update(make_callback(bot, CB_THINK))
+    finally:
+        await application.shutdown()
+    assert bot.edits == []
+
+
+async def test_a_tool_turn_still_shows_one_collapsed_line(config) -> None:
+    bot, _ = await send(
+        config,
+        [
+            make_reply("", [("c1", "run_shell", {"command": "echo hi"})], reasoning="run it"),
+            make_reply("it said hi", reasoning="it worked"),
+        ],
+        "run echo hi",
+    )
+    assert texts(bot).count("🧠") == 1
+
+
+async def test_the_stub_reports_the_models_time_not_the_turns(config) -> None:
+    """On a turn that spent most of itself waiting on a tool, "thought for Ns"
+    would be a lie — the number has to be the model's."""
+    from lumi.bot import thinking_stub
+
+    result = TurnResult(text="done", reasoning="x" * 10)
+    result.elapsed = 30.0
+    result.thinking_seconds = 4.0
+    assert "thought for 4s" in thinking_stub(result)
+
+    # And it falls back to the turn total when nothing timed the model.
+    result.thinking_seconds = 0.0
+    assert "thought for 30s" in thinking_stub(result)
+
+
+async def test_a_turn_paused_for_approval_still_offers_its_trace(config) -> None:
+    """Both keyboards on the same turn, and neither shadowing the other."""
+    bot, _ = await send(
+        config,
+        [
+            make_reply(
+                "",
+                [("c1", "run_shell", {"command": "rm -rf workspace/tmp"})],
+                reasoning="this deletes things",
+            )
+        ],
+        "clean up",
+    )
+    assert "needs your approval" in texts(bot)
+    assert "🧠" in texts(bot)
+    assert len([m for m in bot.sent if m.get("reply_markup")]) == 2
+
+
+async def test_a_huge_trace_is_truncated_rather_than_spamming_the_chat(config) -> None:
+    application, bot, _ = build(config, [make_reply("four", reasoning="x" * 40_000)])
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "how many r's?"))
+        stub = next(m for m in bot.sent if m.get("reply_markup"))
+        token = stub["reply_markup"].inline_keyboard[0][0].callback_data
+        await application.process_update(make_callback(bot, token))
+    finally:
+        await application.shutdown()
+
+    assert len(bot.edits) == 1
+    assert len(bot.edits[0]["text"]) < 4096  # still one Telegram message
+    assert "truncated" in bot.edits[0]["text"]
+
+
+# --------------------------------------------------------------------------- #
+# the store behind the button
+# --------------------------------------------------------------------------- #
+
+
+def test_a_stored_trace_comes_back() -> None:
+    store = TraceStore()
+    assert store.get(store.put("the thinking")) == "the thinking"
+
+
+def test_an_unknown_token_is_simply_absent() -> None:
+    assert TraceStore().get("nope") is None
+
+
+def test_tokens_are_short_enough_for_callback_data() -> None:
+    assert len(TraceStore().put("x")) <= 64
+
+
+def test_an_expired_trace_is_gone() -> None:
+    store = TraceStore(ttl=0.0)
+    token = store.put("the thinking")
+    assert store.get(token) is None
+
+
+def test_the_store_is_bounded() -> None:
+    """A tap that never comes must not keep a model's reasoning alive forever."""
+    store = TraceStore(limit=3)
+    tokens = [store.put(f"trace {i}") for i in range(10)]
+    assert len(store) == 3
+    assert store.get(tokens[-1]) == "trace 9"
+    assert store.get(tokens[0]) is None  # the oldest went first
+
+
+def test_stale_traces_are_pruned_on_the_way_in() -> None:
+    store = TraceStore(ttl=60.0)
+    token = store.put("old")
+    store._ttl = 0.0  # as if the entry had aged out
+    store.put("new")
+    assert store.get(token) is None
+    assert len(store) == 1
+
+
+# --------------------------------------------------------------------------- #
+# /reasoning
+# --------------------------------------------------------------------------- #
+
+
+async def test_reasoning_reports_the_setup(config) -> None:
+    bot, _ = await send(config, [], "/reasoning")
+    body = texts(bot)
+    assert "reasoning" in body
+    assert "off" in body
+
+
+async def test_reasoning_off_hides_the_trace(config) -> None:
+    bot, _ = await send(config, [], "/reasoning off")
+    assert "trace in chat: off" in texts(bot)
+
+    bot, _ = await send(config, [make_reply("four", reasoning=THINKING)], "how many r's?")
+    assert "🧠" not in texts(bot)
+
+
+async def test_reasoning_on_brings_the_trace_back(config) -> None:
+    application, bot, _ = build(config, [])
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "/reasoning off"))
+        bot._sent.clear()
+        await application.process_update(make_update(bot, "/reasoning on"))
+    finally:
+        await application.shutdown()
+
+    assert "trace in chat: on" in texts(bot)
+
+
+async def test_reasoning_rejects_nonsense(config) -> None:
+    bot, _ = await send(config, [], "/reasoning maybe")
+    assert "usage" in texts(bot).lower()
+
+
+async def test_status_mentions_reasoning(config) -> None:
+    bot, _ = await send(config, [], "/status")
+    assert "reasoning: off" in texts(bot)
+
+
+async def test_help_mentions_the_thinking_toggle(config) -> None:
+    bot, _ = await send(config, [], "/help")
+    assert "/reasoning" in texts(bot)
+    assert "show thinking" in texts(bot)

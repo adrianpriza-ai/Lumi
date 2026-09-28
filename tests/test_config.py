@@ -364,3 +364,124 @@ def test_an_unknown_strategy_is_reported(config) -> None:
 def test_the_strategy_can_come_from_the_environment(config, monkeypatch) -> None:
     monkeypatch.setenv("LUMI__LLM__KEY_STRATEGY", "round_robin")
     assert load_config(config.root).llm.strategy_of() == "round_robin"
+
+
+# --------------------------------------------------------------------------- #
+# reasoning
+# --------------------------------------------------------------------------- #
+
+
+def test_reasoning_is_off_by_default(config) -> None:
+    """Off by default, so a model that does not reason behaves exactly as it did
+    before this existed."""
+    assert config.llm.reasoning is False
+    assert config.llm.reasoning_effort == ""
+    assert not [p for p in validate(config) if "reasoning" in p]
+
+
+@pytest.mark.parametrize("effort", ["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+def test_every_documented_effort_is_accepted(config, effort: str) -> None:
+    config.llm.reasoning_effort = effort
+    assert config.llm.effort_of() == effort
+    assert not [p for p in validate(config) if "reasoning_effort" in p]
+
+
+def test_effort_is_normalised(config) -> None:
+    config.llm.reasoning_effort = "  HIGH "
+    assert config.llm.effort_of() == "high"
+
+
+def test_an_empty_effort_sends_nothing_in_plain_mode(config) -> None:
+    """reasoning off, effort unset: the parameter stays out of the request."""
+    assert config.llm.reasoning is False
+    assert config.llm.effort_of() == ""
+
+
+def test_an_empty_effort_sends_the_default_in_reasoning_mode(config) -> None:
+    """On endpoints like Ollama's, reasoning_effort's presence is the thinking
+    on/off switch — omitting it would leave a default-off model silent."""
+    config.llm.reasoning = True
+    assert config.llm.effort_of() == "medium"
+
+
+def test_effort_none_still_means_none(config) -> None:
+    """``"none"`` actively asks a model that thinks to skip thinking; it must
+    not be collapsed into the default."""
+    config.llm.reasoning = True
+    config.llm.reasoning_effort = "none"
+    assert config.llm.effort_of() == "none"
+
+
+def test_an_unknown_effort_is_reported_and_omitted(config) -> None:
+    """Reported so a typo is visible, but omitted rather than fatal — the
+    provider's default is a perfectly good answer."""
+    config.llm.reasoning_effort = "turbo"
+    assert config.llm.effort_of() == ""
+    assert any("reasoning_effort" in p for p in validate(config))
+
+
+def test_a_negative_thinking_budget_is_reported(config) -> None:
+    config.llm.reasoning = True
+    config.llm.reasoning_tokens = -1
+    assert any("reasoning_tokens" in p for p in validate(config))
+
+
+def test_the_reasoning_settings_can_come_from_the_environment(config, monkeypatch) -> None:
+    monkeypatch.setenv("LUMI__LLM__REASONING", "true")
+    monkeypatch.setenv("LUMI__LLM__REASONING_EFFORT", "high")
+    monkeypatch.setenv("LUMI__LLM__REASONING_TOKENS", "8000")
+    llm = load_config(config.root).llm
+    assert llm.reasoning is True
+    assert llm.effort_of() == "high"
+    assert llm.reasoning_tokens == 8000
+
+
+def test_the_trace_is_shown_by_default(config) -> None:
+    assert config.llm.show_reasoning is True
+
+
+# --------------------------------------------------------------------------- #
+# bot network settings
+# --------------------------------------------------------------------------- #
+
+
+def test_network_defaults(config) -> None:
+    """Direct connection, generous connect timeout, a few startup retries."""
+    assert config.bot.proxy_url == ""
+    assert config.bot.connect_timeout == 15.0
+    assert config.bot.bootstrap_retries == 3
+
+
+def test_network_settings_can_come_from_toml(project) -> None:
+    (project / "config.toml").write_text(
+        "[bot]\n"
+        "require_owner = false\n"
+        "proxy_url = 'socks5://127.0.0.1:9050'\n"
+        "connect_timeout = 30.5\n"
+        "bootstrap_retries = 7\n",
+        encoding="utf-8",
+    )
+    bot = load_config(project).bot
+    assert bot.proxy_url == "socks5://127.0.0.1:9050"
+    assert bot.connect_timeout == 30.5
+    assert bot.bootstrap_retries == 7
+
+
+def test_network_settings_can_come_from_the_environment(project, monkeypatch) -> None:
+    monkeypatch.setenv("LUMI__BOT__PROXY_URL", "http://127.0.0.1:7890")
+    monkeypatch.setenv("LUMI__BOT__CONNECT_TIMEOUT", "20")
+    monkeypatch.setenv("LUMI__BOT__BOOTSTRAP_RETRIES", "5")
+    bot = load_config(project).bot
+    assert bot.proxy_url == "http://127.0.0.1:7890"
+    assert bot.connect_timeout == 20.0
+    assert bot.bootstrap_retries == 5
+
+
+def test_a_non_positive_connect_timeout_is_reported(config) -> None:
+    config.bot.connect_timeout = 0
+    assert any("connect_timeout" in p for p in validate(config))
+
+
+def test_negative_bootstrap_retries_are_reported(config) -> None:
+    config.bot.bootstrap_retries = -1
+    assert any("bootstrap_retries" in p for p in validate(config))

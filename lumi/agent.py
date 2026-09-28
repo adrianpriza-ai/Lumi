@@ -99,6 +99,17 @@ class TurnResult:
     iterations: int = 0
     error: str = ""
     elapsed: float = 0.0
+    #: The model's thinking, joined across every iteration of the turn. Empty
+    #: unless a reasoning model was in use. Deliberately *not* written back into
+    #: the conversation: the trace is not part of the message history, and
+    #: replaying it would be rejected by most providers.
+    reasoning: str = ""
+    #: Reasoning tokens the provider reported, when it reports the split.
+    reasoning_tokens: int = 0
+    #: Seconds spent inside the model, summed over iterations. Separate from
+    #: :attr:`elapsed` because that also counts tool execution, and "thought for
+    #: 20s" would be a lie on a turn that spent 18 of them waiting on a search.
+    thinking_seconds: float = 0.0
 
     @property
     def ok(self) -> bool:
@@ -107,6 +118,10 @@ class TurnResult:
     @property
     def needs_approval(self) -> bool:
         return bool(self.pending)
+
+    @property
+    def has_reasoning(self) -> bool:
+        return bool(self.reasoning.strip())
 
 
 @dataclass(slots=True)
@@ -203,11 +218,31 @@ class Agent:
 
     # -- the loop ---------------------------------------------------------- #
 
-    async def handle(self, chat_id: int | str, text: str, *, source: str = "chat") -> TurnResult:
-        """Run one full turn for *text*."""
+    async def handle(
+        self,
+        chat_id: int | str,
+        text: str,
+        *,
+        source: str = "chat",
+        image_b64: str | None = None,
+        image_mime: str = "image/jpeg",
+    ) -> TurnResult:
+        """Run one full turn for *text*, optionally with an image.
+
+        When *image_b64* is provided the user message is sent as a multimodal
+        content array (text + image_url) so vision-capable models can see it.
+        """
         conv = self.conversation(chat_id)
         self._refresh_system_prompt(conv)
-        conv.messages.append({"role": "user", "content": text})
+        content: str | list[dict[str, Any]]
+        if image_b64:
+            content = [
+                {"type": "text", "text": text},
+                {"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{image_b64}"}},
+            ]
+        else:
+            content = text
+        conv.messages.append({"role": "user", "content": content})
         self.history.append(chat_id, "user", text, session=conv.session)
         return await self._loop(conv, self._context(source, chat_id))
 
@@ -230,6 +265,7 @@ class Agent:
             self._trim(conv)
 
             try:
+                asked = time.monotonic()
                 reply = await self.llm.complete(conv.messages, tools=specs or None)
             except LLMError as exc:
                 result.error = str(exc)
@@ -238,8 +274,17 @@ class Agent:
                     conv.chat_id, "assistant", f"[error] {exc}", session=conv.session
                 )
                 return result
+            result.thinking_seconds += time.monotonic() - asked
 
             conv.messages.append(_assistant_message(reply))
+
+            # Accumulate onto the result rather than a local, so every exit from
+            # this loop reports the same thinking: a turn that stops to ask for
+            # approval has already thought through the first attempt, and
+            # throwing that away would hide the most interesting part.
+            if reply.reasoning:
+                result.reasoning = f"{result.reasoning}\n\n{reply.reasoning}".strip()
+            result.reasoning_tokens += reply.usage.get("reasoning", 0)
 
             if not reply.wants_tools:
                 result.text = reply.text
@@ -411,7 +456,13 @@ class Agent:
 
 
 def _assistant_message(reply: LLMReply) -> dict[str, Any]:
-    """Rebuild the assistant turn in the exact shape the API expects."""
+    """Rebuild the assistant turn in the exact shape the API expects.
+
+    ``reply.reasoning`` is left out on purpose. Replaying a thinking trace is
+    not something the chat-completions API asks for, and several providers
+    reject the whole request if an assistant turn carries a field they do not
+    recognise.
+    """
     if not reply.wants_tools:
         return {"role": "assistant", "content": reply.text}
     return {

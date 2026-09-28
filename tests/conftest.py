@@ -82,7 +82,14 @@ class FakeLLM:
         return "fake"
 
 
-def make_reply(text: str = "", tool_calls: list | None = None, finish_reason: str = "stop"):
+def make_reply(
+    text: str = "",
+    tool_calls: list | None = None,
+    finish_reason: str = "stop",
+    *,
+    reasoning: str = "",
+    reasoning_tokens: int = 0,
+):
     """Build an LLMReply with tool calls given as (id, name, arguments) tuples."""
     from lumi.llm.base import LLMReply, ToolCall
 
@@ -91,6 +98,8 @@ def make_reply(text: str = "", tool_calls: list | None = None, finish_reason: st
     ]
     return LLMReply(
         text=text,
+        reasoning=reasoning,
         tool_calls=calls,
         finish_reason=finish_reason if not calls else "tool_calls",
+        usage={"reasoning": reasoning_tokens} if reasoning_tokens else {},
     )

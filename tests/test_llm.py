@@ -57,21 +57,45 @@ def client_with(config, completions: StubCompletions) -> OpenAICompatClient:
     return client
 
 
-def reply(text: str = "", tool_calls: list | None = None, finish_reason: str = "stop", usage=True):
+def reply(
+    text: str = "",
+    tool_calls: list | None = None,
+    finish_reason: str = "stop",
+    usage=True,
+    *,
+    reasoning: str | None = None,
+    reasoning_tokens: int = 0,
+):
+    """A stand-in for a chat completion.
+
+    ``reasoning`` lands as an attribute on the message rather than in the
+    dataclass, which is exactly what the real SDK does with a provider's
+    untyped extra field — and is the thing :mod:`lumi.llm.reasoning` probes.
+    """
     function_calls = [
         SimpleNamespace(
             id=cid, function=SimpleNamespace(name=name, arguments=arguments)
         )
         for cid, name, arguments in (tool_calls or [])
     ]
+    message = SimpleNamespace(content=text, tool_calls=function_calls or None)
+    if reasoning is not None:
+        message.reasoning_content = reasoning
+    details = SimpleNamespace(reasoning_tokens=reasoning_tokens) if reasoning_tokens else None
     return SimpleNamespace(
         choices=[
             SimpleNamespace(
-                message=SimpleNamespace(content=text, tool_calls=function_calls or None),
+                message=message,
                 finish_reason=finish_reason,
             )
         ],
-        usage=SimpleNamespace(prompt_tokens=11, completion_tokens=7) if usage else None,
+        usage=(
+            SimpleNamespace(
+                prompt_tokens=11, completion_tokens=7, completion_tokens_details=details
+            )
+            if usage
+            else None
+        ),
     )
 
 
@@ -226,9 +250,9 @@ def pooled(config, monkeypatch, *keys: str, strategy: str = "fallback") -> None:
     config.llm.key_strategy = strategy
 
 
-def status_error(code: int) -> Exception:
+def status_error(code: int, message: str = "the model refused") -> Exception:
     """An exception shaped like the SDK's: a ``status_code`` and a message."""
-    exc = RuntimeError(f"Error code: {code} - the model refused")
+    exc = RuntimeError(f"Error code: {code} - {message}")
     exc.status_code = code  # type: ignore[attr-defined]
     return exc
 
@@ -411,3 +435,221 @@ async def test_a_custom_endpoint_does_not_get_the_openai_hint(config, monkeypatc
     with pytest.raises(LLMError) as caught:
         await client_with(config, completions).complete([{"role": "user", "content": "q"}])
     assert "That is OpenAI itself" not in str(caught.value)
+
+
+# --------------------------------------------------------------------------- #
+# reasoning models
+# --------------------------------------------------------------------------- #
+
+
+def reasoning_config(config, **overrides) -> None:
+    """Put the config into reasoning mode, as ``reasoning = true`` would."""
+    config.llm.reasoning = True
+    for name, value in overrides.items():
+        setattr(config.llm, name, value)
+
+
+async def test_reasoning_mode_drops_temperature(config) -> None:
+    """The single most common reason a reasoning model refuses to run."""
+    reasoning_config(config)
+    completions = StubCompletions(reply("hi"))
+    await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+    assert "temperature" not in completions.requests[0]
+
+
+async def test_temperature_is_still_sent_without_reasoning(config) -> None:
+    completions = StubCompletions(reply("hi"))
+    await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+    assert completions.requests[0]["temperature"] == 0.7
+
+
+async def test_reasoning_mode_uses_max_completion_tokens(config) -> None:
+    reasoning_config(config)
+    completions = StubCompletions(reply("hi"))
+    await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+
+    request = completions.requests[0]
+    assert "max_tokens" not in request
+    # 2000 for the answer plus 2000 of headroom, so a long trace cannot eat
+    # the reply.
+    assert request["max_completion_tokens"] == 4000
+
+
+async def test_the_thinking_budget_is_configurable(config) -> None:
+    reasoning_config(config, reasoning_tokens=500, max_tokens=1000)
+    completions = StubCompletions(reply("hi"))
+    await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+    assert completions.requests[0]["max_completion_tokens"] == 1500
+
+
+async def test_effort_is_sent_when_set(config) -> None:
+    reasoning_config(config, reasoning_effort="high")
+    completions = StubCompletions(reply("hi"))
+    await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+    assert completions.requests[0]["reasoning_effort"] == "high"
+
+
+async def test_no_effort_sends_the_default_so_thinking_switches_on(config) -> None:
+    """An unset effort must not omit the parameter: on endpoints like Ollama's
+    its presence is the thinking on/off switch, so omitting it silently leaves
+    a default-off model (gemma4, ...) never thinking at all."""
+    reasoning_config(config)
+    completions = StubCompletions(reply("hi"))
+    await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+    assert completions.requests[0]["reasoning_effort"] == "medium"
+
+
+async def test_plain_mode_never_sends_an_effort(config) -> None:
+    """reasoning = false, effort unset: the parameter is none of the request's
+    business, whatever an ambient LUMI__LLM__REASONING_EFFORT might say."""
+    config.llm.reasoning = False
+    config.llm.reasoning_effort = "high"
+    completions = StubCompletions(reply("hi"))
+    await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+    assert "reasoning_effort" not in completions.requests[0]
+
+
+async def test_an_unknown_effort_is_omitted_rather_than_sent(config) -> None:
+    reasoning_config(config, reasoning_effort="turbo")
+    completions = StubCompletions(reply("hi"))
+    await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+    assert "reasoning_effort" not in completions.requests[0]
+
+
+async def test_effort_none_is_sent_when_asked_for(config) -> None:
+    reasoning_config(config, reasoning_effort="none")
+    completions = StubCompletions(reply("hi"))
+    await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+    assert completions.requests[0]["reasoning_effort"] == "none"
+
+
+# -- the downgrade ladder ---------------------------------------------------- #
+
+
+async def test_an_endpoint_that_only_knows_max_tokens_still_works(config) -> None:
+    reasoning_config(config, reasoning_effort="high")
+    completions = StubCompletions(
+        reply("answered"),
+        error=[RuntimeError("Unsupported parameter: 'max_completion_tokens'")],
+    )
+    result = await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+
+    assert result.text == "answered"
+    second = completions.requests[1]
+    assert "max_completion_tokens" not in second
+    assert second["max_tokens"] == 4000
+    # Everything else is untouched: only the rejected parameter is dropped.
+    assert second["reasoning_effort"] == "high"
+    assert "temperature" not in second
+
+
+async def test_the_ladder_keeps_going_until_nothing_is_left_to_drop(config) -> None:
+    reasoning_config(config, reasoning_effort="high")
+    completions = StubCompletions(
+        reply("answered"),
+        error=[
+            RuntimeError("Unsupported parameter: 'max_completion_tokens'"),
+            RuntimeError("Unrecognized request argument supplied: reasoning_effort"),
+        ],
+    )
+    result = await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+
+    assert result.text == "answered"
+    assert len(completions.requests) == 3
+    final = completions.requests[2]
+    assert "reasoning_effort" not in final
+    assert "max_completion_tokens" not in final
+    assert final["max_tokens"] == 4000
+
+
+async def test_a_value_error_is_not_retried(config) -> None:
+    """Retrying a 400 about a bad value would only bury the message."""
+    reasoning_config(config, reasoning_effort="high")
+    completions = StubCompletions(error=status_error(400, "temperature is only supported when set to 1"))
+    with pytest.raises(LLMError):
+        await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+    assert len(completions.requests) == 1
+
+
+async def test_the_ladder_stops_when_every_variant_is_refused(config) -> None:
+    reasoning_config(config, reasoning_effort="high")
+    completions = StubCompletions(error=RuntimeError("unsupported parameter: everything"))
+    with pytest.raises(LLMError):
+        await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+    assert len(completions.requests) == 3
+
+
+async def test_the_ladder_does_not_apply_without_reasoning_mode(config) -> None:
+    """A non-reasoning request sends one variant, so an endpoint that dislikes
+    the message shape is told once rather than three times."""
+    completions = StubCompletions(error=RuntimeError("unsupported parameter: whatever"))
+    with pytest.raises(LLMError):
+        await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+    assert len(completions.requests) == 1
+
+
+async def test_a_reasoning_model_failure_names_the_config_fix(config, monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
+    completions = StubCompletions(error=status_error(400, "temperature is only supported when set to 1"))
+    with pytest.raises(LLMError) as caught:
+        await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+
+    message = str(caught.value)
+    assert "reasoning = true" in message
+    assert "max_completion_tokens" in message
+
+
+async def test_no_reasoning_hint_when_already_in_reasoning_mode(config, monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
+    reasoning_config(config)
+    completions = StubCompletions(error=status_error(400, "temperature is only supported when set to 1"))
+    with pytest.raises(LLMError) as caught:
+        await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+    assert "reasoning = true" not in str(caught.value)
+
+
+# -- reading the trace back -------------------------------------------------- #
+
+
+async def test_the_reasoning_field_is_captured(config) -> None:
+    completions = StubCompletions(reply("42", reasoning="counted the letters first"))
+    result = await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+    assert result.reasoning == "counted the letters first"
+    assert result.text == "42"
+
+
+async def test_reasoning_tokens_are_recorded_when_reported(config) -> None:
+    completions = StubCompletions(reply("42", reasoning="thinking", reasoning_tokens=310))
+    result = await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+    assert result.usage["reasoning"] == 310
+
+
+async def test_absent_reasoning_token_details_are_tolerated(config) -> None:
+    """Most providers do not report the split, and a missing one must not be
+    mistaken for zero-and-therefore-broken."""
+    completions = StubCompletions(reply("42", reasoning="thinking"))
+    result = await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+    assert "reasoning" not in result.usage
+    assert result.usage["completion"] == 7
+
+
+async def test_inline_think_tags_never_reach_the_answer(config) -> None:
+    completions = StubCompletions(reply("<think>weighing it up</think>here is the answer"))
+    result = await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+    assert result.text == "here is the answer"
+    assert result.reasoning == "weighing it up"
+
+
+async def test_a_trace_field_wins_over_inline_tags(config) -> None:
+    completions = StubCompletions(
+        reply("<think>tags</think>answer", reasoning="from the field")
+    )
+    result = await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+    assert result.reasoning == "from the field"
+    assert result.text == "answer"
+
+
+async def test_a_non_reasoning_model_yields_no_trace(config) -> None:
+    completions = StubCompletions(reply("just an answer"))
+    result = await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+    assert result.reasoning == ""

@@ -14,9 +14,11 @@ cannot silently expose the shell.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import time
 import tomllib
+import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -26,6 +28,7 @@ from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -47,13 +50,41 @@ Handler = Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]
 #: Callback data prefix; keeps our buttons from colliding with anything else.
 CB_OK = "lumi:ok:"
 CB_NO = "lumi:no:"
+#: Second segment is "show" or "hide"; the rest is a token from :class:`TraceStore`.
+CB_THINK = "lumi:think:"
 
 TYPING_INTERVAL = 4.0
+
+#: TCP connect timeout for both Bot API requests, in seconds. PTB's default of
+#: 5s is tight for a slow or censored network, and the failure mode is a
+#: bootstrap abort before the bot ever starts (see bot.bootstrap_retries).
+DEFAULT_CONNECT_TIMEOUT = 15.0
+#: Attempts PTB makes to bootstrap (initialize + delete/set webhook) before
+#: giving up. PTB's own default of 0 means one attempt and abort — a single
+#: wifi hiccup at startup would kill the bot.
+DEFAULT_BOOTSTRAP_RETRIES = 3
+#: Pool size for the getUpdates request object. PTB sizes it at 1 connection;
+#: that is fine except with a non-empty bot.proxy_url, where httpx with
+#: ``max_connections=1`` is documented to misbehave (PTB wiki: "Working with
+#: proxies"). One extra connection is harmless without a proxy.
+GET_UPDATES_POOL_SIZE = 2
+
+#: How long a collapsed thinking trace stays expandable. Long enough to come
+#: back to a message you scrolled past, short enough that scrolling back through
+#: old turns does not resurrect a model's entire reasoning.
+TRACE_TTL = 30 * 60.0
+#: Ceiling on stored traces, so a busy day cannot grow without bound.
+TRACE_CACHE_MAX = 64
 
 HELP_TEXT = """\
 *what i can do*
 just talk to me. i remember you between sessions, look things up on the web,
 read and write files in this project, and run shell commands.
+
+send me a photo and i'll look at it. add a caption to tell me what to look for.
+
+if i'm running on a reasoning model i'll think first, then say a small grey line
+above my answer. tap *show thinking* if you want to see how i got there.
 
 *slash commands*
 `/help` — this list
@@ -61,6 +92,7 @@ read and write files in this project, and run shell commands.
 `/run <command>` — run a shell command directly
 `/search <query>` — web search
 `/fetch <url>` — read a page
+`/reasoning` — reasoning setup, or `on`/`off` to show or hide traces
 `/memory` — show what i remember
 `/remember <fact>` — save a fact
 `/forget [n]` — drop the last n saved facts
@@ -300,15 +332,137 @@ def render_approval(action: PendingAction) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Thinking traces
+# --------------------------------------------------------------------------- #
+
+
+class TraceStore:
+    """Thinking traces waiting behind a collapsed message.
+
+    Telegram has no way to hide text, so the collapsed line carries only a
+    summary and the trace itself lives here, keyed by a short token that fits in
+    the button's callback data. That is the whole reason this exists: a model
+    can think for a long time and produce more than fits in one message, and
+    none of it should sit in the chat until someone asks for it.
+
+    Evicted by age and by count, so a tap that never comes cannot keep a
+    conversation's reasoning alive for the life of the process.
+    """
+
+    def __init__(self, ttl: float = TRACE_TTL, limit: int = TRACE_CACHE_MAX) -> None:
+        self._ttl = ttl
+        self._limit = limit
+        self._traces: dict[str, tuple[float, str]] = {}
+
+    def put(self, trace: str) -> str:
+        """Store *trace* and return the token that retrieves it."""
+        self._prune()
+        token = uuid.uuid4().hex[:12]
+        self._traces[token] = (time.monotonic(), trace)
+        while len(self._traces) > self._limit:
+            self._traces.pop(next(iter(self._traces)))
+        return token
+
+    def get(self, token: str) -> str | None:
+        entry = self._traces.get(token)
+        if entry is None:
+            return None
+        stored_at, trace = entry
+        if time.monotonic() - stored_at > self._ttl:
+            self._traces.pop(token, None)
+            return None
+        return trace
+
+    def _prune(self) -> None:
+        cutoff = time.monotonic() - self._ttl
+        for token in [t for t, (at, _) in self._traces.items() if at < cutoff]:
+            self._traces.pop(token, None)
+
+    def __len__(self) -> int:
+        return len(self._traces)
+
+
+def thinking_stub(result: TurnResult) -> str:
+    """The collapsed one-liner shown above an answer.
+
+    Deliberately says how long the model thought rather than what about, so
+    reading the chat stays cheap and the button is the only way in. The duration
+    is the model's own time, not the turn's: on a turn that spent most of itself
+    waiting on a web search, "thought for 20s" would be a lie.
+    """
+    seconds = result.thinking_seconds or result.elapsed
+    parts = [f"thought for {seconds:.0f}s"] if seconds else []
+    if result.reasoning_tokens:
+        parts.append(f"{result.reasoning_tokens:,} reasoning tokens")
+    parts.append(f"{len(result.reasoning):,} chars")
+    return "_🧠 " + " · ".join(parts) + "_"
+
+
+def thinking_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("show thinking", callback_data=f"{CB_THINK}show:{token}")]]
+    )
+
+
+def thinking_keyboard_hide() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("hide", callback_data=f"{CB_THINK}hide:")]]
+    )
+
+
+async def _edit_thinking(
+    query: Any, text: str, *, keyboard: InlineKeyboardMarkup | None = None
+) -> None:
+    """Replace the collapsed stub in place, degrading on bad markdown.
+
+    Same contract as :func:`reply`: our own markdown first, plain text if the
+    Bot API will not take it, and silence if even that fails — a failed edit
+    must never surface as an error to someone who just wanted to read a reply.
+    """
+    for kwargs in (
+        {"parse_mode": ParseMode.MARKDOWN, "reply_markup": keyboard},
+        {"reply_markup": keyboard},
+    ):
+        try:
+            await query.edit_message_text(text, **kwargs)
+            return
+        except BadRequest:
+            continue
+        except TelegramError as exc:
+            log.warning("could not edit the thinking message: %s", exc)
+            return
+    log.warning("the thinking message was rejected as markdown and as plain text")
+
+
+def render_thinking(trace: str) -> str:
+    """The expanded trace, fenced so its shape survives markdown.
+
+    Truncated to what one message can hold: an expanded trace is a curiosity,
+    and a 40,000-character wall is not, so the rest is dropped rather than
+    split across a dozen messages nobody asked for.
+    """
+    return f"🧠 *thinking*\n\n```\n{truncate(trace.strip(), 3600)}\n```"
+
+
+# --------------------------------------------------------------------------- #
 # Result rendering
 # --------------------------------------------------------------------------- #
 
 
-async def deliver(update: Update, result: TurnResult, config: Config) -> None:
+async def deliver(
+    update: Update, result: TurnResult, config: Config, traces: TraceStore | None = None
+) -> None:
     """Turn an agent result into messages, approval prompts included."""
     if result.error and not result.text:
         await reply(update, f"that didn't work: {result.error}")
         return
+
+    # Before the answer, because that is the order it happened in: the model
+    # thought, then it spoke. The line stays collapsed either way, so the answer
+    # below is still what you read.
+    if result.has_reasoning and config.llm.show_reasoning and traces is not None:
+        token = traces.put(result.reasoning)
+        await reply(update, thinking_stub(result), reply_markup=thinking_keyboard(token))
 
     if result.text:
         await reply(update, result.text)
@@ -404,6 +558,15 @@ def build_handlers(config: Config) -> list[Any]:
     def chat_of(update: Update) -> int | str:
         chat = update.effective_chat
         return chat.id if chat else 0
+
+    def traces_of(context: ContextTypes.DEFAULT_TYPE) -> TraceStore:
+        """The store behind the collapsed thinking messages.
+
+        Read from bot_data rather than captured, so a test can build an
+        application without a real one and still exercise the whole path.
+        """
+        store: TraceStore = context.application.bot_data["traces"]
+        return store
 
     # -- basic commands ---------------------------------------------------- #
 
@@ -521,6 +684,38 @@ def build_handlers(config: Config) -> list[Any]:
         registry = agent_of(context).registry
         await reply(update, f"*tools*\n\n{registry.describe()}")
 
+    async def reasoning_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Report the reasoning setup, and toggle the visible trace.
+
+        ``/reasoning`` with no argument only reports. ``on`` and ``off`` flip
+        ``llm.show_reasoning`` for this process, which is the same scope as
+        every other config change here: a restart restores config.toml, and that
+        is the right time to make it stick.
+        """
+        if not await authorised(update):
+            return
+        llm = config.llm
+        argument = (context.args[0].strip().lower() if context.args else "")
+
+        if argument in ("on", "off"):
+            llm.show_reasoning = argument == "on"
+            log.info("thinking traces turned %s by chat %s", argument, chat_of(update))
+        elif argument:
+            await reply(update, "usage: `/reasoning` or `/reasoning on|off`")
+            return
+
+        effort = llm.effort_of() or "provider default"
+        await reply(
+            update,
+            "*reasoning*\n"
+            f"model mode: {'on' if llm.reasoning else 'off'}\n"
+            f"effort: {effort}\n"
+            f"thinking budget: {llm.reasoning_tokens:,} tokens on top of "
+            f"{llm.max_tokens:,}\n"
+            f"temperature: {'omitted' if llm.reasoning and llm.temperature is not None else llm.temperature}\n"
+            f"trace in chat: {'on' if llm.show_reasoning else 'off'}",
+        )
+
     async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await authorised(update):
             return
@@ -531,6 +726,8 @@ def build_handlers(config: Config) -> list[Any]:
             f"uptime: {uptime:.0f}s",
             f"model: `{config.llm.model_of()}`",
             f"endpoint: {config.llm.base_url_of()} (from {config.llm.where_from()})",
+            f"reasoning: {'on' if config.llm.reasoning else 'off'}"
+            + (f" at {config.llm.effort_of()}" if config.llm.reasoning else ""),
             f"tools: {', '.join(agent.registry.names()) or 'none'}",
         ]
         for tool in agent.registry.all():
@@ -692,6 +889,9 @@ def build_handlers(config: Config) -> list[Any]:
             await query.answer("not authorised", show_alert=True)
             return
         data = query.data or ""
+        if data.startswith(CB_THINK):
+            await _expand_thinking(update, context, data[len(CB_THINK) :])
+            return
         approved = data.startswith(CB_OK)
         action_id = data[len(CB_OK) :] if approved else data[len(CB_NO) :]
         if not action_id:
@@ -702,6 +902,25 @@ def build_handlers(config: Config) -> list[Any]:
 
     # -- the main text path ------------------------------------------------ #
 
+    async def fetch_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
+        """Download the largest photo size and return it as base64.
+
+        Telegram sends one message per resolution; the last entry is the
+        biggest. Returns None (after explaining itself) if the download fails,
+        so a bad image never turns into a model call with a broken payload.
+        """
+        message = update.effective_message
+        if message is None or not message.photo:
+            return None
+        try:
+            file = await context.bot.get_file(message.photo[-1].file_id)
+            buffer = await file.download_as_bytearray()
+        except (TelegramError, BadRequest, OSError) as exc:
+            log.warning("could not download photo: %s", exc)
+            await reply(update, "i couldn't download that image — try sending it again.")
+            return None
+        return base64.b64encode(bytes(buffer)).decode("ascii")
+
     async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.effective_message
         if message is None or not message.text:
@@ -710,6 +929,14 @@ def build_handlers(config: Config) -> list[Any]:
             return
         if not _should_reply(update, context, config):
             return
+        # A photo with a caption arrives here, because a caption counts as text.
+        # Download the image so the model can actually see it.
+        if message.photo:
+            image_b64 = await fetch_photo(update, context)
+            if image_b64 is None:
+                return
+            await run_agent(update, context, message.text, image_b64=image_b64)
+            return
         await run_agent(update, context, message.text)
 
     async def on_non_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -717,7 +944,22 @@ def build_handlers(config: Config) -> list[Any]:
             return
         if not _should_reply(update, context, config):
             return
-        await reply(update, "i read text only right now — send a message instead.")
+        message = update.effective_message
+        if message is None:
+            return
+
+        # A photo with no caption: nothing textual to act on, so ask the obvious
+        # question rather than handing the model an empty prompt.
+        if message.photo:
+            image_b64 = await fetch_photo(update, context)
+            if image_b64 is None:
+                return
+            await run_agent(
+                update, context, "what's in this image?", image_b64=image_b64
+            )
+            return
+
+        await reply(update, "i read text and images only — send a message or a photo.")
 
     async def on_unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await authorised(update):
@@ -742,17 +984,24 @@ def build_handlers(config: Config) -> list[Any]:
 
     # -- shared runners ---------------------------------------------------- #
 
-    async def run_agent(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    async def run_agent(
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        text: str,
+        *,
+        image_b64: str | None = None,
+        image_mime: str = "image/jpeg",
+    ) -> None:
         agent = agent_of(context)
         chat_id = chat_of(update)
         async with _Typing(context.bot, chat_id):
             try:
-                result = await agent.handle(chat_id, text)
+                result = await agent.handle(chat_id, text, image_b64=image_b64, image_mime=image_mime)
             except Exception as exc:  # noqa: BLE001 - a crash must not kill the bot
                 log.exception("agent turn failed")
                 await reply(update, f"i broke on that: {format_error(exc)}")
                 return
-        await deliver(update, result, config)
+        await deliver(update, result, config, traces_of(context))
 
     async def run_tool(
         update: Update, context: ContextTypes.DEFAULT_TYPE, tool: str, arguments: dict[str, Any]
@@ -766,7 +1015,42 @@ def build_handlers(config: Config) -> list[Any]:
                 log.exception("tool %s failed", tool)
                 await reply(update, f"i broke on that: {format_error(exc)}")
                 return
-        await deliver(update, result, config)
+        await deliver(update, result, config, traces_of(context))
+
+    async def _expand_thinking(
+        update: Update, context: ContextTypes.DEFAULT_TYPE, payload: str
+    ) -> None:
+        """Show or hide a collapsed thinking trace, in place.
+
+        Toggles rather than expanding once, because a chat that is being
+        scrolled back through is exactly where you want to close it again.
+        """
+        query = update.callback_query
+        if query is None:
+            return
+        action, _, token = payload.partition(":")
+
+        if action == "hide":
+            # No token needed: collapsing does not read the trace, so it works
+            # even after the store has forgotten it.
+            await query.answer("hidden")
+            await _edit_thinking(query, "_thinking hidden_")
+            return
+
+        if action != "show" or not token:
+            await query.answer("malformed button", show_alert=True)
+            return
+
+        traces: TraceStore = context.application.bot_data["traces"]
+        trace = traces.get(token)
+        if trace is None:
+            # Expired or evicted. Say so in the toast rather than silently
+            # editing the message, which would look like a broken button.
+            await query.answer("that trace has expired — ask again to get a new one", show_alert=True)
+            return
+
+        await query.answer("ok")
+        await _edit_thinking(query, render_thinking(trace), keyboard=thinking_keyboard_hide())
 
     async def _resolve(
         update: Update,
@@ -798,7 +1082,7 @@ def build_handlers(config: Config) -> list[Any]:
                 log.exception("resolving approval failed")
                 await reply(update, f"i broke on that: {format_error(exc)}")
                 return
-        await deliver(update, result, config)
+        await deliver(update, result, config, traces_of(context))
 
     # -- whitelist persistence --------------------------------------------- #
 
@@ -848,6 +1132,7 @@ def build_handlers(config: Config) -> list[Any]:
         CommandHandler("forget", gated(forget_command), filters=owner_filter),
         CommandHandler("personality", gated(personality_command), filters=owner_filter),
         CommandHandler("tools", gated(tools_command), filters=owner_filter),
+        CommandHandler("reasoning", gated(reasoning_command), filters=owner_filter),
         CommandHandler("status", gated(status_command), filters=owner_filter),
         CommandHandler("doctor", gated(doctor_command), filters=owner_filter),
         CommandHandler("reload", gated(reload_command), filters=owner_filter),
@@ -860,6 +1145,13 @@ def build_handlers(config: Config) -> list[Any]:
         CommandHandler("whitelist_remove_user", gated(whitelist_remove_user), filters=owner_filter),
         CommandHandler("whitelist_add_group", gated(whitelist_add_group), filters=owner_filter),
         CommandHandler("whitelist_remove_group", gated(whitelist_remove_group), filters=owner_filter),
+        # Inline buttons: the approval Confirm/Cancel pair and the "show
+        # thinking" toggle. One handler for both, because both are the same
+        # shape — a callback_data prefix that says which kind of button it is.
+        # Not wrapped in ``gated``: a tap is never a message in a group, so the
+        # mention rule does not apply, and ``button`` checks the sender itself.
+        # (CallbackQueryHandler takes a ``pattern``, not ``filters``, in v22.)
+        CallbackQueryHandler(button),
         # Keyword arguments on purpose: MessageHandler's parameter order changed
         # between python-telegram-bot v20 and v22, and the keyword form is stable.
         MessageHandler(
@@ -884,6 +1176,23 @@ def build_handlers(config: Config) -> list[Any]:
 STARTED = time.monotonic()
 
 
+def _apply_network_settings(builder: ApplicationBuilder, config: Config) -> None:
+    """Apply the network settings from ``[bot]`` to *builder*.
+
+    The connect timeout is deliberately generous: the first thing PTB does is a
+    TCP connect to api.telegram.org, and on a slow or censored network the
+    library default of 5s is not enough for even that handshake — the bot then
+    dies in bootstrap before printing a single line. Skipped entirely when a
+    test injected its own Bot object, because the request objects were already
+    built and there is nothing to tune.
+    """
+    if config.bot.proxy_url:
+        builder.proxy(config.bot.proxy_url).get_updates_proxy(config.bot.proxy_url)
+    builder.connect_timeout(config.bot.connect_timeout)
+    builder.get_updates_connect_timeout(config.bot.connect_timeout)
+    builder.get_updates_connection_pool_size(GET_UPDATES_POOL_SIZE)
+
+
 def build_application(config: Config, agent: Agent | None = None, *, bot: Any = None) -> Application:
     """Assemble the python-telegram-bot Application.
 
@@ -906,12 +1215,17 @@ def build_application(config: Config, agent: Agent | None = None, *, bot: Any = 
     builder: ApplicationBuilder = (
         Application.builder().bot(bot) if bot is not None else Application.builder().token(token)
     )
+    if bot is None:
+        # A test-injected Bot was already built with its own request objects;
+        # the builder's request settings only apply to a bot built here.
+        _apply_network_settings(builder, config)
     application = builder.post_init(_post_init).post_shutdown(_post_shutdown).build()
 
     application.bot_data["config"] = config
     application.bot_data["memory"] = memory
     application.bot_data["personality"] = personality
     application.bot_data["history"] = history
+    application.bot_data["traces"] = TraceStore()
     application.bot_data["agent"] = agent or Agent(config, personality, memory, history)
 
     for handler in build_handlers(config):
@@ -950,12 +1264,22 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> 
 def run(config: Config) -> None:
     """Start long polling. Blocks until interrupted."""
     application = build_application(config)
-    log.info("polling for updates — ctrl-c to stop")
+    retries = config.bot.bootstrap_retries
+    log.info(
+        "polling for updates — ctrl-c to stop (connect timeout %ss, up to %s bootstrap attempt(s)%s)",
+        config.bot.connect_timeout,
+        retries + 1,
+        f" via {config.bot.proxy_url}" if config.bot.proxy_url else "",
+    )
     try:
         application.run_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True,
             close_loop=False,
+            # PTB's default is 0: one TCP connect failure to api.telegram.org
+            # aborts the whole startup. A couple of retries turn a momentary
+            # outage into a delay instead of a crash.
+            bootstrap_retries=retries,
         )
     except KeyboardInterrupt:
         log.info("interrupted, shutting down")

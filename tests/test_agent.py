@@ -143,6 +143,96 @@ async def test_tool_call_then_answer(config) -> None:
     assert result.iterations == 2
 
 
+# --------------------------------------------------------------------------- #
+# reasoning
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_plain_answer_carries_no_reasoning(config) -> None:
+    agent = make_agent(config, [make_reply("hello there")])
+    result = await agent.handle(CHAT, "hi")
+    assert not result.has_reasoning
+    assert result.reasoning == ""
+
+
+async def test_the_trace_reaches_the_turn_result(config) -> None:
+    agent = make_agent(
+        config, [make_reply("42", reasoning="counted the letters first", reasoning_tokens=310)]
+    )
+    result = await agent.handle(CHAT, "how many r's in strawberry?")
+
+    assert result.has_reasoning
+    assert result.reasoning == "counted the letters first"
+    assert result.reasoning_tokens == 310
+
+
+async def test_traces_accumulate_across_iterations(config) -> None:
+    """A tool-using turn thinks more than once, and both passes are interesting."""
+    agent = make_agent(
+        config,
+        [
+            make_reply("", [("c1", "run_shell", {"command": "echo hi"})], reasoning="need to run it"),
+            make_reply("it said hi", reasoning="it worked"),
+        ],
+    )
+    result = await agent.handle(CHAT, "run echo hi")
+
+    assert result.reasoning == "need to run it\n\nit worked"
+
+
+async def test_a_turn_that_pauses_for_approval_keeps_its_thinking(config) -> None:
+    """The most interesting trace of all is the one produced before the bot
+    stopped to ask the owner. Discarding it would hide exactly the moment worth
+    reading."""
+    agent = make_agent(
+        config,
+        [
+            make_reply(
+                "",
+                [("c1", "run_shell", {"command": "rm -rf workspace/tmp"})],
+                reasoning="this deletes files; I should ask first",
+            )
+        ],
+    )
+    result = await agent.handle(CHAT, "clean up")
+
+    assert result.needs_approval
+    assert "ask first" in result.reasoning
+
+
+async def test_reasoning_tokens_sum_across_iterations(config) -> None:
+    agent = make_agent(
+        config,
+        [
+            make_reply("", [("c1", "run_shell", {"command": "echo hi"})], reasoning_tokens=100),
+            make_reply("done", reasoning_tokens=50),
+        ],
+    )
+    result = await agent.handle(CHAT, "run it")
+    assert result.reasoning_tokens == 150
+
+
+async def test_the_trace_is_not_replayed_into_the_conversation(config) -> None:
+    """Replaying a thinking trace is not something chat-completions asks for, and
+    several providers reject the whole request if an assistant turn carries a
+    field they do not recognise."""
+    agent = make_agent(
+        config,
+        [
+            make_reply("", [("c1", "run_shell", {"command": "echo hi"})], reasoning="first pass"),
+            make_reply("done", reasoning="second pass"),
+        ],
+    )
+    await agent.handle(CHAT, "run it")
+
+    for call in agent.llm.calls:
+        for message in call:
+            if message["role"] == "assistant":
+                assert "first pass" not in str(message)
+                assert "second pass" not in str(message)
+                assert "reasoning" not in message
+
+
 async def test_tool_result_is_fed_back_to_the_model(config) -> None:
     agent = make_agent(
         config,

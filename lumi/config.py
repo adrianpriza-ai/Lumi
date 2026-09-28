@@ -63,6 +63,18 @@ class BotConfig:
     #: User ids allowed to use the bot alongside the owner. These users can
     #: run all commands except whitelist management (owner-only).
     whitelisted_users: list[str] = field(default_factory=list)
+    #: SOCKS5 or HTTP proxy for the Bot API, e.g. "socks5://127.0.0.1:9050".
+    #: Empty connects directly. Use this where api.telegram.org is slow or
+    #: blocked; a local router or system proxy is not picked up automatically.
+    proxy_url: str = ""
+    #: TCP connect timeout for Bot API requests, in seconds. PTB's own default
+    #: of 5s aborts bootstrap on a slow or lossy network before the bot has
+    #: even answered get_me.
+    connect_timeout: float = 15.0
+    #: Extra attempts PTB makes to bootstrap (initialize, delete/set webhook)
+    #: after a network failure. 0 means exactly one attempt — PTB's default,
+    #: and the reason one wifi hiccup at startup used to kill the bot.
+    bootstrap_retries: int = 3
 
 
 OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
@@ -76,6 +88,22 @@ MODEL_ENV_VARS = ("OPENAI_MODEL",)
 
 #: How several keys in one env var are spent. See :mod:`lumi.llm.keypool`.
 KEY_STRATEGIES = ("fallback", "round_robin", "random")
+
+#: Accepted values for ``llm.reasoning_effort``. See :meth:`LLMConfig.effort_of`
+#: for what an unset value means.
+REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+
+#: What ``reasoning = true`` sends when no effort is configured. Deliberately
+#: not "omit the parameter": on some OpenAI-compatible endpoints (Ollama's
+#: among them) the presence of ``reasoning_effort`` is itself the thinking
+#: on/off switch, so an omitted parameter leaves a default-off model never
+#: thinking at all. ``medium`` is the closest thing to a cross-provider
+#: default — it is also OpenAI's own default for its reasoning models.
+DEFAULT_REASONING_EFFORT = "medium"
+
+
+
+
 
 
 @dataclass(slots=True)
@@ -92,6 +120,50 @@ class LLMConfig:
     max_tool_iterations: int = 8
     history_turns: int = 20
     max_memory_chars: int = 6000
+    #: Drive the model in reasoning mode: omit ``temperature`` and reserve room
+    #: for the thinking trace. Safe to leave on for a model that does not
+    #: reason — the extra parameters are simply unused, and a non-reasoning
+    #: endpoint never sees ``reasoning_effort`` unless it is set below.
+    reasoning: bool = False
+    #: How hard to think. See :meth:`effort_of` for what empty means; in short,
+    #: reasoning mode sends :data:`DEFAULT_REASONING_EFFORT` and plain mode sends
+    #: nothing.
+    reasoning_effort: str = ""
+    #: Token headroom for the thinking trace, on top of ``max_tokens``. The
+    #: trace is billed as output, so without this a long think eats the answer.
+    reasoning_tokens: int = 2000
+    #: Post the thinking trace in Telegram as a collapsed line with a button to
+    #: expand it, rather than dumping it above the answer.
+    show_reasoning: bool = True
+
+    def effort_of(self) -> str:
+        """The reasoning effort to send, normalised.
+
+        Three cases:
+
+        - A recognised value goes out as written; ``"none"`` included, which
+          actively tells a model that thinks to skip thinking.
+        - Empty falls back to :data:`DEFAULT_REASONING_EFFORT` when ``reasoning``
+          is on, and to "send nothing" when it is off. The asymmetry is the
+          point: in reasoning mode an omitted ``reasoning_effort`` is not
+          neutral — on Ollama's OpenAI-compatible endpoint the parameter's
+          presence is the think switch, so omitting it silently disables the
+          thinking that ``reasoning = true`` promised. In plain mode the
+          parameter is never sent anyway.
+        - An unrecognised value is a typo rather than a reason to refuse to
+          boot, so it warns and omits the parameter instead of raising, leaving
+          the provider's default in charge. :func:`validate` also reports it.
+        """
+        chosen = self.reasoning_effort.strip().lower()
+        if chosen in REASONING_EFFORTS:
+            return chosen
+        if not chosen:
+            return DEFAULT_REASONING_EFFORT if self.reasoning else ""
+        log.warning(
+            "unknown llm.reasoning_effort %r; omitting the parameter instead. Known: %s",
+            self.reasoning_effort, ", ".join(REASONING_EFFORTS),
+        )
+        return ""
 
     def api_keys(self) -> list[str]:
         """Every key in ``api_key_env``, in the order they were written.
@@ -641,6 +713,16 @@ def validate(config: Config) -> list[str]:
             f"unknown llm.key_strategy {config.llm.key_strategy!r}. "
             f"Known: {', '.join(KEY_STRATEGIES)}"
         )
+    # Reported rather than fatal, because Lumi omits the parameter and lets the
+    # provider's default stand — a typo here should be visible, not silent.
+    if config.llm.reasoning_effort.strip().lower() not in ("", *REASONING_EFFORTS):
+        problems.append(
+            f"unknown llm.reasoning_effort {config.llm.reasoning_effort!r}. "
+            f"Known: {', '.join(REASONING_EFFORTS)} (or empty for {DEFAULT_REASONING_EFFORT} "
+            "while reasoning = true)"
+        )
+    if config.llm.reasoning and config.llm.reasoning_tokens < 0:
+        problems.append("llm.reasoning_tokens cannot be negative")
     if config.telegram_token is None:
         problems.append("TELEGRAM_BOT_TOKEN is unset — the Telegram bot cannot start.")
     if config.bot.group_reply_mode.strip().lower() not in {"mention", "always", "off"}:
@@ -648,6 +730,10 @@ def validate(config: Config) -> list[str]:
             f"unknown bot.group_reply_mode {config.bot.group_reply_mode!r}. "
             "Known: mention, always, off"
         )
+    if config.bot.connect_timeout <= 0:
+        problems.append("bot.connect_timeout must be a positive number of seconds")
+    if config.bot.bootstrap_retries < 0:
+        problems.append("bot.bootstrap_retries cannot be negative")
     if config.bot.require_owner and config.owner_id is None:
         problems.append(
             "TELEGRAM_OWNER_ID is unset. The shell and file tools are locked to the owner, "

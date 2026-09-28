@@ -33,6 +33,10 @@ class ToolCall:
 @dataclass(slots=True)
 class LLMReply:
     text: str = ""
+    #: The thinking trace, when the model returned one. Separate from ``text``
+    #: because that is how every provider that supports reasoning actually sends
+    #: it; see :mod:`lumi.llm.reasoning`. Empty for models that do not reason.
+    reasoning: str = ""
     tool_calls: list[ToolCall] = field(default_factory=list)
     finish_reason: str = ""
     usage: dict[str, int] = field(default_factory=dict)

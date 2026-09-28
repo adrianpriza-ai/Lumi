@@ -28,6 +28,22 @@ WARN = "warn"
 FAIL = "fail"
 
 
+def _reasoning_note(config: Config) -> str:
+    """How the model is being driven, appended to the llm check.
+
+    Worth stating even when it is off: the most common report of a reasoning
+    model that "just does not work" is a turn that 400s on temperature, and
+    this line is where the answer is.
+    """
+    if not config.llm.reasoning:
+        return ", reasoning off"
+    effort = config.llm.effort_of() or "provider default"
+    return (
+        f", reasoning on at {effort} "
+        f"(temperature omitted, {config.llm.reasoning_tokens:,} thinking tokens)"
+    )
+
+
 @dataclass(slots=True)
 class Check:
     name: str
@@ -117,6 +133,22 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
             f"{owner} (only this id gets the shell and file tools)" if owner else "missing — see .env.example",
         )
     )
+    if config.bot.proxy_url:
+        checks.append(
+            Check(
+                "telegram proxy",
+                OK,
+                f"{config.bot.proxy_url} (Bot API via bot.proxy_url)",
+            )
+        )
+    checks.append(
+        Check(
+            "telegram network",
+            OK,
+            f"connect timeout {config.bot.connect_timeout:g}s, "
+            f"{config.bot.bootstrap_retries + 1} bootstrap attempt(s)",
+        )
+    )
     keys = config.llm.api_keys()
     if keys:
         detail = (
@@ -132,7 +164,8 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
             "llm",
             OK,
             f"{config.llm.model_of()} via {config.llm.base_url_of()} "
-            f"(from {config.llm.where_from()}), keys: {config.llm.strategy_of()}",
+            f"(from {config.llm.where_from()}), keys: {config.llm.strategy_of()}"
+            + _reasoning_note(config),
         )
     )
 

@@ -54,7 +54,7 @@ server works with no code change at all — just add it to `.mcp.json`.
 ## Commands
 
 | Command | What it does |
-| --- | --- |
+|-|-|
 | `lumi run` | Start the Telegram bot |
 | `lumi chat` | REPL against the same agent, no Telegram required |
 | `lumi ask "..."` | One question, one answer, exits |
@@ -65,8 +65,14 @@ server works with no code change at all — just add it to `.mcp.json`.
 | `lumi config [--key llm.model]` | Print the resolved configuration |
 
 In Telegram: `/help` `/run` `/search` `/fetch` `/memory` `/remember` `/forget`
-`/personality` `/tools` `/status` `/doctor` `/reload` `/reset`, plus `/approve`
-and `/deny`. Anything that is not a command is just a message to the agent.
+`/personality` `/tools` `/reasoning` `/status` `/doctor` `/reload` `/reset`, plus
+`/approve`, `/deny`, and the whitelist commands. Anything that is not a command
+is just a message to the agent.
+
+Send the bot a photo and it looks at it. The caption becomes your question; a
+photo with no caption gets a default "what's in this image?". This needs a
+vision-capable model — a text-only model will simply fail to use the image, so
+point `llm.model` at a multimodal one.
 
 In group chats the bot only answers when **mentioned** (`@Lumi_a_bot ...`),
 **replied to**, or sent a slash command targeting it (`/help@Lumi_a_bot`). See
@@ -108,12 +114,22 @@ model = "anthropic/claude-sonnet-4.5"
 api_key_env = "OPENROUTER_API_KEY"   # this provider's own key variable
 ```
 
+Images sent in Telegram are passed through the standard OpenAI multimodal
+content array, so any endpoint that accepts `image_url` parts works. Pick a
+vision-capable model (`gpt-4o`, `claude-3.5+`, `gemini-2.*`, `llama-3.2-vision`,
+`qwen2-vl`, …) or photo support will not work.
+
 Resolution order, most specific wins:
 
 1. `base_url` / `model` / `api_key_env` / `key_strategy` in `config.toml`
 2. `LUMI__LLM__BASE_URL`, `LUMI__LLM__MODEL`, `LUMI__LLM__API_KEY_ENV`, `LUMI__LLM__KEY_STRATEGY`
 3. `OPENAI_BASE_URL` (or `OPENAI_API_BASE`), `OPENAI_MODEL`, and the key named by `api_key_env`
 4. OpenAI and `gpt-4.1-mini`
+
+The reasoning settings (`reasoning`, `reasoning_effort`, `reasoning_tokens`,
+`show_reasoning`) are Lumi's own, so they resolve from `config.toml` and
+`LUMI__LLM__*` only — no bare environment variable. See
+[Reasoning models](#reasoning-models).
 
 Always check what actually took effect:
 
@@ -127,6 +143,65 @@ lumi doctor | grep llm              # -> model via endpoint (from OPENAI_BASE_UR
 If a call fails, the error names the endpoint, model and key variable it used, so
 a key rejected by the wrong host is obvious immediately. `temperature = null`
 omits the parameter, which some reasoning models require.
+
+### Reasoning models
+
+A reasoning model thinks before it answers, and that breaks three conventions
+the rest of the program relies on. All three are handled by one flag:
+
+```toml
+[llm]
+reasoning = true
+reasoning_effort = "medium"   # empty = "medium"; the value switches thinking on
+reasoning_tokens = 2000       # headroom for the trace, on top of max_tokens
+show_reasoning = true
+```
+
+`reasoning = true` does three things:
+
+| | Why |
+|-|-|
+| drops `temperature` | these models reject any value but their own default, and a 400 on every turn is the usual symptom |
+| moves the limit to `max_completion_tokens` | o-series and gpt-5 reject the old `max_tokens` name outright |
+| adds `reasoning_tokens` to the ceiling | thinking is billed as output, so without headroom a long trace eats the answer |
+
+If the endpoint rejects one of those parameters anyway, Lumi drops it and retries
+with a plainer request rather than making you work out which combination your
+provider wants. The same applies to `reasoning_effort`. Leaving `reasoning` on
+for a model that does not reason is harmless — the extra parameters go unused.
+
+`reasoning_effort` is `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or
+`max`. Empty is not the same as `"none"`: empty sends `medium` while `reasoning`
+is on, and `"none"` actively tells the model to skip thinking. Sending a value
+matters more than which value: on some OpenAI-compatible endpoints (Ollama's,
+for instance) `reasoning_effort` doubles as the thinking on/off switch, so a
+model that ships thinking-off by default only ever thinks when a value is sent.
+Ollama's own docs put it as: *"reasoning_effort and reasoning.effort control
+model thinking."*
+
+If a reasoning model 400s and you have not set the flag, the error says so and
+names the line to add.
+
+#### Seeing the thinking
+
+When a model returns a trace, the chat gets one collapsed line above the answer,
+in the order it actually happened — the model thought, then it spoke:
+
+> 🧠 thought for 12s · 1,200 reasoning tokens · 2,140 chars — `[show thinking]`
+
+Tapping the button expands the trace in place, and collapses it again. Nothing
+is pre-typed into the message, so a chat scrolled back through stays readable
+unless you ask for the detail. Traces expire after 30 minutes or 64 turns,
+whichever comes first — an unopened one is not worth keeping.
+
+`/reasoning` reports the current setup; `/reasoning off` (or `on`) hides the
+trace for the running process. `lumi ask` prints the trace to **stderr**, so
+`lumi ask "..." > answer.md` still captures nothing but the answer.
+
+The trace is read from `reasoning_content`, `reasoning` or `thinking` depending
+on the provider, and a model that inlines `<think>` tags instead of using a
+field has them stripped out — otherwise raw XML ends up in the chat. It is never
+written back into the conversation history.
 
 ### Several keys
 
@@ -144,7 +219,7 @@ separator is not a broken key.
 `llm.key_strategy` decides how they are spent:
 
 | Strategy | Behaviour | Use it when |
-| --- | --- | --- |
+|-|-|-|
 | `fallback` (default) | First key, moving on only when a call fails in a way another key would survive — 401, 403, 429, 5xx, dropped connection. A 400 fails immediately. | Keys are backups for one account |
 | `round_robin` | One call each, in turn, so quotas are shared evenly. | Keys live on separate accounts |
 | `random` | A random key per call. Same balance as round-robin, no shared cursor. | Same, and you do not care about order |
@@ -180,7 +255,7 @@ shows how many keys it found and which strategy is active.
 ## Tools
 
 | Tool | Capability |
-| --- | --- |
+|-|-|
 | `run_shell` | Shell commands, with the allow/confirm/deny engine |
 | `files` | Read anywhere in the project, write only in `workspace/` |
 | `memory` | Remember and recall; forgetting is human-only by design |
@@ -254,6 +329,23 @@ specific group (e.g. a private "Lumi lab"):
 group_reply_mode = "mention"
 always_reply_chats = ["-1001234567890"]
 ```
+
+## Reaching api.telegram.org
+
+If the bot dies at startup with `telegram.error.TimedOut` / `ConnectTimeout`,
+the TCP connection to `api.telegram.org` failed. Three knobs under `[bot]`
+address it:
+
+- `proxy_url` — route the Bot API through a SOCKS5 or HTTP proxy (e.g.
+  `socks5://127.0.0.1:9050`). The usual fix where Telegram is throttled or
+  blocked.
+- `connect_timeout` — TCP connect timeout in seconds (default 15). The stock
+  5s can be too tight on a slow network.
+- `bootstrap_retries` — extra startup attempts after a network failure
+  (default 3, so a single hiccup delays boot instead of aborting it).
+
+`lumi doctor` and the Telegram `/doctor` command report which settings are in
+effect.
 
 ## Web providers
 
@@ -350,6 +442,7 @@ lumi/
 ├── llm/
 │   ├── base.py        LLMClient contract, LLMReply, ToolCall
 │   ├── keypool.py     key rotation, failure classification, masking
+│   ├── reasoning.py   thinking traces, token ceilings, param negotiation
 │   └── openai_compat.py  every OpenAI-compatible endpoint
 ├── tools/
 │   ├── base.py        Tool ABC, ToolResult, NeedsApproval

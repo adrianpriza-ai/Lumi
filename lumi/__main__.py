@@ -88,6 +88,13 @@ async def _ask_once(config: Config, question: str, chat_id: str = "cli") -> int:
             print(f"  {action.tool}: {action.reason}")
             print(f"  $ {action.preview}")
         return 3
+    # The thinking trace goes to stderr so `lumi ask "..." > answer.md` still
+    # captures nothing but the answer. In a terminal there is no button to
+    # collapse it behind, and a terminal is where you go to look at this.
+    if result.has_reasoning and config.llm.show_reasoning:
+        print(f"--- thinking ({result.thinking_seconds or result.elapsed:.1f}s) ---", file=sys.stderr)
+        print(result.reasoning, file=sys.stderr)
+        print("---", file=sys.stderr)
     if result.error:
         print(f"error: {result.error}", file=sys.stderr)
     print(result.text or "(no answer)")
@@ -168,6 +175,9 @@ async def _chat(config: Config) -> int:
                 result = await agent.resolve("cli", action.id, approved, source="cli")
         elif result.text:
             print(result.text)
+        if result.has_reasoning and config.llm.show_reasoning:
+            seconds = result.thinking_seconds or result.elapsed
+            print(f"  [thought for {seconds:.1f}s]", file=sys.stderr)
         if result.error:
             print(f"[{result.error}]", file=sys.stderr)
         print()
