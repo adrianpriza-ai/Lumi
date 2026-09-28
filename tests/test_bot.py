@@ -130,7 +130,7 @@ def texts(bot: FakeBot) -> str:
 
 async def test_stranger_is_rejected(config) -> None:
     bot, _ = await send(config, [make_reply("should never be sent")], "hi", user_id=STRANGER)
-    assert "not the owner" in texts(bot).lower()
+    assert "not whitelisted" in texts(bot).lower()
     assert "should never be sent" not in texts(bot)
 
 
@@ -147,7 +147,7 @@ async def test_owner_filter_blocks_before_the_agent(config) -> None:
 
 async def test_tools_are_invisible_to_strangers(config) -> None:
     bot, _ = await send(config, [], "/run rm -rf /", user_id=STRANGER)
-    assert "not the owner" in texts(bot).lower()
+    assert "not whitelisted" in texts(bot).lower()
 
 
 # --------------------------------------------------------------------------- #
@@ -389,7 +389,7 @@ async def test_stranger_gets_one_clear_sentence(config) -> None:
     """A stranger learns nothing about what this bot can reach."""
     bot, _ = await send(config, [], "/tools", user_id=STRANGER)
     body = texts(bot)
-    assert "not the owner" in body.lower()
+    assert "not whitelisted" in body.lower()
     for leak in ("run_shell", "test-model", "workspace", "MEMORY.md"):
         assert leak not in body, f"{leak!r} leaked to a stranger"
 
@@ -687,3 +687,109 @@ async def send_photo_in_group(config, *, mention_text: str | None = None) -> tup
     finally:
         await application.shutdown()
     return bot, agent
+
+
+# --------------------------------------------------------------------------- #
+# whitelist system
+# --------------------------------------------------------------------------- #
+
+WHITELISTED_USER = 555
+WHITELISTED_GROUP = -2002
+
+
+async def test_whitelisted_user_can_use_the_bot(config) -> None:
+    config.bot.whitelisted_users = [str(WHITELISTED_USER)]
+    bot, _ = await send(config, [make_reply("hello friend")], "hi", user_id=WHITELISTED_USER)
+    assert "hello friend" in texts(bot)
+
+
+async def test_whitelisted_user_cannot_manage_whitelist(config) -> None:
+    config.bot.whitelisted_users = [str(WHITELISTED_USER)]
+    bot, _ = await send(config, [], "/whitelist", user_id=WHITELISTED_USER)
+    assert "only the owner" in texts(bot).lower()
+
+
+async def test_non_whitelisted_user_is_still_rejected(config) -> None:
+    config.bot.whitelisted_users = [str(WHITELISTED_USER)]
+    bot, _ = await send(config, [make_reply("should never be sent")], "hi", user_id=STRANGER)
+    assert "not whitelisted" in texts(bot).lower()
+    assert "should never be sent" not in texts(bot)
+
+
+async def test_whitelisted_group_replies_without_mention(config) -> None:
+    config.bot.whitelisted_groups = [str(WHITELISTED_GROUP)]
+    bot, _ = await send(
+        config,
+        [make_reply("group reply")],
+        "hello group",
+        chat_id=WHITELISTED_GROUP,
+        chat_type="supergroup",
+    )
+    assert "group reply" in texts(bot)
+
+
+async def test_non_whitelisted_group_still_requires_mention(config) -> None:
+    config.bot.whitelisted_groups = [str(WHITELISTED_GROUP)]
+    bot, agent = await send(
+        config,
+        [make_reply("should not fire")],
+        "hello group",
+        chat_id=-9999,
+        chat_type="supergroup",
+    )
+    assert bot.sent == []
+    assert agent.llm.calls == []
+
+
+async def test_owner_can_add_user_to_whitelist(config) -> None:
+    bot, _ = await send(config, [], "/whitelist_add_user 777")
+    assert "added" in texts(bot).lower()
+    assert "777" in texts(bot)
+
+
+async def test_owner_can_remove_user_from_whitelist(config) -> None:
+    config.bot.whitelisted_users = ["777"]
+    bot, _ = await send(config, [], "/whitelist_remove_user 777")
+    assert "removed" in texts(bot).lower()
+
+
+async def test_owner_can_add_group_to_whitelist(config) -> None:
+    bot, _ = await send(config, [], "/whitelist_add_group -100123")
+    assert "added" in texts(bot).lower()
+    assert "-100123" in texts(bot)
+
+
+async def test_owner_can_remove_group_from_whitelist(config) -> None:
+    config.bot.whitelisted_groups = ["-100123"]
+    bot, _ = await send(config, [], "/whitelist_remove_group -100123")
+    assert "removed" in texts(bot).lower()
+
+
+async def test_whitelist_command_shows_current_lists(config) -> None:
+    config.bot.whitelisted_users = ["555"]
+    config.bot.whitelisted_groups = ["-2002"]
+    bot, _ = await send(config, [], "/whitelist")
+    body = texts(bot)
+    assert "whitelist" in body.lower()
+    assert "555" in body
+    assert "-2002" in body
+
+
+async def test_whitelist_add_user_requires_id(config) -> None:
+    bot, _ = await send(config, [], "/whitelist_add_user")
+    assert "usage" in texts(bot).lower()
+
+
+async def test_whitelist_add_group_requires_id(config) -> None:
+    bot, _ = await send(config, [], "/whitelist_add_group")
+    assert "usage" in texts(bot).lower()
+
+
+async def test_whitelist_add_user_rejects_non_integer(config) -> None:
+    bot, _ = await send(config, [], "/whitelist_add_user abc")
+    assert "not a valid id" in texts(bot).lower()
+
+
+async def test_whitelist_add_group_rejects_non_integer(config) -> None:
+    bot, _ = await send(config, [], "/whitelist_add_group xyz")
+    assert "not a valid id" in texts(bot).lower()

@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+import tomllib
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -69,11 +70,17 @@ read and write files in this project, and run shell commands.
 `/doctor` — diagnose the whole setup
 `/reload` — re-read personality, memory and config
 `/reset` — forget this conversation (keeps long-term memory)
+`/whitelist` — show whitelisted users and groups (owner only)
+`/whitelist_add_user <id>` — add a user to the whitelist (owner only)
+`/whitelist_remove_user <id>` — remove a user from the whitelist (owner only)
+`/whitelist_add_group <id>` — add a group to the whitelist (owner only)
+`/whitelist_remove_group <id>` — remove a group from the whitelist (owner only)
 
 dangerous commands ask for confirmation first. i can't delete that, on purpose.
 """
 
-NOT_AUTHORISED = "this bot is private. your id is not the owner."
+NOT_AUTHORISED = "this bot is private. your id is not whitelisted."
+NOT_OWNER = "only the owner can manage the whitelist."
 
 
 # --------------------------------------------------------------------------- #
@@ -103,6 +110,8 @@ def _should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, config: Co
     if chat is None:
         return True
     if str(chat.id) in config.bot.always_reply_chats:
+        return True
+    if str(chat.id) in config.bot.whitelisted_groups:
         return True
     if chat.type == Chat.PRIVATE:
         return True
@@ -319,12 +328,53 @@ async def deliver(update: Update, result: TurnResult, config: Config) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _is_allowed(user: Any, config: Config) -> bool:
+    """Whether *user* is authorised to use the bot (owner or whitelisted)."""
+    owner = config.owner_id
+    if owner is not None and user.id == owner:
+        return True
+    return str(user.id) in config.bot.whitelisted_users
+
+
+def _is_owner(user: Any, config: Config) -> bool:
+    """Whether *user* is the owner (not just whitelisted)."""
+    owner = config.owner_id
+    return owner is not None and user.id == owner
+
+
+def _toml_value(value: Any) -> str:
+    """Serialize a value to TOML."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    if isinstance(value, list):
+        return "[" + ", ".join(_toml_value(v) for v in value) + "]"
+    return f'"{value}"'
+
+
+def _write_toml(f: Any, data: dict[str, Any], prefix: str = "") -> None:
+    """Write a dict as TOML."""
+    for key, value in data.items():
+        if isinstance(value, dict):
+            continue
+        f.write(f"{key} = {_toml_value(value)}\n")
+    for key, value in data.items():
+        if isinstance(value, dict):
+            section = f"{prefix}{key}"
+            f.write(f"\n[{section}]\n")
+            _write_toml(f, value, prefix=f"{section}.")
+
+
 def build_handlers(config: Config) -> list[Any]:
     owner = config.owner_id
 
     async def authorised(update: Update) -> bool:
         user = update.effective_user
-        if owner is not None and user is not None and user.id == owner:
+        if user is not None and _is_allowed(user, config):
             return True
         await reply(update, NOT_AUTHORISED)
         log.warning("rejected %s from user %s", update.effective_message and "message", user and user.id)
@@ -524,14 +574,122 @@ def build_handlers(config: Config) -> list[Any]:
             return
         await _resolve(update, context, approved=False)
 
+    # -- whitelist management (owner only) --------------------------------- #
+
+    async def whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await authorised(update):
+            return
+        user = update.effective_user
+        if user is None or not _is_owner(user, config):
+            await reply(update, NOT_OWNER)
+            return
+        lines = ["*whitelist*"]
+        lines.append(f"owner: `{config.owner_id}`")
+        lines.append("")
+        lines.append("*whitelisted users:*")
+        if config.bot.whitelisted_users:
+            for uid in config.bot.whitelisted_users:
+                lines.append(f"- `{uid}`")
+        else:
+            lines.append("- _(none)_")
+        lines.append("")
+        lines.append("*whitelisted groups:*")
+        if config.bot.whitelisted_groups:
+            for gid in config.bot.whitelisted_groups:
+                lines.append(f"- `{gid}`")
+        else:
+            lines.append("- _(none)_")
+        await reply(update, "\n".join(lines))
+
+    async def whitelist_add_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await authorised(update):
+            return
+        user = update.effective_user
+        if user is None or not _is_owner(user, config):
+            await reply(update, NOT_OWNER)
+            return
+        if not context.args:
+            await reply(update, "usage: `/whitelist_add_user <id>`")
+            return
+        new_id = context.args[0].strip()
+        try:
+            int(new_id)
+        except ValueError:
+            await reply(update, f"`{new_id}` is not a valid id")
+            return
+        if new_id not in config.bot.whitelisted_users:
+            config.bot.whitelisted_users.append(new_id)
+            _save_whitelist(config)
+            await reply(update, f"added `{new_id}` to the user whitelist.")
+        else:
+            await reply(update, f"`{new_id}` is already whitelisted.")
+
+    async def whitelist_remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await authorised(update):
+            return
+        user = update.effective_user
+        if user is None or not _is_owner(user, config):
+            await reply(update, NOT_OWNER)
+            return
+        if not context.args:
+            await reply(update, "usage: `/whitelist_remove_user <id>`")
+            return
+        remove_id = context.args[0].strip()
+        if remove_id in config.bot.whitelisted_users:
+            config.bot.whitelisted_users.remove(remove_id)
+            _save_whitelist(config)
+            await reply(update, f"removed `{remove_id}` from the user whitelist.")
+        else:
+            await reply(update, f"`{remove_id}` is not in the user whitelist.")
+
+    async def whitelist_add_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await authorised(update):
+            return
+        user = update.effective_user
+        if user is None or not _is_owner(user, config):
+            await reply(update, NOT_OWNER)
+            return
+        if not context.args:
+            await reply(update, "usage: `/whitelist_add_group <id>`")
+            return
+        new_id = context.args[0].strip()
+        try:
+            int(new_id)
+        except ValueError:
+            await reply(update, f"`{new_id}` is not a valid id")
+            return
+        if new_id not in config.bot.whitelisted_groups:
+            config.bot.whitelisted_groups.append(new_id)
+            _save_whitelist(config)
+            await reply(update, f"added `{new_id}` to the group whitelist.")
+        else:
+            await reply(update, f"`{new_id}` is already whitelisted.")
+
+    async def whitelist_remove_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await authorised(update):
+            return
+        user = update.effective_user
+        if user is None or not _is_owner(user, config):
+            await reply(update, NOT_OWNER)
+            return
+        if not context.args:
+            await reply(update, "usage: `/whitelist_remove_group <id>`")
+            return
+        remove_id = context.args[0].strip()
+        if remove_id in config.bot.whitelisted_groups:
+            config.bot.whitelisted_groups.remove(remove_id)
+            _save_whitelist(config)
+            await reply(update, f"removed `{remove_id}` from the group whitelist.")
+        else:
+            await reply(update, f"`{remove_id}` is not in the group whitelist.")
+
     async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
         if query is None:
             return
-        owner = config.owner_id
         user = update.effective_user
-        if owner is not None and (user is None or user.id != owner):
-            await query.answer("not the owner", show_alert=True)
+        if user is None or not _is_allowed(user, config):
+            await query.answer("not authorised", show_alert=True)
             return
         data = query.data or ""
         approved = data.startswith(CB_OK)
@@ -642,9 +800,38 @@ def build_handlers(config: Config) -> list[Any]:
                 return
         await deliver(update, result, config)
 
+    # -- whitelist persistence --------------------------------------------- #
+
+    def _save_whitelist(cfg: Config) -> None:
+        """Persist the whitelist to config.local.toml."""
+        path = cfg.root / "config.local.toml"
+        existing: dict[str, Any] = {}
+        if path.is_file():
+            try:
+                with path.open("rb") as f:
+                    existing = tomllib.load(f)
+            except Exception:
+                existing = {}
+
+        bot_section = existing.get("bot", {})
+        bot_section["whitelisted_users"] = cfg.bot.whitelisted_users
+        bot_section["whitelisted_groups"] = cfg.bot.whitelisted_groups
+        existing["bot"] = bot_section
+
+        with path.open("w") as f:
+            _write_toml(f, existing)
+
     # -- assembly ---------------------------------------------------------- #
 
-    owner_filter = filters.User(user_id=owner) if owner is not None else filters.User(user_id=0)
+    allowed_user_ids: list[int] = []
+    if owner is not None:
+        allowed_user_ids.append(owner)
+    for uid in config.bot.whitelisted_users:
+        try:
+            allowed_user_ids.append(int(uid.strip()))
+        except ValueError:
+            log.warning("ignoring non-integer whitelisted user id %r", uid)
+    owner_filter = filters.User(user_id=allowed_user_ids) if allowed_user_ids else filters.User(user_id=0)
 
     return [
         # Owner-gated commands, all before the catch-all text handler.
@@ -667,6 +854,12 @@ def build_handlers(config: Config) -> list[Any]:
         CommandHandler("reset", gated(reset_command), filters=owner_filter),
         CommandHandler(["approve", "yes", "y"], gated(approve), filters=owner_filter),
         CommandHandler(["deny", "no", "n"], gated(deny), filters=owner_filter),
+        # Whitelist management — owner only (checked inside each handler).
+        CommandHandler("whitelist", gated(whitelist_command), filters=owner_filter),
+        CommandHandler("whitelist_add_user", gated(whitelist_add_user), filters=owner_filter),
+        CommandHandler("whitelist_remove_user", gated(whitelist_remove_user), filters=owner_filter),
+        CommandHandler("whitelist_add_group", gated(whitelist_add_group), filters=owner_filter),
+        CommandHandler("whitelist_remove_group", gated(whitelist_remove_group), filters=owner_filter),
         # Keyword arguments on purpose: MessageHandler's parameter order changed
         # between python-telegram-bot v20 and v22, and the keyword form is stable.
         MessageHandler(

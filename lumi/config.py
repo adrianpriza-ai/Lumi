@@ -56,6 +56,13 @@ class BotConfig:
     #: Chat ids where the bot always replies, regardless of ``group_reply_mode``.
     #: Strings to accommodate the negative supergroup ids Telegram hands out.
     always_reply_chats: list[str] = field(default_factory=list)
+    #: Group chat ids allowed to use the bot. Members of these groups can
+    #: interact with the bot (subject to ``group_reply_mode`` for non-mentions).
+    #: Strings to accommodate the negative supergroup ids Telegram hands out.
+    whitelisted_groups: list[str] = field(default_factory=list)
+    #: User ids allowed to use the bot alongside the owner. These users can
+    #: run all commands except whitelist management (owner-only).
+    whitelisted_users: list[str] = field(default_factory=list)
 
 
 OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"

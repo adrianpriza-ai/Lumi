@@ -26,6 +26,13 @@ group_reply_mode = "mention"
 # without lifting the global rule. Telegram chat ids are negative for
 # supergroups; quotes keep them as strings.
 #   always_reply_chats = ["-1001234567890"]
+# Group chat ids allowed to use the bot. Members of these groups can
+# interact with the bot (subject to `group_reply_mode` for non-mentions).
+# Telegram chat ids are negative for supergroups; quotes keep them as strings.
+#   whitelisted_groups = ["-1001234567890"]
+# User ids allowed to use the bot alongside the owner. These users can
+# run all commands except whitelist management (owner-only).
+#   whitelisted_users = ["123456789", "987654321"]
 
 [llm]
 # Any OpenAI-compatible endpoint: OpenAI, Ollama, LM Studio, vLLM, Groq,
