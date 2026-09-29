@@ -16,6 +16,7 @@ import difflib
 from pathlib import Path
 from typing import Any
 
+from ..artifacts import ArtifactError, ArtifactStore
 from ..config import Config
 from ..paths import is_within, relative_to_root
 from ..util.log import get_logger
@@ -40,11 +41,17 @@ MAX_LIST_ENTRIES = 500
 class FilesTool(Tool):
     name = "files"
     description = """
-Read, write, list and search files inside this project.
+Read, write, list, search and upload files inside this project.
 
 Paths are relative to the project root. Reads work anywhere in the project;
 writes only work inside the project's workspace directory, and overwriting an
 existing file needs the owner's approval.
+
+Set `upload: true` on a write to also send the finished file to the chat as a
+document — use it whenever the owner asked for "a file" they can download. The
+`upload` action sends a file that already exists (e.g. one a shell command
+produced) without modifying it. Delivery is handled for you: just say which
+file, and it arrives in the chat.
 
 Prefer this over shell redirection for anything that involves file contents:
 it validates the path, caps the size, and shows a diff before it overwrites.
@@ -55,7 +62,7 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["read", "write", "append", "list", "search", "stat"],
+                "enum": ["read", "write", "append", "list", "search", "stat", "upload"],
                 "description": "What to do.",
             },
             "path": {
@@ -82,6 +89,13 @@ it validates the path, caps the size, and shows a diff before it overwrites.
                 "description": "Optional read cap in bytes (default from config).",
                 "minimum": 1,
             },
+            "upload": {
+                "type": "boolean",
+                "description": (
+                    "write only: also send the file to the chat as a document when "
+                    "the write succeeds."
+                ),
+            },
         },
         "required": ["action"],
         "additionalProperties": False,
@@ -92,6 +106,18 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         self.settings = config.tools.files
         self.root = config.root
         self.writable_roots = self.settings.writable_roots()
+        # Lazily created: the store needs the bot's upload cap, which lives in
+        # the bot config section.
+        self._store: ArtifactStore | None = None
+
+    @property
+    def store(self) -> ArtifactStore:
+        if self._store is None:
+            self._store = ArtifactStore(
+                self.config.root,
+                max_bytes=max(1, self.config.bot.max_upload_mb) * 1024 * 1024,
+            )
+        return self._store
 
     def available(self) -> tuple[bool, str]:
         if not self.settings.enabled:
@@ -141,9 +167,12 @@ it validates the path, caps the size, and shows a diff before it overwrites.
             "list": self._list,
             "search": self._search,
             "stat": self._stat,
+            "upload": self._upload,
         }.get(action)
         if handler is None:
-            raise ToolError(f"unknown action {action!r}; use read, write, append, list, search or stat")
+            raise ToolError(
+                f"unknown action {action!r}; use read, write, append, list, search, stat or upload"
+            )
         return await handler(arguments, ctx)
 
     async def _read(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
@@ -207,12 +236,60 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         verb = "overwrote" if existed else "created"
         log.info("%s %s (%d bytes)", verb, self._display(path), len(content))
         diff = _short_diff(previous, content) if existed else ""
-        return ToolResult(
+
+        result = ToolResult(
             text=f"{verb} {self._display(path)} ({len(content)} bytes)\n{diff}",
             ok=True,
             data={"path": str(path), "bytes": len(content), "created": not existed},
             summary=f"{verb} {self._display(path)}",
         )
+        if arguments.get("upload") and self.settings.uploads:
+            await self._attach(result, path)
+        return result
+
+    # -- delivery to the chat ----------------------------------------------- #
+
+    async def _attach(self, result: ToolResult, path: Path) -> None:
+        """Stage *path* onto *result* as an artifact, best effort.
+
+        A failure to deliver must not fail the write that already succeeded, so
+        every error path here degrades to a note in the result text.
+        """
+        try:
+            artifact = self.store.send(path, origin=self.name, project_root=self.root)
+        except ArtifactError as exc:
+            result.text += f"\n(note: not sent to the chat — {exc})"
+            return
+        except OSError as exc:
+            result.text += f"\n(note: not sent to the chat — {exc})"
+            return
+        result.artifacts.append(artifact)
+        result.text += f"\n(will be sent to the chat as a document: {artifact.path})"
+
+    async def _upload(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        """Send an existing project file to the chat as a document.
+
+        The file itself is not modified; this only stages it for delivery. Use
+        it after generating something with the shell, or when the owner asks
+        for a file that already exists.
+        """
+        if not self.settings.uploads:
+            return ToolResult.failure(
+                "file delivery is disabled in config (tools.files.uploads = false)"
+            )
+        raw = arguments.get("path")
+        if not raw or not str(raw).strip():
+            raise ToolError("path is required for an upload")
+        path = self._resolve(raw, for_write=False)
+        if not path.is_file():
+            return ToolResult.failure(f"no such file: {self._display(path)}")
+
+        result = ToolResult(text="", ok=True, summary=f"upload {self._display(path)}")
+        await self._attach(result, path)
+        if not result.artifacts:
+            result.ok = False
+            result.text = result.text.strip() or "could not stage that file for delivery"
+        return result
 
     async def _append(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         path = self._resolve(arguments.get("path"), for_write=True)
@@ -313,7 +390,11 @@ it validates the path, caps the size, and shows a diff before it overwrites.
 
     def summary_line(self) -> str:
         allowed = ", ".join(relative_to_root(r) for r in self.writable_roots)
-        return f"`{self.name}` — read/write/list/search inside the project (writable: {allowed})"
+        delivery = "can send files to the chat" if self.settings.uploads else "delivery disabled"
+        return (
+            f"`{self.name}` — read/write/list/search the project (writable: {allowed}), "
+            f"{delivery}"
+        )
 
 
 def _ignored(path: Path) -> bool:

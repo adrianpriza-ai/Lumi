@@ -16,6 +16,7 @@ from ...util.log import get_logger
 from ...util.text import truncate
 from ..base import Tool, ToolContext, ToolError, ToolResult
 from .providers.base import Page, SearchResult, WebProvider
+from .providers.exa_provider import ExaProvider
 from .providers.firecrawl_provider import FirecrawlProvider
 from .providers.mcp_provider import MCPProvider
 from .providers.tavily_provider import TavilyProvider
@@ -33,6 +34,8 @@ def build_providers(config: Config) -> dict[str, WebProvider]:
                 built[name] = TavilyProvider(web.tavily)
             elif name == "firecrawl":
                 built[name] = FirecrawlProvider(web.firecrawl)
+            elif name == "exa":
+                built[name] = ExaProvider(web.exa)
             elif name == "mcp":
                 built[name] = MCPProvider(web.mcp, config.root)
             else:  # pragma: no cover - validate() catches this at startup

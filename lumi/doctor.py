@@ -141,12 +141,13 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
                 f"{config.bot.proxy_url} (Bot API via bot.proxy_url)",
             )
         )
+    retries = config.bot.bootstrap_retries
     checks.append(
         Check(
             "telegram network",
             OK,
             f"connect timeout {config.bot.connect_timeout:g}s, "
-            f"{config.bot.bootstrap_retries + 1} bootstrap attempt(s)",
+            f"{'unlimited' if retries < 0 else f'{retries + 1}'} bootstrap attempt(s)",
         )
     )
     keys = config.llm.api_keys()

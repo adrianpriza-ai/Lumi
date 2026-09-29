@@ -36,15 +36,36 @@ log = get_logger(__name__)
 #: Environment variables that pass through to the child process.
 ENV_PASSTHROUGH: frozenset[str] = frozenset(
     {
-        "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TERM", "SHELL", "USER", "LOGNAME",
-        "SYSTEMROOT", "COMSPEC", "PATHEXT", "TEMP", "TMP", "HOME", "TMPDIR",
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TZ",
+        "TERM",
+        "SHELL",
+        "USER",
+        "LOGNAME",
+        "SYSTEMROOT",
+        "COMSPEC",
+        "PATHEXT",
+        "TEMP",
+        "TMP",
+        "HOME",
+        "TMPDIR",
         # Build tooling that legitimately needs to know where it is.
-        "VIRTUAL_ENV", "CONDA_PREFIX", "NODE_PATH", "PYTHONPATH", "GOPATH", "GOROOT",
+        "VIRTUAL_ENV",
+        "CONDA_PREFIX",
+        "NODE_PATH",
+        "PYTHONPATH",
+        "GOPATH",
+        "GOROOT",
     }
 )
 
 #: Anything matching this is stripped, whatever its name.
-SECRET_PATTERN = re.compile(r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|SESSION|COOKIE)", re.IGNORECASE)
+SECRET_PATTERN = re.compile(
+    r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|SESSION|COOKIE)", re.IGNORECASE
+)
 
 #: Hard ceiling regardless of config, so a bad config cannot wedge the bot.
 MAX_TIMEOUT_SECONDS = 600
@@ -66,6 +87,8 @@ Rules:
   approval first. If you get "needs approval", say what the command does and
   why, and let the owner decide — do not try to rephrase it into something
   sneakier.
+- The working directory is judged after any `cd`, so `cd .. && rm -rf x` is
+  checked against the directory it would actually delete from.
 - Output is truncated. If you need more, redirect to a file and read it back.
 - The environment is scrubbed: API keys are not visible to the command.
 """.strip()
@@ -100,6 +123,12 @@ Rules:
         self.shell_config = config.tools.shell
         self.root = config.root
         self.cwd = config.shell_cwd
+        # The write boundary is configurable and defaults to the whole project,
+        # which is the behaviour people expect from a coding bot that has to be
+        # able to edit the code it is working on.
+        self.workspace = (
+            self.shell_config.writable_roots()[0] if self.shell_config.writable else config.root
+        )
         # The working directory is part of the layout, not something the user has
         # to create by hand. A fresh clone should be runnable immediately.
         try:
@@ -157,6 +186,9 @@ Rules:
             cwd=cwd,
             project_root=self.root,
             home=Path.home(),
+            # Writes are confined to the workspace, not merely to the project:
+            # the rest of the repo is Lumi's own source and the owner's config.
+            write_root=self.workspace,
             ask_before_risky=self.shell_config.ask_before_risky,
             extra_deny=self.shell_config.extra_deny,
             extra_confirm=self.shell_config.extra_confirm,
@@ -173,7 +205,9 @@ Rules:
         timeout = self._timeout(arguments.get("timeout_seconds"))
         verdict = self.classify(command, cwd)
 
-        log.info("shell verdict=%s cwd=%s cmd=%s", verdict.tier.value, cwd, truncate(command, 200, "…"))
+        log.info(
+            "shell verdict=%s cwd=%s cmd=%s", verdict.tier.value, cwd, truncate(command, 200, "…")
+        )
 
         if verdict.blocked:
             # Deliberately does not echo the rule name: no need to teach a model
@@ -221,7 +255,9 @@ Rules:
             raw_out, raw_err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             return proc.returncode or 0, _decode(raw_out), _decode(raw_err), False
         except TimeoutError:
-            log.warning("command timed out after %ss, killing the process group: %s", timeout, command)
+            log.warning(
+                "command timed out after %ss, killing the process group: %s", timeout, command
+            )
             _kill_group(proc)
             try:
                 raw_out, raw_err = await asyncio.wait_for(proc.communicate(), timeout=5)
@@ -241,7 +277,10 @@ Rules:
         ctx: ToolContext,
     ) -> ToolResult:
         cap = self.shell_config.max_output_chars
-        lines = [f"$ {command}", f"cwd: {cwd.relative_to(self.root) if is_within(cwd, self.root) else cwd}"]
+        lines = [
+            f"$ {command}",
+            f"cwd: {cwd.relative_to(self.root) if is_within(cwd, self.root) else cwd}",
+        ]
 
         if timed_out:
             lines.append(f"TIMED OUT after {self._timeout(None)}s — the command was killed.")

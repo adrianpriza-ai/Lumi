@@ -47,6 +47,11 @@ class BotConfig:
     startup_chat_id: str = ""
     require_owner: bool = True
     log_prefix: str = "lumi"
+    #: Ceiling on a file the bot will send to Telegram as a document, in MB.
+    #: Telegram's own Bot API document limit is 50 MB; the lower default keeps
+    #: the outbox from filling with one runaway export. The artifact harness
+    #: refuses anything larger with a model-readable reason.
+    max_upload_mb: int = 20
     #: How the bot behaves in group chats. ``"mention"`` (default) only replies
     #: when the bot is mentioned, replied to, or sent a slash command targeting
     #: it specifically (e.g. ``/help@Lumi_a_bot``). ``"always"`` replies to every
@@ -73,8 +78,13 @@ class BotConfig:
     connect_timeout: float = 15.0
     #: Extra attempts PTB makes to bootstrap (initialize, delete/set webhook)
     #: after a network failure. 0 means exactly one attempt — PTB's default,
-    #: and the reason one wifi hiccup at startup used to kill the bot.
-    bootstrap_retries: int = 3
+    #: and the reason one wifi hiccup at startup used to kill the bot. -1
+    #: retries forever, so the bot waits out an outage instead of exiting
+    #: once the counter runs dry (the polling loop already retries forever
+    #: once the bot is up; this makes startup behave the same). One counter,
+    #: not per-outage: bootstrap aborts on the first success, so the count
+    #: only ever accumulates while the network is continuously down.
+    bootstrap_retries: int = -1
 
 
 OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
@@ -100,10 +110,6 @@ REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 #: thinking at all. ``medium`` is the closest thing to a cross-provider
 #: default — it is also OpenAI's own default for its reasoning models.
 DEFAULT_REASONING_EFFORT = "medium"
-
-
-
-
 
 
 @dataclass(slots=True)
@@ -161,7 +167,8 @@ class LLMConfig:
             return DEFAULT_REASONING_EFFORT if self.reasoning else ""
         log.warning(
             "unknown llm.reasoning_effort %r; omitting the parameter instead. Known: %s",
-            self.reasoning_effort, ", ".join(REASONING_EFFORTS),
+            self.reasoning_effort,
+            ", ".join(REASONING_EFFORTS),
         )
         return ""
 
@@ -200,7 +207,9 @@ class LLMConfig:
             return chosen
         log.warning(
             "unknown llm.key_strategy %r; falling back to %r. Known: %s",
-            self.key_strategy, "fallback", ", ".join(KEY_STRATEGIES),
+            self.key_strategy,
+            "fallback",
+            ", ".join(KEY_STRATEGIES),
         )
         return "fallback"
 
@@ -248,8 +257,16 @@ class ShellConfig:
     max_output_chars: int = 6000
     ask_before_risky: bool = True
     home: str = "project"  # "project" | "inherit"
+    #: Where a command is allowed to write. Empty means the whole project, which
+    #: is the default because a coding bot has to be able to edit the code it
+    #: works on. Set it to ["workspace"] to confine writes to the scratch folder
+    #: and make every other write in the project ask first.
+    writable: list[str] = field(default_factory=list)
     extra_deny: list[str] = field(default_factory=list)
     extra_confirm: list[str] = field(default_factory=list)
+
+    def writable_roots(self) -> list[Path]:
+        return [resolve(p) for p in self.writable]
 
 
 @dataclass(slots=True)
@@ -259,6 +276,11 @@ class FilesConfig:
     readable_from_project: bool = True
     max_read_chars: int = 20_000
     max_write_chars: int = 200_000
+    #: When true, the ``files`` tool accepts an ``upload`` flag: files written
+    #: under the writable roots are staged into the artifact outbox and delivered
+    #: to the chat as documents. Also enables the dedicated ``upload`` action,
+    #: which registers a file that already exists.
+    uploads: bool = True
 
     def writable_roots(self) -> list[Path]:
         return [resolve(p) for p in self.writable]
@@ -305,7 +327,9 @@ class TavilyConfig:
             return chosen
         log.warning(
             "unknown tools.web.tavily.key_strategy %r; falling back to %r. Known: %s",
-            self.key_strategy, "fallback", ", ".join(WEB_KEY_STRATEGIES),
+            self.key_strategy,
+            "fallback",
+            ", ".join(WEB_KEY_STRATEGIES),
         )
         return "fallback"
 
@@ -336,7 +360,47 @@ class FirecrawlConfig:
             return chosen
         log.warning(
             "unknown tools.web.firecrawl.key_strategy %r; falling back to %r. Known: %s",
-            self.key_strategy, "fallback", ", ".join(WEB_KEY_STRATEGIES),
+            self.key_strategy,
+            "fallback",
+            ", ".join(WEB_KEY_STRATEGIES),
+        )
+        return "fallback"
+
+
+@dataclass(slots=True)
+class ExaConfig:
+    enabled: bool = True
+    api_key_env: str = "EXA_API_KEY"
+    base_url: str = "https://api.exa.ai"
+    #: "auto" (default) lets Exa choose between neural and keyword search per
+    #: query; "neural" forces embeddings-ranked results, "keyword" forces
+    #: traditional matching. See https://docs.exa.ai for the trade-offs.
+    search_type: str = "auto"
+    #: Optional Exa category, e.g. "news", "github", "paper", "pdf". Empty
+    #: means no category filter.
+    category: str = ""
+    #: How to spend several keys. See :data:`WEB_KEY_STRATEGIES`.
+    key_strategy: str = "fallback"
+
+    def api_keys(self) -> list[str]:
+        """Every key in ``api_key_env``, in the order they were written."""
+        return parse_env_var(self.api_key_env)
+
+    def api_key(self) -> str | None:
+        """The primary key, or None when the variable is unset or empty."""
+        keys = self.api_keys()
+        return keys[0] if keys else None
+
+    def key_strategy_of(self) -> str:
+        """The rotation strategy, normalised. Unknown values fall back to ``fallback``."""
+        chosen = self.key_strategy.strip().lower() or "fallback"
+        if chosen in WEB_KEY_STRATEGIES:
+            return chosen
+        log.warning(
+            "unknown tools.web.exa.key_strategy %r; falling back to %r. Known: %s",
+            self.key_strategy,
+            "fallback",
+            ", ".join(WEB_KEY_STRATEGIES),
         )
         return "fallback"
 
@@ -413,7 +477,9 @@ class Context7Config:
             return chosen
         log.warning(
             "unknown tools.context7.key_strategy %r; falling back to %r. Known: %s",
-            self.key_strategy, "fallback", ", ".join(CONTEXT7_KEY_STRATEGIES),
+            self.key_strategy,
+            "fallback",
+            ", ".join(CONTEXT7_KEY_STRATEGIES),
         )
         return "fallback"
 
@@ -421,12 +487,15 @@ class Context7Config:
 @dataclass(slots=True)
 class WebConfig:
     enabled: bool = True
-    provider_order: list[str] = field(default_factory=lambda: ["tavily", "firecrawl", "mcp"])
+    provider_order: list[str] = field(
+        default_factory=lambda: ["firecrawl", "exa", "tavily", "mcp"]
+    )
     max_results: int = 5
     max_content_chars: int = 6000
     timeout_seconds: int = 90
     tavily: TavilyConfig = field(default_factory=TavilyConfig)
     firecrawl: FirecrawlConfig = field(default_factory=FirecrawlConfig)
+    exa: ExaConfig = field(default_factory=ExaConfig)
     mcp: MCPConfig = field(default_factory=MCPConfig)
 
 
@@ -732,8 +801,8 @@ def validate(config: Config) -> list[str]:
         )
     if config.bot.connect_timeout <= 0:
         problems.append("bot.connect_timeout must be a positive number of seconds")
-    if config.bot.bootstrap_retries < 0:
-        problems.append("bot.bootstrap_retries cannot be negative")
+    if config.bot.bootstrap_retries < -1:
+        problems.append("bot.bootstrap_retries cannot be less than -1 (-1 retries forever)")
     if config.bot.require_owner and config.owner_id is None:
         problems.append(
             "TELEGRAM_OWNER_ID is unset. The shell and file tools are locked to the owner, "
@@ -749,9 +818,16 @@ def validate(config: Config) -> list[str]:
         if name not in {"shell", "files", "memory", "web", "context7"}:
             problems.append(f"unknown tool {name!r} in tools.enabled")
 
-    providers = [p for p in config.tools.web.provider_order if p not in {"tavily", "firecrawl", "mcp"}]
+    if config.bot.max_upload_mb <= 0:
+        problems.append("bot.max_upload_mb must be a positive number of megabytes")
+
+    providers = [
+        p for p in config.tools.web.provider_order if p not in {"tavily", "firecrawl", "exa", "mcp"}
+    ]
     if providers:
-        problems.append(f"unknown web providers in tools.web.provider_order: {', '.join(providers)}")
+        problems.append(
+            f"unknown web providers in tools.web.provider_order: {', '.join(providers)}"
+        )
 
     # The context7 tool degrades silently when no key is set, so it never blocks
     # startup; flag an unknown strategy though, because that one is a typo.
@@ -771,11 +847,15 @@ def validate(config: Config) -> list[str]:
             config.tools.web.firecrawl.enabled,
             config.tools.web.firecrawl.key_strategy,
         ),
+        (
+            "tools.web.exa",
+            config.tools.web.exa.enabled,
+            config.tools.web.exa.key_strategy,
+        ),
     ):
         if enabled and strategy.strip().lower() not in WEB_KEY_STRATEGIES:
             problems.append(
-                f"unknown {label}.key_strategy {strategy!r}. "
-                f"Known: {', '.join(WEB_KEY_STRATEGIES)}"
+                f"unknown {label}.key_strategy {strategy!r}. Known: {', '.join(WEB_KEY_STRATEGIES)}"
             )
 
     return problems

@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..artifacts import Artifact
 from ..util.text import truncate
 
 
@@ -81,6 +82,11 @@ class ToolResult:
     data: dict[str, Any] = field(default_factory=dict)
     #: Short line echoed into the transcript so the log shows what was used.
     summary: str = ""
+    #: Files this call produced that the chat should receive. The agent loop
+    #: collects these into :attr:`lumi.agent.TurnResult.artifacts`; the
+    #: presentation layer (Telegram as documents, the CLI as paths) decides how
+    #: to deliver them. Tools never talk to Telegram directly.
+    artifacts: list[Artifact] = field(default_factory=list)
 
     @classmethod
     def failure(cls, text: str, **data: Any) -> ToolResult:

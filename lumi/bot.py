@@ -16,10 +16,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import os
 import time
 import tomllib
 import uuid
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 from telegram import Chat, InlineKeyboardButton, InlineKeyboardMarkup, MessageEntity, Update
@@ -36,6 +38,7 @@ from telegram.ext import (
 )
 
 from .agent import Agent, PendingAction, TurnResult
+from .artifacts import Artifact, ArtifactError, ArtifactStore
 from .config import Config, ConfigError, validate
 from .doctor import platform_line, run_checks
 from .memory import History, MemoryFile
@@ -82,6 +85,8 @@ just talk to me. i remember you between sessions, look things up on the web,
 read and write files in this project, and run shell commands.
 
 send me a photo and i'll look at it. add a caption to tell me what to look for.
+send me a document and i'll read it — it lands in workspace/uploads/ and i can
+work with it from there. ask me to make a file and i'll send it back as one.
 
 if i'm running on a reasoning model i'll think first, then say a small grey line
 above my answer. tap *show thinking* if you want to see how i got there.
@@ -100,6 +105,8 @@ above my answer. tap *show thinking* if you want to see how i got there.
 `/tools` — list my tools
 `/status` — model, tools and provider health
 `/doctor` — diagnose the whole setup
+`/config` — the resolved configuration this process runs on (owner only)
+`/env` — which credentials are set, values masked (owner only)
 `/reload` — re-read personality, memory and config
 `/reset` — forget this conversation (keeps long-term memory)
 `/whitelist` — show whitelisted users and groups (owner only)
@@ -113,6 +120,147 @@ dangerous commands ask for confirmation first. i can't delete that, on purpose.
 
 NOT_AUTHORISED = "this bot is private. your id is not whitelisted."
 NOT_OWNER = "only the owner can manage the whitelist."
+NOT_OWNER_SENSITIVE = "only the owner can see that."
+
+
+def _mask(value: str | None) -> str:
+    """A credential safe to show in chat.
+
+    Stricter than :func:`lumi.llm.keypool.mask`, which is tuned for log lines:
+    only the first two and last four characters survive, and anything shorter
+    than 12 characters is described by length instead. Full values are never
+    sent to Telegram — a chat lives on Telegram's servers and on every device
+    logged into the account, so even an owner-only command keeps its secrets.
+    """
+    if not value:
+        return ""
+    if len(value) < 12:
+        return f"(len {len(value)})"
+    return f"{value[:2]}…{value[-4:]}"
+
+
+def _render_env(config: Config) -> str:
+    """The ``/env`` body: which credentials exist, masked, never in full."""
+    lines = [
+        "*env* — credential status (masked)",
+        "_full values are never sent to this chat._",
+        "",
+    ]
+
+    token = config.telegram_token
+    lines.append(
+        f"`TELEGRAM_BOT_TOKEN` = `{_mask(token)}`"
+        if token
+        else "`TELEGRAM_BOT_TOKEN` — unset (the bot cannot start)"
+    )
+
+    # One line per key-bearing variable, in web tier order for the providers.
+    # unset is a normal state for tavily (keyless tier) and context7 (hidden
+    # until set), so the role says what an unset means rather than alarming.
+    specs = (
+        (
+            config.llm.api_key_env,
+            config.llm.api_keys(),
+            config.llm.strategy_of(),
+            "the model endpoint",
+        ),
+        (
+            config.tools.web.firecrawl.api_key_env,
+            config.tools.web.firecrawl.api_keys(),
+            config.tools.web.firecrawl.key_strategy_of(),
+            "web tier 1: firecrawl",
+        ),
+        (
+            config.tools.web.exa.api_key_env,
+            config.tools.web.exa.api_keys(),
+            config.tools.web.exa.key_strategy_of(),
+            "web tier 2: exa",
+        ),
+        (
+            config.tools.web.tavily.api_key_env,
+            config.tools.web.tavily.api_keys(),
+            config.tools.web.tavily.key_strategy_of(),
+            "web tier 3: tavily (free keyless tier when unset)",
+        ),
+        (
+            config.tools.context7.api_key_env,
+            config.tools.context7.api_keys(),
+            config.tools.context7.key_strategy_of(),
+            "context7 (hidden from the model until set)",
+        ),
+    )
+    for name, keys, strategy, role in specs:
+        if keys:
+            pool = f" ({len(keys)} keys, {strategy})" if len(keys) > 1 else ""
+            lines.append(f"`{name}` = `{_mask(keys[0])}`{pool} — {role}")
+        else:
+            lines.append(f"`{name}` — unset — {role}")
+
+    overrides = sorted(key for key in os.environ if key.startswith("LUMI__"))
+    if overrides:
+        lines += ["", "*LUMI__ overrides:*"]
+        for name in overrides:
+            lines.append(f"- `{name}={truncate(os.environ[name], 60)}`")
+
+    lines += [
+        "",
+        "_keys are read at startup: edit .env, then restart. `/reload` does not re-read credentials._",
+    ]
+    return "\n".join(lines)
+
+
+def _render_config(config: Config) -> str:
+    """The ``/config`` body: the resolved configuration this process runs on.
+
+    Same values ``lumi config`` prints in a terminal, shaped for chat. Reads
+    only the config tree — no bot_data — so it stays a pure function and the
+    live view is exactly what the running handlers closed over.
+    """
+    llm = config.llm
+    web = config.tools.web
+    shell = config.tools.shell
+    files = config.tools.files
+    bot = config.bot
+    temperature = "provider default" if llm.temperature is None else str(llm.temperature)
+    return "\n".join(
+        [
+            "*config* — resolved, live",
+            "",
+            "*model*",
+            f"- `{llm.model_of()}` via {llm.base_url_of()} (from {llm.where_from()})",
+            f"- temperature: {temperature} · max_tokens: {llm.max_tokens:,} · keys: {llm.strategy_of()}",
+            f"- reasoning: {'on at ' + (llm.effort_of() or 'provider default') if llm.reasoning else 'off'}"
+            f" · trace in chat: {'on' if llm.show_reasoning else 'off'}",
+            f"- agent: {llm.max_tool_iterations} tool iterations · {llm.history_turns} history turns"
+            f" · memory cap {llm.max_memory_chars:,} chars",
+            "",
+            f"*web* — {'enabled' if web.enabled else 'DISABLED'}",
+            f"- order: {' → '.join(web.provider_order)}",
+            f"- firecrawl: scrape top {web.firecrawl.auto_scrape_top_n} · {web.firecrawl.key_strategy_of()}",
+            f"- exa: type {web.exa.search_type}"
+            + (f", category {web.exa.category}" if web.exa.category else ""),
+            f"- tavily: depth {web.tavily.search_depth}, topic {web.tavily.topic}",
+            f"- mcp: {web.mcp.config_file} · timeout {web.mcp.timeout_seconds}s",
+            f"- call timeout {web.timeout_seconds}s · content cap {web.max_content_chars:,} chars",
+            "",
+            f"*shell* — cwd {shell.cwd} · timeout {shell.timeout_seconds}s"
+            f" · output cap {shell.max_output_chars:,} chars",
+            f"- safety: {'asks before risky' if shell.ask_before_risky else 'hard block, no prompts'}"
+            f" · home: {shell.home} · writes: {', '.join(shell.writable) or 'whole project'}",
+            "",
+            "*files*",
+            f"- writable: {', '.join(files.writable) or 'none'}"
+            f" · read cap {files.max_read_chars:,} · write cap {files.max_write_chars:,}",
+            "",
+            "*bot*",
+            f"- group mode: {bot.group_reply_mode} · whitelisted users: {len(bot.whitelisted_users)}"
+            f" · groups: {len(bot.whitelisted_groups)}",
+            f"- file delivery: documents up to {bot.max_upload_mb} MB"
+            f" · files tool: {'uploads on' if files.uploads else 'uploads off'}",
+            f"- logging: {config.logging.level} → {config.logging.file}",
+            f"- config file: {config.config_path or 'none (built-in defaults)'}",
+        ]
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -445,6 +593,42 @@ def render_thinking(trace: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Artifacts (file delivery)
+# --------------------------------------------------------------------------- #
+
+
+def artifact_caption(artifact: Artifact) -> str:
+    """A short, plain-text caption identifying the file."""
+    return artifact.caption()
+
+
+async def send_artifact(update: Update, artifact: Artifact) -> None:
+    """Send one artifact as a document, degrading to a path when it fails.
+
+    The caption is deliberately plain text (no parse mode): filenames with
+    underscores would fight legacy Markdown parsing, and the file is the
+    payload — the caption only has to identify it.
+    """
+    message = update.effective_message
+    if message is None:
+        return
+    try:
+        with artifact.absolute.open("rb") as handle:
+            await message.reply_document(
+                document=handle,
+                filename=Path(artifact.path).name,
+                caption=artifact.caption(),
+            )
+    except (BadRequest, TelegramError, OSError) as exc:
+        log.warning("could not send artifact %s: %s", artifact.path, exc)
+        await reply(
+            update,
+            f"📎 couldn't attach {artifact.path} ({artifact.size} bytes) — "
+            f"it's on disk at `{artifact.path}`",
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Result rendering
 # --------------------------------------------------------------------------- #
 
@@ -452,9 +636,13 @@ def render_thinking(trace: str) -> str:
 async def deliver(
     update: Update, result: TurnResult, config: Config, traces: TraceStore | None = None
 ) -> None:
-    """Turn an agent result into messages, approval prompts included."""
+    """Turn an agent result into messages, documents included."""
     if result.error and not result.text:
         await reply(update, f"that didn't work: {result.error}")
+        # A crashed turn can still have staged files (e.g. the model wrote with
+        # upload: true and a later iteration hit the cap). Deliver what exists.
+        for artifact in result.artifacts:
+            await send_artifact(update, artifact)
         return
 
     # Before the answer, because that is the order it happened in: the model
@@ -466,6 +654,11 @@ async def deliver(
 
     if result.text:
         await reply(update, result.text)
+
+    # Deliver artifacts after the text — the chat reads the explanation first,
+    # then gets the file.
+    for artifact in result.artifacts:
+        await send_artifact(update, artifact)
 
     for action in result.pending:
         await reply_html(update, render_approval(action), reply_markup=approval_keyboard(action))
@@ -566,6 +759,11 @@ def build_handlers(config: Config) -> list[Any]:
         application without a real one and still exercise the whole path.
         """
         store: TraceStore = context.application.bot_data["traces"]
+        return store
+
+    def artifacts_of(context: ContextTypes.DEFAULT_TYPE) -> ArtifactStore:
+        """The store that stages incoming document uploads."""
+        store: ArtifactStore = context.application.bot_data["artifacts"]
         return store
 
     # -- basic commands ---------------------------------------------------- #
@@ -741,6 +939,38 @@ def build_handlers(config: Config) -> list[Any]:
             return
         checks = run_checks(config, agent_of(context).registry)
         await reply(update, "*doctor*\n" + "\n".join(check.render() for check in checks))
+
+    async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Owner-only view of the resolved configuration.
+
+        Shows what this process is actually running with — config.toml merged
+        with config.local.toml and LUMI__ env overrides. Nothing here is secret
+        (keys are ``/env``'s job), but it is owner-only anyway: a whitelisted
+        user in a shared group does not need to see the endpoint or the layout.
+        """
+        if not await authorised(update):
+            return
+        user = update.effective_user
+        if user is None or not _is_owner(user, config):
+            await reply(update, NOT_OWNER_SENSITIVE)
+            return
+        await reply(update, _render_config(config))
+
+    async def env_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Owner-only credential status, masked.
+
+        Deliberately never prints a full key: the double gate (owner filter on
+        the handler, explicit check inside) is the same defence as ``/run``,
+        but the payload here would be credentials, so the values themselves are
+        masked too. See :func:`_mask` for why.
+        """
+        if not await authorised(update):
+            return
+        user = update.effective_user
+        if user is None or not _is_owner(user, config):
+            await reply(update, NOT_OWNER_SENSITIVE)
+            return
+        await reply(update, _render_env(config))
 
     async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await authorised(update):
@@ -939,6 +1169,52 @@ def build_handlers(config: Config) -> list[Any]:
             return
         await run_agent(update, context, message.text)
 
+    async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """An incoming file: store it in the project, then let the model at it.
+
+        Documents arrive through the non-text handler (a document with a caption
+        has ``text`` unset, so it never reaches ``on_text`` — the caption rides
+        along in ``message.caption``). The file lands under
+        ``workspace/uploads/<chat_id>/`` and the model gets a prompt naming the
+        path and the file's facts, so it can read, rename, summarise or process
+        it like any other project file.
+        """
+        message = update.effective_message
+        if message is None or message.document is None:
+            return
+        chat_id = chat_of(update)
+
+        try:
+            file = await context.bot.get_file(message.document.file_id)
+            buffer = await file.download_as_bytearray()
+        except (TelegramError, BadRequest, OSError) as exc:
+            log.warning("could not download document: %s", exc)
+            await reply(update, "i couldn't download that file — try sending it again.")
+            return
+
+        store = artifacts_of(context)
+        name = message.document.file_name or "upload.bin"
+        try:
+            artifact = store.ingest(bytes(buffer), name, chat_id, config.root)
+        except ArtifactError as exc:
+            await reply(update, f"i can't take that file: {exc}")
+            return
+        except OSError as exc:
+            log.warning("could not store document %s: %s", name, exc)
+            await reply(update, "i couldn't store that file — check the logs.")
+            return
+
+        log.info("document %s (%d bytes) stored for chat %s", artifact.path, artifact.size, chat_id)
+        await reply(update, f"📎 saved {artifact.path} ({artifact.size:,} bytes)")
+
+        caption = (message.caption or "").strip()
+        prompt = (
+            f"[The owner sent a file: {artifact.path} ({artifact.size} bytes, {artifact.mime}). "
+            "It is in the project; read it with the `files` tool before acting on it."
+            f"]\n\n{caption or 'What is this file, and what should I do with it?'}"
+        )
+        await run_agent(update, context, prompt)
+
     async def on_non_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await authorised(update):
             return
@@ -946,6 +1222,13 @@ def build_handlers(config: Config) -> list[Any]:
             return
         message = update.effective_message
         if message is None:
+            return
+
+        # A document (with or without a caption): store it in the project so
+        # the model can work on it like any other file, then hand the model a
+        # prompt that says where it landed.
+        if message.document:
+            await on_document(update, context)
             return
 
         # A photo with no caption: nothing textual to act on, so ask the obvious
@@ -1135,6 +1418,10 @@ def build_handlers(config: Config) -> list[Any]:
         CommandHandler("reasoning", gated(reasoning_command), filters=owner_filter),
         CommandHandler("status", gated(status_command), filters=owner_filter),
         CommandHandler("doctor", gated(doctor_command), filters=owner_filter),
+        # Owner only, checked inside each handler on top of the filter: these
+        # expose the backend (endpoint, layout, credential inventory).
+        CommandHandler("config", gated(config_command), filters=owner_filter),
+        CommandHandler("env", gated(env_command), filters=owner_filter),
         CommandHandler("reload", gated(reload_command), filters=owner_filter),
         CommandHandler("reset", gated(reset_command), filters=owner_filter),
         CommandHandler(["approve", "yes", "y"], gated(approve), filters=owner_filter),
@@ -1226,6 +1513,9 @@ def build_application(config: Config, agent: Agent | None = None, *, bot: Any = 
     application.bot_data["personality"] = personality
     application.bot_data["history"] = history
     application.bot_data["traces"] = TraceStore()
+    application.bot_data["artifacts"] = ArtifactStore(
+        config.root, max_bytes=max(1, config.bot.max_upload_mb) * 1024 * 1024
+    )
     application.bot_data["agent"] = agent or Agent(config, personality, memory, history)
 
     for handler in build_handlers(config):
@@ -1262,13 +1552,20 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def run(config: Config) -> None:
-    """Start long polling. Blocks until interrupted."""
+    """Start long polling. Blocks until interrupted.
+
+    Bootstrap retries follow PTB's contract: the counter counts consecutive
+    failures and the loop aborts on the first success, so a bot that got online
+    once has no residual budget to lose. ``-1`` means retry startup forever —
+    matching the polling loop's own unlimited retries once the bot is up — so
+    the process waits out an outage instead of exiting while the owner sleeps.
+    """
     application = build_application(config)
     retries = config.bot.bootstrap_retries
     log.info(
-        "polling for updates — ctrl-c to stop (connect timeout %ss, up to %s bootstrap attempt(s)%s)",
+        "polling for updates — ctrl-c to stop (connect timeout %ss, %s bootstrap attempt(s)%s)",
         config.bot.connect_timeout,
-        retries + 1,
+        "unlimited" if retries < 0 else f"up to {retries + 1}",
         f" via {config.bot.proxy_url}" if config.bot.proxy_url else "",
     )
     try:
@@ -1277,8 +1574,8 @@ def run(config: Config) -> None:
             drop_pending_updates=True,
             close_loop=False,
             # PTB's default is 0: one TCP connect failure to api.telegram.org
-            # aborts the whole startup. A couple of retries turn a momentary
-            # outage into a delay instead of a crash.
+            # aborts the whole startup. -1 keeps retrying startup forever,
+            # matching the polling loop's own unlimited retries once running.
             bootstrap_retries=retries,
         )
     except KeyboardInterrupt:

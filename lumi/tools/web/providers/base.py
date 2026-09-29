@@ -1,8 +1,9 @@
 """Web provider contract.
 
-Three implementations ship: the Tavily SDK, the Firecrawl SDK, and a generic MCP
-client that reads ``.mcp.json``. They all normalise to :class:`SearchHit` and
-:class:`Page` so the tool layer never has to care which one answered.
+Four implementations ship: the Firecrawl SDK, the Exa SDK, the Tavily SDK, and
+a generic MCP client that reads ``.mcp.json``. They all normalise to
+:class:`SearchHit` and :class:`Page` so the tool layer never has to care which
+one answered.
 """
 
 from __future__ import annotations

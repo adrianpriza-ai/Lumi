@@ -97,6 +97,17 @@ class FakeBot(Bot):
     async def get_file(self, file_id: str, **kwargs: Any) -> Any:
         return _FakeFile(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
 
+    async def send_document(self, chat_id: Any, document: Any = None, **kwargs: Any) -> Any:
+        """Record a document send; read the payload if it is a real file handle."""
+        payload = None
+        if hasattr(document, "read"):
+            payload = document.read()
+            document.seek(0) if hasattr(document, "seek") else None
+        elif isinstance(document, bytes):
+            payload = document
+        self._sent.append({"chat_id": chat_id, "document": payload, **kwargs})
+        return None
+
 
 def make_update(bot: Bot, text: str | None = None, *, chat_id: int = CHAT, user_id: int = OWNER,
                 message_id: int = 1, chat_type: str = "private",
@@ -124,6 +135,29 @@ def make_update(bot: Bot, text: str | None = None, *, chat_id: int = CHAT, user_
     if reply_to_message is not None:
         message["reply_to_message"] = reply_to_message
     return Update.de_json({"update_id": message_id, "message": message}, bot)
+
+
+def make_document_update(bot: Bot, *, caption: str | None = None, chat_id: int = CHAT,
+                         chat_type: str = "private", user_id: int = OWNER,
+                         file_name: str = "notes.txt",
+                         file_size: int = 11) -> Update:
+    """An update carrying a document message (with or without a caption)."""
+    message: dict[str, Any] = {
+        "message_id": 5,
+        "date": int(time.time()),
+        "chat": {"id": chat_id, "type": chat_type, "title": "Lab"},
+        "from": {"id": user_id, "is_bot": False, "first_name": "Owner", "username": "owner"},
+        "document": {
+            "file_id": "doc1",
+            "file_unique_id": "du1",
+            "file_name": file_name,
+            "mime_type": "text/plain",
+            "file_size": file_size,
+        },
+    }
+    if caption is not None:
+        message["caption"] = caption
+    return Update.de_json({"update_id": 5, "message": message}, bot)
 
 
 def make_callback(bot: Bot, data: str, *, chat_id: int = CHAT, user_id: int = OWNER) -> Update:
@@ -175,7 +209,12 @@ async def send(config, replies, text: str, **kwargs) -> tuple[FakeBot, Agent]:
 
 
 def texts(bot: FakeBot) -> str:
-    return "\n".join(message["text"] for message in bot.sent)
+    return "\n".join(message["text"] for message in bot.sent if "text" in message)
+
+
+def documents(bot: FakeBot) -> list[dict[str, Any]]:
+    """Every document the bot tried to send (payload bytes recorded)."""
+    return [message for message in bot.sent if "document" in message]
 
 
 # --------------------------------------------------------------------------- #
@@ -1148,6 +1187,273 @@ async def test_photo_in_group_without_mention_is_silent(config) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# file delivery and document intake
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_model_written_file_is_delivered_as_a_document(config) -> None:
+    """The full out path: the model writes with upload:true, the chat gets a file."""
+    application, bot, agent = build(
+        config,
+        [
+            make_reply(
+                "",
+                [
+                    (
+                        "c1",
+                        "files",
+                        {
+                            "action": "write",
+                            "path": "workspace/report.md",
+                            "content": "# Report\n\ncontents here",
+                            "upload": True,
+                        },
+                    )
+                ],
+            ),
+            make_reply("here is the report"),
+        ],
+    )
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "make me a report"))
+    finally:
+        await application.shutdown()
+
+    assert "here is the report" in texts(bot)
+    docs = documents(bot)
+    assert len(docs) == 1
+    assert docs[0]["document"] == b"# Report\n\ncontents here"
+    assert "report.md" in docs[0]["caption"]
+
+
+async def test_an_upload_action_result_is_delivered(config) -> None:
+    """The files.upload action, driven by the model, reaches the chat."""
+    (config.shell_cwd / "shell-made.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+    application, bot, agent = build(
+        config,
+        [
+            make_reply("", [("c1", "files", {"action": "upload", "path": "workspace/shell-made.csv"})]),
+            make_reply("sent it"),
+        ],
+    )
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "send me that csv"))
+    finally:
+        await application.shutdown()
+
+    docs = documents(bot)
+    assert len(docs) == 1
+    assert docs[0]["document"] == b"a,b\n1,2\n"
+
+
+async def test_a_plain_turn_sends_no_document(config) -> None:
+    bot, _ = await send(config, [make_reply("just words")], "hi")
+    assert documents(bot) == []
+
+
+async def test_the_document_caption_is_plain_and_identifies_the_file(config) -> None:
+    application, bot, agent = build(
+        config,
+        [
+            make_reply("", [("c1", "files", {"action": "upload", "path": "workspace/notes.md"})]),
+            make_reply("ok"),
+        ],
+    )
+    (config.shell_cwd / "notes.md").write_text("note", encoding="utf-8")
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "send notes"))
+    finally:
+        await application.shutdown()
+
+    docs = documents(bot)
+    assert docs, "the file must be delivered"
+    caption = docs[0]["caption"]
+    assert "notes.md" in caption
+    assert "from files" in caption, "the origin names the tool that produced it"
+
+
+async def test_a_failed_delivery_degrades_to_a_path(config, monkeypatch) -> None:
+    """If reply_document fails, the owner still learns where the file lives."""
+    from telegram.error import TelegramError
+
+    class NoSendBot(FakeBot):
+        async def send_document(self, chat_id: Any, document: Any = None, **kwargs: Any) -> Any:
+            raise TelegramError("attachment rejected")
+
+    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
+    memory.load()
+    agent = Agent(
+        config=config,
+        personality=Personality.load(config.personality_file),
+        memory=memory,
+        history=History(config.history_dir),
+        registry=build_registry(config, memory),
+        llm=FakeLLM(
+            [
+                make_reply("", [("c1", "files", {"action": "upload", "path": "workspace/doomed.md"})]),
+                make_reply("here you go"),
+            ]
+        ),
+    )
+    bot = NoSendBot()
+    application = build_application(config, agent, bot=bot)
+    (config.shell_cwd / "doomed.md").write_text("x", encoding="utf-8")
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "send it"))
+    finally:
+        await application.shutdown()
+
+    body = texts(bot)
+    assert "couldn't attach" in body
+    assert "workspace/doomed.md" in body
+    assert "here you go" in body, "the turn itself still succeeded"
+
+
+class FakeDocBot(FakeBot):
+    """A FakeBot whose get_file serves real text bytes for document downloads."""
+
+    def __init__(self, data: bytes = b"hello world") -> None:
+        super().__init__()
+        self._data = data
+
+    async def get_file(self, file_id: str, **kwargs: Any) -> Any:
+        return _FakeFile(self._data)
+
+
+async def test_a_document_message_is_stored_and_announced(config) -> None:
+    """The in path: an owner uploads a file, it lands in workspace/uploads/."""
+    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
+    memory.load()
+    agent = Agent(
+        config=config,
+        personality=Personality.load(config.personality_file),
+        memory=memory,
+        history=History(config.history_dir),
+        registry=build_registry(config, memory),
+        llm=FakeLLM([make_reply("it's a shopping list")]),
+    )
+    bot = FakeDocBot(b"hello world")
+    application = build_application(config, agent, bot=bot)
+    await application.initialize()
+    try:
+        await application.process_update(
+            make_document_update(bot, caption="what did i write here?")
+        )
+    finally:
+        await application.shutdown()
+
+    body = texts(bot)
+    assert "workspace/uploads/42/notes.txt" in body
+    assert "11 bytes" in body
+
+    stored = config.root / "workspace" / "uploads" / "42" / "notes.txt"
+    assert stored.is_file()
+    assert stored.read_bytes() == b"hello world"
+
+    # The model got a prompt naming the file and the caption.
+    assert agent.llm.calls, "the model should be asked about the document"
+    last_user = [m for m in agent.llm.calls[0] if m["role"] == "user"][-1]
+    prompt = last_user["content"]
+    assert isinstance(prompt, str)
+    assert "workspace/uploads/42/notes.txt" in prompt
+    assert "what did i write here?" in prompt
+
+
+async def test_a_document_without_a_caption_gets_a_default_prompt(config) -> None:
+    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
+    memory.load()
+    agent = Agent(
+        config=config,
+        personality=Personality.load(config.personality_file),
+        memory=memory,
+        history=History(config.history_dir),
+        registry=build_registry(config, memory),
+        llm=FakeLLM([make_reply("it's a list")]),
+    )
+    bot = FakeDocBot()
+    application = build_application(config, agent, bot=bot)
+    await application.initialize()
+    try:
+        await application.process_update(make_document_update(bot))
+    finally:
+        await application.shutdown()
+
+    last_user = [m for m in agent.llm.calls[0] if m["role"] == "user"][-1]
+    assert "what is this file" in last_user["content"].lower()
+
+
+async def test_a_disallowed_document_is_refused_politely(config) -> None:
+    application, bot, agent = build(config, [make_reply("never")])
+    await application.initialize()
+    try:
+        await application.process_update(
+            make_document_update(bot, file_name="program.exe")
+        )
+    finally:
+        await application.shutdown()
+
+    assert "can't take that file" in texts(bot)
+    assert agent.llm.calls == []
+
+
+async def test_a_document_download_failure_explains_itself(config) -> None:
+    from telegram.error import TelegramError
+
+    application, bot, agent = build(config, [make_reply("never")])
+    await application.initialize()
+    try:
+        async def fail_get_file(self, file_id: str, **kwargs: Any) -> Any:
+            raise TelegramError("file gone")
+
+        original = FakeBot.get_file
+        FakeBot.get_file = fail_get_file
+        try:
+            await application.process_update(make_document_update(bot))
+        finally:
+            FakeBot.get_file = original
+    finally:
+        await application.shutdown()
+
+    assert "couldn't download that file" in texts(bot)
+    assert agent.llm.calls == []
+
+
+async def test_document_intake_in_a_group_without_mention_is_silent(config) -> None:
+    """Group rules apply to documents exactly as to text and photos."""
+    application, bot, agent = build(config, [make_reply("never")])
+    await application.initialize()
+    try:
+        await application.process_update(
+            make_document_update(bot, chat_id=GROUP_CHAT, chat_type="supergroup")
+        )
+    finally:
+        await application.shutdown()
+
+    assert bot.sent == []
+    assert agent.llm.calls == []
+
+
+async def test_document_intake_respects_the_whitelist(config) -> None:
+    application, bot, agent = build(config, [make_reply("never")])
+    await application.initialize()
+    try:
+        await application.process_update(
+            make_document_update(bot, user_id=STRANGER)
+        )
+    finally:
+        await application.shutdown()
+
+    assert "not whitelisted" in texts(bot).lower()
+    assert agent.llm.calls == []
+    stored = config.root / "workspace" / "uploads"
+    assert not stored.exists(), "a stranger's file must not be stored"
+
+
+# --------------------------------------------------------------------------- #
 # reasoning
 # --------------------------------------------------------------------------- #
 
@@ -1438,3 +1744,103 @@ async def test_help_mentions_the_thinking_toggle(config) -> None:
     bot, _ = await send(config, [], "/help")
     assert "/reasoning" in texts(bot)
     assert "show thinking" in texts(bot)
+
+
+# --------------------------------------------------------------------------- #
+# /config and /env (owner-only introspection)
+# --------------------------------------------------------------------------- #
+
+
+async def test_config_shows_the_resolved_settings(config) -> None:
+    bot, _ = await send(config, [], "/config")
+    body = texts(bot)
+    assert "test-model" in body
+    assert "firecrawl → exa → tavily → mcp" in body
+    assert "group mode: mention" in body
+    assert "workspace" in body
+
+
+async def test_config_reflects_live_toggles(config) -> None:
+    """The view reads the same config object the handlers mutate."""
+    config.llm.show_reasoning = False
+    config.bot.group_reply_mode = "always"
+    bot, _ = await send(config, [], "/config")
+    body = texts(bot)
+    assert "trace in chat: off" in body
+    assert "group mode: always" in body
+
+
+async def test_env_masks_long_keys(config, monkeypatch) -> None:
+    secret = "sk-proj-abcdef1234567890abcdef"
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    bot, _ = await send(config, [], "/env")
+    body = texts(bot)
+    assert "sk…cdef" in body
+    assert secret not in body
+    assert "OPENAI_API_KEY" in body
+
+
+async def test_env_describes_short_keys_by_length(config) -> None:
+    """A short key must not be half-revealed by the mask."""
+    bot, _ = await send(config, [], "/env")
+    body = texts(bot)
+    assert "(len 8)" in body  # conftest sets OPENAI_API_KEY=test-key
+    assert "test-key" not in body
+
+
+async def test_env_reports_a_key_pool(config, monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "key-one, key-two, key-three")
+    bot, _ = await send(config, [], "/env")
+    body = texts(bot)
+    assert "3 keys" in body
+    assert "fallback" in body
+    assert "key-two" not in body
+
+
+async def test_env_reports_unset_variables_honestly(config, monkeypatch) -> None:
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
+    bot, _ = await send(config, [], "/env")
+    body = texts(bot)
+    assert "TAVILY_API_KEY` — unset" in body
+    assert "keyless" in body  # unset tavily is normal, not an error
+    assert "EXA_API_KEY` — unset" in body
+
+
+async def test_env_lists_lumi_overrides(config, monkeypatch) -> None:
+    monkeypatch.setenv("LUMI__LLM__MODEL", "override-model")
+    bot, _ = await send(config, [], "/env")
+    body = texts(bot)
+    assert "LUMI__LLM__MODEL" in body
+    assert "override-model" in body
+
+
+async def test_env_says_keys_need_a_restart(config) -> None:
+    bot, _ = await send(config, [], "/env")
+    assert "restart" in texts(bot).lower()
+
+
+async def test_help_advertises_the_owner_introspection_commands(config) -> None:
+    bot, _ = await send(config, [], "/help")
+    body = texts(bot)
+    assert "/config" in body
+    assert "/env" in body
+    assert "masked" in body
+
+
+async def test_env_and_config_are_owner_only(config) -> None:
+    """A whitelisted user is allowed the bot but not the backend view."""
+    config.bot.whitelisted_users = [str(WHITELISTED_USER)]
+    bot, _ = await send(config, [], "/config", user_id=WHITELISTED_USER)
+    assert "only the owner can see that" in texts(bot).lower()
+
+    bot, _ = await send(config, [], "/env", user_id=WHITELISTED_USER, message_id=2)
+    assert "only the owner can see that" in texts(bot).lower()
+
+
+async def test_env_leaks_nothing_to_a_stranger(config) -> None:
+    bot, _ = await send(config, [], "/env", user_id=STRANGER)
+    body = texts(bot)
+    assert "not whitelisted" in body.lower()
+    for leak in ("OPENAI_API_KEY", "test-key", "sk…"):
+        assert leak not in body, f"{leak!r} leaked to a stranger"

@@ -1,8 +1,8 @@
-"""Tavily + Firecrawl provider tests.
+"""Tavily + Firecrawl + Exa provider tests.
 
 The SDK clients are injected through the providers' private ``_get_client``
-method, so each test owns the response shape and never touches the network.
-The contract under test:
+method (or the keyless slot), so each test owns the response shape and never
+touches the network. The contract under test:
 
 - **Tavily keyless** — the provider is *available* without an API key and
   builds its client with ``api_key=None`` when none is configured.
@@ -10,6 +10,8 @@ The contract under test:
   first healthy key wins; an unknown strategy falls back to ``fallback``.
 - **Firecrawl multi-key** — same rotation rules; the provider is *not*
   available without a key.
+- **Exa multi-key** — same rotation rules; the provider is *not* available
+  without a key; search highlights fall back to full text when missing.
 """
 
 from __future__ import annotations
@@ -17,7 +19,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from lumi.config import FirecrawlConfig, TavilyConfig
+from lumi.config import ExaConfig, FirecrawlConfig, TavilyConfig
+from lumi.tools.web.providers.exa_provider import ExaProvider
 from lumi.tools.web.providers.firecrawl_provider import FirecrawlProvider
 from lumi.tools.web.providers.tavily_provider import TavilyProvider
 
@@ -292,6 +295,183 @@ def test_firecrawl_strategy_unknown_falls_back(monkeypatch) -> None:
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-91")
     provider = FirecrawlProvider(FirecrawlConfig(key_strategy="telepathy"))
     assert provider._pool.strategy == "fallback"
+
+
+# --------------------------------------------------------------------------- #
+# Exa — availability
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class FakeExaClient:
+    """Mimics ``AsyncExa`` for search and get_contents."""
+
+    search_reply: Any = None
+    contents_reply: Any = None
+    search_error: Exception | None = None
+    contents_error: Exception | None = None
+    search_calls: int = 0
+    contents_calls: int = 0
+    last_search_kwargs: dict[str, Any] | None = None
+
+    async def search(self, *_args, **kwargs):
+        self.search_calls += 1
+        self.last_search_kwargs = kwargs
+        if self.search_error:
+            raise self.search_error
+        return self.search_reply
+
+    async def get_contents(self, *_args, **_kwargs):
+        self.contents_calls += 1
+        if self.contents_error:
+            raise self.contents_error
+        return self.contents_reply
+
+
+def test_exa_is_not_available_without_a_key(monkeypatch) -> None:
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
+    provider = ExaProvider(ExaConfig())
+    ok, reason = provider.available()
+    assert not ok
+    assert "EXA_API_KEY" in reason
+
+
+def test_exa_is_available_with_a_key(monkeypatch) -> None:
+    monkeypatch.setenv("EXA_API_KEY", "exa-91")
+    provider = ExaProvider(ExaConfig())
+    assert provider.available()[0]
+
+
+# --------------------------------------------------------------------------- #
+# Exa — search
+# --------------------------------------------------------------------------- #
+
+
+def test_exa_search_normalises_results(monkeypatch) -> None:
+    monkeypatch.setenv("EXA_API_KEY", "exa-91")
+    provider = ExaProvider(ExaConfig())
+    reply = {
+        "results": [
+            {"title": "One", "url": "https://one.test", "text": "full body", "score": 0.91},
+            {"title": "Two", "url": "https://two.test", "highlights": ["h1", "h2"]},
+        ]
+    }
+    provider._clients = {"exa-91": FakeExaClient(search_reply=reply)}
+
+    import asyncio
+
+    result = asyncio.run(provider.search("hi", 5))
+    assert result.ok
+    assert [h.url for h in result.hits] == ["https://one.test", "https://two.test"]
+    assert result.hits[0].content == "full body"
+    # No text? Fall back to the highlights.
+    assert result.hits[1].content == "h1 h2"
+    assert result.hits[0].score == 0.91
+
+
+def test_exa_search_forwards_type_and_category(monkeypatch) -> None:
+    monkeypatch.setenv("EXA_API_KEY", "exa-91")
+    provider = ExaProvider(ExaConfig(search_type="neural", category="news"))
+    fake = FakeExaClient(search_reply={"results": []})
+    provider._clients = {"exa-91": fake}
+
+    import asyncio
+
+    asyncio.run(provider.search("hi", 3))
+    assert fake.last_search_kwargs is not None
+    assert fake.last_search_kwargs.get("type") == "neural"
+    assert fake.last_search_kwargs.get("category") == "news"
+    assert fake.last_search_kwargs.get("num_results") == 3
+
+
+def test_exa_search_omits_an_empty_category(monkeypatch) -> None:
+    monkeypatch.setenv("EXA_API_KEY", "exa-91")
+    provider = ExaProvider(ExaConfig())
+    fake = FakeExaClient(search_reply={"results": []})
+    provider._clients = {"exa-91": fake}
+
+    import asyncio
+
+    asyncio.run(provider.search("hi", 3))
+    assert fake.last_search_kwargs is not None
+    assert fake.last_search_kwargs.get("category") is None
+
+
+def test_exa_search_reports_an_empty_result_set(monkeypatch) -> None:
+    """A successful search with no hits is the query's fault: ok, no error."""
+    monkeypatch.setenv("EXA_API_KEY", "exa-91")
+    provider = ExaProvider(ExaConfig())
+    provider._clients = {"exa-91": FakeExaClient(search_reply={"results": []})}
+
+    import asyncio
+
+    result = asyncio.run(provider.search("hi", 5))
+    assert result.ok
+    assert result.hits == []
+
+
+# --------------------------------------------------------------------------- #
+# Exa — multi-key rotation and fetch
+# --------------------------------------------------------------------------- #
+
+
+def test_exa_pool_rotates_on_failure(monkeypatch) -> None:
+    monkeypatch.setenv("EXA_API_KEY", "exa-91, exa-92")
+    provider = ExaProvider(ExaConfig())
+
+    bad = FakeExaClient(search_error=RuntimeError("ratelimit"))
+    good = FakeExaClient(search_reply={"results": [{"url": "https://ok", "title": "OK"}]})
+    provider._clients = {"exa-91": bad, "exa-92": good}
+
+    import asyncio
+
+    result = asyncio.run(provider.search("hi", 5))
+    assert result.ok
+    assert result.hits[0].url == "https://ok"
+    assert bad.search_calls == 1
+    assert good.search_calls == 1
+
+
+def test_exa_fetch_rotates(monkeypatch) -> None:
+    monkeypatch.setenv("EXA_API_KEY", "exa-91, exa-92")
+    provider = ExaProvider(ExaConfig())
+
+    bad = FakeExaClient(contents_error=RuntimeError("boom"))
+    good = FakeExaClient(contents_reply={"results": [{"url": "https://x", "title": "T", "text": "body"}]})
+    provider._clients = {"exa-91": bad, "exa-92": good}
+
+    import asyncio
+
+    page = asyncio.run(provider.fetch("https://x"))
+    assert page.title == "T"
+    assert page.markdown == "body"
+    assert bad.contents_calls == 1
+    assert good.contents_calls == 1
+
+
+def test_exa_fetch_matches_the_url_not_just_the_first_result(monkeypatch) -> None:
+    monkeypatch.setenv("EXA_API_KEY", "exa-91")
+    provider = ExaProvider(ExaConfig())
+    reply = {"results": [{"url": "https://other", "text": "wrong page"}]}
+    provider._clients = {"exa-91": FakeExaClient(contents_reply=reply)}
+
+    import asyncio
+
+    page = asyncio.run(provider.fetch("https://wanted"))
+    assert "no content" in page.markdown
+
+
+def test_exa_strategy_unknown_falls_back(monkeypatch) -> None:
+    monkeypatch.setenv("EXA_API_KEY", "exa-91")
+    provider = ExaProvider(ExaConfig(key_strategy="telepathy"))
+    assert provider._pool.strategy == "fallback"
+
+
+def test_exa_api_keys_returns_a_pool(monkeypatch) -> None:
+    monkeypatch.setenv("EXA_API_KEY", "exa-91, exa-92")
+    cfg = ExaConfig()
+    assert cfg.api_keys() == ["exa-91", "exa-92"]
+    assert cfg.api_key() == "exa-91"
 
 
 # --------------------------------------------------------------------------- #

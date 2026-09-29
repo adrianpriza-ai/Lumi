@@ -42,8 +42,14 @@ proxy_url = ""
 # lossy network: the stock 5s can abort startup before the bot is up.
 connect_timeout = 15.0
 # Extra startup attempts after a network failure while bootstrapping
-# (initialize, delete/set webhook). 0 means exactly one attempt.
-bootstrap_retries = 3
+# (initialize, delete/set webhook). 0 means exactly one attempt. -1 retries
+# forever, so the bot waits out an outage instead of exiting when the count
+# runs dry — the same behaviour polling already has once the bot is up.
+bootstrap_retries = -1
+# Largest file the bot will deliver to the chat as a document, in MB.
+# Telegram's own document ceiling is 50 MB. Anything larger is refused with a
+# reason the model can read out loud.
+max_upload_mb = 20
 
 [llm]
 # Any OpenAI-compatible endpoint: OpenAI, Ollama, LM Studio, vLLM, Groq,
@@ -133,6 +139,11 @@ ask_before_risky = true
 # "project" pins HOME to the project root so nothing writes into your real
 # home directory. "inherit" passes your real HOME through.
 home = "project"
+# Where a command is allowed to write, relative to the project root. Empty
+# (the default) means the whole project, which is what a coding bot needs in
+# order to edit the code it works on. Set to ["workspace"] to confine writes to
+# the scratch folder and make every other write ask first.
+writable = []
 extra_deny = []
 # Regexes matched against the raw command; a hit means DENY.
 extra_confirm = []
@@ -145,6 +156,11 @@ writable = ["workspace"]
 readable_from_project = true
 max_read_chars = 20000
 max_write_chars = 200000
+# Let the model send files to the chat: `upload: true` on a write, or the
+# dedicated `upload` action for an existing file. Incoming documents from the
+# chat are stored under workspace/uploads/ regardless of this flag; set it to
+# false to disable the outgoing direction only.
+uploads = true
 
 [tools.memory]
 enabled = true
@@ -156,8 +172,8 @@ auto_remember = true
 enabled = true
 # Providers are tried in this order; the first available one answers.
 # "mcp" reads .mcp.json from the project root, so you can drive any MCP
-# server (tavily, firecrawl, or your own) with zero extra code.
-provider_order = ["firecrawl", "tavily", "mcp"]
+# server (tavily, firecrawl, exa, or your own) with zero extra code.
+provider_order = ["firecrawl", "exa", "tavily", "mcp"]
 max_results = 5
 max_content_chars = 6000
 # Seconds to wait on any single provider call.
@@ -192,14 +208,27 @@ auto_scrape_top_n = 3
 # tier, so unset means the provider is unavailable — not a fallback option.
 key_strategy = "fallback"
 
+[tools.web.providers.exa]
+enabled = true
+api_key_env = "EXA_API_KEY"
+base_url = "https://api.exa.ai"
+# "auto" (default) lets Exa pick neural or keyword search per query;
+# "neural" and "keyword" force one. Optional category, e.g. "news", "github",
+# "paper", "pdf" — empty means no filter.
+search_type = "auto"
+category = ""
+# Same rotation rules as Firecrawl and Tavily. Exa has no keyless tier, so
+# unset means the provider is unavailable — not a fallback option.
+key_strategy = "fallback"
+
 [tools.web.providers.mcp]
 enabled = true
 config_file = ".mcp.json"
 timeout_seconds = 60
 # Tool name patterns matched against each server's advertised tool list.
 # First match wins; the list is just a preference order.
-search_tools = ["tavily_search", "firecrawl_search", "search"]
-fetch_tools = ["tavily_extract", "firecrawl_scrape", "scrape", "extract"]
+search_tools = ["web_search_exa", "tavily_search", "firecrawl_search", "search"]
+fetch_tools = ["crawl_urls", "tavily_extract", "firecrawl_scrape", "scrape", "extract"]
 
 [tools.context7]
 # The `context7` tool fetches up-to-date library docs and code examples from

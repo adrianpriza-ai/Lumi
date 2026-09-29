@@ -446,10 +446,10 @@ def test_the_trace_is_shown_by_default(config) -> None:
 
 
 def test_network_defaults(config) -> None:
-    """Direct connection, generous connect timeout, a few startup retries."""
+    """Direct connection, generous connect timeout, unlimited startup retries."""
     assert config.bot.proxy_url == ""
     assert config.bot.connect_timeout == 15.0
-    assert config.bot.bootstrap_retries == 3
+    assert config.bot.bootstrap_retries == -1
 
 
 def test_network_settings_can_come_from_toml(project) -> None:
@@ -482,6 +482,13 @@ def test_a_non_positive_connect_timeout_is_reported(config) -> None:
     assert any("connect_timeout" in p for p in validate(config))
 
 
-def test_negative_bootstrap_retries_are_reported(config) -> None:
-    config.bot.bootstrap_retries = -1
+def test_below_minus_one_bootstrap_retries_are_reported(config) -> None:
+    """-1 is the documented 'retry forever' value; anything lower is a typo."""
+    config.bot.bootstrap_retries = -2
     assert any("bootstrap_retries" in p for p in validate(config))
+
+
+def test_minus_one_bootstrap_retries_validate(config) -> None:
+    """-1 means retry startup forever and is accepted."""
+    config.bot.bootstrap_retries = -1
+    assert not any("bootstrap_retries" in p for p in validate(config))

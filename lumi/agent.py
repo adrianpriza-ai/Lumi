@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from .artifacts import Artifact
 from .config import Config
 from .llm import LLMClient, ToolCall, build_llm
 from .llm.base import LLMError, LLMReply
@@ -62,6 +63,10 @@ When you use a tool:
 - Prefer reading a file over guessing its contents, and prefer the `files` tool
   over shell redirection when writing.
 - Cite web results by their bracketed number, e.g. "as of today [2]".
+- To give the owner a downloadable file, write it with the `files` tool using
+  `upload: true` (or call the `upload` action on an existing file). The file
+  arrives in the chat as a document automatically — never paste file contents
+  into the message as a substitute.
 - Save durable facts about the owner with the `memory` tool, sparingly.
 - Only the tools listed above are available right now. If a capability is
   missing here it is because an API key is unset or the tool was disabled in
@@ -110,6 +115,10 @@ class TurnResult:
     #: :attr:`elapsed` because that also counts tool execution, and "thought for
     #: 20s" would be a lie on a turn that spent 18 of them waiting on a search.
     thinking_seconds: float = 0.0
+    #: Files the tools produced for the chat. Collected from every ToolResult
+    #: during the turn; the presentation layer delivers them (Telegram as
+    #: documents). The CLI prints their paths instead.
+    artifacts: list[Artifact] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -361,6 +370,16 @@ class Agent:
                 "content": tool_result.for_model(),
             }
         )
+        # Stage any files this call produced for the chat. Collected on the
+        # result, delivered by the presentation layer — the loop stays
+        # transport-agnostic.
+        if tool_result.artifacts:
+            result.artifacts.extend(tool_result.artifacts)
+            log.info(
+                "turn collected %d artifact(s) from %s: %s",
+                len(tool_result.artifacts), call.name,
+                ", ".join(a.path for a in tool_result.artifacts),
+            )
         tools_used.append(call.name)
         self.history.append(
             conv.chat_id, "tool", f"{call.name}: {tool_result.summary}", session=conv.session, tool=call.name
@@ -394,7 +413,14 @@ class Agent:
         conv.pending = [p for p in conv.pending if p.id != action_id]
         conv.messages.append({"role": "user", "content": outcome})
         self.history.append(conv.chat_id, "user", outcome, session=conv.session, tool=action.tool)
-        return await self._loop(conv, ctx, tools_used=used)
+        resumed = await self._loop(conv, ctx, tools_used=used)
+        if approved and tool_result.artifacts:
+            # An approved write can carry artifacts too (files written with
+            # upload: true that needed an overwrite confirmation). _loop only
+            # collects artifacts from model-driven tool calls, so merge these
+            # in before handing the turn back to the presentation layer.
+            resumed.artifacts.extend(tool_result.artifacts)
+        return resumed
 
     # -- direct invocation (used by /run, /search, /fetch) ----------------- #
 
