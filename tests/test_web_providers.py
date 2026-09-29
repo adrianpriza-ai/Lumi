@@ -39,10 +39,12 @@ class FakeTavilyClient:
     extract_error: Exception | None = None
     search_calls: int = 0
     extract_calls: int = 0
+    last_search_kwargs: dict[str, Any] | None = None
     last_api_key: str | None | object = "__unset__"  # distinguish None from unset
 
-    async def search(self, *_args, **_kwargs):
+    async def search(self, *_args, **kwargs):
         self.search_calls += 1
+        self.last_search_kwargs = kwargs
         if self.search_error:
             raise self.search_error
         return self.search_reply
@@ -64,9 +66,11 @@ class FakeFirecrawlClient:
     scrape_error: Exception | None = None
     search_calls: int = 0
     scrape_calls: int = 0
+    last_search_kwargs: dict[str, Any] | None = None
 
-    async def search(self, *_args, **_kwargs):
+    async def search(self, *_args, **kwargs):
         self.search_calls += 1
+        self.last_search_kwargs = kwargs
         if self.search_error:
             raise self.search_error
         return self.search_reply
@@ -515,3 +519,153 @@ def test_firecrawl_top_up_does_not_rotate(monkeypatch) -> None:
     asyncio.run(provider.search("x", 5))
     # Exactly one scrape — not two.
     assert c1.scrape_calls + c2.scrape_calls == 1
+
+
+# --------------------------------------------------------------------------- #
+# Recency: every provider must turn a day window into its API's filter shape.
+# --------------------------------------------------------------------------- #
+
+
+def test_tavily_recency_maps_to_time_range(monkeypatch) -> None:
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-91")
+    provider = TavilyProvider(TavilyConfig())
+    # A key is set, so the pool path runs: inject the fake per key.
+    fake = FakeTavilyClient(search_reply={"results": [], "answer": ""})
+    provider._auth_clients["tvly-91"] = fake
+
+    import asyncio
+
+    asyncio.run(provider.search("hi", 5, days=7))
+
+    assert fake.last_search_kwargs is not None
+    assert fake.last_search_kwargs.get("time_range") == "week"
+
+
+def test_tavily_without_recency_sends_no_time_range(monkeypatch) -> None:
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-91")
+    provider = TavilyProvider(TavilyConfig())
+    fake = FakeTavilyClient(search_reply={"results": [], "answer": ""})
+    provider._auth_clients["tvly-91"] = fake
+
+    import asyncio
+
+    asyncio.run(provider.search("hi", 5))
+
+    assert fake.last_search_kwargs is not None
+    assert fake.last_search_kwargs.get("time_range") is None
+
+
+def test_tavily_parses_published_date(monkeypatch) -> None:
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-91")
+    provider = TavilyProvider(TavilyConfig())
+    reply = {
+        "results": [{"url": "https://x", "title": "X", "published_date": "2026-02-01"}],
+        "answer": "",
+    }
+    provider._auth_clients["tvly-91"] = FakeTavilyClient(search_reply=reply)
+
+    import asyncio
+
+    result = asyncio.run(provider.search("hi", 5))
+    assert result.hits[0].published == "2026-02-01"
+
+
+def test_firecrawl_recency_maps_to_tbs(monkeypatch) -> None:
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-91")
+    provider = FirecrawlProvider(FirecrawlConfig())
+    fake = FakeFirecrawlClient(search_reply={"web": [], "news": []})
+    provider._clients = {"fc-91": fake}
+
+    import asyncio
+
+    asyncio.run(provider.search("hi", 5, days=3))
+
+    assert fake.last_search_kwargs is not None
+    assert fake.last_search_kwargs.get("tbs") == "qdr:w"
+
+
+def test_firecrawl_without_recency_sends_no_tbs(monkeypatch) -> None:
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-91")
+    provider = FirecrawlProvider(FirecrawlConfig())
+    fake = FakeFirecrawlClient(search_reply={"web": [], "news": []})
+    provider._clients = {"fc-91": fake}
+
+    import asyncio
+
+    asyncio.run(provider.search("hi", 5))
+
+    assert fake.last_search_kwargs is not None
+    assert fake.last_search_kwargs.get("tbs") is None
+
+
+def test_firecrawl_long_recency_uses_an_explicit_cutoff(monkeypatch) -> None:
+    """Past a year there is no coarse bucket; the ISO cutoff carries the window."""
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-91")
+    provider = FirecrawlProvider(FirecrawlConfig())
+    fake = FakeFirecrawlClient(search_reply={"web": [], "news": []})
+    provider._clients = {"fc-91": fake}
+
+    import asyncio
+
+    asyncio.run(provider.search("hi", 5, days=800))
+
+    assert fake.last_search_kwargs is not None
+    tbs = fake.last_search_kwargs.get("tbs") or ""
+    assert tbs.startswith("cdr:1,cd_min:")
+
+
+def test_firecrawl_parses_published_dates(monkeypatch) -> None:
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-91")
+    provider = FirecrawlProvider(FirecrawlConfig())
+    reply = {
+        "web": [{"url": "https://x", "title": "X", "publishedDate": "2026-03-10"}],
+        "news": [],
+    }
+    provider._clients = {"fc-91": FakeFirecrawlClient(search_reply=reply)}
+
+    import asyncio
+
+    result = asyncio.run(provider.search("hi", 5))
+    assert result.hits[0].published == "2026-03-10"
+
+
+def test_exa_recency_sets_start_published_date(monkeypatch) -> None:
+    from lumi.tools.web.providers.base import recent_cutoff as _cutoff
+
+    monkeypatch.setenv("EXA_API_KEY", "exa-91")
+    provider = ExaProvider(ExaConfig())
+    fake = FakeExaClient(search_reply={"results": []})
+    provider._clients = {"exa-91": fake}
+
+    import asyncio
+
+    asyncio.run(provider.search("hi", 5, days=30))
+
+    assert fake.last_search_kwargs is not None
+    assert fake.last_search_kwargs.get("start_published_date") == _cutoff(30)
+
+
+def test_exa_without_recency_omits_start_published_date(monkeypatch) -> None:
+    monkeypatch.setenv("EXA_API_KEY", "exa-91")
+    provider = ExaProvider(ExaConfig())
+    fake = FakeExaClient(search_reply={"results": []})
+    provider._clients = {"exa-91": fake}
+
+    import asyncio
+
+    asyncio.run(provider.search("hi", 5))
+
+    assert fake.last_search_kwargs is not None
+    assert fake.last_search_kwargs.get("start_published_date") is None
+
+
+def test_exa_parses_published_date(monkeypatch) -> None:
+    monkeypatch.setenv("EXA_API_KEY", "exa-91")
+    provider = ExaProvider(ExaConfig())
+    reply = {"results": [{"url": "https://x", "title": "X", "publishedDate": "2026-04-02"}]}
+    provider._clients = {"exa-91": FakeExaClient(search_reply=reply)}
+
+    import asyncio
+
+    result = asyncio.run(provider.search("hi", 5))
+    assert result.hits[0].published == "2026-04-02"

@@ -32,7 +32,7 @@ from typing import Any
 from ....config import MCPConfig
 from ....paths import resolve
 from ....util.log import get_logger
-from .base import Page, SearchHit, SearchResult, WebProvider
+from .base import Page, SearchHit, SearchResult, WebProvider, recent_cutoff
 
 log = get_logger(__name__)
 
@@ -267,7 +267,9 @@ class MCPProvider(WebProvider):
 
     # -- WebProvider ------------------------------------------------------- #
 
-    async def search(self, query: str, max_results: int) -> SearchResult:
+    async def search(
+        self, query: str, max_results: int, days: int | None = None
+    ) -> SearchResult:
         result = SearchResult(query=query, provider=self.name)
         chosen = await self._pick(
             self.config.search_tools, lambda name: "search" in name
@@ -286,6 +288,14 @@ class MCPProvider(WebProvider):
             arguments["max_results"] = max_results
         elif "limit" in tool.properties:
             arguments["limit"] = max_results
+        # Tavily-shaped servers understand a coarse bucket; anything that takes
+        # an ISO date gets the exact cutoff instead. Servers that accept
+        # neither simply ignore both keys.
+        if days and days > 0:
+            if "time_range" in tool.properties:
+                arguments["time_range"] = _mcp_time_range(days)
+            elif "start_published_date" in tool.properties:
+                arguments["start_published_date"] = recent_cutoff(days)
 
         try:
             text = await self._call(spec, tool, arguments, float(self.config.timeout_seconds))
@@ -339,6 +349,14 @@ class MCPProvider(WebProvider):
 # --------------------------------------------------------------------------- #
 # Result flattening
 # --------------------------------------------------------------------------- #
+
+
+def _mcp_time_range(days: int) -> str:
+    """Coarse bucket for servers that mirror Tavily's ``time_range`` shape."""
+    for ceiling, name in ((1, "day"), (7, "week"), (31, "month"), (365, "year")):
+        if days <= ceiling:
+            return name
+    return "year"
 
 
 def _flatten(result: Any) -> str:
@@ -403,6 +421,7 @@ def _parse_search_payload(text: str, result: SearchResult) -> None:
                     snippet=str(item.get("content") or item.get("description") or item.get("snippet") or ""),
                     content=body,
                     score=item.get("score"),
+                    published=str(item.get("published_date") or item.get("publishedDate") or ""),
                 )
             )
         if result.hits or result.answer:

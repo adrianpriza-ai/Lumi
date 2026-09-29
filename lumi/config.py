@@ -490,7 +490,11 @@ class WebConfig:
     provider_order: list[str] = field(
         default_factory=lambda: ["firecrawl", "exa", "tavily", "mcp"]
     )
-    max_results: int = 5
+    max_results: int = 4
+    #: Floor for an acceptable search: when the first provider returns fewer
+    #: hits than this, the next providers top the result up (deduplicated by
+    #: URL) instead of the sparse answer going back to the model as-is.
+    min_results: int = 2
     max_content_chars: int = 6000
     timeout_seconds: int = 90
     tavily: TavilyConfig = field(default_factory=TavilyConfig)

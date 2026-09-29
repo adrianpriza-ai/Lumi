@@ -174,10 +174,23 @@ enabled = true
 # "mcp" reads .mcp.json from the project root, so you can drive any MCP
 # server (tavily, firecrawl, exa, or your own) with zero extra code.
 provider_order = ["firecrawl", "exa", "tavily", "mcp"]
-max_results = 5
+# Four hits covers a question while keeping context lean: each hit costs
+# ~1.5k chars of tool budget plus provider credits, and the per-hit content
+# floor means every one of the four still carries real body text.
+max_results = 4
+# Floor for an acceptable search: when the first provider comes back with
+# fewer hits than this, the next provider in the order tops the result up
+# (deduplicated by URL) instead of the sparse answer going back as-is.
+# Two is the deliberate minimum: it still guarantees a 1-hit answer never
+# ships, but no longer spends a whole second provider call just to grow a
+# 2-hit result to 3.
+min_results = 2
 max_content_chars = 6000
 # Seconds to wait on any single provider call.
 timeout_seconds = 90
+# Tool-message budget: body text is shared out between hits, with a floor per
+# hit for result sets of five or fewer, so a default search carries real
+# content instead of teaser snippets while staying under the 8000-char cap.
 
 [tools.web.providers.tavily]
 enabled = true

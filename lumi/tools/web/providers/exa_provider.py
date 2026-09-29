@@ -6,11 +6,15 @@ highlights instead of raw HTML. Highlights are the Exa-recommended default for
 agentic search — they are tuned to be token-efficient — so the search path asks
 for highlights and falls back to full text only when a hit carries none.
 
+Freshness: Exa supports filtering on the publish date directly. A recency
+window is sent as ``start_published_date``, so year-old pages stop outranking
+this week's news on time-sensitive queries.
+
 Like Firecrawl, Exa has no keyless tier: an unset ``EXA_API_KEY`` makes the
 provider unavailable, which the web tool surfaces honestly and falls through
 from. Several keys are supported. A comma-separated list is a rotation pool —
-the same shape ``OPENAI_API_KEY`` already uses — and a failed key is parked for
-a minute before it is retried, so a 429 that clears itself recovers without a
+the same shape ``OPENAI_API_KEY`` already uses — and a failed key is parked for a
+minute before it is retried, so a 429 that clears itself recovers without a
 restart. The rotation lives in :class:`lumi.llm.keypool.KeyPool`; this module
 just describes which keys are ``available`` and which client to build per key.
 """
@@ -22,7 +26,7 @@ from typing import Any
 from ....config import ExaConfig
 from ....llm.keypool import KeyPool, mask
 from ....util.log import get_logger
-from .base import Page, SearchHit, SearchResult, WebProvider
+from .base import Page, SearchHit, SearchResult, WebProvider, recent_cutoff
 
 log = get_logger(__name__)
 
@@ -74,7 +78,9 @@ class ExaProvider(WebProvider):
 
     # -- public surface ---------------------------------------------------- #
 
-    async def search(self, query: str, max_results: int) -> SearchResult:
+    async def search(
+        self, query: str, max_results: int, days: int | None = None
+    ) -> SearchResult:
         """Search via Exa, retrying the pool on failure.
 
         No keyless tier: ``available()`` guarantees at least one key exists,
@@ -98,6 +104,7 @@ class ExaProvider(WebProvider):
                     type=self.config.search_type,
                     category=self.config.category or None,
                     contents={"text": True},
+                    start_published_date=recent_cutoff(days) if days else None,
                 )
             except Exception as exc:  # noqa: BLE001
                 log.warning("exa search failed on %s: %s", mask(key), exc)
@@ -167,6 +174,7 @@ class ExaProvider(WebProvider):
                     snippet=snippet,
                     content=text or joined,
                     score=item.get("score"),
+                    published=str(item.get("publishedDate") or ""),
                 )
             )
 

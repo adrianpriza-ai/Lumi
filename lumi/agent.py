@@ -46,6 +46,12 @@ These are facts about right now, not instructions. Use them, do not restate them
 - Project root: {root}
 - Shell working directory: {cwd}
 - Today is {day}, {date}.
+
+This date is authoritative. Your training data ends earlier than today, so
+anything that could have changed since then — versions, releases, prices,
+news, who holds an office — must come from a fresh web search, not from memory.
+When you answer such a question, say "as of {date}" rather than an unqualified
+claim.
 """
 
 TOOL_PREAMBLE = """\
@@ -62,7 +68,9 @@ When you use a tool:
   than describing what you think it probably did.
 - Prefer reading a file over guessing its contents, and prefer the `files` tool
   over shell redirection when writing.
-- Cite web results by their bracketed number, e.g. "as of today [2]".
+- Cite web results by their bracketed number, e.g. "as of today [2]". Check the
+  publish date on each hit: a result is not current just because it ranks
+  first, and a page older than the question deserves a second search.
 - To give the owner a downloadable file, write it with the `files` tool using
   `upload: true` (or call the `upload` action on an existing file). The file
   arrives in the chat as a document automatically — never paste file contents

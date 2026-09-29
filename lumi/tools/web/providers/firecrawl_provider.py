@@ -20,7 +20,7 @@ from typing import Any
 from ....config import FirecrawlConfig
 from ....llm.keypool import KeyPool, mask
 from ....util.log import get_logger
-from .base import Page, SearchHit, SearchResult, WebProvider
+from .base import Page, SearchHit, SearchResult, WebProvider, recent_cutoff
 
 log = get_logger(__name__)
 
@@ -72,7 +72,9 @@ class FirecrawlProvider(WebProvider):
 
     # -- public surface ---------------------------------------------------- #
 
-    async def search(self, query: str, max_results: int) -> SearchResult:
+    async def search(
+        self, query: str, max_results: int, days: int | None = None
+    ) -> SearchResult:
         """Search via Firecrawl, retrying the pool on failure.
 
         Unlike Tavily there is no keyless tier: the ``available()`` check
@@ -93,6 +95,7 @@ class FirecrawlProvider(WebProvider):
                 raw = await client.search(
                     query,
                     limit=max_results,
+                    tbs=_tbs(days),
                     scrape_options={"formats": ["markdown"]},
                 )
             except Exception as exc:  # noqa: BLE001
@@ -179,6 +182,7 @@ class FirecrawlProvider(WebProvider):
                     url=url,
                     snippet=str(item.get("description") or ""),
                     content=str(item.get("markdown") or item.get("content") or ""),
+                    published=str(item.get("publishedDate") or ""),
                 )
             )
         news = data.get("news") or []
@@ -191,6 +195,7 @@ class FirecrawlProvider(WebProvider):
                         title=str(item.get("title") or ""),
                         url=url,
                         snippet=str(item.get("description") or ""),
+                        published=str(item.get("publishedDate") or ""),
                     )
                 )
 
@@ -207,6 +212,22 @@ class FirecrawlProvider(WebProvider):
             if isinstance(page, str) and page.strip():
                 hit.content = page
                 hit.title = hit.title or page[:80]
+
+
+def _tbs(days: int | None) -> str | None:
+    """Google ``tbs`` time filter for a day window; ``None`` means unfiltered."""
+    if not days or days <= 0:
+        return None
+    if days <= 1:
+        return "qdr:d"
+    if days <= 7:
+        return "qdr:w"
+    if days <= 31:
+        return "qdr:m"
+    if days <= 365:
+        return "qdr:y"
+    # No coarser bucket exists; the explicit ISO cutoff still ranks freshness.
+    return f"cdr:1,cd_min:{recent_cutoff(days)}"
 
 
 __all__ = ["FirecrawlProvider"]

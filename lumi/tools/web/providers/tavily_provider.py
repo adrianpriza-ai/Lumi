@@ -26,6 +26,16 @@ from .base import Page, SearchHit, SearchResult, WebProvider
 
 log = get_logger(__name__)
 
+#: Day-window ceilings mapped to Tavily's coarse ``time_range`` buckets.
+#: A bucket must fully contain the window, so "last 3 days" does not silently
+#: widen to a month.
+TAVILY_TIME_RANGES: tuple[tuple[int, str], ...] = (
+    (1, "day"),
+    (7, "week"),
+    (31, "month"),
+    (365, "year"),
+)
+
 
 class TavilyProvider(WebProvider):
     name = "tavily"
@@ -82,18 +92,18 @@ class TavilyProvider(WebProvider):
 
     # -- public surface ---------------------------------------------------- #
 
-    async def search(self, query: str, max_results: int) -> SearchResult:
+    async def search(self, query: str, max_results: int, days: int | None = None) -> SearchResult:
         if not self._pool:
             # Keyless mode: single attempt, no rotation. The SDK's keyless
             # path returns 429 quickly when the rate limit trips, and there
             # is nothing else to fall back to — surface the error plainly.
-            return await self._search_with(None, query, max_results)
+            return await self._search_with(None, query, max_results, days)
 
         tried: list[str] = []
         last_error = ""
         while (key := self._pool.pick(exclude=tried)) is not None:
             tried.append(key)
-            result = await self._search_with(key, query, max_results)
+            result = await self._search_with(key, query, max_results, days)
             if result.ok:
                 # The call itself succeeded — even an empty result is the
                 # query's fault, not the key's. Mark healthy and return.
@@ -123,7 +133,9 @@ class TavilyProvider(WebProvider):
 
     # -- single-call helpers ---------------------------------------------- #
 
-    async def _search_with(self, key: str | None, query: str, max_results: int) -> SearchResult:
+    async def _search_with(
+        self, key: str | None, query: str, max_results: int, days: int | None
+    ) -> SearchResult:
         result = SearchResult(query=query, provider=self.name)
         try:
             client = self._get_client(key)
@@ -134,6 +146,9 @@ class TavilyProvider(WebProvider):
                 max_results=max_results,
                 include_answer=self.config.include_answer,
                 include_raw_content="markdown" if self.config.include_raw_content else None,
+                # A recency window makes the index rank recent pages instead of
+                # the most-linked ones, which is how year-old answers win.
+                time_range=_time_range(days),
             )
         except Exception as exc:  # noqa: BLE001 - surfaced as a failed result
             log.warning("tavily search failed: %s", exc)
@@ -153,6 +168,7 @@ class TavilyProvider(WebProvider):
                     snippet=str(item.get("content") or ""),
                     content=str(item.get("raw_content") or item.get("content") or ""),
                     score=item.get("score"),
+                    published=str(item.get("published_date") or ""),
                 )
             )
         answer = data.get("answer")
@@ -177,6 +193,16 @@ class TavilyProvider(WebProvider):
         if failed:
             return Page(url=url, markdown=f"extraction failed: {failed}")
         return Page(url=url, markdown="(no content returned)")
+
+
+def _time_range(days: int | None) -> str | None:
+    """Map a day window to Tavily's coarse buckets; ``None`` means unfiltered."""
+    if not days or days <= 0:
+        return None
+    for bucket in TAVILY_TIME_RANGES:
+        if days <= bucket[0]:
+            return bucket[1]
+    return "month"
 
 
 __all__ = ["TavilyProvider"]
