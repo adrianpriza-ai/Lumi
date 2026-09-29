@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: this workflow only ever reads the repo.
+permissions:
+  contents: read
+
+# Superseded runs on a PR are wasted minutes. Runs on main are never cancelled,
+# because main is the record.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # Same command the README tells you to run locally, so a green build
+      # means the documented workflow is the one that actually works.
+      - name: Ruff
+        run: ruff check lumi tests
+
+  test:
+    name: pytest ${{ matrix.python-version }}
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      # One broken version should not hide the result on the others.
+      fail-fast: false
+      matrix:
+        # The versions claimed in pyproject.toml classifiers. Add one there first.
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      # The suite is hermetic: conftest points LUMI_HOME at a tmp dir, writes its
+      # own dummy .env, and scrubs TAVILY/FIRECRAWL/EXA/MCP vars, so no secrets
+      # and no network keys are needed here. If a test ever starts reading a real
+      # credential, that is a bug in the test, not a reason to add a secret.
+      - name: Pytest
+        run: pytest -q
