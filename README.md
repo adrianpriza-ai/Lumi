@@ -71,9 +71,9 @@ In Telegram: `/help` `/run` `/search` `/fetch` `/memory` `/remember` `/forget`
 is just a message to the agent.
 
 Send the bot a photo and it looks at it. The caption becomes your question; a
-photo with no caption gets a default "what's in this image?". This needs a
-vision-capable model — a text-only model will simply fail to use the image, so
-point `llm.model` at a multimodal one. See
+photo with no caption gets a default "what's in this image?". Images go to
+`llm.vision_model` when one is set, so `llm.model` can stay text-only — unset,
+everything goes to `llm.model`, which then has to be vision-capable. See
 [CONFIGURATION.md](CONFIGURATION.md#the-llm) for the multimodal note and
 [Configuration](CONFIGURATION.md) for how the model is resolved.
 
@@ -106,7 +106,8 @@ lumi/
 ├── config.py          config loading, dataclasses, env overrides
 ├── paths.py           every path, resolved from the project root
 ├── personality.py     PERSONALITY.md -> system prompt
-├── memory.py          MEMORY.md + JSONL transcripts
+├── memory.py          MEMORY.md + JSONL transcripts (read tail-first)
+├── context.py         the context window: what fits, what is condensed
 ├── artifacts.py       the file harness — outbox for documents, intake for uploads
 ├── agent.py           the tool-calling loop, including approvals
 ├── bot.py             Telegram handlers (all the edge cases live here)

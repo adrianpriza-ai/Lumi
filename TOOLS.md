@@ -57,8 +57,13 @@ Three tiers, resolved in order, strictest wins:
 On top of that: writes outside the project are blocked, `HOME` is pinned to the
 project, the child environment is scrubbed of anything matching
 `*KEY*|*TOKEN*|*SECRET*|*PASSWORD*` (so a command cannot exfiltrate your API
-keys), every command runs in its own process group and is killed on timeout, and
-output is capped.
+keys), and every command runs in its own process group and is killed on timeout.
+
+Output is not truncated. `tools.shell.max_output_chars` is `0` by default, so the
+model sees the whole thing; what gets dropped instead is *old* output, when the
+conversation outgrows the context window — at which point the model is told a
+command ran and that its output is no longer in front of it. Set the cap to a
+number if you would rather always see a short version.
 
 The checks read the token stream, not just the raw text, so a few things are
 caught that a regex over the command line would miss: `cd .. && rm -rf data` is
@@ -153,6 +158,19 @@ Local servers work too:
 ```json
 { "mcpServers": { "my-search": { "type": "local", "command": ["npx", "-y", "my-mcp-server"] } } }
 ```
+
+### How much comes back
+
+A search returns `tools.web.max_results` hits (10 by default) and page text is
+not truncated: `tools.web.max_content_chars` is `0`, so a hit the model can
+actually read is a hit it will not have to search for again. The model is told
+it may ask for more than the default, up to 50.
+
+A thin result set is topped up rather than answered — if the first provider
+returns fewer than `min_results` hits, the next provider in the order fills the
+gap (deduplicated by URL) before the model sees it. Every result carries the
+date it was searched and, where the provider knows it, the publish date, so a
+stale page cannot pass for a current one.
 
 ## Context7 (library docs)
 

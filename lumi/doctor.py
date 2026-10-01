@@ -160,12 +160,14 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
     else:
         detail = "missing — the bot cannot answer anything"
     checks.append(Check(f"{config.llm.api_key_env}", OK if keys else FAIL, detail))
+    vision = config.llm.vision_model_of()
     checks.append(
         Check(
             "llm",
             OK,
             f"{config.llm.model_of()} via {config.llm.base_url_of()} "
             f"(from {config.llm.where_from()}), keys: {config.llm.strategy_of()}"
+            + (f", vision: {vision}" if vision else "")
             + _reasoning_note(config),
         )
     )
@@ -284,6 +286,23 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
                 checks.append(Check(f"tool {tool.name}", OK if ok else WARN, reason or tool.summary_line()))
         except Exception as exc:  # noqa: BLE001
             checks.append(Check("tools", FAIL, format_error(exc)))
+
+    # -- memory ------------------------------------------------------------ #
+    try:
+        from .context import ContextWindow
+
+        memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
+        memory.load()
+        size = memory.prompt_size(ContextWindow(config).memory_limit())
+        detail = f"{size['chars']:,} chars, {memory.stats()['managed_count']} remembered fact(s)"
+        if size["over"]:
+            detail += (
+                f" — over the {size['budget']:,}-char budget, so the oldest "
+                f"{size['dropped']} are not sent (raise llm.max_memory_chars)"
+            )
+        checks.append(Check("memory", WARN if size["over"] else OK, detail))
+    except Exception as exc:  # noqa: BLE001
+        checks.append(Check("memory", WARN, format_error(exc)))
 
     # -- history ----------------------------------------------------------- #
     try:

@@ -12,6 +12,7 @@ memory (see `/forget`). Anything else is free-form context.
 
 <!-- lumi:managed:start -->
 <!-- Managed memories are appended below this line and removed from the top. -->
+- [2026-09-30] The user likes to be called 'papa' in our role-play fun, and Nored is my maker.
 <!-- lumi:managed:end -->
 
 ## Context

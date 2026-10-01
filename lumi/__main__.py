@@ -28,7 +28,7 @@ from .util.text import format_error
 
 log = get_logger("lumi.cli")
 
-BANNER = "lumi — /help for commands, /quit to exit, /reset to clear the conversation"
+BANNER = """lumi — /help for commands, /quit to exit, /reset to clear the conversation, /context for the window"""
 
 
 def _config_and_log(args: argparse.Namespace) -> Config:
@@ -147,9 +147,13 @@ async def _chat(config: Config) -> int:
             agent.reset("cli")
             print("conversation cleared\n")
             continue
+        if lowered == "/context":
+            report = agent.context_report("cli")
+            print("\n".join(report.lines()), "\n")
+            continue
         if lowered in {"/help", "/?"}:
             print(BANNER)
-            print("/quit  /reset\n")
+            print("/quit  /reset  /context\n")
             continue
         if lowered == "/tools":
             print(agent.registry.describe(), "\n")
@@ -310,6 +314,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         resolved = {
             "llm.base_url": config.llm.base_url_of,
             "llm.model": config.llm.model_of,
+            "llm.vision_model": config.llm.vision_model_of,
             "llm.key_strategy": config.llm.strategy_of,
         }.get(args.key)
         print(resolved() if resolved else node)

@@ -43,7 +43,10 @@ def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
     monkeypatch.setenv("TELEGRAM_OWNER_ID", "42")
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    for leaked in ("TAVILY_API_KEY", "FIRECRAWL_API_KEY", "EXA_API_KEY", "LUMI_MCP_URL"):
+    for leaked in (
+        "TAVILY_API_KEY", "FIRECRAWL_API_KEY", "EXA_API_KEY", "LUMI_MCP_URL",
+        "OPENAI_MODEL", "OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_VISION_MODEL",
+    ):
         monkeypatch.delenv(leaked, raising=False)
     return tmp_path
 

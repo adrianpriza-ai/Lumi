@@ -112,8 +112,26 @@ async def test_sends_the_model_and_messages(config) -> None:
     request = completions.requests[0]
     assert request["model"] == "test-model"
     assert request["messages"] == [{"role": "user", "content": "hello"}]
-    assert request["max_tokens"] == 2000
     assert "tools" not in request
+
+
+async def test_no_token_ceiling_is_sent_by_default(config) -> None:
+    """A ceiling here is a wall the model stops at. Unset means the provider's
+    own limit applies, and the parameter is left out entirely."""
+    completions = StubCompletions(reply("hi"))
+    client = client_with(config, completions)
+    await client.complete([{"role": "user", "content": "hello"}])
+
+    assert "max_tokens" not in completions.requests[0]
+
+
+async def test_a_configured_ceiling_is_sent(config) -> None:
+    config.llm.max_tokens = 4096
+    completions = StubCompletions(reply("hi"))
+    client = client_with(config, completions)
+    await client.complete([{"role": "user", "content": "hello"}])
+
+    assert completions.requests[0]["max_tokens"] == 4096
 
 
 async def test_sends_tools_and_auto_choice(config) -> None:
@@ -463,8 +481,21 @@ async def test_temperature_is_still_sent_without_reasoning(config) -> None:
     assert completions.requests[0]["temperature"] == 0.7
 
 
-async def test_reasoning_mode_uses_max_completion_tokens(config) -> None:
+async def test_reasoning_mode_sends_no_ceiling_by_default(config) -> None:
+    """Thinking is billed as output, so headroom used to be added to a ceiling.
+    With no ceiling configured there is nothing to add to, and the provider's
+    own limit already covers the trace."""
     reasoning_config(config)
+    completions = StubCompletions(reply("hi"))
+    await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+
+    request = completions.requests[0]
+    assert "max_tokens" not in request
+    assert "max_completion_tokens" not in request
+
+
+async def test_reasoning_mode_moves_a_ceiling_to_max_completion_tokens(config) -> None:
+    reasoning_config(config, max_tokens=2000, reasoning_tokens=2000)
     completions = StubCompletions(reply("hi"))
     await client_with(config, completions).complete([{"role": "user", "content": "q"}])
 
@@ -527,7 +558,7 @@ async def test_effort_none_is_sent_when_asked_for(config) -> None:
 
 
 async def test_an_endpoint_that_only_knows_max_tokens_still_works(config) -> None:
-    reasoning_config(config, reasoning_effort="high")
+    reasoning_config(config, reasoning_effort="high", max_tokens=4000)
     completions = StubCompletions(
         reply("answered"),
         error=[RuntimeError("Unsupported parameter: 'max_completion_tokens'")],
@@ -544,7 +575,7 @@ async def test_an_endpoint_that_only_knows_max_tokens_still_works(config) -> Non
 
 
 async def test_the_ladder_keeps_going_until_nothing_is_left_to_drop(config) -> None:
-    reasoning_config(config, reasoning_effort="high")
+    reasoning_config(config, reasoning_effort="high", max_tokens=4000)
     completions = StubCompletions(
         reply("answered"),
         error=[
@@ -572,11 +603,38 @@ async def test_a_value_error_is_not_retried(config) -> None:
 
 
 async def test_the_ladder_stops_when_every_variant_is_refused(config) -> None:
-    reasoning_config(config, reasoning_effort="high")
+    reasoning_config(config, reasoning_effort="high", max_tokens=4000)
     completions = StubCompletions(error=RuntimeError("unsupported parameter: everything"))
     with pytest.raises(LLMError):
         await client_with(config, completions).complete([{"role": "user", "content": "q"}])
     assert len(completions.requests) == 3
+
+
+async def test_a_context_overflow_names_the_limit_and_the_config_line(config) -> None:
+    """The one 400 with an exact fix, and the provider prints the number: quote
+    it back rather than leaving the owner to guess which setting it was."""
+    config.llm.context_window = 200_000
+    completions = StubCompletions(
+        error=status_error(
+            400,
+            "The prompt is too long: 500026, model maximum context length: 262144",
+        )
+    )
+    with pytest.raises(LLMError) as caught:
+        await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+
+    message = str(caught.value)
+    assert "262,144" in message, "the model's own limit, quoted back"
+    assert "200,000" in message, "what we are configured to send"
+    assert "llm.context_window" in message
+    assert "llm.context_headroom" in message
+
+
+async def test_a_context_overflow_without_a_quoted_limit_still_explains(config) -> None:
+    completions = StubCompletions(error=status_error(400, "context_length_exceeded"))
+    with pytest.raises(LLMError) as caught:
+        await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+    assert "llm.context_window" in str(caught.value)
 
 
 async def test_the_ladder_does_not_apply_without_reasoning_mode(config) -> None:
@@ -653,3 +711,89 @@ async def test_a_non_reasoning_model_yields_no_trace(config) -> None:
     completions = StubCompletions(reply("just an answer"))
     result = await client_with(config, completions).complete([{"role": "user", "content": "q"}])
     assert result.reasoning == ""
+
+
+# --------------------------------------------------------------------------- #
+# vision model routing
+# --------------------------------------------------------------------------- #
+
+
+def multimodal_message(text: str) -> dict:
+    """A user turn carrying an image, exactly as the agent builds it for a photo."""
+    return {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": text},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ],
+    }
+
+
+async def test_plain_turns_use_the_default_model(config) -> None:
+    config.llm.vision_model = "gpt-4o"
+    completions = StubCompletions(reply("hi"))
+    await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+    assert completions.requests[0]["model"] == "test-model"
+
+
+async def test_an_image_turn_switches_to_the_vision_model(config) -> None:
+    config.llm.vision_model = "gpt-4o"
+    completions = StubCompletions(reply("i see a cat"))
+    await client_with(config, completions).complete([multimodal_message("what is this?")])
+    assert completions.requests[0]["model"] == "gpt-4o"
+
+
+async def test_an_image_anywhere_in_history_routes_the_whole_request(config) -> None:
+    """A text-only follow-up would still be rejected by the default model, so
+    the vision model has to stay on until the image leaves the context."""
+    config.llm.vision_model = "gpt-4o"
+    completions = StubCompletions(reply("ok"))
+    messages = [
+        {"role": "user", "content": "what is this?"},
+        {"role": "assistant", "content": "a cat"},
+        multimodal_message("earlier"),
+        {"role": "user", "content": "text-only follow-up"},
+    ]
+    await client_with(config, completions).complete(messages)
+    assert completions.requests[0]["model"] == "gpt-4o"
+
+
+async def test_an_unset_vision_model_sends_everything_to_the_default(config) -> None:
+    config.llm.vision_model = ""
+    completions = StubCompletions(reply("hi"))
+    await client_with(config, completions).complete([multimodal_message("what is this?")])
+    assert completions.requests[0]["model"] == "test-model"
+
+
+async def test_the_vision_model_can_come_from_the_environment(config, monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_VISION_MODEL", "qwen2-vl")
+    completions = StubCompletions(reply("i see it"))
+    await client_with(config, completions).complete([multimodal_message("what is this?")])
+    assert completions.requests[0]["model"] == "qwen2-vl"
+
+
+async def test_an_explicit_vision_model_beats_the_environment(config, monkeypatch) -> None:
+    config.llm.vision_model = "gpt-4o"
+    monkeypatch.setenv("OPENAI_VISION_MODEL", "qwen2-vl")
+    completions = StubCompletions(reply("i see it"))
+    await client_with(config, completions).complete([multimodal_message("what is this?")])
+    assert completions.requests[0]["model"] == "gpt-4o"
+
+
+async def test_a_failed_image_request_suggests_the_vision_setting(config) -> None:
+    """The classic failure — photos to a text-only model — should name the fix."""
+    config.llm.vision_model = ""
+    completions = StubCompletions(error=RuntimeError("400 image input not supported"))
+    with pytest.raises(LLMError) as caught:
+        await client_with(config, completions).complete([multimodal_message("what is this?")])
+    message = str(caught.value)
+    assert "vision_model" in message
+    assert "test-model" in message
+
+
+async def test_the_vision_hint_does_not_appear_without_an_image(config) -> None:
+    config.llm.vision_model = ""
+    completions = StubCompletions(error=RuntimeError("400 bad request"))
+    with pytest.raises(LLMError) as caught:
+        await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+    assert "vision_model" not in str(caught.value)

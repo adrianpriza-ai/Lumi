@@ -67,6 +67,12 @@ provider = "openai"
 base_url = ""
 # Same deal for the model: this value, then OPENAI_MODEL, then the default.
 model = "gpt-4.1-mini"
+# Optional second model for photo turns: when a message carries an image (or an
+# image is still in the replayed history), it is sent to this one instead of
+# `model`, so the default can stay text-only. Same endpoint and keys; empty
+# sends everything — photos included — to `model`. Same precedence too: this
+# value, then OPENAI_VISION_MODEL, then unset.
+vision_model = ""
 # Which environment variable holds the key. Point this at your provider's own
 # name if it differs, e.g. "GROQ_API_KEY" or "OPENROUTER_API_KEY".
 # A comma-separated list is a rotation pool: "sk-...90, sk-...91".
@@ -83,13 +89,58 @@ key_strategy = "fallback"
 # null = let the provider pick its default (needed for some reasoning models).
 # Ignored while `reasoning = true`, which omits it entirely — see below.
 temperature = 0.7
-max_tokens = 2000
-# How many tool-call round trips the agent may take for one message.
-max_tool_iterations = 8
-# Prior turns replayed from data/history/<chat_id>.jsonl into the prompt.
-history_turns = 20
-# MEMORY.md is truncated to this many characters when injected.
-max_memory_chars = 6000
+# Ceiling on output tokens. 0 sends no ceiling at all, which is the default and
+# the right answer: a number here is a wall the model stops at, and a truncated
+# answer that stops mid-sentence is worse than a long one. Raise it if your
+# provider needs a specific limit, or leave it at 0 to let the model decide.
+max_tokens = 0
+# How many tool-call round trips the agent may take for one message. A guard
+# against a runaway loop rather than a budget — a model that needs 20 round
+# trips is looping, and gets told so instead of burning tokens forever.
+max_tool_iterations = 20
+# Prior turns replayed from data/history/<chat_id>.jsonl on a fresh
+# conversation. 0 means "as many as the context window holds", which is the
+# point of budgeting history in tokens rather than in turn counts: a fixed count
+# is forty messages on a quiet day and four on a busy one.
+history_turns = 0
+# Cap on the MEMORY.md block injected into the system prompt. This is the one
+# limit that is not optional: the file goes into the part of the prompt that
+# nothing can condense away, so an unbounded one would grow into the window and
+# quietly push the conversation out of it. 0 means "no explicit cap" — the file
+# still gets an eighth of the context window (about 64k chars at 200k tokens),
+# which is room for hundreds of facts. Set a number to cap it harder; the oldest
+# facts are what get elided, and the prompt says so when it happens.
+max_memory_chars = 0
+
+# --- Context window ---------------------------------------------------------
+# The conversation is measured against the model's window, in tokens, and the
+# oldest part is condensed into a record before anything is dropped. That is
+# what stops the bot forgetting what you said an hour ago and then answering
+# from imagination instead.
+#
+# Set context_window to your model's real limit, and context_headroom to that
+# model's maximum *output* tokens, so a full-length answer always fits. Both
+# numbers come from the provider: send a request with an absurd max_tokens and
+# it will tell you "maximum context length" and "maximum output tokens". If a
+# request ever overflows anyway, the error names the limit and the config line
+# to change. Everything else here has a sane default.
+context_window = 200000
+# Held back from the window for the reply itself. Set it to the model's maximum
+# *output* tokens if you want a full-length answer to always fit — 65536 for
+# Nemotron 3 Super, for instance. The rest of the window is history.
+context_headroom = 16000
+# Messages at the tail that are never condensed, however full the window gets.
+# Losing the newest turns is how a model starts contradicting the message it
+# was replying to.
+context_keep_recent = 12
+# When the window fills, ask the model to write a record of the oldest part
+# before it is dropped, and keep that instead. Off means the old part is simply
+# dropped with a marker: cheaper, and the past is then gone.
+compaction = true
+# Conversations held in memory at once. Each is bounded by context_window, so
+# this is the ceiling on what the process holds; an evicted chat replays itself
+# from its transcript, so nothing is lost but a re-read.
+max_conversations = 32
 
 # --- Reasoning models -------------------------------------------------------
 # Turn this on for a model that thinks before it answers (gpt-oss, DeepSeek
@@ -116,8 +167,10 @@ reasoning = false
 # switch, so omitting it leaves the model's own (usually off) default in
 # charge. "none" actively tells a model to skip thinking.
 reasoning_effort = ""
-# Token headroom for the thinking, on top of max_tokens.
-reasoning_tokens = 2000
+# Token headroom for the thinking, on top of max_tokens. 0 — the default — adds
+# nothing, which is right when max_tokens is also 0: with no ceiling sent, the
+# provider's own output limit already covers the trace.
+reasoning_tokens = 0
 # Post the thinking trace in Telegram as one collapsed line under the answer,
 # with a button to expand it. `/reasoning off` in the chat turns it off for the
 # running process. In `lumi ask` the trace goes to stderr instead, so redirecting
@@ -133,7 +186,10 @@ enabled = true
 # Working directory, relative to the project root. Use "." for the repo itself.
 cwd = "workspace"
 timeout_seconds = 60
-max_output_chars = 6000
+# Characters of a command's output handed to the model. 0 sends all of it: the
+# context window decides what fits, and it drops old output as the conversation
+# grows rather than mangling every command in real time.
+max_output_chars = 0
 # Set false to hard-block anything that is not plainly safe (no prompts).
 ask_before_risky = true
 # "project" pins HOME to the project root so nothing writes into your real
@@ -154,7 +210,10 @@ enabled = true
 writable = ["workspace"]
 # Readable from the whole project (so the bot can read its own source).
 readable_from_project = true
-max_read_chars = 20000
+# Characters of a file handed to the model on read. Generous by default,
+# because a read is usually done to look at the whole thing; 0 means no cap,
+# and the model's own `max_bytes` argument is there for the files that need one.
+max_read_chars = 200000
 max_write_chars = 200000
 # Let the model send files to the chat: `upload: true` on a write, or the
 # dedicated `upload` action for an existing file. Incoming documents from the
@@ -174,10 +233,10 @@ enabled = true
 # "mcp" reads .mcp.json from the project root, so you can drive any MCP
 # server (tavily, firecrawl, exa, or your own) with zero extra code.
 provider_order = ["firecrawl", "exa", "tavily", "mcp"]
-# Four hits covers a question while keeping context lean: each hit costs
-# ~1.5k chars of tool budget plus provider credits, and the per-hit content
-# floor means every one of the four still carries real body text.
-max_results = 4
+# Hits per search. Ten covers a hard question with room for the angles that do
+# not pan out, and every one of them is content the model can actually read.
+# 0 means "whatever the model asks for"; the model is told it may raise this.
+max_results = 10
 # Floor for an acceptable search: when the first provider comes back with
 # fewer hits than this, the next provider in the order tops the result up
 # (deduplicated by URL) instead of the sparse answer going back as-is.
@@ -185,12 +244,12 @@ max_results = 4
 # ships, but no longer spends a whole second provider call just to grow a
 # 2-hit result to 3.
 min_results = 2
-max_content_chars = 6000
+# Characters of body text per search or fetched page. 0 does not cut at all,
+# which is the default: a teaser snippet is what makes a model search again,
+# and again, paying for the same page every time.
+max_content_chars = 0
 # Seconds to wait on any single provider call.
 timeout_seconds = 90
-# Tool-message budget: body text is shared out between hits, with a floor per
-# hit for result sets of five or fewer, so a default search carries real
-# content instead of teaser snippets while staying under the 8000-char cap.
 
 [tools.web.providers.tavily]
 enabled = true

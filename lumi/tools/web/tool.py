@@ -23,6 +23,13 @@ from .providers.tavily_provider import TavilyProvider
 
 log = get_logger(__name__)
 
+#: Ceiling on ``max_results`` / ``min_results``, whatever the model asks for.
+#: High enough to be a guard rather than a policy: providers cap themselves
+#: (Tavily at 20, others lower), and a request above their ceiling returns what
+#: they have instead of failing. Cutting the model's ask down to a number we
+#: invented is what made searches come back thin.
+MAX_RESULTS = 50
+
 
 def build_providers(config: Config) -> dict[str, WebProvider]:
     """Instantiate every provider named in the configured order."""
@@ -84,9 +91,12 @@ unfamiliar.
             },
             "max_results": {
                 "type": "integer",
-                "description": "How many results to return (default from config).",
+                "description": (
+                    "How many results to return (default from config). Raise it for a "
+                    "hard question — more hits means more sources to cross-check."
+                ),
                 "minimum": 1,
-                "maximum": 20,
+                "maximum": MAX_RESULTS,
             },
             "min_results": {
                 "type": "integer",
@@ -95,7 +105,7 @@ unfamiliar.
                     "provider before answering (default from config)."
                 ),
                 "minimum": 1,
-                "maximum": 20,
+                "maximum": MAX_RESULTS,
             },
             "recency": {
                 "type": "integer",
@@ -136,11 +146,12 @@ unfamiliar.
         raise ToolError(f"unknown action {action!r}; use search or fetch")
 
     def _max_results(self, arguments: dict[str, Any]) -> int:
+        """The model's ask, else the config default. 0 in config means unlimited."""
         try:
             requested = int(arguments.get("max_results") or self.settings.max_results)
         except (TypeError, ValueError):
             requested = self.settings.max_results
-        return max(1, min(requested, 20))
+        return max(1, min(requested, MAX_RESULTS))
 
     def _recency_days(self, arguments: dict[str, Any]) -> int | None:
         """The ``recency`` argument as a day count; anything odd means unfiltered."""
@@ -156,7 +167,7 @@ unfamiliar.
             requested = int(arguments.get("min_results"))
         except (TypeError, ValueError):
             requested = self.settings.min_results
-        return max(1, min(requested, 20))
+        return max(1, min(requested, MAX_RESULTS))
 
     async def _search(self, arguments: dict[str, Any]) -> ToolResult:
         query = str(arguments.get("query") or "").strip()

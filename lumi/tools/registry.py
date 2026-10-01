@@ -46,16 +46,33 @@ class ToolRegistry:
     def specs(self) -> list[dict[str, Any]]:
         return [tool.spec() for tool in self.all() if tool.available()[0]]
 
-    def describe(self, available_only: bool = False) -> str:
+    def describe(self, available_only: bool = False, *, html: bool = False) -> str:
         """A human-readable summary of every registered tool.
 
         With ``available_only=True`` the list is filtered down to tools that
         can actually run right now — this is what the system prompt uses, so
         the model never sees a tool it cannot call. The default (everything)
         is what ``/tools`` shows, so the owner can see *why* something is off.
+
+        With ``html=True`` the same list comes back as Telegram HTML —
+        ``<code>`` around tool names, ``&lt;unavailable: …&gt;`` annotations —
+        so it can be sent to the chat without an unbalanced underscore in a
+        tool description breaking the whole message.
         """
         if not self._tools:
-            return "_no tools enabled_"
+            return "<i>no tools enabled</i>" if html else "_no tools enabled_"
+        if html:
+            from ..util.text import escape_html, sanitize_html
+
+            lines = []
+            for tool in self.all():
+                ok, reason = tool.available()
+                if available_only and not ok:
+                    continue
+                mark = "" if ok else f" <i>(unavailable: {escape_html(reason)})</i>"
+                first = tool.description.strip().splitlines()[0] if tool.description.strip() else ""
+                lines.append(f"- <code>{tool.name}</code>{mark} — {sanitize_html(first)}")
+            return "\n".join(lines)
         lines = []
         for tool in self.all():
             ok, reason = tool.available()

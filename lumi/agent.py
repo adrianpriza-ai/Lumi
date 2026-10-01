@@ -7,6 +7,11 @@ One user message becomes a bounded conversation with the model:
 3. call the model, execute whatever tools it asks for, feed the results back,
 4. repeat until it produces prose or hits ``llm.max_tool_iterations``.
 
+What "bounded" means is :mod:`lumi.context`'s business, not this loop's: the
+conversation is measured against the model's context window, and when it no
+longer fits the old part is condensed into a record rather than deleted. The
+loop itself only has to ask for the fit before every call.
+
 Approval is part of the loop, not a wrapper around it. A tool that wants
 confirmation raises :class:`~lumi.tools.base.NeedsApproval`; the loop records the
 call as pending and stops. The chat renders a Confirm/Cancel pair, and
@@ -24,6 +29,7 @@ from typing import Any
 
 from .artifacts import Artifact
 from .config import Config
+from .context import ContextReport, ContextWindow
 from .llm import LLMClient, ToolCall, build_llm
 from .llm.base import LLMError, LLMReply
 from .memory import History, MemoryFile
@@ -34,8 +40,10 @@ from .util.log import get_logger
 
 log = get_logger(__name__)
 
-#: Cap on messages held per conversation, before trimming on a user boundary.
-MAX_MESSAGES = 60
+#: Conversations held in memory at once. Also a hard cap, so a bad
+#: ``llm.context_window`` cannot turn into unbounded memory; the live
+#: conversation is never evicted, and an evicted one replays from its transcript.
+MAX_CONVERSATIONS = 32
 
 RUNTIME_PREAMBLE = """\
 ## Runtime
@@ -79,6 +87,31 @@ When you use a tool:
 - Only the tools listed above are available right now. If a capability is
   missing here it is because an API key is unset or the tool was disabled in
   config — say so plainly rather than trying to call it.
+"""
+
+FORMAT_PREAMBLE = """\
+## Formatting (important)
+
+Your messages go to a Telegram chat that parses HTML, not Markdown. Write
+Telegraph-style HTML tags — they are the only thing that renders:
+
+- Bold: <b>like this</b>. Italic: <i>like this</i>. Underline: <u>underlined</u>.
+- Inline code: <code>like this</code>. Code blocks: <pre>like this</pre> (multi-line
+  is fine). Never use backticks, ``` fences, asterisks or underscores as
+  formatting — in this chat they show up literally, and stray `_` or `*`
+  characters look like noise. Write file paths, shell commands, model names,
+  versions and URLs inside <code></code>.
+- Escape <, > and & outside tags as &lt; &gt; &amp; when you mean them as text,
+  e.g. "a &lt; b" or "M&amp;Ms". A bare < followed by a letter starts a tag and
+  can swallow the rest of your message.
+- Use formatting sparingly, the way you would in a good chat message: bold for
+  a short headline when a message is long, code style for anything you could
+  type into a terminal. No headings, no bullet lists unless the answer is
+  genuinely a list, and at most one emoji per message.
+
+If a tool result contains Markdown (a web page, a README), convert it: do not
+paste **double asterisks**, # headings or [links](https://example.com) raw —
+say the link's text and put the URL in <code></code>, or just describe it.
 """
 
 
@@ -143,13 +176,27 @@ class TurnResult:
 
 @dataclass(slots=True)
 class Conversation:
-    """Per-chat state: the live message list plus the pending queue."""
+    """Per-chat state: the live message list, the pending queue, and the counters
+    that say what the context window has had to do to it."""
 
     chat_id: int | str
     messages: list[dict[str, Any]] = field(default_factory=list)
     session: str = ""
     pending: list[PendingAction] = field(default_factory=list)
     seeded: bool = False
+    #: The condensed record standing in for turns that no longer fit. Persisted
+    #: to the transcript, so a restart resumes the thread rather than forgetting
+    #: it a second time.
+    summary: str = ""
+    #: Counters for ``/context``: how much has been summarised, elided, dropped.
+    summarised: int = 0
+    elided: int = 0
+    dropped: int = 0
+    #: Set when the system prompt and the newest turn alone exceed the window —
+    #: a misconfiguration, reported in ``/context`` rather than papered over.
+    truncated: bool = False
+    #: Monotonic clock of last use, for evicting the quietest chat.
+    touched: float = 0.0
 
 
 class Agent:
@@ -168,12 +215,25 @@ class Agent:
         self.history = history
         self.registry = registry if registry is not None else build_registry(config, memory)
         self.llm = llm if llm is not None else build_llm(config)
+        self.context = ContextWindow(config, llm=self.llm, history=history)
         self._conversations: dict[int | str, Conversation] = {}
+        self._max_conversations = max(1, int(config.llm.max_conversations or MAX_CONVERSATIONS))
 
     # -- prompt ------------------------------------------------------------ #
 
+    def memory_limit(self) -> int:
+        """Characters of MEMORY.md to put in the system prompt.
+
+        Delegated to the context window, which is where the rule lives: the
+        memory file is the one part of the prompt nothing can condense away, so
+        it is the one part that has to be bounded up front.
+        """
+        return self.context.memory_limit()
+
     def system_prompt(self) -> str:
         now = datetime.now(UTC)
+        limit = self.memory_limit()
+        memory_block = self.memory.for_prompt(limit)
         parts = [
             self.personality.text,
             RUNTIME_PREAMBLE.format(
@@ -185,8 +245,16 @@ class Agent:
                 date=now.strftime("%d %B %Y"),
             ),
             TOOL_PREAMBLE.format(tools=self.registry.describe(available_only=True) or "_none_"),
-            "## Long-term memory\n\nThis is your memory file. It persists across conversations.\n\n"
-            + self.memory.for_prompt(),
+            FORMAT_PREAMBLE,
+            "## Long-term memory\n\n"
+            + (
+                "This is your memory file. It persists across conversations. Anything "
+                "marked as elided below is still on disk, just too old to send — say so "
+                "rather than pretending you were never told.\n\n"
+                if "[older remembered fact" in memory_block or "[older memory elided]" in memory_block
+                else "This is your memory file. It persists across conversations.\n\n"
+            )
+            + memory_block,
         ]
         return "\n\n".join(part.strip() for part in parts if part.strip())
 
@@ -197,36 +265,61 @@ class Agent:
         if conv is None:
             conv = Conversation(chat_id=chat_id, session=self.history.new_session(chat_id))
             self._conversations[chat_id] = conv
+            self._evict_quietest(keep=chat_id)
+        conv.touched = time.monotonic()
         if not conv.seeded:
             conv.seeded = True
             conv.messages.append({"role": "system", "content": self.system_prompt()})
-            for entry in self.history.recent_dialogue(chat_id, self.config.llm.history_turns):
-                conv.messages.append(entry)
+            self.context.replay(conv)
         return conv
+
+    def _evict_quietest(self, *, keep: int | str) -> None:
+        """Forget the quietest conversation once there are too many in memory.
+
+        A conversation cannot grow past the window it was assembled for, so the
+        count of chats is the only thing that decides how much this process
+        holds. Evicting costs a re-read: the transcript is on disk, and
+        :meth:`context.ContextWindow.replay` rebuilds the chat from its tail —
+        which is the same code path a restart takes.
+
+        A chat with a pending approval is never evicted, because the owner has
+        to be able to answer it and the state lives only in memory.
+        """
+        while len(self._conversations) > self._max_conversations:
+            candidates = [
+                conv for chat_id, conv in self._conversations.items()
+                if chat_id != keep and not conv.pending
+            ]
+            if not candidates:
+                return
+            quietest = min(candidates, key=lambda c: c.touched)
+            del self._conversations[quietest.chat_id]
+            log.info(
+                "evicted the conversation for chat %s from memory (%d held); "
+                "it replays from its transcript on the next message",
+                quietest.chat_id, len(self._conversations),
+            )
 
     def reset(self, chat_id: int | str) -> None:
         self._conversations.pop(chat_id, None)
         log.info("conversation reset for chat %s", chat_id)
 
+    def context_report(self, chat_id: int | str) -> ContextReport:
+        """What the context for *chat_id* currently holds. For ``/context``."""
+        return self.context.report(self.conversation(chat_id))
+
+    def conversation_state(self, chat_id: int | str) -> Conversation | None:
+        """The live conversation for *chat_id*, or ``None`` if it is not in memory.
+
+        Does not create one: this is for looking at a chat, not starting it.
+        """
+        return self._conversations.get(chat_id)
+
+    def conversations_in_memory(self) -> int:
+        return len(self._conversations)
+
     def _context(self, source: str, chat_id: int | str) -> ToolContext:
         return ToolContext(cwd=self.config.shell_cwd, source=source, chat_id=chat_id)
-
-    def _trim(self, conv: Conversation) -> None:
-        """Drop old messages, always cutting on a user boundary.
-
-        Cutting anywhere else would leave a ``tool`` message whose preceding
-        ``assistant`` tool_calls entry is gone, which the API rejects.
-        """
-        if len(conv.messages) <= MAX_MESSAGES:
-            return
-        cut = next(
-            (i for i, m in enumerate(conv.messages) if i >= 1 and m.get("role") == "user"),
-            None,
-        )
-        if cut is None or cut == 0:
-            return
-        conv.messages = conv.messages[cut:]
-        log.debug("trimmed conversation for %s to %d messages", conv.chat_id, len(conv.messages))
 
     def _refresh_system_prompt(self, conv: Conversation) -> None:
         """Keep the system prompt current without losing the message history."""
@@ -269,6 +362,26 @@ class Agent:
         ctx: ToolContext,
         tools_used: list[str] | None = None,
     ) -> TurnResult:
+        """Run a turn, and leave the conversation inside its window afterwards.
+
+        The fit happens before every call *and* once the turn is over: a reply
+        is itself a message, and a conversation left over budget is a
+        conversation whose next turn starts by throwing something away. Doing
+        it here rather than at the start of the next turn means the record of
+        what was condensed is written while the turns it covers are still in
+        front of us.
+        """
+        await self.context.prepare(conv)
+        result = await self._turn(conv, ctx, tools_used)
+        await self.context.prepare(conv)
+        return result
+
+    async def _turn(
+        self,
+        conv: Conversation,
+        ctx: ToolContext,
+        tools_used: list[str] | None = None,
+    ) -> TurnResult:
         started = time.monotonic()
         tools = list(tools_used or [])
         result = TurnResult()
@@ -279,7 +392,7 @@ class Agent:
 
         for iteration in range(1, self.config.llm.max_tool_iterations + 1):
             result.iterations = iteration
-            self._trim(conv)
+            await self.context.prepare(conv)
 
             try:
                 asked = time.monotonic()
@@ -292,6 +405,9 @@ class Agent:
                 )
                 return result
             result.thinking_seconds += time.monotonic() - asked
+            # The provider's own prompt count is the only exact figure available,
+            # so it is fed straight back into the estimator for the next call.
+            self.context.observe(reply.usage, conv.messages)
 
             conv.messages.append(_assistant_message(reply))
 
@@ -513,4 +629,11 @@ def _assistant_message(reply: LLMReply) -> dict[str, Any]:
     }
 
 
-__all__ = ["Agent", "TurnResult", "PendingAction", "Conversation", "MAX_MESSAGES"]
+__all__ = [
+    "Agent",
+    "TurnResult",
+    "PendingAction",
+    "Conversation",
+    "ContextReport",
+    "MAX_CONVERSATIONS",
+]

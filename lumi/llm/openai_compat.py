@@ -31,9 +31,49 @@ from ..util.log import get_logger
 from ..util.text import format_error
 from .base import LLMClient, LLMError, LLMReply, ToolCall
 from .keypool import KeyPool, is_retryable, mask
-from .reasoning import completion_ceiling, rejects_param, split_think, trace_of
+from .reasoning import (
+    completion_ceiling,
+    is_context_overflow,
+    rejects_param,
+    reported_context_limit,
+    split_think,
+    trace_of,
+)
 
 log = get_logger(__name__)
+
+
+def has_image_part(messages: list[dict[str, Any]]) -> bool:
+    """Whether any message in *messages* carries an image part.
+
+    OpenAI-compatible providers send a photo as a ``content`` array holding an
+    ``image_url`` item; plain turns keep ``content`` a string. Both shapes are
+    checked defensively — some proxies normalise in one direction or the other —
+    and anything unrecognised simply does not count as an image.
+    """
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and "image_url" in part:
+                return True
+    return False
+
+
+def request_model(messages: list[dict[str, Any]], config: LLMConfig) -> str:
+    """The model id for this request: the vision model when images are present.
+
+    The vision model is consulted for the whole request, not just the newest
+    turn: replayed history can carry an image from an earlier photo, and a
+    text-only default model would reject the transcript on the next turn for a
+    reason nobody could see. An unset vision model routes everything — images
+    included — to the default, which is the correct behaviour when the default
+    is itself multimodal.
+    """
+    if has_image_part(messages):
+        return config.vision_model_of() or config.model_of()
+    return config.model_of()
 
 
 class OpenAICompatClient(LLMClient):
@@ -43,6 +83,8 @@ class OpenAICompatClient(LLMClient):
         self.config = config
         self._pool = KeyPool(config.api_keys(), config.strategy_of())
         self._clients: dict[str, Any] = {}
+        #: (model id, carried an image) for the call in flight, for error text.
+        self._last_request: tuple[str, bool] = (config.model_of(), False)
 
     def _client_for(self, key: str) -> Any:
         """The SDK client bound to *key*, built on first use.
@@ -89,15 +131,20 @@ class OpenAICompatClient(LLMClient):
           knob. It stays available for everyone else.
         - the token ceiling moves to ``max_completion_tokens`` and grows by
           ``llm.reasoning_tokens``, because the thinking trace is billed as
-          output and would otherwise eat the answer.
+          output and would otherwise eat the answer. With both at their default
+          of 0 no ceiling is sent at all and the provider's own limit stands.
         - ``reasoning_effort`` is never absent in this mode: an unset effort
           resolves to :data:`lumi.config.DEFAULT_REASONING_EFFORT` in
           :meth:`LLMConfig.effort_of`, because on endpoints like Ollama's the
           parameter's presence is the thinking on/off switch and omitting it
           would leave a default-off model silent.
+
+        The model id itself is per request: turns whose context carries an
+        image (the latest photo, or one still in replayed history) go to
+        ``llm.vision_model`` when one is set. See :func:`request_model`.
         """
         config = self.config
-        params: dict[str, Any] = {"model": config.model_of(), "messages": messages}
+        params: dict[str, Any] = {"model": request_model(messages, config), "messages": messages}
 
         if config.temperature is not None and not config.reasoning:
             params["temperature"] = config.temperature
@@ -105,8 +152,10 @@ class OpenAICompatClient(LLMClient):
         ceiling = (
             completion_ceiling(config.max_tokens, config.reasoning_tokens)
             if config.reasoning
-            else config.max_tokens
+            else max(0, config.max_tokens)
         )
+        # 0 means unset: the parameter is left out entirely rather than sent as
+        # zero, and the provider's own output limit applies.
         if ceiling:
             params["max_completion_tokens" if config.reasoning else "max_tokens"] = ceiling
 
@@ -180,6 +229,12 @@ class OpenAICompatClient(LLMClient):
             )
 
         variants = self._variants(self._params(messages, tools))
+        # Remember which model this call went out under so a failure can name
+        # it and point at the config line that fixes the common mistakes.
+        self._last_request = (
+            request_model(messages, self.config),
+            has_image_part(messages),
+        )
         tried: list[str] = []
         failure: BaseException | None = None
         # One attempt per key, never more: a single key must behave exactly as
@@ -213,15 +268,52 @@ class OpenAICompatClient(LLMClient):
         the most confusing failure this program can produce.
         """
         endpoint = self.config.base_url_of()
+        model, with_images = self._last_request
         if failure is None:  # pragma: no cover - only if the pool goes empty mid-call
             return (
                 f"no usable key in {self.config.api_key_env}.\n\n"
                 f"Endpoint: {endpoint} (from {self.config.where_from()})\n"
-                f"Model: {self.config.model_of()}"
+                f"Model: {model}"
             )
 
         hint = ""
-        if endpoint == OPENAI_DEFAULT_BASE_URL:
+        if is_context_overflow(failure):
+            # The one 400 with an exact fix, and the provider almost always
+            # names its own limit in the message — so quote it back and point
+            # at the line that has to change. Without this the only visible
+            # symptom is that the model starts refusing, with nothing in the
+            # conversation to explain why.
+            actual = reported_context_limit(failure)
+            window = self.config.context_window
+            hint = (
+                f"\n\nThis request did not fit the model's context window. "
+                f"{self.config.model_of()} reports a limit of {actual:,} tokens"
+                if actual
+                else "\n\nThis request did not fit the model's context window. "
+            )
+            hint += (
+                f", while llm.context_window is set to {window:,}. "
+                "Set it in the [llm] block of config.toml (or LUMI__LLM__CONTEXT_WINDOW)"
+                + (
+                    f" — {actual:,} is what this endpoint just told you it accepts."
+                    if actual and window != actual
+                    else "."
+                )
+            )
+            hint += (
+                " llm.context_headroom is "
+                f"{self.config.context_headroom:,} tokens, held back so the reply fits;"
+                " history is packed to whatever is left."
+            )
+        elif with_images and not self.config.vision_model_of():
+            # The request carried an image and no vision model is configured,
+            # so the likeliest cause is a text-only default. Name the fix.
+            hint = (
+                f"\n\nThis request carried an image. If {model} cannot read images, "
+                "add a multimodal model to the [llm] block of config.toml: "
+                '`vision_model = "gpt-4o"` (or any vision-capable id your endpoint serves).'
+            )
+        elif endpoint == OPENAI_DEFAULT_BASE_URL:
             hint = (
                 "\n\nThat is OpenAI itself. If you meant a different provider, set "
                 "OPENAI_BASE_URL in .env, or base_url in the [llm] block of config.toml."
@@ -246,7 +338,7 @@ class OpenAICompatClient(LLMClient):
         return (
             f"{format_error(failure)}\n\n"
             f"Endpoint: {endpoint} (from {self.config.where_from()})\n"
-            f"Model: {self.config.model_of()}\n"
+            f"Model: {model}\n"
             f"Key: {self.config.api_key_env}{pool}{hint}"
         )
 

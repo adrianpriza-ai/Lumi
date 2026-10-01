@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from lumi.util.text import (
     TELEGRAM_LIMIT,
+    escape_html,
     escape_markdown,
     format_error,
+    markdown_code_to_html,
+    sanitize_html,
     split_message,
     truncate,
     truncate_middle,
@@ -46,6 +49,49 @@ def test_hard_split_for_unbroken_input() -> None:
     chunks = split_message("z" * 500, 100)
     assert len(chunks) >= 5
     assert all(len(c) <= 100 for c in chunks)
+
+
+def test_html_tags_are_reopened_after_a_split() -> None:
+    """A chunk cut inside <pre> must still parse on its own."""
+    text = "<pre>" + "x" * 400 + "</pre>"
+    chunks = split_message(text, 120)
+    assert len(chunks) > 1
+    for chunk in chunks:
+        assert chunk.count("<pre>") == chunk.count("</pre>")
+        assert chunk.count("<b>") == chunk.count("</b>")
+
+
+def test_inline_tags_reopen_across_a_split() -> None:
+    """Realistic nesting depth (a few tags) survives cuts at a small limit."""
+    text = ("<b>bold " * 4) + ("body " * 80) + "end</b>"
+    chunks = split_message(text, 120)
+    assert len(chunks) > 1
+    for chunk in chunks:
+        assert chunk.count("<b>") == chunk.count("</b>")
+
+
+def test_pathological_nesting_terminates_and_respects_the_limit() -> None:
+    """Depth that cannot fit its own closers must not loop forever: chunks stay
+    within the limit and the sender's plain-text fallback absorbs the mess."""
+    text = "<b>bold " * 30 + "end</b>"
+    chunks = split_message(text, 100)
+    assert len(chunks) > 1
+    assert all(len(chunk) <= 100 for chunk in chunks)
+    assert "".join(chunks).count("<b>") >= 30
+
+
+def test_a_tag_cut_in_half_is_not_balanced_away() -> None:
+    """A literal partial tag (escaped by the sanitizer later) splits cleanly."""
+    text = "word " * 60 + "<brken " + "word " * 60
+    chunks = split_message(text, 100)
+    assert "".join(chunks).replace("\n", "")
+
+
+def test_stray_tag_with_attributes_is_not_counted() -> None:
+    """Only the shapes the sanitizer keeps may be balanced."""
+    text = '<b onclick="x">' + "y" * 300
+    chunks = split_message(text, 100)
+    assert all("</b>" not in chunk for chunk in chunks)
 
 
 def test_never_splits_inside_a_fenced_code_block() -> None:
@@ -120,6 +166,68 @@ def test_escape_markdown_escapes_the_dangerous_set() -> None:
 
 def test_escape_leaves_ordinary_text_alone() -> None:
     assert escape_markdown("plain text 123") == "plain text 123"
+
+
+# --------------------------------------------------------------------------- #
+# Telegram HTML
+# --------------------------------------------------------------------------- #
+
+
+def test_escape_html_handles_the_three_reserved_characters() -> None:
+    assert escape_html('a < b & c > "d"') == "a &lt; b &amp; c &gt; \"d\""
+    assert escape_html("underscores_and_asterisks*stay*") == "underscores_and_asterisks*stay*"
+
+
+def test_sanitize_html_passes_telegram_tags_through() -> None:
+    text = "<b>bold</b> and <code>x_1</code> plus <pre>line1\nline2</pre>"
+    assert sanitize_html(text) == text
+
+
+def test_sanitize_html_escapes_stray_angle_brackets() -> None:
+    assert "&lt;script&gt;" in sanitize_html("<script>alert(1)</script>")
+    assert "2 &lt; 3" in sanitize_html("if 2 < 3 then ok")
+
+
+def test_sanitize_html_escapes_bare_ampersands_but_not_entities() -> None:
+    assert "R&amp;D" in sanitize_html("R&D at 5%")
+    assert sanitize_html("a && b") == "a &amp;&amp; b"
+    assert "&amp;amp;" not in sanitize_html("&amp;gt; already escaped")  # not double-escaped
+    assert "&lt;" in sanitize_html("&lt; pre-escaped entity")
+
+
+def test_sanitize_html_keeps_underscores_and_asterisks_visible() -> None:
+    """The whole point: content the legacy Markdown mode choked on survives."""
+    text = "saved to workspace/uploads/42/notes_test.txt, max_tokens = 4096"
+    assert sanitize_html(text) == text
+
+
+def test_sanitize_html_strips_tag_attributes() -> None:
+    """A whitelisted tag carrying extra attributes is escaped into visible text."""
+    text = '<b onclick="alert(1)">hi</b>'
+    out = sanitize_html(text)
+    assert out.startswith("&lt;b"), "the dangerous opener must become literal text"
+    assert out.endswith("</b>")
+    out = sanitize_html('see <a href="https://example.com/x">the page</a>')
+    assert '<a href="https://example.com/x">' in out
+
+
+def test_markdown_code_bridges_fences_and_spans() -> None:
+    out = markdown_code_to_html("look:\n```python\nprint('hi')\n```\nand `x_1` inline")
+    assert "<pre>print(&#39;hi&#39;)</pre>" in out or "<pre>print('hi')</pre>" in out
+    assert "<code>x_1</code>" in out
+    assert "```" not in out
+
+
+def test_markdown_code_bridge_leaves_a_lone_backtick_alone() -> None:
+    assert markdown_code_to_html("it's a ` mystery") == "it's a ` mystery"
+
+
+def test_sanitize_plus_bridge_is_idempotent() -> None:
+    """Escaped text sent through the pipeline again must not double-escape."""
+    once = sanitize_html(markdown_code_to_html("a & b with `x < y`"))
+    twice = sanitize_html(once)
+    assert once == twice
+    assert "&amp;amp;" not in twice
 
 
 # --------------------------------------------------------------------------- #

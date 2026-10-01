@@ -39,14 +39,13 @@ from .base import Tool, ToolContext, ToolError, ToolResult
 
 log = get_logger(__name__)
 
-#: Hard ceiling on characters returned to the agent loop, so a very long doc
-#: snippet cannot blow out the conversation. Per-call ``max_chars`` overrides
-#: but is clamped to this ceiling.
-_DEFAULT_MAX_CHARS = 12_000
-_MAX_CHARS_CEILING = 50_000
+#: Characters of each snippet handed to the model. 0 (the default) sends the
+#: snippet whole: documentation is the entire point of this tool, and a snippet
+#: cut mid-example is the one thing guaranteed to be re-fetched.
+_DEFAULT_MAX_CHARS = 0
 
 #: Hard ceiling on result-count requests; Context7 ignores anything higher.
-_MAX_RESULTS_CEILING = 10
+_MAX_RESULTS_CEILING = 20
 
 
 @dataclass(slots=True)

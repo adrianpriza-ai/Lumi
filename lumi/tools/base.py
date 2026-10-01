@@ -92,7 +92,16 @@ class ToolResult:
     def failure(cls, text: str, **data: Any) -> ToolResult:
         return cls(text=text, ok=False, data=data, summary=text[:120])
 
-    def for_model(self, max_chars: int = 8000) -> str:
+    def for_model(self, max_chars: int = 0) -> str:
+        """The tool's output as the model sees it.
+
+        No cap by default (``max_chars=0``). Cutting here used to mean every
+        tool result was truncated whether the conversation had room or not —
+        the model then re-ran the same command with a redirect to see the rest,
+        which is slower and costs more than the full output would have. The
+        context window is the right place to decide what fits; see
+        :mod:`lumi.context`, which elides old results when the window fills.
+        """
         return truncate(self.text, max_chars)
 
 

@@ -95,6 +95,9 @@ OPENAI_DEFAULT_MODEL = "gpt-4.1-mini"
 #: an existing .env or shell profile keeps working.
 BASE_URL_ENV_VARS = ("OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_API_BASE_URL")
 MODEL_ENV_VARS = ("OPENAI_MODEL",)
+#: Environment variable honoured as a fallback for the vision model, matching
+#: the way :data:`MODEL_ENV_VARS` backs up ``llm.model``.
+VISION_MODEL_ENV_VARS = ("OPENAI_VISION_MODEL",)
 
 #: How several keys in one env var are spent. See :mod:`lumi.llm.keypool`.
 KEY_STRATEGIES = ("fallback", "round_robin", "random")
@@ -116,16 +119,62 @@ DEFAULT_REASONING_EFFORT = "medium"
 class LLMConfig:
     provider: str = "openai"
     model: str = OPENAI_DEFAULT_MODEL
+    #: Model for turns whose context carries an image (a photo in the chat).
+    #: Empty means "use ``model`` for everything". Set it when the default is
+    #: text-only: a multimodal request to a text-only model is a 400. Any turn
+    #: routes to this model once an image is anywhere in the replayed context,
+    #: because a text-only default could not read the history back either.
+    vision_model: str = ""
     #: Empty means "ask the environment". See :meth:`base_url_of`.
     base_url: str = ""
     api_key_env: str = "OPENAI_API_KEY"
     #: How to spend the keys in ``api_key_env``. See :meth:`api_keys`.
     key_strategy: str = "fallback"
     temperature: float | None = 0.7
-    max_tokens: int = 2000
-    max_tool_iterations: int = 8
-    history_turns: int = 20
-    max_memory_chars: int = 6000
+    #: Ceiling on output tokens. 0 (the default) sends no ceiling at all, so
+    #: the provider's own limit stands. A number here is a wall the model stops
+    #: at: a 2000-token answer is not "a long answer", it is an answer cut off
+    #: mid-sentence, and the fix is a bigger number the provider will ignore
+    #: anyway. Raise it, or leave it at 0 to let the model decide.
+    max_tokens: int = 0
+    #: Guard against a runaway tool loop, not a budget. One message is one task,
+    #: so 20 round trips is already generous; anything past that is a model
+    #: looping, and the loop stops and says so rather than burning tokens.
+    max_tool_iterations: int = 20
+    #: Prior turns replayed from data/history/<chat_id>.jsonl on a fresh
+    #: conversation. 0 means "as many as the context window holds" — which is
+    #: the point of budgeting history by tokens instead of by turn count.
+    history_turns: int = 0
+    #: Cap on the MEMORY.md block injected into the system prompt. 0 (the
+    #: default) means "no explicit cap" — which is not the same as unbounded:
+    #: the block is still held to an eighth of the context window, because this
+    #: is the one part of the prompt that nothing downstream can reclaim. A file
+    #: that grows into the window is a file that quietly crowds out the
+    #: conversation, and it does it silently. Set a number to cap it harder.
+    max_memory_chars: int = 0
+    #: Size of the model's context window, in tokens. This is the one number
+    #: conversation history is managed against — see :mod:`lumi.context`.
+    context_window: int = 200_000
+    #: Tokens held back from the window for the reply (and its tool call) that
+    #: comes out of the request the history was assembled for.
+    context_headroom: int = 16_000
+    #: Messages at the tail of a conversation that are never compacted away,
+    #: however full the window gets. Losing the newest turns is how a model
+    #: starts contradicting the message it was replying to.
+    context_keep_recent: int = 12
+    #: When the window fills up, ask the model to summarise the oldest part of
+    #: the conversation before it is dropped. Off means the old part is dropped
+    #: with a marker instead — cheaper, and the past is then simply gone.
+    compaction: bool = True
+    #: Conversations held in memory at once. Each one is bounded by
+    #: ``context_window``, so this is the ceiling on the process's memory use;
+    #: an evicted chat replays itself from its transcript, so nothing is lost.
+    max_conversations: int = 32
+    #: Chars per token in the context estimator, before the provider has
+    #: reported a real prompt size to calibrate against. 3.5 is deliberately
+    #: pessimistic: over-estimating costs a little headroom, under-estimating
+    #: costs a rejected request.
+    chars_per_token: float = 3.5
     #: Drive the model in reasoning mode: omit ``temperature`` and reserve room
     #: for the thinking trace. Safe to leave on for a model that does not
     #: reason — the extra parameters are simply unused, and a non-reasoning
@@ -137,7 +186,10 @@ class LLMConfig:
     reasoning_effort: str = ""
     #: Token headroom for the thinking trace, on top of ``max_tokens``. The
     #: trace is billed as output, so without this a long think eats the answer.
-    reasoning_tokens: int = 2000
+    #: 0 means "no separate headroom", which is also what an unset
+    #: ``max_tokens`` implies: with no ceiling sent, the provider's own output
+    #: limit applies and there is nothing to add to.
+    reasoning_tokens: int = 0
     #: Post the thinking trace in Telegram as a collapsed line with a button to
     #: expand it, rather than dumping it above the answer.
     show_reasoning: bool = True
@@ -239,6 +291,22 @@ class LLMConfig:
                 return value
         return self.model.strip() or OPENAI_DEFAULT_MODEL
 
+    def vision_model_of(self) -> str:
+        """The model for image-bearing requests, or empty to always use :meth:`model_of`.
+
+        Same precedence as :meth:`model_of`: an explicit ``llm.vision_model``
+        wins, then ``OPENAI_VISION_MODEL``, then unset — which routes every
+        turn, images included, to the default model.
+        """
+        chosen = self.vision_model.strip()
+        if chosen:
+            return chosen
+        for name in VISION_MODEL_ENV_VARS:
+            value = (os.environ.get(name) or "").strip()
+            if value:
+                return value
+        return ""
+
     def where_from(self) -> str:
         """Where the endpoint came from, for /status, /doctor and error messages."""
         if self.base_url.strip():
@@ -254,7 +322,11 @@ class ShellConfig:
     enabled: bool = True
     cwd: str = "workspace"
     timeout_seconds: int = 60
-    max_output_chars: int = 6000
+    #: Characters of a command's output handed back to the model. 0 (the
+    #: default) sends all of it: the context window is what decides what fits,
+    #: and it drops the oldest output when the conversation outgrows the model
+    #: rather than mangling every command in real time.
+    max_output_chars: int = 0
     ask_before_risky: bool = True
     home: str = "project"  # "project" | "inherit"
     #: Where a command is allowed to write. Empty means the whole project, which
@@ -274,7 +346,11 @@ class FilesConfig:
     enabled: bool = True
     writable: list[str] = field(default_factory=lambda: ["workspace"])
     readable_from_project: bool = True
-    max_read_chars: int = 20_000
+    #: Characters of a file handed to the model on read. Generous by default
+    #: because a read is usually done to look at the whole thing; 0 means no
+    #: cap, and the model's own ``max_bytes`` argument is there for the files
+    #: that need one.
+    max_read_chars: int = 200_000
     max_write_chars: int = 200_000
     #: When true, the ``files`` tool accepts an ``upload`` flag: files written
     #: under the writable roots are staged into the artifact outbox and delivered
@@ -490,12 +566,19 @@ class WebConfig:
     provider_order: list[str] = field(
         default_factory=lambda: ["firecrawl", "exa", "tavily", "mcp"]
     )
-    max_results: int = 4
+    #: How many hits a search returns. The ceiling is the provider's, not ours:
+    #: 10 covers a hard question with room for the angles that do not pan out,
+    #: and every hit is content the model can read rather than a title it has
+    #: to take on trust. 0 means "whatever the model asks for".
+    max_results: int = 10
     #: Floor for an acceptable search: when the first provider returns fewer
     #: hits than this, the next providers top the result up (deduplicated by
     #: URL) instead of the sparse answer going back to the model as-is.
     min_results: int = 2
-    max_content_chars: int = 6000
+    #: Characters of body text per search or fetched page. 0 (the default) does
+    #: not cut: a teaser snippet is what makes a model search again, and again,
+    #: paying for the same page each time.
+    max_content_chars: int = 0
     timeout_seconds: int = 90
     tavily: TavilyConfig = field(default_factory=TavilyConfig)
     firecrawl: FirecrawlConfig = field(default_factory=FirecrawlConfig)
@@ -796,6 +879,36 @@ def validate(config: Config) -> list[str]:
         )
     if config.llm.reasoning and config.llm.reasoning_tokens < 0:
         problems.append("llm.reasoning_tokens cannot be negative")
+    # 0 is the "no limit" state for every one of these, so only a negative
+    # number is a mistake — a limit is something you opt into here, not
+    # something the defaults impose on you.
+    for label, value in (
+        ("llm.max_tokens", config.llm.max_tokens),
+        ("llm.reasoning_tokens", config.llm.reasoning_tokens),
+        ("llm.max_tool_iterations", config.llm.max_tool_iterations),
+        ("llm.history_turns", config.llm.history_turns),
+        ("llm.max_memory_chars", config.llm.max_memory_chars),
+        ("llm.context_headroom", config.llm.context_headroom),
+        ("llm.context_keep_recent", config.llm.context_keep_recent),
+        ("llm.max_conversations", config.llm.max_conversations),
+        ("tools.shell.max_output_chars", config.tools.shell.max_output_chars),
+        ("tools.files.max_read_chars", config.tools.files.max_read_chars),
+        ("tools.web.max_results", config.tools.web.max_results),
+        ("tools.web.max_content_chars", config.tools.web.max_content_chars),
+    ):
+        if value < 0:
+            problems.append(f"{label} cannot be negative (0 means: no limit)")
+    if config.llm.context_window <= 0:
+        problems.append("llm.context_window must be a positive number of tokens")
+    if config.llm.context_headroom >= config.llm.context_window:
+        problems.append(
+            "llm.context_headroom leaves no room for history; it must be smaller "
+            "than llm.context_window"
+        )
+    if config.llm.chars_per_token <= 0:
+        problems.append("llm.chars_per_token must be a positive number")
+    if config.tools.files.max_write_chars <= 0:
+        problems.append("tools.files.max_write_chars must be a positive number of characters")
     if config.telegram_token is None:
         problems.append("TELEGRAM_BOT_TOKEN is unset — the Telegram bot cannot start.")
     if config.bot.group_reply_mode.strip().lower() not in {"mention", "always", "off"}:

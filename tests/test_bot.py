@@ -478,6 +478,28 @@ async def test_status_command(config) -> None:
     assert "test-model" in body
 
 
+async def test_context_command_reports_the_window(config) -> None:
+    """A bot that forgets is hard to argue with, so what it is holding has to
+    be inspectable rather than a matter of trust."""
+    bot, _ = await send(config, [], "/context")
+    body = texts(bot)
+    assert "window" in body
+    assert "in use" in body
+    assert "condensed" in body
+    assert "transcript" in body
+
+
+async def test_context_shows_the_record_once_there_is_one(config) -> None:
+    history = History(config.history_dir)
+    history.append(CHAT, "user", "how do we deploy?")
+    history.append(CHAT, "assistant", "through the release script")
+    history.append(CHAT, "summary", "they work on a service called lumi and deploy it with a script")
+    bot, _ = await send(config, [], "/context")
+    body = texts(bot)
+    assert "condensed record" in body
+    assert "deploy it with a script" in body
+
+
 async def test_doctor_command_runs_checks(config) -> None:
     bot, _ = await send(config, [], "/doctor")
     body = texts(bot)
@@ -1802,9 +1824,9 @@ async def test_env_reports_unset_variables_honestly(config, monkeypatch) -> None
     monkeypatch.delenv("EXA_API_KEY", raising=False)
     bot, _ = await send(config, [], "/env")
     body = texts(bot)
-    assert "TAVILY_API_KEY` — unset" in body
+    assert "TAVILY_API_KEY</code> — unset" in body
     assert "keyless" in body  # unset tavily is normal, not an error
-    assert "EXA_API_KEY` — unset" in body
+    assert "EXA_API_KEY</code> — unset" in body
 
 
 async def test_env_lists_lumi_overrides(config, monkeypatch) -> None:

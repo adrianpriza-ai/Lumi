@@ -14,16 +14,29 @@ from datetime import UTC, datetime, timedelta
 
 from ....util.text import truncate
 
-#: Body-text floor for a hit when a search returns few results. The result's
-#: budget is shared between the hits, but with five or fewer — the default
-#: ``max_results`` — each hit gets at least this many characters of substance,
-#: so snippets are readable instead of teaser-sized. Total render size stays
-#: under the agent's ``for_model`` cap (8000 chars) in every case.
+#: Body-text floor for a hit when a search returns few results *and* a content
+#: cap is set: the budget is shared between the hits, but with five or fewer
+#: each gets at least this much body text, so snippets stay readable instead of
+#: teaser-sized. With no cap at all (``max_chars=0``) nothing is cut and this
+#: does not apply.
 PER_HIT_CONTENT_CHARS = 1400
 
 #: Hit count up to which the per-hit floor applies. Above this, sharing the
-#: budget evenly is the only way to keep the render bounded.
+#: budget evenly is the only way to keep a capped render bounded.
 PER_HIT_FLOOR_MAX_HITS = 5
+
+
+def _share(max_chars: int, hits: int) -> int:
+    """Characters of body text per hit.
+
+    Zero — the ``truncate`` no-op — when there is no cap to share out, which is
+    the default: a hit's body is the evidence the model is being asked to read,
+    and cutting it produces a search that has to be repeated.
+    """
+    if max_chars <= 0:
+        return 0
+    share = max_chars // max(hits, 1)
+    return max(PER_HIT_CONTENT_CHARS, share) if hits <= PER_HIT_FLOOR_MAX_HITS else share
 
 
 @dataclass(slots=True)
@@ -74,16 +87,7 @@ class SearchResult:
         if self.answer:
             lines += ["", "Summary:", self.answer]
         lines.append("")
-        # Share the budget out, with a floor for small result sets: a lone hit
-        # gets the whole cap, and up to five hits each get enough to be worth
-        # reading. Larger sets share evenly so the render cannot balloon past
-        # the tool-message cap.
-        share = max_chars // max(len(self.hits), 1)
-        per_hit = (
-            max(PER_HIT_CONTENT_CHARS, share)
-            if len(self.hits) <= PER_HIT_FLOOR_MAX_HITS
-            else share
-        )
+        per_hit = _share(max_chars, len(self.hits))
         for index, hit in enumerate(self.hits, start=1):
             lines.append(hit.render(index, per_hit))
             lines.append("")

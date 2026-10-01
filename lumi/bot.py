@@ -44,7 +44,14 @@ from .doctor import platform_line, run_checks
 from .memory import History, MemoryFile
 from .personality import Personality
 from .util.log import get_logger
-from .util.text import escape_markdown, format_error, split_message, truncate
+from .util.text import (
+    escape_html,
+    format_error,
+    markdown_code_to_html,
+    sanitize_html,
+    split_message,
+    truncate,
+)
 
 log = get_logger(__name__)
 
@@ -79,8 +86,13 @@ TRACE_TTL = 30 * 60.0
 #: Ceiling on stored traces, so a busy day cannot grow without bound.
 TRACE_CACHE_MAX = 64
 
+# All bot-authored strings are Telegram HTML: <b>…</b> for headers, <code>…</code>
+# around commands and paths, <i>…</i> for asides. HTML only reserves < > & —
+# and every dynamic value goes through escape_html/sanitize_html — so a path
+# with underscores or a model name with asterisks can never break a message the
+# way the legacy Markdown modes did.
 HELP_TEXT = """\
-*what i can do*
+<b>what i can do</b>
 just talk to me. i remember you between sessions, look things up on the web,
 read and write files in this project, and run shell commands.
 
@@ -89,31 +101,32 @@ send me a document and i'll read it — it lands in workspace/uploads/ and i can
 work with it from there. ask me to make a file and i'll send it back as one.
 
 if i'm running on a reasoning model i'll think first, then say a small grey line
-above my answer. tap *show thinking* if you want to see how i got there.
+above my answer. tap <i>show thinking</i> if you want to see how i got there.
 
-*slash commands*
-`/help` — this list
-`/ask <question>` — same as just typing
-`/run <command>` — run a shell command directly
-`/search <query>` — web search
-`/fetch <url>` — read a page
-`/reasoning` — reasoning setup, or `on`/`off` to show or hide traces
-`/memory` — show what i remember
-`/remember <fact>` — save a fact
-`/forget [n]` — drop the last n saved facts
-`/personality` — show the personality file
-`/tools` — list my tools
-`/status` — model, tools and provider health
-`/doctor` — diagnose the whole setup
-`/config` — the resolved configuration this process runs on (owner only)
-`/env` — which credentials are set, values masked (owner only)
-`/reload` — re-read personality, memory and config
-`/reset` — forget this conversation (keeps long-term memory)
-`/whitelist` — show whitelisted users and groups (owner only)
-`/whitelist_add_user <id>` — add a user to the whitelist (owner only)
-`/whitelist_remove_user <id>` — remove a user from the whitelist (owner only)
-`/whitelist_add_group <id>` — add a group to the whitelist (owner only)
-`/whitelist_remove_group <id>` — remove a group from the whitelist (owner only)
+<b>slash commands</b>
+<code>/help</code> — this list
+<code>/ask &lt;question&gt;</code> — same as just typing
+<code>/run &lt;command&gt;</code> — run a shell command directly
+<code>/search &lt;query&gt;</code> — web search
+<code>/fetch &lt;url&gt;</code> — read a page
+<code>/reasoning</code> — reasoning setup, or <code>on</code>/<code>off</code> to show or hide traces
+<code>/memory</code> — show what i remember
+<code>/remember &lt;fact&gt;</code> — save a fact
+<code>/forget [n]</code> — drop the last n saved facts
+<code>/personality</code> — show the personality file
+<code>/tools</code> — list my tools
+<code>/context</code> — what i'm holding in my context window right now
+<code>/status</code> — model, tools and provider health
+<code>/doctor</code> — diagnose the whole setup
+<code>/config</code> — the resolved configuration this process runs on (owner only)
+<code>/env</code> — which credentials are set, values masked (owner only)
+<code>/reload</code> — re-read personality, memory and config
+<code>/reset</code> — forget this conversation (keeps long-term memory)
+<code>/whitelist</code> — show whitelisted users and groups (owner only)
+<code>/whitelist_add_user &lt;id&gt;</code> — add a user to the whitelist (owner only)
+<code>/whitelist_remove_user &lt;id&gt;</code> — remove a user from the whitelist (owner only)
+<code>/whitelist_add_group &lt;id&gt;</code> — add a group to the whitelist (owner only)
+<code>/whitelist_remove_group &lt;id&gt;</code> — remove a group from the whitelist (owner only)
 
 dangerous commands ask for confirmation first. i can't delete that, on purpose.
 """
@@ -142,16 +155,16 @@ def _mask(value: str | None) -> str:
 def _render_env(config: Config) -> str:
     """The ``/env`` body: which credentials exist, masked, never in full."""
     lines = [
-        "*env* — credential status (masked)",
-        "_full values are never sent to this chat._",
+        "<b>env</b> — credential status (masked)",
+        "<i>full values are never sent to this chat.</i>",
         "",
     ]
 
     token = config.telegram_token
     lines.append(
-        f"`TELEGRAM_BOT_TOKEN` = `{_mask(token)}`"
+        f"<code>TELEGRAM_BOT_TOKEN</code> = <code>{_mask(token)}</code>"
         if token
-        else "`TELEGRAM_BOT_TOKEN` — unset (the bot cannot start)"
+        else "<code>TELEGRAM_BOT_TOKEN</code> — unset (the bot cannot start)"
     )
 
     # One line per key-bearing variable, in web tier order for the providers.
@@ -190,21 +203,24 @@ def _render_env(config: Config) -> str:
         ),
     )
     for name, keys, strategy, role in specs:
+        name = escape_html(name)
         if keys:
-            pool = f" ({len(keys)} keys, {strategy})" if len(keys) > 1 else ""
-            lines.append(f"`{name}` = `{_mask(keys[0])}`{pool} — {role}")
+            pool = f" ({len(keys)} keys, {escape_html(strategy)})" if len(keys) > 1 else ""
+            lines.append(f"<code>{name}</code> = <code>{_mask(keys[0])}</code>{pool} — {role}")
         else:
-            lines.append(f"`{name}` — unset — {role}")
+            lines.append(f"<code>{name}</code> — unset — {role}")
 
     overrides = sorted(key for key in os.environ if key.startswith("LUMI__"))
     if overrides:
-        lines += ["", "*LUMI__ overrides:*"]
+        lines += ["", "<b>LUMI__ overrides:</b>"]
         for name in overrides:
-            lines.append(f"- `{name}={truncate(os.environ[name], 60)}`")
+            lines.append(
+                f"- <code>{escape_html(name)}={escape_html(truncate(os.environ[name], 60))}</code>"
+            )
 
     lines += [
         "",
-        "_keys are read at startup: edit .env, then restart. `/reload` does not re-read credentials._",
+        "<i>keys are read at startup: edit .env, then restart. /reload does not re-read credentials.</i>",
     ]
     return "\n".join(lines)
 
@@ -222,43 +238,65 @@ def _render_config(config: Config) -> str:
     files = config.tools.files
     bot = config.bot
     temperature = "provider default" if llm.temperature is None else str(llm.temperature)
+    # Every one of these reports "provider default" or "no cap" at 0, because
+    # 0 is the state most of them ship in. Memory is the exception: 0 means the
+    # file is bounded by its share of the window rather than sent whole.
+    ceiling = f"{llm.max_tokens:,}" if llm.max_tokens > 0 else "provider default (no cap sent)"
+    memory_cap = (
+        f"{llm.max_memory_chars:,} chars"
+        if llm.max_memory_chars > 0
+        else f"{(llm.context_window - llm.context_headroom) // 8 * 3:,} chars (an eighth of the window)"
+    )
+    web_content = f"{web.max_content_chars:,} chars" if web.max_content_chars > 0 else "uncapped"
+    shell_output = f"{shell.max_output_chars:,} chars" if shell.max_output_chars > 0 else "uncapped"
     return "\n".join(
         [
-            "*config* — resolved, live",
+            "<b>config</b> — resolved, live",
             "",
-            "*model*",
-            f"- `{llm.model_of()}` via {llm.base_url_of()} (from {llm.where_from()})",
-            f"- temperature: {temperature} · max_tokens: {llm.max_tokens:,} · keys: {llm.strategy_of()}",
-            f"- reasoning: {'on at ' + (llm.effort_of() or 'provider default') if llm.reasoning else 'off'}"
+            "<b>model</b>",
+            f"- <code>{escape_html(llm.model_of())}</code> via {escape_html(llm.base_url_of())} (from {escape_html(llm.where_from())})"
+            + (
+                f"\n- vision: <code>{escape_html(llm.vision_model_of())}</code> for image turns"
+                if llm.vision_model_of()
+                else "\n- vision: unset — photos go to the default model"
+            ),
+            f"- temperature: {escape_html(temperature)} · max_tokens: {escape_html(ceiling)} · keys: {escape_html(llm.strategy_of())}",
+            f"- reasoning: {'on at ' + escape_html(llm.effort_of() or 'provider default') if llm.reasoning else 'off'}"
             f" · trace in chat: {'on' if llm.show_reasoning else 'off'}",
-            f"- agent: {llm.max_tool_iterations} tool iterations · {llm.history_turns} history turns"
-            f" · memory cap {llm.max_memory_chars:,} chars",
+            f"- context: {llm.context_window:,} token window, {llm.context_headroom:,} held back"
+            f" · keep {llm.context_keep_recent} recent"
+            f" · compaction {'on' if llm.compaction else 'off'}"
+            f" · {llm.max_conversations} chats in memory",
+            f"- agent: {llm.max_tool_iterations} tool iterations"
+            f" · history: {'as much as fits' if not llm.history_turns else f'at least {llm.history_turns} turns'}"
+            f" · memory {memory_cap}",
+            "",            f"<b>web</b> — {'enabled' if web.enabled else 'DISABLED'}",
+            f"- order: {' → '.join(escape_html(p) for p in web.provider_order)}",
+            f"- results: {web.max_results or 'unlimited'} per search · floor {web.min_results}",
+            f"- firecrawl: scrape top {web.firecrawl.auto_scrape_top_n} · {escape_html(web.firecrawl.key_strategy_of())}",
+            f"- exa: type {escape_html(web.exa.search_type)}"
+            + (f", category {escape_html(web.exa.category)}" if web.exa.category else ""),
+            f"- tavily: depth {escape_html(web.tavily.search_depth)}, topic {escape_html(web.tavily.topic)}",
+            f"- mcp: {escape_html(str(web.mcp.config_file))} · timeout {web.mcp.timeout_seconds}s",
+            f"- call timeout {web.timeout_seconds}s · page content {web_content}",
             "",
-            f"*web* — {'enabled' if web.enabled else 'DISABLED'}",
-            f"- order: {' → '.join(web.provider_order)}",
-            f"- firecrawl: scrape top {web.firecrawl.auto_scrape_top_n} · {web.firecrawl.key_strategy_of()}",
-            f"- exa: type {web.exa.search_type}"
-            + (f", category {web.exa.category}" if web.exa.category else ""),
-            f"- tavily: depth {web.tavily.search_depth}, topic {web.tavily.topic}",
-            f"- mcp: {web.mcp.config_file} · timeout {web.mcp.timeout_seconds}s",
-            f"- call timeout {web.timeout_seconds}s · content cap {web.max_content_chars:,} chars",
-            "",
-            f"*shell* — cwd {shell.cwd} · timeout {shell.timeout_seconds}s"
-            f" · output cap {shell.max_output_chars:,} chars",
+            f"<b>shell</b> — cwd {escape_html(str(shell.cwd))} · timeout {shell.timeout_seconds}s"
+            f" · output {shell_output}",
             f"- safety: {'asks before risky' if shell.ask_before_risky else 'hard block, no prompts'}"
-            f" · home: {shell.home} · writes: {', '.join(shell.writable) or 'whole project'}",
+            f" · home: {escape_html(str(shell.home))} · writes: {escape_html(', '.join(shell.writable)) or 'whole project'}",
             "",
-            "*files*",
-            f"- writable: {', '.join(files.writable) or 'none'}"
-            f" · read cap {files.max_read_chars:,} · write cap {files.max_write_chars:,}",
+            "<b>files</b>",
+            f"- writable: {escape_html(', '.join(files.writable)) or 'none'}"
+            f" · read {'no cap' if files.max_read_chars <= 0 else f'{files.max_read_chars:,}'}"
+            f" · write cap {files.max_write_chars:,}",
             "",
-            "*bot*",
-            f"- group mode: {bot.group_reply_mode} · whitelisted users: {len(bot.whitelisted_users)}"
+            "<b>bot</b>",
+            f"- group mode: {escape_html(bot.group_reply_mode)} · whitelisted users: {len(bot.whitelisted_users)}"
             f" · groups: {len(bot.whitelisted_groups)}",
             f"- file delivery: documents up to {bot.max_upload_mb} MB"
             f" · files tool: {'uploads on' if files.uploads else 'uploads off'}",
-            f"- logging: {config.logging.level} → {config.logging.file}",
-            f"- config file: {config.config_path or 'none (built-in defaults)'}",
+            f"- logging: {escape_html(config.logging.level)} → {escape_html(str(config.logging.file))}",
+            f"- config file: {escape_html(str(config.config_path)) if config.config_path else 'none (built-in defaults)'}",
         ]
     )
 
@@ -371,24 +409,33 @@ def _is_addressed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 
 async def reply(update: Update, text: str, **kwargs: Any) -> None:
-    """Send *text*, splitting it and degrading gracefully on bad markdown.
+    """Send *text*, splitting it and degrading gracefully on bad HTML.
 
-    The model writes Telegram-flavoured markdown, which is not valid in every
-    message (an unbalanced ``_`` is enough). Rather than sanitising its prose, try
-    the pretty version and fall back to plain text for the chunk that failed.
+    *text* is arbitrary — model prose, shell output, web results — so it goes
+    through :func:`sanitize_html` first: Telegram's formatting tags survive,
+    everything else (stray angle brackets, a bare ``&`` in ``R&D``) is escaped
+    into literal text. That is the whole reason the bot speaks HTML rather than
+    legacy Markdown: an underscore in a filename cannot fail the parse, and the
+    fallback below is paranoia rather than a load-bearing path.
     """
     message = update.effective_message
     if message is None or not text.strip():
         return
-    for chunk in split_message(text):
+    # Models are coached to write Telegram HTML, but they slip into Markdown
+    # code fences and spans out of habit. Bridge those to HTML first; the
+    # sanitizer then keeps Telegram's tags and escapes everything else, so the
+    # send cannot fail on stray angle brackets or a bare ampersand.
+    for chunk in split_message(markdown_code_to_html(text)):
         try:
             await message.reply_text(
-                chunk,
-                parse_mode=ParseMode.MARKDOWN,
+                sanitize_html(chunk),
+                parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
                 **kwargs,
             )
         except BadRequest:
+            # Unreachable when the text is sanitised, kept as a safety net:
+            # send it raw and, failing that, stripped of all markup.
             try:
                 await message.reply_text(chunk, disable_web_page_preview=True, **kwargs)
             except TelegramError as exc:
@@ -398,20 +445,25 @@ async def reply(update: Update, text: str, **kwargs: Any) -> None:
 
 
 async def reply_html(update: Update, text: str, **kwargs: Any) -> None:
-    """For our own UI strings, where the markdown is ours and therefore correct."""
+    """Send our own UI strings, where the HTML tags are ours and therefore exact.
+
+    Unlike :func:`reply` this does not sanitise — the markup was written by
+    hand — but the fallback still escapes everything, so a caller bug degrades
+    to a plain message instead of a silently dropped one.
+    """
     message = update.effective_message
     if message is None:
         return
     for chunk in split_message(text):
         try:
             await message.reply_text(
-                chunk, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True, **kwargs
+                chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True, **kwargs
             )
         except (BadRequest, TelegramError) as exc:
             log.warning("could not deliver a chunk: %s", exc)
             with contextlib.suppress(TelegramError):
                 await message.reply_text(
-                    escape_markdown(chunk), disable_web_page_preview=True, **kwargs
+                    escape_html(chunk), disable_web_page_preview=True, **kwargs
                 )
 
 
@@ -473,9 +525,9 @@ def approval_keyboard(action: PendingAction) -> InlineKeyboardMarkup:
 def render_approval(action: PendingAction) -> str:
     detail = truncate(action.preview, 1200, marker="\n…")
     return (
-        f"*needs your approval*\n"
-        f"`{action.tool}` — {action.reason}\n\n"
-        f"```\n{detail}\n```"
+        f"<b>needs your approval</b>\n"
+        f"<code>{escape_html(action.tool)}</code> — {escape_html(action.reason)}\n\n"
+        f"<pre>{escape_html(detail)}</pre>"
     )
 
 
@@ -543,7 +595,7 @@ def thinking_stub(result: TurnResult) -> str:
     if result.reasoning_tokens:
         parts.append(f"{result.reasoning_tokens:,} reasoning tokens")
     parts.append(f"{len(result.reasoning):,} chars")
-    return "_🧠 " + " · ".join(parts) + "_"
+    return "<i>🧠 " + " · ".join(parts) + "</i>"
 
 
 def thinking_keyboard(token: str) -> InlineKeyboardMarkup:
@@ -561,14 +613,14 @@ def thinking_keyboard_hide() -> InlineKeyboardMarkup:
 async def _edit_thinking(
     query: Any, text: str, *, keyboard: InlineKeyboardMarkup | None = None
 ) -> None:
-    """Replace the collapsed stub in place, degrading on bad markdown.
+    """Replace the collapsed stub in place, degrading on bad HTML.
 
-    Same contract as :func:`reply`: our own markdown first, plain text if the
+    Same contract as :func:`reply`: our own markup first, escaped text if the
     Bot API will not take it, and silence if even that fails — a failed edit
     must never surface as an error to someone who just wanted to read a reply.
     """
     for kwargs in (
-        {"parse_mode": ParseMode.MARKDOWN, "reply_markup": keyboard},
+        {"parse_mode": ParseMode.HTML, "reply_markup": keyboard},
         {"reply_markup": keyboard},
     ):
         try:
@@ -579,17 +631,19 @@ async def _edit_thinking(
         except TelegramError as exc:
             log.warning("could not edit the thinking message: %s", exc)
             return
-    log.warning("the thinking message was rejected as markdown and as plain text")
+    log.warning("the thinking message was rejected as HTML and as plain text")
 
 
 def render_thinking(trace: str) -> str:
-    """The expanded trace, fenced so its shape survives markdown.
+    """The expanded trace, wrapped in ``<pre>`` so its shape survives.
 
-    Truncated to what one message can hold: an expanded trace is a curiosity,
-    and a 40,000-character wall is not, so the rest is dropped rather than
-    split across a dozen messages nobody asked for.
+    The trace is model output, so it is escaped before wrapping: a stray ``<``
+    in a thought must become visible text, not a parse error or a swallowed
+    tag. Truncated to what one message can hold — an expanded trace is a
+    curiosity, and a 40,000-character wall is not, so the rest is dropped
+    rather than split across a dozen messages nobody asked for.
     """
-    return f"🧠 *thinking*\n\n```\n{truncate(trace.strip(), 3600)}\n```"
+    return f"🧠 <b>thinking</b>\n\n<pre>{escape_html(truncate(trace.strip(), 3600))}</pre>"
 
 
 # --------------------------------------------------------------------------- #
@@ -623,8 +677,8 @@ async def send_artifact(update: Update, artifact: Artifact) -> None:
         log.warning("could not send artifact %s: %s", artifact.path, exc)
         await reply(
             update,
-            f"📎 couldn't attach {artifact.path} ({artifact.size} bytes) — "
-            f"it's on disk at `{artifact.path}`",
+            f"📎 couldn't attach {escape_html(artifact.path)} ({artifact.size} bytes) — "
+            f"it's on disk at <code>{escape_html(artifact.path)}</code>",
         )
 
 
@@ -638,7 +692,7 @@ async def deliver(
 ) -> None:
     """Turn an agent result into messages, documents included."""
     if result.error and not result.text:
-        await reply(update, f"that didn't work: {result.error}")
+        await reply(update, f"that didn't work: {escape_html(result.error)}")
         # A crashed turn can still have staged files (e.g. the model wrote with
         # upload: true and a later iteration hit the cap). Deliver what exists.
         for artifact in result.artifacts:
@@ -664,9 +718,11 @@ async def deliver(
         await reply_html(update, render_approval(action), reply_markup=approval_keyboard(action))
 
     if result.error and result.text:
-        note = f"_note: {result.error}_"
+        note = f"<i>note: {escape_html(result.error)}</i>"
         if result.tools_used:
-            note += f"\n_tools used: {', '.join(dict.fromkeys(result.tools_used))}_"
+            note += (
+                f"\n<i>tools used: {escape_html(', '.join(dict.fromkeys(result.tools_used)))}</i>"
+            )
         await reply(update, note)
 
 
@@ -766,19 +822,24 @@ def build_handlers(config: Config) -> list[Any]:
         store: ArtifactStore = context.application.bot_data["artifacts"]
         return store
 
+    def history_of(context: ContextTypes.DEFAULT_TYPE) -> History:
+        """The transcript store, for ``/context``."""
+        store: History = context.application.bot_data["history"]
+        return store
+
     # -- basic commands ---------------------------------------------------- #
 
     async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await authorised(update):
             return
         user = update.effective_user
-        name = user.first_name if user else "there"
+        name = escape_html(user.first_name) if user else "there"
         log.info("start from %s (%s)", name, user and user.id)
         await reply(
             update,
             f"hey {name}. i'm up.\n\n{HELP_TEXT}\n\n"
-            f"model: `{config.llm.model_of()}` via {config.llm.base_url_of()}\n"
-            f"tools: {', '.join(agent_of(context).registry.names()) or 'none'}",
+            f"model: <code>{escape_html(config.llm.model_of())}</code> via {escape_html(config.llm.base_url_of())}\n"
+            f"tools: {escape_html(', '.join(agent_of(context).registry.names()) or 'none')}",
         )
 
     async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -791,7 +852,7 @@ def build_handlers(config: Config) -> list[Any]:
             return
         text = " ".join(context.args).strip() if context.args else ""
         if not text:
-            await reply(update, "usage: `/ask <question>`")
+            await reply(update, "usage: <code>/ask &lt;question&gt;</code>")
             return
         await run_agent(update, context, text)
 
@@ -802,7 +863,10 @@ def build_handlers(config: Config) -> list[Any]:
             return
         command = " ".join(context.args).strip() if context.args else ""
         if not command:
-            await reply(update, "usage: `/run <command>`\ne.g. `/run git status --short`")
+            await reply(
+                update,
+                "usage: <code>/run &lt;command&gt;</code>\ne.g. <code>/run git status --short</code>",
+            )
             return
         await run_tool(update, context, "run_shell", {"command": command})
 
@@ -811,7 +875,7 @@ def build_handlers(config: Config) -> list[Any]:
             return
         query = " ".join(context.args).strip() if context.args else ""
         if not query:
-            await reply(update, "usage: `/search <query>`")
+            await reply(update, "usage: <code>/search &lt;query&gt;</code>")
             return
         await run_tool(update, context, "web", {"action": "search", "query": query})
 
@@ -820,7 +884,7 @@ def build_handlers(config: Config) -> list[Any]:
             return
         url = " ".join(context.args).strip() if context.args else ""
         if not url:
-            await reply(update, "usage: `/fetch <url>`")
+            await reply(update, "usage: <code>/fetch &lt;url&gt;</code>")
             return
         await run_tool(update, context, "web", {"action": "fetch", "url": url})
 
@@ -832,13 +896,29 @@ def build_handlers(config: Config) -> list[Any]:
         memory: MemoryFile = context.application.bot_data["memory"]
         memory.ensure_loaded()
         stats = memory.stats()
-        body = memory.for_prompt(limit=3000)
-        await reply(
-            update,
-            f"*memory* — {stats['managed_count']} saved fact(s), {stats['chars']} chars\n"
-            f"`{stats['path']}`\n\n{truncate(body, 3000)}\n\n"
-            f"add one with `/remember <fact>`, drop the newest with `/forget`.",
-        )
+        # The chat view is a window onto the file, so it shows what the model
+        # actually gets — including the part that did not fit, which is the one
+        # worth knowing about.
+        limit = agent_of(context).memory_limit()
+        size = memory.prompt_size(limit)
+        body = memory.for_prompt(limit)
+        lines = [
+            f"<b>memory</b> — {stats['managed_count']} saved fact(s), {stats['chars']} chars",
+            f"<code>{escape_html(stats['path'])}</code>",
+        ]
+        if size["over"]:
+            lines.append(
+                f"showing {size['sent_chars']:,} of {size['chars']:,} chars "
+                f"(budget {limit:,}); the oldest {size['dropped']} fact(s) are on disk "
+                f"but not being sent — raise <code>llm.max_memory_chars</code>"
+            )
+        lines += [
+            "",
+            sanitize_html(body),
+            "",
+            "add one with <code>/remember &lt;fact&gt;</code>, drop the newest with <code>/forget</code>.",
+        ]
+        await reply(update, "\n".join(lines))
 
     async def remember_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await authorised(update):
@@ -858,14 +938,16 @@ def build_handlers(config: Config) -> list[Any]:
             try:
                 count = max(1, int(context.args[0]))
             except ValueError:
-                await reply(update, "usage: `/forget [count]` — count has to be a number")
+                await reply(
+                    update, "usage: <code>/forget [count]</code> — count has to be a number"
+                )
                 return
         memory: MemoryFile = context.application.bot_data["memory"]
         removed = memory.forget(count)
         if not removed:
             await reply(update, "nothing to forget — there are no saved facts.")
             return
-        listed = "\n".join(f"- {item}" for item in removed)
+        listed = "\n".join(f"- {escape_html(item)}" for item in removed)
         await reply(update, f"forgot {len(removed)}:\n{listed}")
 
     # -- introspection ----------------------------------------------------- #
@@ -874,13 +956,17 @@ def build_handlers(config: Config) -> list[Any]:
         if not await authorised(update):
             return
         personality: Personality = context.application.bot_data["personality"]
-        await reply(update, f"*PERSONALITY.md* — {len(personality.text)} chars\n\n" + personality.text)
+        await reply(
+            update,
+            f"<b>PERSONALITY.md</b> — {len(personality.text)} chars\n\n"
+            + sanitize_html(personality.text),
+        )
 
     async def tools_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await authorised(update):
             return
         registry = agent_of(context).registry
-        await reply(update, f"*tools*\n\n{registry.describe()}")
+        await reply(update, f"<b>tools</b>\n\n{registry.describe(html=True)}")
 
     async def reasoning_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Report the reasoning setup, and toggle the visible trace.
@@ -899,20 +985,54 @@ def build_handlers(config: Config) -> list[Any]:
             llm.show_reasoning = argument == "on"
             log.info("thinking traces turned %s by chat %s", argument, chat_of(update))
         elif argument:
-            await reply(update, "usage: `/reasoning` or `/reasoning on|off`")
+            await reply(update, "usage: <code>/reasoning</code> or <code>/reasoning on|off</code>")
             return
 
         effort = llm.effort_of() or "provider default"
+        budget = (
+            f"{llm.reasoning_tokens:,} tokens on top of {llm.max_tokens:,}"
+            if llm.max_tokens > 0
+            else "none — no output ceiling is sent, the provider decides"
+        )
         await reply(
             update,
-            "*reasoning*\n"
+            "<b>reasoning</b>\n"
             f"model mode: {'on' if llm.reasoning else 'off'}\n"
-            f"effort: {effort}\n"
-            f"thinking budget: {llm.reasoning_tokens:,} tokens on top of "
-            f"{llm.max_tokens:,}\n"
+            f"effort: {escape_html(effort)}\n"
+            f"thinking budget: {escape_html(budget)}\n"
             f"temperature: {'omitted' if llm.reasoning and llm.temperature is not None else llm.temperature}\n"
             f"trace in chat: {'on' if llm.show_reasoning else 'off'}",
         )
+
+    async def context_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """What the model is actually holding for this chat right now.
+
+        A bot that forgets is hard to argue with, so the state behind that is
+        inspectable: the window, the budget, how much of it is in use, and what
+        has been condensed to make room. The record itself is quoted when there
+        is one, because that text is now the only version of the old
+        conversation the model has.
+        """
+        if not await authorised(update):
+            return
+        agent = agent_of(context)
+        chat_id = chat_of(update)
+        report = agent.context_report(chat_id)
+        lines = ["<b>context</b>", *report.lines()]
+
+        conv = agent.conversation_state(chat_id)
+        if conv is not None and conv.summary:
+            lines += ["", "<b>condensed record</b>", sanitize_html(conv.summary)]
+        transcript = history_of(context).stats(chat_id)
+        lines += [
+            "",
+            f"transcript: {truncate(str(transcript['path']), 60, '…')}"
+            f" · {transcript['bytes']:,} bytes"
+            + (" (replay reads the tail only)" if transcript["truncated"] else ""),
+            f"in memory: {agent.conversations_in_memory()} chat(s),"
+            f" each bounded by its {report.window:,}-token window",
+        ]
+        await reply(update, "\n".join(lines))
 
     async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await authorised(update):
@@ -920,25 +1040,32 @@ def build_handlers(config: Config) -> list[Any]:
         agent = agent_of(context)
         uptime = time.monotonic() - STARTED
         lines = [
-            "*status*",
+            "<b>status</b>",
             f"uptime: {uptime:.0f}s",
-            f"model: `{config.llm.model_of()}`",
-            f"endpoint: {config.llm.base_url_of()} (from {config.llm.where_from()})",
+            f"model: <code>{escape_html(config.llm.model_of())}</code>",
+        ]
+        vision = config.llm.vision_model_of()
+        if vision:
+            lines.append(
+                f"vision model: <code>{escape_html(vision)}</code> (for photos)"
+            )
+        lines += [
+            f"endpoint: {escape_html(config.llm.base_url_of())} (from {escape_html(config.llm.where_from())})",
             f"reasoning: {'on' if config.llm.reasoning else 'off'}"
-            + (f" at {config.llm.effort_of()}" if config.llm.reasoning else ""),
-            f"tools: {', '.join(agent.registry.names()) or 'none'}",
+            + (f" at {escape_html(config.llm.effort_of())}" if config.llm.reasoning else ""),
+            f"tools: {escape_html(', '.join(agent.registry.names())) or 'none'}",
         ]
         for tool in agent.registry.all():
             ok, reason = tool.available()
             if not ok:
-                lines.append(f"- `{tool.name}`: {reason}")
+                lines.append(f"- <code>{tool.name}</code>: {escape_html(reason)}")
         await reply(update, "\n".join(lines))
 
     async def doctor_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await authorised(update):
             return
         checks = run_checks(config, agent_of(context).registry)
-        await reply(update, "*doctor*\n" + "\n".join(check.render() for check in checks))
+        await reply(update, "<b>doctor</b>\n" + sanitize_html("\n".join(check.render() for check in checks)))
 
     async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Owner-only view of the resolved configuration.
@@ -1010,22 +1137,22 @@ def build_handlers(config: Config) -> list[Any]:
         if user is None or not _is_owner(user, config):
             await reply(update, NOT_OWNER)
             return
-        lines = ["*whitelist*"]
-        lines.append(f"owner: `{config.owner_id}`")
+        lines = ["<b>whitelist</b>"]
+        lines.append(f"owner: <code>{config.owner_id}</code>")
         lines.append("")
-        lines.append("*whitelisted users:*")
+        lines.append("<b>whitelisted users:</b>")
         if config.bot.whitelisted_users:
             for uid in config.bot.whitelisted_users:
-                lines.append(f"- `{uid}`")
+                lines.append(f"- <code>{escape_html(uid)}</code>")
         else:
-            lines.append("- _(none)_")
+            lines.append("- <i>(none)</i>")
         lines.append("")
-        lines.append("*whitelisted groups:*")
+        lines.append("<b>whitelisted groups:</b>")
         if config.bot.whitelisted_groups:
             for gid in config.bot.whitelisted_groups:
-                lines.append(f"- `{gid}`")
+                lines.append(f"- <code>{escape_html(gid)}</code>")
         else:
-            lines.append("- _(none)_")
+            lines.append("- <i>(none)</i>")
         await reply(update, "\n".join(lines))
 
     async def whitelist_add_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1036,20 +1163,20 @@ def build_handlers(config: Config) -> list[Any]:
             await reply(update, NOT_OWNER)
             return
         if not context.args:
-            await reply(update, "usage: `/whitelist_add_user <id>`")
+            await reply(update, "usage: <code>/whitelist_add_user &lt;id&gt;</code>")
             return
         new_id = context.args[0].strip()
         try:
             int(new_id)
         except ValueError:
-            await reply(update, f"`{new_id}` is not a valid id")
+            await reply(update, f"<code>{escape_html(new_id)}</code> is not a valid id")
             return
         if new_id not in config.bot.whitelisted_users:
             config.bot.whitelisted_users.append(new_id)
             _save_whitelist(config)
-            await reply(update, f"added `{new_id}` to the user whitelist.")
+            await reply(update, f"added <code>{escape_html(new_id)}</code> to the user whitelist.")
         else:
-            await reply(update, f"`{new_id}` is already whitelisted.")
+            await reply(update, f"<code>{escape_html(new_id)}</code> is already whitelisted.")
 
     async def whitelist_remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await authorised(update):
@@ -1059,15 +1186,15 @@ def build_handlers(config: Config) -> list[Any]:
             await reply(update, NOT_OWNER)
             return
         if not context.args:
-            await reply(update, "usage: `/whitelist_remove_user <id>`")
+            await reply(update, "usage: <code>/whitelist_remove_user &lt;id&gt;</code>")
             return
         remove_id = context.args[0].strip()
         if remove_id in config.bot.whitelisted_users:
             config.bot.whitelisted_users.remove(remove_id)
             _save_whitelist(config)
-            await reply(update, f"removed `{remove_id}` from the user whitelist.")
+            await reply(update, f"removed <code>{escape_html(remove_id)}</code> from the user whitelist.")
         else:
-            await reply(update, f"`{remove_id}` is not in the user whitelist.")
+            await reply(update, f"<code>{escape_html(remove_id)}</code> is not in the user whitelist.")
 
     async def whitelist_add_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await authorised(update):
@@ -1077,20 +1204,20 @@ def build_handlers(config: Config) -> list[Any]:
             await reply(update, NOT_OWNER)
             return
         if not context.args:
-            await reply(update, "usage: `/whitelist_add_group <id>`")
+            await reply(update, "usage: <code>/whitelist_add_group &lt;id&gt;</code>")
             return
         new_id = context.args[0].strip()
         try:
             int(new_id)
         except ValueError:
-            await reply(update, f"`{new_id}` is not a valid id")
+            await reply(update, f"<code>{escape_html(new_id)}</code> is not a valid id")
             return
         if new_id not in config.bot.whitelisted_groups:
             config.bot.whitelisted_groups.append(new_id)
             _save_whitelist(config)
-            await reply(update, f"added `{new_id}` to the group whitelist.")
+            await reply(update, f"added <code>{escape_html(new_id)}</code> to the group whitelist.")
         else:
-            await reply(update, f"`{new_id}` is already whitelisted.")
+            await reply(update, f"<code>{escape_html(new_id)}</code> is already whitelisted.")
 
     async def whitelist_remove_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await authorised(update):
@@ -1100,15 +1227,15 @@ def build_handlers(config: Config) -> list[Any]:
             await reply(update, NOT_OWNER)
             return
         if not context.args:
-            await reply(update, "usage: `/whitelist_remove_group <id>`")
+            await reply(update, "usage: <code>/whitelist_remove_group &lt;id&gt;</code>")
             return
         remove_id = context.args[0].strip()
         if remove_id in config.bot.whitelisted_groups:
             config.bot.whitelisted_groups.remove(remove_id)
             _save_whitelist(config)
-            await reply(update, f"removed `{remove_id}` from the group whitelist.")
+            await reply(update, f"removed <code>{escape_html(remove_id)}</code> from the group whitelist.")
         else:
-            await reply(update, f"`{remove_id}` is not in the group whitelist.")
+            await reply(update, f"<code>{escape_html(remove_id)}</code> is not in the group whitelist.")
 
     async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -1197,7 +1324,7 @@ def build_handlers(config: Config) -> list[Any]:
         try:
             artifact = store.ingest(bytes(buffer), name, chat_id, config.root)
         except ArtifactError as exc:
-            await reply(update, f"i can't take that file: {exc}")
+            await reply(update, f"i can't take that file: {escape_html(str(exc))}")
             return
         except OSError as exc:
             log.warning("could not store document %s: %s", name, exc)
@@ -1205,7 +1332,7 @@ def build_handlers(config: Config) -> list[Any]:
             return
 
         log.info("document %s (%d bytes) stored for chat %s", artifact.path, artifact.size, chat_id)
-        await reply(update, f"📎 saved {artifact.path} ({artifact.size:,} bytes)")
+        await reply(update, f"📎 saved <code>{escape_html(artifact.path)}</code> ({artifact.size:,} bytes)")
 
         caption = (message.caption or "").strip()
         prompt = (
@@ -1254,7 +1381,7 @@ def build_handlers(config: Config) -> list[Any]:
         # context.args is None when a command was sent with no arguments, so the
         # name has to come from the text itself.
         command = text.split(maxsplit=1)[0] if text.strip() else "that"
-        await reply(update, f"i don't know `{command}`. try /help for what i can do.")
+        await reply(update, f"i don't know <code>{escape_html(command)}</code>. try /help for what i can do.")
 
     async def on_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Anyone who is not the owner gets one clear sentence and nothing else.
@@ -1317,7 +1444,7 @@ def build_handlers(config: Config) -> list[Any]:
             # No token needed: collapsing does not read the trace, so it works
             # even after the store has forgotten it.
             await query.answer("hidden")
-            await _edit_thinking(query, "_thinking hidden_")
+            await _edit_thinking(query, "<i>thinking hidden</i>")
             return
 
         if action != "show" or not token:
@@ -1355,7 +1482,7 @@ def build_handlers(config: Config) -> list[Any]:
         if update.callback_query is not None:
             with contextlib.suppress(BadRequest, TelegramError):
                 await update.callback_query.edit_message_text(
-                    f"{verb}…", parse_mode=ParseMode.MARKDOWN
+                    f"{verb}…", parse_mode=ParseMode.HTML
                 )
 
         async with _Typing(context.bot, chat_id):
@@ -1416,6 +1543,7 @@ def build_handlers(config: Config) -> list[Any]:
         CommandHandler("personality", gated(personality_command), filters=owner_filter),
         CommandHandler("tools", gated(tools_command), filters=owner_filter),
         CommandHandler("reasoning", gated(reasoning_command), filters=owner_filter),
+        CommandHandler("context", gated(context_command), filters=owner_filter),
         CommandHandler("status", gated(status_command), filters=owner_filter),
         CommandHandler("doctor", gated(doctor_command), filters=owner_filter),
         # Owner only, checked inside each handler on top of the filter: these

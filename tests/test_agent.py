@@ -19,7 +19,29 @@ from lumi.tools import build_registry
 CHAT = 1234
 
 
-def make_agent(config, replies) -> Agent:
+class CondensingLLM(FakeLLM):
+    """Answers normally, and plays along when asked to condense a conversation.
+
+    Distinguishing the two by the request rather than by call order is what
+    keeps the context tests readable: a compaction happens whenever the window
+    fills, which is not something a test should have to count.
+    """
+
+    def __init__(self, answer: str = "answer") -> None:
+        super().__init__([])
+        self.answer = answer
+        self.condensed = 0
+
+    async def complete(self, messages, *, tools=None):
+        self.calls.append([dict(m) for m in messages])
+        first = str((messages[0] if messages else {}).get("content", ""))
+        if "condensing the earlier part" in first:
+            self.condensed += 1
+            return make_reply(f"record {self.condensed}: questions up to {self.condensed} were settled")
+        return make_reply(self.answer)
+
+
+def make_agent(config, replies, llm=None) -> Agent:
     memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
     memory.load()
     return Agent(
@@ -28,7 +50,7 @@ def make_agent(config, replies) -> Agent:
         memory=memory,
         history=History(config.history_dir),
         registry=build_registry(config, memory),
-        llm=FakeLLM(replies),
+        llm=llm if llm is not None else FakeLLM(replies),
     )
 
 
@@ -56,6 +78,17 @@ async def test_system_prompt_carries_personality_and_memory(config) -> None:
     assert "You are Lumi" in system["content"]  # PERSONALITY.md
     assert "lumi:managed" in system["content"]  # MEMORY.md
     assert "run_shell" in system["content"]  # tool list
+
+
+async def test_system_prompt_teaches_telegram_html(config) -> None:
+    """The formatting section must pin the model to HTML and away from Markdown."""
+    agent = make_agent(config, [make_reply("ok")])
+    await agent.handle(CHAT, "hi")
+
+    content = agent.llm.calls[0][0]["content"]
+    assert "## Formatting" in content
+    assert "<b>like this</b>" in content
+    assert "Never use backticks" in content
 
 
 async def test_system_prompt_hides_tools_without_a_key(config, monkeypatch) -> None:
@@ -103,9 +136,10 @@ async def test_turn_is_written_to_history(config) -> None:
     agent = make_agent(config, [make_reply("remembered this")])
     await agent.handle(CHAT, "hello")
 
-    dialogue = History(config.history_dir).recent_dialogue(CHAT, 10)
-    assert {"role": "user", "content": "hello"} in dialogue
-    assert {"role": "assistant", "content": "remembered this"} in dialogue
+    dialogue = History(config.history_dir).recent_dialogue(CHAT)
+    assert [d["role"] for d in dialogue.messages] == ["user", "assistant"]
+    assert {"role": "user", "content": "hello"} in dialogue.messages
+    assert {"role": "assistant", "content": "remembered this"} in dialogue.messages
 
 
 async def test_llm_error_is_reported_not_raised(config) -> None:
@@ -521,17 +555,101 @@ async def test_conversations_are_per_chat(config) -> None:
     assert agent.conversation(1) is not agent.conversation(2)
 
 
-async def test_message_trimming_keeps_a_user_boundary(config, monkeypatch) -> None:
-    import lumi.agent as agent_module
+async def test_a_long_conversation_is_condensed_not_forgotten(config) -> None:
+    """A conversation that outgrows its window keeps its past as a record.
 
-    monkeypatch.setattr(agent_module, "MAX_MESSAGES", 6)
-    agent = make_agent(config, [make_reply(f"reply {i}") for i in range(8)])
+    The old failure mode was a message count: past 60 messages the oldest
+    prefix was deleted, and the model was later asked about something it had
+    never seen. Here the window is tiny, and what survives is the record plus
+    the recent turns verbatim.
+    """
+    config.llm.context_window = 4_000
+    config.llm.context_headroom = 400
+    config.llm.context_keep_recent = 4
+    config.llm.max_tool_iterations = 1
+
+    agent = make_agent(config, [], llm=CondensingLLM("answer"))
+
     for i in range(8):
+        await agent.handle(CHAT, f"question {i} " + "detail " * 300)
+
+    conv = agent.conversation(CHAT)
+    assert agent.llm.condensed > 0, "the window filled, so something had to be condensed"
+    assert conv.summary, "the past should survive as a record, not vanish"
+    assert conv.summarised > 0
+    assert agent.context.estimate(conv.messages) <= agent.context.budget
+    # The newest turn is still there verbatim — that is the one being answered.
+    assert any("question 7 " in str(m.get("content", "")) for m in conv.messages)
+    # And the record survived on disk, so a restart inherits it too.
+    assert any(t.role == "summary" for t in History(config.history_dir).tail(CHAT))
+
+
+async def test_the_window_is_not_managed_by_message_count(config) -> None:
+    """Fifty short messages must not be trimmed: there was room for all of them."""
+    config.llm.max_tool_iterations = 1
+    agent = make_agent(config, [make_reply(f"reply {i}") for i in range(25)])
+    for i in range(25):
         await agent.handle(CHAT, f"message {i}")
 
-    messages = agent.conversation(CHAT).messages
-    assert len(messages) <= 8
-    assert messages[0]["role"] in {"system", "user"}
+    conv = agent.conversation(CHAT)
+    assert len(conv.messages) >= 25
+    assert conv.dropped == 0
+    assert conv.summary == ""
+
+
+async def test_a_restart_replays_the_record_and_the_turns_after_it(config) -> None:
+    """A condensed record is written to the transcript, so a fresh process
+    resumes the thread instead of starting the conversation over."""
+    config.llm.context_window = 4_000
+    config.llm.context_headroom = 400
+    config.llm.context_keep_recent = 4
+    config.llm.max_tool_iterations = 1
+    agent = make_agent(config, [], llm=CondensingLLM("answer"))
+    for i in range(8):
+        await agent.handle(CHAT, f"question {i} " + "detail " * 300)
+    record = agent.conversation(CHAT).summary
+    assert record
+
+    # A new agent over the same transcript: what /reset does, without the delete.
+    restarted = make_agent(config, [make_reply("welcome back")])
+    await restarted.handle(CHAT, "what were we doing?")
+    sent = restarted.llm.calls[0]
+    assert any("condensed record" in str(m.get("content", "")) for m in sent)
+    assert any("what were we doing?" in str(m.get("content", "")) for m in sent)
+
+
+async def test_a_tool_pair_is_never_split(config) -> None:
+    """Compaction moves an assistant's tool calls with their results, or the
+    next request is a 400 rather than a shorter conversation."""
+    from lumi.context import blocks
+
+    config.llm.context_window = 2_000
+    config.llm.context_headroom = 200
+    config.llm.context_keep_recent = 2
+    config.llm.max_tool_iterations = 1
+    agent = make_agent(config, [], llm=CondensingLLM("answer"))
+    for i in range(8):
+        await agent.handle(CHAT, f"question {i} " + "detail " * 200)
+
+    conv = agent.conversation(CHAT)
+    for group in blocks(conv.messages):
+        if group[0].get("role") == "assistant" and group[0].get("tool_calls"):
+            assert [m["role"] for m in group[1:]] == ["tool"]
+
+
+async def test_memory_of_chats_in_is_bounded(config) -> None:
+    """Each conversation is capped by the window, so the number of chats is what
+    decides how much the process holds — and an evicted one replays from disk."""
+    config.llm.max_conversations = 3
+    config.llm.max_tool_iterations = 1
+    agent = make_agent(config, [make_reply(f"reply {i}") for i in range(20)])
+    for chat_id in range(1, 6):
+        await agent.handle(chat_id, f"hello from {chat_id}")
+        await agent.handle(chat_id, f"and again from {chat_id}")
+
+    assert agent.conversations_in_memory() <= 4  # the live one plus the cap
+    # The most recent chat is never the one evicted.
+    assert agent.conversation_state(5) is not None
 
 
 def test_disabled_tools_are_not_registered(config) -> None:

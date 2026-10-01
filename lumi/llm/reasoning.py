@@ -115,8 +115,13 @@ def completion_ceiling(max_tokens: int, reasoning_tokens: int) -> int:
 
     Reasoning tokens come out of the same budget as the answer, so a limit set
     for a non-reasoning model silently truncates the *answer* rather than the
-    thinking when a trace is long. Negative values are floored at zero rather
-    than propagated, because a negative ceiling is rejected by every provider.
+    thinking when a trace is long.
+
+    Returns 0 — "send no ceiling at all" — when both values are unset, which is
+    the default. The provider's own output limit is a better answer than a
+    number picked here, and adding headroom to nothing is still nothing.
+    Negative values are floored at zero rather than propagated, because a
+    negative ceiling is rejected by every provider.
     """
     return max(0, max_tokens) + max(0, reasoning_tokens)
 
@@ -136,10 +141,62 @@ def rejects_param(exc: BaseException) -> bool:
     return any(hint in message for hint in _PARAM_REJECTION_HINTS)
 
 
+#: How each of the providers we meet phrases "your prompt did not fit". Every one
+#: of them also names the model's real limit, which is the useful part.
+_CONTEXT_OVERFLOW_HINTS = (
+    "prompt is too long",
+    "maximum context length",
+    "context_length_exceeded",
+    "context window",
+    "too many tokens",
+    "reduce the length of the messages",
+    "input is too long",
+)
+
+#: The limit is always quoted just after one of these, never before: the number
+#: in front of them is the length of what you sent, which is the problem rather
+#: than the answer. Parenthesis and prose both appear ("maximum context length:
+#: 262144", "maximum output tokens (65536)"), so the gap is allowed to be
+#: anything that is not a digit.
+_QUOTED_LIMIT_RE = re.compile(
+    r"(?:max(?:imum)?[\s_-]*(?:context|output|input)[\s_-]*(?:length|tokens?|size)?"
+    r"|context[\s_-]*(?:length|window))"
+    r"[^0-9]{0,24}([0-9][0-9_]{2,})",
+    re.IGNORECASE,
+)
+
+
+def is_context_overflow(exc: BaseException) -> bool:
+    """Whether *exc* means the request outgrew the model's context window.
+
+    Worth telling apart from every other 400, because this one has an exact
+    fix — the number the provider just printed — and because the failure is
+    otherwise invisible until it happens: nothing in the conversation looks
+    wrong, the model simply starts refusing.
+    """
+    message = str(exc).lower()
+    return any(hint in message for hint in _CONTEXT_OVERFLOW_HINTS)
+
+
+def reported_context_limit(exc: BaseException) -> int:
+    """The limit *exc* quoted, in tokens, or 0 when it did not quote one.
+
+    Read from the number that follows the phrase naming it, not the first number
+    in the message: an overflow error usually leads with how long your prompt
+    was, and that number is the thing that went wrong, not the ceiling. Only a
+    phrase that actually names a limit counts, so a message that merely says
+    "too many tokens" reports nothing rather than a number that is not a limit.
+    """
+    match = _QUOTED_LIMIT_RE.search(str(exc))
+    return int(match.group(1).replace("_", "")) if match else 0
+
+
 __all__ = [
     "TRACE_FIELDS",
     "completion_ceiling",
+    "is_context_overflow",
     "rejects_param",
+    "reported_context_limit",
     "split_think",
     "trace_of",
 ]

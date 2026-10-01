@@ -30,6 +30,7 @@ from lumi.tools.web.providers.mcp_provider import (
     _parse_search_payload,
     expand_env,
 )
+from lumi.tools.web.tool import MAX_RESULTS
 
 
 class StubProvider(WebProvider):
@@ -86,7 +87,7 @@ async def test_uses_the_first_available_provider(config) -> None:
     assert result.ok
     assert "firecrawl" in result.text
     assert first.search_calls == []
-    assert second.search_calls == [("hi", 4, None)]
+    assert second.search_calls == [("hi", 10, None)]
 
 
 async def test_falls_through_when_a_provider_raises(config) -> None:
@@ -122,11 +123,37 @@ async def test_all_providers_failing_is_reported_to_the_model(config) -> None:
     assert "could not verify" in result.text  # tells the model how to behave
 
 
-async def test_max_results_is_clamped(config) -> None:
+async def test_max_results_is_honoured(config) -> None:
+    """A search should come back with enough to answer from, so the model's ask
+    is used rather than quietly cut to a number we invented."""
     provider = StubProvider("tavily")
     tool = make_tool(config, provider)
-    await tool.invoke({"action": "search", "query": "hi", "max_results": 999}, None)
-    assert provider.search_calls == [("hi", 20, None)]
+    await tool.invoke({"action": "search", "query": "hi", "max_results": 25}, None)
+    assert provider.search_calls == [("hi", 25, None)]
+
+
+async def test_max_results_is_guarded_not_capped(config) -> None:
+    provider = StubProvider("tavily")
+    tool = make_tool(config, provider)
+    await tool.invoke({"action": "search", "query": "hi", "max_results": 10_000}, None)
+    assert provider.search_calls == [("hi", MAX_RESULTS, None)]
+
+
+async def test_no_content_cap_by_default(config) -> None:
+    """No teaser snippets: a hit the model cannot read is a search it repeats."""
+    assert config.tools.web.max_content_chars == 0
+    provider = StubProvider(
+        "tavily",
+        search_result=SearchResult(
+            query="hi",
+            provider="tavily",
+            hits=[SearchHit(title="t", url="u", content="body " * 5_000)],
+        ),
+    )
+    tool = make_tool(config, provider)
+    result = await tool.invoke({"action": "search", "query": "hi"}, None)
+    assert "… [truncated]" not in result.text
+    assert len(result.text) > 20_000
 
 
 # --------------------------------------------------------------------------- #
@@ -140,7 +167,7 @@ async def test_recency_is_passed_to_the_provider(config) -> None:
 
     await tool.invoke({"action": "search", "query": "hi", "recency": 7}, None)
 
-    assert provider.search_calls == [("hi", 4, 7)]
+    assert provider.search_calls == [("hi", 10, 7)]
 
 
 async def test_recency_defaults_to_unfiltered(config) -> None:
@@ -149,7 +176,7 @@ async def test_recency_defaults_to_unfiltered(config) -> None:
 
     await tool.invoke({"action": "search", "query": "hi"}, None)
 
-    assert provider.search_calls == [("hi", 4, None)]
+    assert provider.search_calls == [("hi", 10, None)]
 
 
 async def test_recency_is_clamped(config) -> None:
@@ -161,9 +188,9 @@ async def test_recency_is_clamped(config) -> None:
     await tool.invoke({"action": "search", "query": "hi", "recency": "nonsense"}, None)
 
     assert provider.search_calls == [
-        ("hi", 4, 3650),
-        ("hi", 4, 1),
-        ("hi", 4, None),
+        ("hi", 10, 3650),
+        ("hi", 10, 1),
+        ("hi", 10, None),
     ]
 
 

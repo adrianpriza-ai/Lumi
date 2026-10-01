@@ -214,7 +214,7 @@ def test_nested_dataclasses_are_rebuilt() -> None:
 
     tools = _build(ToolsConfig, {"shell": {"timeout_seconds": 3}})
     assert tools.shell.timeout_seconds == 3
-    assert tools.files.max_read_chars == 20000  # untouched default
+    assert tools.files.max_read_chars == 200_000  # untouched default
 
 
 def test_type_hints_resolve_under_postponed_annotations() -> None:
@@ -287,6 +287,44 @@ def test_explicit_model_beats_openai_model(config, monkeypatch) -> None:
     config.llm.model = "qwen3:8b"
     monkeypatch.setenv("OPENAI_MODEL", "nemotron-3-nano-reasoning")
     assert config.llm.model_of() == "qwen3:8b"
+
+
+# --------------------------------------------------------------------------- #
+# vision model
+# --------------------------------------------------------------------------- #
+
+
+def test_vision_model_is_unset_by_default(config) -> None:
+    assert config.llm.vision_model_of() == ""
+
+
+def test_vision_model_resolves_from_config(config) -> None:
+    config.llm.vision_model = "gpt-4o"
+    assert config.llm.vision_model_of() == "gpt-4o"
+
+
+def test_vision_model_falls_back_to_its_env_var(config, monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_VISION_MODEL", "qwen2-vl")
+    assert config.llm.vision_model_of() == "qwen2-vl"
+
+
+def test_explicit_vision_model_beats_the_env(config, monkeypatch) -> None:
+    config.llm.vision_model = "gpt-4o"
+    monkeypatch.setenv("OPENAI_VISION_MODEL", "qwen2-vl")
+    assert config.llm.vision_model_of() == "gpt-4o"
+
+
+def test_blank_vision_model_counts_as_unset(config, monkeypatch) -> None:
+    config.llm.vision_model = "   "
+    monkeypatch.delenv("OPENAI_VISION_MODEL", raising=False)
+    assert config.llm.vision_model_of() == ""
+
+
+def test_vision_model_survives_a_toml_load(project) -> None:
+    (project / "config.toml").write_text(
+        "[llm]\nmodel = 'm'\nvision_model = 'gpt-4o'\n", encoding="utf-8"
+    )
+    assert load_config(project).llm.vision_model == "gpt-4o"
 
 
 def test_api_key_env_is_configurable(config, monkeypatch) -> None:

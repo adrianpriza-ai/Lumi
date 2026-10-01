@@ -89,7 +89,9 @@ Rules:
   sneakier.
 - The working directory is judged after any `cd`, so `cd .. && rm -rf x` is
   checked against the directory it would actually delete from.
-- Output is truncated. If you need more, redirect to a file and read it back.
+- Output is sent whole. If a command produces a lot of it, the old results are
+  what gets dropped from the context later, not this one — so redirect to a
+  file and read that back when you only need part of it.
 - The environment is scrubbed: API keys are not visible to the command.
 """.strip()
 
@@ -291,7 +293,7 @@ Rules:
         if stdout.strip():
             lines += ["--- stdout ---", truncate(stdout.strip(), cap)]
         if stderr.strip():
-            lines += ["--- stderr ---", truncate(stderr.strip(), cap // 2)]
+            lines += ["--- stderr ---", truncate(stderr.strip(), cap // 2 if cap > 0 else 0)]
         if not stdout.strip() and not stderr.strip() and not timed_out:
             lines.append("(no output)")
 
