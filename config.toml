@@ -11,8 +11,6 @@ startup_chat_id = ""
 # Refuse to boot if TELEGRAM_OWNER_ID is missing. Keep this true: the shell
 # and file tools are only ever exposed to that user id.
 require_owner = true
-# Prefix used when writing files to the log stream. Cosmetic.
-log_prefix = "lumi"
 # How the bot behaves in group / supergroup chats. Private chats are
 # unaffected — the bot always replies 1:1.
 #   mention  (default) - reply only when the bot is mentioned (@Lumi_a_bot),

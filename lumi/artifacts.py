@@ -114,15 +114,6 @@ class Artifact:
         origin = f" — from {self.origin}" if self.origin else ""
         return f"{self.path} ({human}){origin}"
 
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "path": self.path,
-            "size": self.size,
-            "mime": self.mime,
-            "origin": self.origin,
-            "absolute": str(self.absolute),
-        }
-
 
 class ArtifactError(RuntimeError):
     """Raised when a file cannot become an artifact. The model reads the reason."""
@@ -297,9 +288,6 @@ class ArtifactStore:
     def recent(self, limit: int = 10) -> list[Artifact]:
         """The most recent artifacts, newest last. For ``/status`` and tests."""
         return [self._recent[key] for key in self._recent_order[-limit:]]
-
-    def total_bytes(self) -> int:
-        return sum(a.size for a in self._recent.values())
 
 
 def _safe_basename(name: str) -> str:

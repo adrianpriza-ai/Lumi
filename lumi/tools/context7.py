@@ -87,9 +87,6 @@ class Context7Client:
     def available(self) -> bool:
         return bool(self._pool)
 
-    def describe_keys(self) -> str:
-        return self._pool.describe()
-
     # -- HTTP plumbing ---------------------------------------------------- #
 
     def _client_for(self, key: str) -> Any:
@@ -101,7 +98,7 @@ class Context7Client:
             except ImportError as exc:  # pragma: no cover - openai pulls it in
                 raise ToolError("httpx is not installed; the context7 tool needs it") from exc
             client = httpx.AsyncClient(
-                timeout=httpx.Timeout(self.settings.timeout_seconds),
+                timeout=httpx.Timeout(self.config.timeout_seconds),
                 headers={"Authorization": f"Bearer {key}"},
             )
             self._clients[key] = client

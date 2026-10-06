@@ -20,7 +20,6 @@ import os
 import time
 import tomllib
 import uuid
-from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -55,8 +54,6 @@ from .util.text import (
 
 log = get_logger(__name__)
 
-Handler = Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]
-
 #: Callback data prefix; keeps our buttons from colliding with anything else.
 CB_OK = "lumi:ok:"
 CB_NO = "lumi:no:"
@@ -65,14 +62,6 @@ CB_THINK = "lumi:think:"
 
 TYPING_INTERVAL = 4.0
 
-#: TCP connect timeout for both Bot API requests, in seconds. PTB's default of
-#: 5s is tight for a slow or censored network, and the failure mode is a
-#: bootstrap abort before the bot ever starts (see bot.bootstrap_retries).
-DEFAULT_CONNECT_TIMEOUT = 15.0
-#: Attempts PTB makes to bootstrap (initialize + delete/set webhook) before
-#: giving up. PTB's own default of 0 means one attempt and abort — a single
-#: wifi hiccup at startup would kill the bot.
-DEFAULT_BOOTSTRAP_RETRIES = 3
 #: Pool size for the getUpdates request object. PTB sizes it at 1 connection;
 #: that is fine except with a non-empty bot.proxy_url, where httpx with
 #: ``max_connections=1`` is documented to misbehave (PTB wiki: "Working with
@@ -649,11 +638,6 @@ def render_thinking(trace: str) -> str:
 # --------------------------------------------------------------------------- #
 # Artifacts (file delivery)
 # --------------------------------------------------------------------------- #
-
-
-def artifact_caption(artifact: Artifact) -> str:
-    """A short, plain-text caption identifying the file."""
-    return artifact.caption()
 
 
 async def send_artifact(update: Update, artifact: Artifact) -> None:

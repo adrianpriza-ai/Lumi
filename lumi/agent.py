@@ -125,15 +125,6 @@ class PendingAction:
     reason: str
     preview: str
 
-    def to_tool_call(self) -> ToolCall:
-        return ToolCall(id=self.id, name=self.tool, arguments=self.arguments)
-
-    def one_line(self) -> str:
-        if self.tool == "run_shell":
-            return f"`{self.preview}`"
-        target = self.arguments.get("path") or self.arguments.get("query") or ""
-        return f"`{self.tool}` on {target}" if target else f"`{self.tool}`"
-
 
 @dataclass(slots=True)
 class TurnResult:
@@ -431,13 +422,22 @@ class Agent:
                     )
                 return result
 
+            # Every call in this reply is dispatched before the turn stops: an
+            # assistant message carrying N tool_calls must be followed by N
+            # ``role: "tool"`` messages, or the provider 400s the next request
+            # and the malformed pair stays in the conversation until /reset.
+            # Approval pauses the *loop*, not the set — and each call is judged
+            # on its own, so a sibling that needs nothing still runs.
+            needs_owner = False
             for call in reply.tool_calls:
                 if await self._handle_tool_call(conv, call, ctx, tools, result):
-                    # Something needs the owner; stop rather than continue with a
-                    # half-finished set of side effects.
-                    result.tools_used = tools
-                    result.elapsed = time.monotonic() - started
-                    return result
+                    needs_owner = True
+            if needs_owner:
+                # Stop rather than start another round of side effects while the
+                # owner is still deciding.
+                result.tools_used = tools
+                result.elapsed = time.monotonic() - started
+                return result
 
         # Iteration cap: something is looping. Report it instead of hanging.
         result.text = result.text or (
@@ -600,9 +600,6 @@ class Agent:
             self._refresh_system_prompt(conv)
             self.history.append(chat_id, "system", "reloaded personality and memory")
         return notes
-
-    def close(self) -> None:
-        self._conversations.clear()
 
 
 def _assistant_message(reply: LLMReply) -> dict[str, Any]:

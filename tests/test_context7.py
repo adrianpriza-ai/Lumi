@@ -342,6 +342,52 @@ async def test_unknown_action_raises(monkeypatch) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Real `_client_for` — the only test that does not stub the factory out.
+#
+# Every other test here replaces `client._client_for`, which is exactly how
+# `self.settings` (a `Context7Tool` attribute, never assigned on
+# `Context7Client`) survived a green suite while crashing on every real call.
+# --------------------------------------------------------------------------- #
+
+
+async def test_invoke_builds_a_real_httpx_client(monkeypatch) -> None:
+    """Exercise the real ``_client_for`` body via the tool's public interface.
+
+    The factory is *not* stubbed out (which is precisely how ``self.settings``
+    survived a green suite while crashing on every real call): ``httpx.AsyncClient``
+    is wrapped so the real constructor runs — timeout, headers, caching — and a
+    stub transport is slipped in only at the transport slot, so no network is
+    touched.
+    """
+    monkeypatch.setenv("CONTEXT7_API_KEY", "ctx7sk-91")
+    tool = Context7Tool(_full_config(timeout_seconds=7.5))
+
+    stub = transport((200, {"results": [{"id": "/x/y", "title": "Y"}]}))
+    seen: list[dict[str, Any]] = []
+    real_client = httpx.AsyncClient
+
+    def factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        seen.append(kwargs)
+        kwargs["transport"] = stub
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+    try:
+        result = await tool.invoke(
+            {"action": "resolve_library_id", "library_name": "y"}, ctx()
+        )
+    finally:
+        monkeypatch.undo()
+        await tool.aclose()
+
+    assert result.ok and "/x/y" in result.text
+    (kwargs,) = seen
+    assert kwargs["timeout"].read == pytest.approx(7.5)  # read from config
+    assert kwargs["headers"]["Authorization"] == "Bearer ctx7sk-91"
+    assert len(stub.calls) == 1
+
+
+# --------------------------------------------------------------------------- #
 # Registry integration — this is what the system prompt depends on.
 # --------------------------------------------------------------------------- #
 

@@ -46,7 +46,6 @@ class ConfigError(RuntimeError):
 class BotConfig:
     startup_chat_id: str = ""
     require_owner: bool = True
-    log_prefix: str = "lumi"
     #: Ceiling on a file the bot will send to Telegram as a document, in MB.
     #: Telegram's own Bot API document limit is 50 MB; the lower default keeps
     #: the outbox from filling with one runaway export. The artifact harness

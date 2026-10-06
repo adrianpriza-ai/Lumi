@@ -390,6 +390,45 @@ def last_user_message(agent) -> str:
     return users[-1]
 
 
+async def test_approval_in_a_parallel_set_answers_every_tool_call(config) -> None:
+    """An approval must not strand the *other* tool calls in the same reply.
+
+    An assistant message carrying N ``tool_calls`` needs exactly N
+    ``role: "tool"`` messages before the next request, or every later turn
+    400s and the malformed pair stays in the conversation until ``/reset``.
+    """
+    agent = make_agent(
+        config,
+        [
+            make_reply("", [
+                ("c1", "run_shell", {"command": "rm x.txt"}),
+                ("c2", "run_shell", {"command": "ls"}),
+                ("c3", "run_shell", {"command": "echo hi"}),
+            ]),
+            make_reply("done"),
+        ],
+    )
+    result = await agent.handle(CHAT, "tidy up")
+
+    assert result.needs_approval
+    assert result.pending[0].arguments["command"] == "rm x.txt"
+
+    messages = agent.conversation(CHAT).messages
+    assistant = next(m for m in reversed(messages) if m.get("tool_calls"))
+    asked = [c["id"] for c in assistant["tool_calls"]]
+    answered = [m["tool_call_id"] for m in messages if m["role"] == "tool"]
+    assert sorted(answered) == sorted(asked), (
+        f"assistant asked for {asked}, only {answered} were answered — "
+        "the next request would 400"
+    )
+
+    # The sibling calls that needed no approval still ran and reported back.
+    by_id = {m["tool_call_id"]: m["content"] for m in messages if m["role"] == "tool"}
+    assert "Not executed" in by_id["c1"]
+    assert "Not executed" not in by_id["c2"]
+    assert "Not executed" not in by_id["c3"]
+
+
 async def test_approving_runs_the_command_and_continues(config) -> None:
     agent = make_agent(
         config,

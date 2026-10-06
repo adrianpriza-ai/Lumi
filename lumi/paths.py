@@ -32,11 +32,6 @@ def resolve(relative: str | os.PathLike[str], base: Path | None = None) -> Path:
     return (root / p).resolve()
 
 
-def ensure_dir(path: Path) -> Path:
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
 def is_within(candidate: Path, root: Path) -> bool:
     """True when *candidate* is *root* or lives underneath it.
 

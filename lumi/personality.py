@@ -9,7 +9,6 @@ the next ``/reload`` (or automatically, see :meth:`Personality.load`).
 
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -30,7 +29,6 @@ class Personality:
     path: Path
     text: str
     mtime: float = 0.0
-    loaded_at: float = 0.0
 
     @classmethod
     def load(cls, path: Path) -> Personality:
@@ -50,20 +48,13 @@ class Personality:
         if not text:
             text = FALLBACK_PERSONALITY.strip()
 
-        return cls(path=path, text=text, mtime=mtime, loaded_at=time.time())
+        return cls(path=path, text=text, mtime=mtime)
 
     def reload(self) -> str:
         """Re-read from disk unconditionally. Returns a short status line."""
         self.text = Personality.load(self.path).text
         self.mtime = self.path.stat().st_mtime if self.path.is_file() else 0.0
-        self.loaded_at = time.time()
         return f"personality reloaded ({len(self.text)} chars)"
-
-    def changed_on_disk(self) -> bool:
-        try:
-            return self.path.stat().st_mtime != self.mtime
-        except OSError:
-            return False
 
     def __str__(self) -> str:
         return self.text

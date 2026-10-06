@@ -115,12 +115,6 @@ class MemoryFile:
             log.debug("MEMORY.md changed on disk; reloading")
             self.load()
 
-    def changed_on_disk(self) -> bool:
-        try:
-            return self.path.stat().st_mtime != self._mtime
-        except OSError:
-            return False
-
     # -- managed region ---------------------------------------------------- #
 
     def _managed_bounds(self, text: str) -> tuple[int, int] | None:

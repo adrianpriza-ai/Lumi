@@ -37,23 +37,6 @@ class NeedsApproval(Exception):
         self.reason = reason
         self.preview = preview
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "tool": self.tool,
-            "arguments": self.arguments,
-            "reason": self.reason,
-            "preview": self.preview,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> NeedsApproval:
-        return cls(
-            tool=data["tool"],
-            arguments=data.get("arguments", {}),
-            reason=data.get("reason", ""),
-            preview=data.get("preview", ""),
-        )
-
 
 @dataclass(slots=True)
 class ToolContext:
