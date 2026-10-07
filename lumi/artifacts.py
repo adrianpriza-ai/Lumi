@@ -279,8 +279,13 @@ class ArtifactStore:
     # -- dedup and recall --------------------------------------------------- #
 
     def _remember(self, artifact: Artifact) -> None:
-        self._recent[artifact.absolute.as_posix()] = artifact
-        self._recent_order.append(artifact.absolute.as_posix())
+        key = artifact.absolute.as_posix()
+        fresh = key not in self._recent
+        self._recent[key] = artifact
+        # Only a new key joins the order: re-registering the same file must
+        # not list it twice in recent() or shorten the eviction window.
+        if fresh:
+            self._recent_order.append(key)
         while len(self._recent_order) > self._recent_limit:
             stale = self._recent_order.pop(0)
             self._recent.pop(stale, None)

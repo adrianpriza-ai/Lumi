@@ -79,21 +79,28 @@ class MemoryFile:
     _mtime: float = field(default=0.0, init=False, repr=False)
 
     def load(self) -> str:
-        try:
-            self._mtime = self.path.stat().st_mtime
-        except OSError:
-            self._mtime = 0.0
         if not self.path.is_file():
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._text = f"# Memory\n\n## Facts\n\n{MANAGED_START}\n{MANAGED_END}\n"
             self._write(self._text)
+            # Stamp the mtime *after* the write: recording the mtime of a file
+            # that did not exist yet would leave _mtime at 0.0 and make the
+            # first ensure_loaded() reload what we just wrote.
+            self._stamp_mtime()
             return self._text
+        self._stamp_mtime()
         try:
             self._text = self.path.read_text(encoding="utf-8")
         except OSError as exc:
             log.error("could not read %s: %s", self.path, exc)
             self._text = ""
         return self._text
+
+    def _stamp_mtime(self) -> None:
+        try:
+            self._mtime = self.path.stat().st_mtime
+        except OSError:
+            self._mtime = 0.0
 
     def _write(self, text: str) -> None:
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
@@ -541,9 +548,11 @@ class History:
         """Start a new session id; used to segment a transcript after /reset.
 
         Two resets in the same second must still get distinct ids, otherwise the
-        audit log cannot tell the sessions apart.
+        audit log cannot tell the sessions apart — the uuid covers that. The
+        chat id is part of the id so a row's ``session`` says which
+        conversation it belongs to even outside its own transcript file.
         """
-        return f"s{int(time.time())}-{uuid4().hex[:6]}"
+        return f"s{int(time.time())}-{chat_id}-{uuid4().hex[:6]}"
 
     def clear(self, chat_id: int | str) -> bool:
         path = self.path_for(chat_id)

@@ -9,6 +9,7 @@ the Confirm/Cancel keyboard for a risky command.
 from __future__ import annotations
 
 import base64
+import json
 import time
 from typing import Any
 
@@ -17,7 +18,7 @@ from conftest import FakeLLM, make_reply
 from telegram import Bot, Update, User
 
 from lumi.agent import Agent, TurnResult
-from lumi.bot import CB_NO, CB_OK, CB_THINK, TraceStore, build_application
+from lumi.bot import CB_NO, CB_OK, CB_THINK, TraceStore, build_application, build_handlers
 from lumi.memory import History, MemoryFile
 from lumi.personality import Personality
 from lumi.tools import build_registry
@@ -109,6 +110,24 @@ class FakeBot(Bot):
         return None
 
 
+class StaleToastBot(FakeBot):
+    """A FakeBot whose callback toasts always fail the way Telegram's do.
+
+    Telegram expires callback queries quickly, and PTB processes updates
+    sequentially, so a tap that queues behind a long agent turn can be answered
+    late: ``query.answer()`` then raises ``BadRequest: Query is too old and
+    response timeout expired...``. The follow-up (approval resolve, message
+    edit) does not depend on the toast, so it must happen anyway.
+    """
+
+    async def answer_callback_query(self, *args: Any, **kwargs: Any) -> bool:
+        from telegram.error import BadRequest
+
+        raise BadRequest(
+            "Query is too old and response timeout expired or query id is invalid"
+        )
+
+
 def make_update(bot: Bot, text: str | None = None, *, chat_id: int = CHAT, user_id: int = OWNER,
                 message_id: int = 1, chat_type: str = "private",
                 chat_username: str = "lab_group",
@@ -182,7 +201,7 @@ def make_callback(bot: Bot, data: str, *, chat_id: int = CHAT, user_id: int = OW
     )
 
 
-def build(config, replies) -> tuple[Any, FakeBot, Agent]:
+def build(config, replies, bot: FakeBot | None = None) -> tuple[Any, FakeBot, Agent]:
     memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
     memory.load()
     agent = Agent(
@@ -193,7 +212,8 @@ def build(config, replies) -> tuple[Any, FakeBot, Agent]:
         registry=build_registry(config, memory),
         llm=FakeLLM(replies),
     )
-    bot = FakeBot()
+    if bot is None:
+        bot = FakeBot()
     application = build_application(config, agent, bot=bot)
     return application, bot, agent
 
@@ -242,6 +262,39 @@ async def test_owner_filter_blocks_before_the_agent(config) -> None:
 async def test_tools_are_invisible_to_strangers(config) -> None:
     bot, _ = await send(config, [], "/run rm -rf /", user_id=STRANGER)
     assert "not whitelisted" in texts(bot).lower()
+
+
+def test_the_handler_gate_is_a_live_view_of_the_whitelist(config) -> None:
+    """The filter in front of every handler must read the *live* config.
+
+    A snapshot of the id list taken when handlers were built kept rejecting a
+    user added via ``/whitelist_add_user`` until the process restarted. Every
+    handler also re-checks internally, which hides a gate that never runs at
+    all — so the gate itself has to be asserted, not inferred from replies.
+    """
+    from telegram.ext import MessageHandler
+
+    handlers = build_handlers(config)
+    text_gate = next(
+        h for h in handlers
+        if isinstance(h, MessageHandler) and getattr(h.callback, "__name__", "") == "on_text"
+    )
+    stranger_gate = next(
+        h for h in handlers
+        if isinstance(h, MessageHandler) and getattr(h.callback, "__name__", "") == "on_stranger"
+    )
+    bot = FakeBot()
+
+    # Owner passes, a stranger does not — and the stranger routes to on_stranger.
+    assert text_gate.filters.check_update(make_update(bot, "hi", user_id=OWNER))
+    assert not text_gate.filters.check_update(make_update(bot, "hi", user_id=STRANGER))
+    assert stranger_gate.filters.check_update(make_update(bot, "hi", user_id=STRANGER))
+    assert not stranger_gate.filters.check_update(make_update(bot, "hi", user_id=OWNER))
+
+    # A user added *after* the handlers were built must pass without a restart.
+    config.bot.whitelisted_users.append("777")
+    assert text_gate.filters.check_update(make_update(bot, "hi", user_id=777))
+    assert not stranger_gate.filters.check_update(make_update(bot, "hi", user_id=777))
 
 
 # --------------------------------------------------------------------------- #
@@ -395,6 +448,34 @@ async def test_tapping_cancel_declines_the_command(config) -> None:
 
     assert "left it alone" in texts(bot)
     assert agent.llm.index == 1
+
+
+async def test_a_stale_approval_tap_still_resolves(config) -> None:
+    """A late ``query.answer()`` must not eat the tap.
+
+    Telegram expires callback queries quickly and a tap can queue behind a long
+    agent turn, so the toast raises ``BadRequest: Query is too old...``. The
+    approval resolution does not depend on the toast — it must still run.
+    """
+    application, bot, agent = build(
+        config,
+        [
+            make_reply("", [("c1", "run_shell", {"command": "echo done"})]),
+            make_reply("it printed approved"),
+        ],
+        bot=StaleToastBot(),
+    )
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "/run rm -rf workspace/tmp"))
+        keyboard = next(m["reply_markup"] for m in bot.sent if m.get("reply_markup"))
+        approve = keyboard.inline_keyboard[0][0]
+        await application.process_update(make_callback(bot, approve.callback_data))
+    finally:
+        await application.shutdown()
+
+    assert "it printed approved" in texts(bot)
+    assert not agent.conversation(CHAT).pending  # the tap still resolved it
 
 
 async def test_model_asks_for_approval_from_plain_text(config) -> None:
@@ -1006,6 +1087,89 @@ async def test_whitelist_add_group_rejects_non_integer(config) -> None:
     assert "not a valid id" in texts(bot).lower()
 
 
+async def test_a_new_user_is_allowed_without_a_restart(config) -> None:
+    """``/whitelist_add_user`` must take effect on the *running* application.
+
+    The authorisation filter used to be a snapshot of the id list taken once
+    when handlers were built, so the command reported "added" while the very
+    next message from that user still fell through to "this bot is private" —
+    until the process was restarted.
+    """
+    application, bot, agent = build(config, [make_reply("hello new user")])
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "/whitelist_add_user 777"))
+        assert "added" in texts(bot).lower()
+        # Same application, no restart — the new id must pass the filter now.
+        await application.process_update(make_update(bot, "hi lumi", user_id=777))
+    finally:
+        await application.shutdown()
+
+    assert "not whitelisted" not in texts(bot).lower()
+    assert "hello new user" in texts(bot)
+    assert agent.llm.calls, "the newly whitelisted user should reach the model"
+
+
+async def test_an_added_whitelist_entry_survives_a_restart(config) -> None:
+    """The whitelist must be persisted where the next process reads it back.
+
+    A fresh process has none of the in-memory state, so the add is only real
+    if ``build_handlers`` repopulates the config from disk.
+    """
+    application, bot, _ = build(config, [])
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "/whitelist_add_user 777"))
+    finally:
+        await application.shutdown()
+    assert "added" in texts(bot).lower()
+
+    # Simulate the restart: no in-memory whitelist, fresh handlers.
+    config.bot.whitelisted_users = []
+    application, bot, agent = build(config, [make_reply("hello again")])
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "hi again", user_id=777))
+    finally:
+        await application.shutdown()
+
+    assert "not whitelisted" not in texts(bot).lower()
+    assert "hello again" in texts(bot)
+
+
+async def test_saving_the_whitelist_leaves_config_local_toml_alone(config) -> None:
+    """Persisting the whitelist must not rewrite the user's config.
+
+    It used to round-trip ``config.local.toml`` through a hand-rolled TOML
+    writer that cannot escape newlines: one multi-line value became invalid
+    TOML, and the next boot refused to start with a configuration error.
+    """
+    from lumi.config import load_config
+
+    local = config.root / "config.local.toml"
+    local.write_text(
+        '[bot]\nstartup_chat_id = """\n42\n"""\n[llm]\ncontext_window = 128000\n',
+        encoding="utf-8",
+    )
+    before = local.read_bytes()
+
+    application, bot, _ = build(config, [])
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "/whitelist_add_user 777"))
+    finally:
+        await application.shutdown()
+
+    assert "added" in texts(bot).lower()
+    assert local.read_bytes() == before, "config.local.toml must be left alone"
+    saved = json.loads(
+        (config.root / "data" / "whitelist.json").read_text(encoding="utf-8")
+    )
+    assert "777" in saved["whitelisted_users"]
+    # The file still parses — a ConfigError here means boot is broken.
+    assert load_config(config.root).llm.context_window == 128_000
+
+
 # --------------------------------------------------------------------------- #
 # vision support
 # --------------------------------------------------------------------------- #
@@ -1121,6 +1285,43 @@ async def test_photo_without_caption_gets_default_prompt(config) -> None:
     content = last_user["content"]
     text_part = next(p for p in content if p["type"] == "text")
     assert "what" in text_part["text"].lower()
+
+
+async def test_photo_caption_reaches_the_model(config) -> None:
+    """The caption *is* the question (README: "The caption becomes your question").
+
+    A photo has ``text = None``, so it never matches the text filter and lands
+    in the non-text handler — a caption handled only in the text path is
+    silently dropped and the model gets the canned default instead.
+    """
+    bot = FakePhotoBot(b"\x89PNG\r\n\x1a\n" + b"\x00" * 50)
+    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
+    memory.load()
+    agent = Agent(
+        config=config,
+        personality=Personality.load(config.personality_file),
+        memory=memory,
+        history=History(config.history_dir),
+        registry=build_registry(config, memory),
+        llm=FakeLLM([make_reply("it is a stack trace")]),
+    )
+    application = build_application(config, agent, bot=bot)
+    await application.initialize()
+    try:
+        await application.process_update(
+            _make_photo_update(bot, caption="what does this error mean?")
+        )
+    finally:
+        await application.shutdown()
+
+    assert "it is a stack trace" in texts(bot)
+    user_messages = [m for m in agent.llm.calls[0] if m.get("role") == "user"]
+    content = user_messages[-1]["content"]
+    text_part = next(p for p in content if p["type"] == "text")
+    assert "what does this error mean?" in text_part["text"], (
+        "caption never reached the model"
+    )
+    assert "what's in this image?" not in text_part["text"]
 
 
 async def test_photo_download_failure_gracefully(config) -> None:
@@ -1548,6 +1749,24 @@ async def test_tapping_show_edits_the_message_in_place(config) -> None:
     assert "thinking" in bot.edits[0]["text"].lower()
 
 
+async def test_a_stale_thinking_tap_still_expands(config) -> None:
+    """Same staleness, other button: the expired toast must not prevent the
+    trace from being edited into the message."""
+    application, bot, _ = build(
+        config, [make_reply("four", reasoning=THINKING)], bot=StaleToastBot()
+    )
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "how many r's?"))
+        stub = next(m for m in bot.sent if m.get("reply_markup"))
+        token = stub["reply_markup"].inline_keyboard[0][0].callback_data
+        await application.process_update(make_callback(bot, token))
+    finally:
+        await application.shutdown()
+
+    assert THINKING in bot.edits[0]["text"], "the expired toast ate the tap"
+
+
 async def test_the_expanded_trace_offers_a_way_back(config) -> None:
     application, bot, _ = build(config, [make_reply("four", reasoning=THINKING)])
     await application.initialize()
@@ -1790,6 +2009,17 @@ async def test_config_reflects_live_toggles(config) -> None:
     body = texts(bot)
     assert "trace in chat: off" in body
     assert "group mode: always" in body
+
+
+async def test_config_memory_cap_is_the_limit_the_agent_uses(config) -> None:
+    """The displayed memory cap must be ``Agent.memory_limit()``, verbatim.
+
+    Re-deriving it in the renderer let display and behaviour drift (it used to
+    show 3/8 of the window while the prompt applied an eighth of the budget
+    times chars_per_token).
+    """
+    bot, agent = await send(config, [], "/config")
+    assert f"{agent.memory_limit():,} chars" in texts(bot)
 
 
 async def test_env_masks_long_keys(config, monkeypatch) -> None:

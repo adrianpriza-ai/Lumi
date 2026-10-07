@@ -159,7 +159,9 @@ async def _chat(config: Config) -> int:
             print(agent.registry.describe(), "\n")
             continue
         if lowered.startswith("/memory"):
-            print(agent.memory.for_prompt(), "\n")
+            # The same window share the bot's /memory and the system prompt
+            # apply, so the CLI shows what the model actually gets.
+            print(agent.memory.for_prompt(agent.memory_limit()), "\n")
             continue
         if lowered == "/personality":
             print(agent.personality.text, "\n")
@@ -179,7 +181,7 @@ async def _chat(config: Config) -> int:
                 approved = answer in {"y", "yes"}
                 print("  working…", flush=True)
                 result = await agent.resolve("cli", action.id, approved, source="cli")
-        elif result.text:
+        if result.text:
             print(result.text)
         for artifact in result.artifacts:
             print(f"  [file: {artifact.path} ({artifact.size} bytes)]")

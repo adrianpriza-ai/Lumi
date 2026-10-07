@@ -149,8 +149,6 @@ it validates the path, caps the size, and shows a diff before it overwrites.
             return resolved
         if requested in READABLE_SYSTEM_PATHS or str(resolved) in READABLE_SYSTEM_PATHS:
             return resolved
-        if not self.settings.readable_from_project:
-            raise ToolError(f"reading {resolved} is outside the project and is not permitted")
         raise ToolError(f"reading {resolved} is outside the project directory")
 
     def _display(self, path: Path) -> str:
@@ -182,20 +180,22 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         if path.is_dir():
             return await self._list(arguments, ctx)
 
-        cap = int(arguments.get("max_bytes") or self.settings.max_read_chars)
+        # 0 (from the argument or the setting) means "no cap".
+        cap = int(arguments.get("max_bytes") or 0) or self.settings.max_read_chars
         try:
             size = path.stat().st_size
             with path.open("r", encoding="utf-8", errors="replace") as handle:
-                body = handle.read(cap)
+                body = handle.read() if cap <= 0 else handle.read(cap)
         except OSError as exc:
             return ToolResult.failure(f"could not read {self._display(path)}: {exc}")
 
+        truncated = cap > 0 and size > cap
         header = f"--- {self._display(path)} ({size} bytes"
-        header += ", truncated" if size > cap else ""
+        header += ", truncated" if truncated else ""
         header += ") ---"
         return ToolResult(
             text=f"{header}\n{body}",
-            data={"path": str(path), "size": size, "truncated": size > cap},
+            data={"path": str(path), "size": size, "truncated": truncated},
             summary=f"read {self._display(path)} ({size} bytes)",
         )
 

@@ -64,7 +64,10 @@ provider = "openai"
 #   base_url = "https://openrouter.ai/api/v1"
 base_url = ""
 # Same deal for the model: this value, then OPENAI_MODEL, then the default.
-model = "gpt-4.1-mini"
+# Leave it empty to take the model from the environment (OPENAI_MODEL) or fall
+# back to the default; set a value to pin the model — a pin wins over
+# OPENAI_MODEL, even when it is the default id itself.
+model = ""
 # Optional second model for photo turns: when a message carries an image (or an
 # image is still in the replayed history), it is sent to this one instead of
 # `model`, so the default can stay text-only. Same endpoint and keys; empty
@@ -206,8 +209,6 @@ extra_confirm = []
 enabled = true
 # Only these directories are writable, relative to the project root.
 writable = ["workspace"]
-# Readable from the whole project (so the bot can read its own source).
-readable_from_project = true
 # Characters of a file handed to the model on read. Generous by default,
 # because a read is usually done to look at the whole thing; 0 means no cap,
 # and the model's own `max_bytes` argument is there for the files that need one.

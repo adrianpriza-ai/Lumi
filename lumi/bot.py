@@ -16,9 +16,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import json
 import os
 import time
-import tomllib
 import uuid
 from pathlib import Path
 from typing import Any
@@ -214,12 +214,16 @@ def _render_env(config: Config) -> str:
     return "\n".join(lines)
 
 
-def _render_config(config: Config) -> str:
+def _render_config(config: Config, memory_limit: int) -> str:
     """The ``/config`` body: the resolved configuration this process runs on.
 
     Same values ``lumi config`` prints in a terminal, shaped for chat. Reads
     only the config tree — no bot_data — so it stays a pure function and the
     live view is exactly what the running handlers closed over.
+
+    *memory_limit* is ``Agent.memory_limit()`` — the cap actually applied to
+    the system prompt — rather than a re-derivation, so the display cannot
+    drift from behaviour.
     """
     llm = config.llm
     web = config.tools.web
@@ -231,11 +235,9 @@ def _render_config(config: Config) -> str:
     # 0 is the state most of them ship in. Memory is the exception: 0 means the
     # file is bounded by its share of the window rather than sent whole.
     ceiling = f"{llm.max_tokens:,}" if llm.max_tokens > 0 else "provider default (no cap sent)"
-    memory_cap = (
-        f"{llm.max_memory_chars:,} chars"
-        if llm.max_memory_chars > 0
-        else f"{(llm.context_window - llm.context_headroom) // 8 * 3:,} chars (an eighth of the window)"
-    )
+    memory_cap = f"{memory_limit:,} chars"
+    if llm.max_memory_chars <= 0:
+        memory_cap += " (an eighth of the window)"
     web_content = f"{web.max_content_chars:,} chars" if web.max_content_chars > 0 else "uncapped"
     shell_output = f"{shell.max_output_chars:,} chars" if shell.max_output_chars > 0 else "uncapped"
     return "\n".join(
@@ -599,6 +601,18 @@ def thinking_keyboard_hide() -> InlineKeyboardMarkup:
     )
 
 
+async def _toast(query: Any, text: str = "", **kwargs: Any) -> None:
+    """Answer a callback query, suppressing errors from stale queries.
+
+    Telegram expires callback queries quickly, and PTB processes updates
+    sequentially, so a tap that queues behind a long agent turn can easily be
+    answered late. ``BadRequest`` from an expired query must not propagate —
+    the follow-up action (edit, resolve) does not depend on the toast.
+    """
+    with contextlib.suppress(BadRequest, TelegramError):
+        await query.answer(text, **kwargs)
+
+
 async def _edit_thinking(
     query: Any, text: str, *, keyboard: InlineKeyboardMarkup | None = None
 ) -> None:
@@ -757,7 +771,26 @@ def _write_toml(f: Any, data: dict[str, Any], prefix: str = "") -> None:
 
 
 def build_handlers(config: Config) -> list[Any]:
-    owner = config.owner_id
+    class OwnerFilter(filters.UpdateFilter):
+        """Filter that checks the live config for authorisation.
+
+        Must subclass :class:`telegram.ext.filters.UpdateFilter`, not
+        ``BaseFilter``: ``BaseFilter.check_update`` only tests that the update
+        *contains a message* and never calls ``filter()``, which would silently
+        turn this gate into a no-op (every handler re-checks internally, so the
+        damage is that ``on_stranger`` never fires and strangers walk into each
+        handler before being rejected there).
+        """
+
+        def __init__(self, cfg: Config):
+            super().__init__()
+            self.cfg = cfg
+
+        def filter(self, update: Update) -> bool:
+            user = update.effective_user
+            return user is not None and _is_allowed(user, self.cfg)
+
+    owner_filter = OwnerFilter(config)
 
     async def authorised(update: Update) -> bool:
         user = update.effective_user
@@ -1065,7 +1098,7 @@ def build_handlers(config: Config) -> list[Any]:
         if user is None or not _is_owner(user, config):
             await reply(update, NOT_OWNER_SENSITIVE)
             return
-        await reply(update, _render_config(config))
+        await reply(update, _render_config(config, agent_of(context).memory_limit()))
 
     async def env_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Owner-only credential status, masked.
@@ -1227,7 +1260,7 @@ def build_handlers(config: Config) -> list[Any]:
             return
         user = update.effective_user
         if user is None or not _is_allowed(user, config):
-            await query.answer("not authorised", show_alert=True)
+            await _toast(query, "not authorised", show_alert=True)
             return
         data = query.data or ""
         if data.startswith(CB_THINK):
@@ -1236,9 +1269,9 @@ def build_handlers(config: Config) -> list[Any]:
         approved = data.startswith(CB_OK)
         action_id = data[len(CB_OK) :] if approved else data[len(CB_NO) :]
         if not action_id:
-            await query.answer("malformed button", show_alert=True)
+            await _toast(query, "malformed button", show_alert=True)
             return
-        await query.answer("ok")
+        await _toast(query, "ok")
         await _resolve(update, context, approved=approved, action_id=action_id)
 
     # -- the main text path ------------------------------------------------ #
@@ -1269,14 +1302,6 @@ def build_handlers(config: Config) -> list[Any]:
         if not await authorised(update):
             return
         if not _should_reply(update, context, config):
-            return
-        # A photo with a caption arrives here, because a caption counts as text.
-        # Download the image so the model can actually see it.
-        if message.photo:
-            image_b64 = await fetch_photo(update, context)
-            if image_b64 is None:
-                return
-            await run_agent(update, context, message.text, image_b64=image_b64)
             return
         await run_agent(update, context, message.text)
 
@@ -1342,15 +1367,13 @@ def build_handlers(config: Config) -> list[Any]:
             await on_document(update, context)
             return
 
-        # A photo with no caption: nothing textual to act on, so ask the obvious
-        # question rather than handing the model an empty prompt.
+        # A photo: use the caption if present, otherwise ask the obvious question.
         if message.photo:
             image_b64 = await fetch_photo(update, context)
             if image_b64 is None:
                 return
-            await run_agent(
-                update, context, "what's in this image?", image_b64=image_b64
-            )
+            prompt = (message.caption or "").strip() or "what's in this image?"
+            await run_agent(update, context, prompt, image_b64=image_b64)
             return
 
         await reply(update, "i read text and images only — send a message or a photo.")
@@ -1427,12 +1450,12 @@ def build_handlers(config: Config) -> list[Any]:
         if action == "hide":
             # No token needed: collapsing does not read the trace, so it works
             # even after the store has forgotten it.
-            await query.answer("hidden")
+            await _toast(query, "hidden")
             await _edit_thinking(query, "<i>thinking hidden</i>")
             return
 
         if action != "show" or not token:
-            await query.answer("malformed button", show_alert=True)
+            await _toast(query, "malformed button", show_alert=True)
             return
 
         traces: TraceStore = context.application.bot_data["traces"]
@@ -1440,10 +1463,10 @@ def build_handlers(config: Config) -> list[Any]:
         if trace is None:
             # Expired or evicted. Say so in the toast rather than silently
             # editing the message, which would look like a broken button.
-            await query.answer("that trace has expired — ask again to get a new one", show_alert=True)
+            await _toast(query, "that trace has expired — ask again to get a new one", show_alert=True)
             return
 
-        await query.answer("ok")
+        await _toast(query, "ok")
         await _edit_thinking(query, render_thinking(trace), keyboard=thinking_keyboard_hide())
 
     async def _resolve(
@@ -1481,35 +1504,41 @@ def build_handlers(config: Config) -> list[Any]:
     # -- whitelist persistence --------------------------------------------- #
 
     def _save_whitelist(cfg: Config) -> None:
-        """Persist the whitelist to config.local.toml."""
-        path = cfg.root / "config.local.toml"
-        existing: dict[str, Any] = {}
-        if path.is_file():
-            try:
-                with path.open("rb") as f:
-                    existing = tomllib.load(f)
-            except Exception:
-                existing = {}
+        """Persist the whitelist to data/whitelist.json.
 
-        bot_section = existing.get("bot", {})
-        bot_section["whitelisted_users"] = cfg.bot.whitelisted_users
-        bot_section["whitelisted_groups"] = cfg.bot.whitelisted_groups
-        existing["bot"] = bot_section
-
+        Uses a dedicated JSON file rather than rewriting ``config.local.toml``
+        to avoid corrupting the user's personal config with a hand-rolled TOML
+        writer that cannot round-trip all value types.
+        """
+        path = cfg.root / "data" / "whitelist.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "whitelisted_users": cfg.bot.whitelisted_users,
+            "whitelisted_groups": cfg.bot.whitelisted_groups,
+        }
         with path.open("w") as f:
-            _write_toml(f, existing)
+            json.dump(payload, f, indent=2)
+
+    def _load_whitelist(cfg: Config) -> None:
+        """Load the whitelist from data/whitelist.json into the config.
+
+        Called during ``build_handlers`` so that whitelist changes take effect
+        immediately without requiring a process restart.
+        """
+        path = cfg.root / "data" / "whitelist.json"
+        if not path.is_file():
+            return
+        try:
+            with path.open("r") as f:
+                data = json.load(f)
+            cfg.bot.whitelisted_users = data.get("whitelisted_users", [])
+            cfg.bot.whitelisted_groups = data.get("whitelisted_groups", [])
+        except Exception:
+            log.warning("could not read whitelist file %s", path, exc_info=True)
 
     # -- assembly ---------------------------------------------------------- #
 
-    allowed_user_ids: list[int] = []
-    if owner is not None:
-        allowed_user_ids.append(owner)
-    for uid in config.bot.whitelisted_users:
-        try:
-            allowed_user_ids.append(int(uid.strip()))
-        except ValueError:
-            log.warning("ignoring non-integer whitelisted user id %r", uid)
-    owner_filter = filters.User(user_id=allowed_user_ids) if allowed_user_ids else filters.User(user_id=0)
+    _load_whitelist(config)
 
     return [
         # Owner-gated commands, all before the catch-all text handler.

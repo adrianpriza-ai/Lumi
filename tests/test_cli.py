@@ -131,11 +131,103 @@ def test_doctor_is_happy_with_a_complete_setup(config, capsys) -> None:
     assert "no blocking problems" in capsys.readouterr().out
 
 
+def test_doctor_reports_the_exa_key(config, capsys) -> None:
+    """Exa sits in the default provider_order, so the doctor must name its key."""
+    assert main(["doctor"]) == 0
+    assert "EXA_API_KEY" in capsys.readouterr().out
+
+
 def test_ask_reports_a_missing_model(config, monkeypatch, capsys) -> None:
     (config.root / ".env").unlink()
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     assert main(["ask", "hello"]) == 2
     assert "OPENAI_API_KEY" in capsys.readouterr().err
+
+
+def test_chat_prints_the_answer_after_an_approval(config, capsys, monkeypatch) -> None:
+    """Approving a pending tool call must resume the turn and print its reply."""
+    import asyncio
+
+    from conftest import FakeLLM, make_reply
+
+    from lumi import __main__ as cli
+    from lumi.agent import Agent
+    from lumi.memory import History, MemoryFile
+    from lumi.personality import Personality
+    from lumi.tools import build_registry
+
+    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
+    memory.load()
+    agent = Agent(
+        config=config,
+        personality=Personality.load(config.personality_file),
+        memory=memory,
+        history=History(config.history_dir),
+        registry=build_registry(config, memory),
+        llm=FakeLLM(
+            [
+                make_reply(tool_calls=[("c1", "run_shell", {"command": "rm x.txt"})]),
+                make_reply("done"),
+            ]
+        ),
+    )
+    monkeypatch.setattr(cli, "_build_agent", lambda cfg: agent)
+    scripted = iter(["tidy up", "y", "/quit"])
+
+    async def fake_prompt(message: str) -> str:
+        return next(scripted)
+
+    monkeypatch.setattr(cli, "_prompt", fake_prompt)
+    assert asyncio.run(cli._chat(config)) == 0
+    assert "done" in capsys.readouterr().out
+
+
+def test_chat_memory_shares_the_window_with_the_prompt(config, capsys, monkeypatch) -> None:
+    """``/memory`` in the REPL must apply the same cap the system prompt uses.
+
+    Called with no limit it printed the whole file while the bot's ``/memory``
+    and the prompt both applied ``Agent.memory_limit()``.
+    """
+    import asyncio
+
+    from conftest import FakeLLM
+
+    from lumi import __main__ as cli
+    from lumi.agent import Agent
+    from lumi.memory import MANAGED_END, MANAGED_START, History, MemoryFile
+    from lumi.personality import Personality
+    from lumi.tools import build_registry
+
+    # A small window, so an ordinary memory file overflows its share.
+    config.llm.context_window = 4_000
+    config.llm.context_headroom = 1_000
+    facts = "\n".join(f"- [2026-01-01] fact {i:03d} " + "x" * 60 for i in range(60))
+    config.memory_file.write_text(
+        f"# Memory\n\n## Facts\n\n{MANAGED_START}\n{facts}\n{MANAGED_END}\n",
+        encoding="utf-8",
+    )
+
+    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
+    memory.load()
+    agent = Agent(
+        config=config,
+        personality=Personality.load(config.personality_file),
+        memory=memory,
+        history=History(config.history_dir),
+        registry=build_registry(config, memory),
+        llm=FakeLLM([]),
+    )
+    monkeypatch.setattr(cli, "_build_agent", lambda cfg: agent)
+    scripted = iter(["/memory", "/quit"])
+
+    async def fake_prompt(message: str) -> str:
+        return next(scripted)
+
+    monkeypatch.setattr(cli, "_prompt", fake_prompt)
+    assert asyncio.run(cli._chat(config)) == 0
+    out = capsys.readouterr().out
+    assert "elided" in out  # bounded by the window share, not printed whole
+    assert len(out) < len(memory.text)
 
 
 def test_ask_without_a_question_is_rejected_by_argparse(config) -> None:

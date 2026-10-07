@@ -414,7 +414,7 @@ async def test_the_request_goes_to_the_resolved_endpoint(config, monkeypatch) ->
 
 
 async def test_the_resolved_model_is_sent(config, monkeypatch) -> None:
-    config.llm.model = "gpt-4.1-mini"  # the shipped default, so the env can win
+    config.llm.model = ""  # no pin, so OPENAI_MODEL resolves the model
     monkeypatch.setenv("OPENAI_MODEL", "nemotron-3-nano-reasoning")
     completions = StubCompletions(reply("hi"))
     await client_with(config, completions).complete([{"role": "user", "content": "q"}])

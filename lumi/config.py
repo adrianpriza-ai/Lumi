@@ -117,7 +117,12 @@ DEFAULT_REASONING_EFFORT = "medium"
 @dataclass(slots=True)
 class LLMConfig:
     provider: str = "openai"
-    model: str = OPENAI_DEFAULT_MODEL
+    #: Model id to send. Empty means "unset" — see :meth:`model_of` for the
+    #: precedence that fills it in: this value (whatever it is, including the
+    #: default id itself), then ``OPENAI_MODEL``, then
+    #: :data:`OPENAI_DEFAULT_MODEL`. :meth:`model_of` always returns a model;
+    #: this field is only the configured part of it.
+    model: str = ""
     #: Model for turns whose context carries an image (a photo in the chat).
     #: Empty means "use ``model`` for everything". Set it when the default is
     #: text-only: a multimodal request to a text-only model is a 400. Any turn
@@ -281,14 +286,21 @@ class LLMConfig:
         return OPENAI_DEFAULT_BASE_URL
 
     def model_of(self) -> str:
-        """The model id to send, with the same precedence as :meth:`base_url_of`."""
-        if self.model.strip() and self.model.strip() != OPENAI_DEFAULT_MODEL:
+        """The model id to send, with the same precedence as :meth:`base_url_of`.
+
+        An explicit ``llm.model`` wins — even when it happens to equal
+        :data:`OPENAI_DEFAULT_MODEL`, because a deliberate pin is a pin, not
+        "unset" — then ``OPENAI_MODEL``, then the built-in default. The empty
+        string is the only "unset" state, so a config that says nothing about
+        the model still defers to the environment exactly as before.
+        """
+        if self.model.strip():
             return self.model.strip()
         for name in MODEL_ENV_VARS:
             value = (os.environ.get(name) or "").strip()
             if value:
                 return value
-        return self.model.strip() or OPENAI_DEFAULT_MODEL
+        return OPENAI_DEFAULT_MODEL
 
     def vision_model_of(self) -> str:
         """The model for image-bearing requests, or empty to always use :meth:`model_of`.
@@ -344,7 +356,6 @@ class ShellConfig:
 class FilesConfig:
     enabled: bool = True
     writable: list[str] = field(default_factory=lambda: ["workspace"])
-    readable_from_project: bool = True
     #: Characters of a file handed to the model on read. Generous by default
     #: because a read is usually done to look at the whole thing; 0 means no
     #: cap, and the model's own ``max_bytes`` argument is there for the files

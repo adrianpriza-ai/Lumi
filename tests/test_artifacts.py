@@ -130,6 +130,15 @@ def test_recent_returns_the_newest_last(store: ArtifactStore, config) -> None:
     assert len(store.recent(2)) == 2
 
 
+def test_recent_lists_a_re_registered_file_once(store: ArtifactStore, config) -> None:
+    """Re-sending the same file must not duplicate it in recent()."""
+    path = config.root / "workspace" / "dup.md"
+    path.write_text("hi", encoding="utf-8")
+    for _ in range(3):
+        store.send(path, project_root=config.root)
+    assert len(store.recent(10)) == 1
+
+
 def test_caption_is_human_readable(store: ArtifactStore, config) -> None:
     (config.root / "workspace" / "tiny.txt").write_text("hi", encoding="utf-8")
     artifact = store.send(config.root / "workspace" / "tiny.txt", origin="files",

@@ -392,3 +392,17 @@ def test_read_of_an_unknown_chat_is_empty(history: History) -> None:
 
 def test_sessions_are_distinct(history: History) -> None:
     assert history.new_session(1) != history.new_session(1)
+
+
+def test_a_session_id_names_its_chat(history: History) -> None:
+    """The chat_id parameter must appear in the id, not be silently dropped."""
+    assert "-cli-" in history.new_session("cli")
+    assert "-42-" in history.new_session(42)
+
+
+def test_load_stamps_the_mtime_of_the_file_it_created(tmp_path: Path) -> None:
+    """A file created by load() must be stamped, or the first ensure_loaded()
+    sees 0.0 on disk and re-reads what was just written."""
+    memory = MemoryFile(tmp_path / "MEMORY.md")
+    memory.load()
+    assert memory._mtime == (tmp_path / "MEMORY.md").stat().st_mtime

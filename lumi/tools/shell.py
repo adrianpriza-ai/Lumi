@@ -231,7 +231,7 @@ Rules:
         code, stdout, stderr, timed_out = await self._run(command, cwd, timeout)
         elapsed = asyncio.get_running_loop().time() - started
 
-        return self._render(command, cwd, code, stdout, stderr, timed_out, elapsed, ctx)
+        return self._render(command, cwd, code, stdout, stderr, timed_out, elapsed, timeout, ctx)
 
     async def _run(
         self,
@@ -276,6 +276,7 @@ Rules:
         stderr: str,
         timed_out: bool,
         elapsed: float,
+        timeout: int,
         ctx: ToolContext,
     ) -> ToolResult:
         cap = self.shell_config.max_output_chars
@@ -285,7 +286,9 @@ Rules:
         ]
 
         if timed_out:
-            lines.append(f"TIMED OUT after {self._timeout(None)}s — the command was killed.")
+            # The budget actually enforced — the model may have asked for its
+            # own timeout, which can differ from the configured one.
+            lines.append(f"TIMED OUT after {timeout}s — the command was killed.")
             code = -1
         else:
             lines.append(f"exit: {code}  ({elapsed:.2f}s)")

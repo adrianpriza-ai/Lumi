@@ -88,6 +88,18 @@ async def test_timeout_kills_the_process_group(shell: ShellTool, config) -> None
     assert "TIMED OUT" in result.text
 
 
+async def test_timeout_message_names_the_budget_that_was_used(
+    shell: ShellTool, config
+) -> None:
+    """A per-call timeout must be reported, not the configured default."""
+    config.tools.shell.timeout_seconds = 30
+    result = await shell.invoke(
+        {"command": "sleep 30", "timeout_seconds": 1}, ctx(source="cli", confirmed=True)
+    )
+    assert result.data["timed_out"] is True
+    assert "TIMED OUT after 1s" in result.text
+
+
 async def test_output_is_capped(shell: ShellTool, config) -> None:
     config.tools.shell.max_output_chars = 200
     result = await shell.invoke(
@@ -286,6 +298,29 @@ async def test_stat(files: FilesTool) -> None:
     result = await files.invoke({"action": "stat", "path": "config.toml"}, ctx())
     assert "type: file" in result.text
     assert "size:" in result.text
+
+
+async def test_zero_max_read_chars_means_no_cap(files: FilesTool, config) -> None:
+    """`max_read_chars = 0` is documented as "no cap"; it must not read zero bytes."""
+    files.settings.max_read_chars = 0
+    (config.shell_cwd / "notes.txt").write_text("x" * 500, encoding="utf-8")
+    result = await files.invoke({"action": "read", "path": "workspace/notes.txt"}, ctx())
+    assert result.ok
+    assert "x" * 500 in result.text
+    assert "truncated" not in result.text
+    assert result.data["truncated"] is False
+
+
+async def test_explicit_max_bytes_still_caps_when_setting_is_zero(files: FilesTool, config) -> None:
+    files.settings.max_read_chars = 0
+    (config.shell_cwd / "notes.txt").write_text("x" * 500, encoding="utf-8")
+    result = await files.invoke(
+        {"action": "read", "path": "workspace/notes.txt", "max_bytes": 100}, ctx()
+    )
+    assert result.ok
+    assert "x" * 100 in result.text
+    assert "x" * 101 not in result.text
+    assert result.data["truncated"] is True
 
 
 async def test_read_outside_the_project_is_refused(files: FilesTool) -> None:

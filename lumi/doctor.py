@@ -189,11 +189,13 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
 
     # -- web providers ----------------------------------------------------- #
     # Tavily has a keyless tier (provider stays available without a key);
-    # Firecrawl does not. Each provider also takes a key pool, so the doctor
-    # reports the strategy when more than one key is configured.
+    # Firecrawl and Exa do not — an unset key means the provider is skipped.
+    # Each provider also takes a key pool, so the doctor reports the strategy
+    # when more than one key is configured.
     for provider_name, cfg in (
         ("tavily", config.tools.web.tavily),
         ("firecrawl", config.tools.web.firecrawl),
+        ("exa", config.tools.web.exa),
     ):
         if not cfg.enabled:
             checks.append(Check(cfg.api_key_env, WARN, "provider disabled in config"))
@@ -308,7 +310,8 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
     try:
         history_dir = config.history_dir
         files = list(history_dir.glob("*.jsonl")) if history_dir.is_dir() else []
-        total = sum(1 for f in files for _ in f.open("r", encoding="utf-8"))
+        # read_text per file, not an unclosed handle per file.
+        total = sum(len(f.read_text(encoding="utf-8").splitlines()) for f in files)
         checks.append(Check("history", OK, f"{len(files)} chat(s), {total} turns"))
     except Exception as exc:  # noqa: BLE001
         checks.append(Check("history", WARN, format_error(exc)))

@@ -277,8 +277,8 @@ def test_config_toml_base_url_wins_over_env(project, monkeypatch) -> None:
 
 
 def test_model_falls_back_to_openai_model(config, monkeypatch) -> None:
-    """config.toml ships the default model, so the env must still win over it."""
-    config.llm.model = "gpt-4.1-mini"  # the shipped default
+    """Unset in config.toml, the environment still decides the model."""
+    config.llm.model = ""  # what an absent `model =` line leaves behind
     monkeypatch.setenv("OPENAI_MODEL", "nemotron-3-nano-reasoning")
     assert config.llm.model_of() == "nemotron-3-nano-reasoning"
 
@@ -287,6 +287,26 @@ def test_explicit_model_beats_openai_model(config, monkeypatch) -> None:
     config.llm.model = "qwen3:8b"
     monkeypatch.setenv("OPENAI_MODEL", "nemotron-3-nano-reasoning")
     assert config.llm.model_of() == "qwen3:8b"
+
+
+def test_pinning_the_default_model_still_beats_openai_model(config, monkeypatch) -> None:
+    """A pin equal to the built-in default is a pin, not "unset"."""
+    config.llm.model = "gpt-4.1-mini"
+    monkeypatch.setenv("OPENAI_MODEL", "nemotron-3-nano-reasoning")
+    assert config.llm.model_of() == "gpt-4.1-mini"
+
+
+def test_a_toml_pin_equal_to_the_default_beats_the_env(project, monkeypatch) -> None:
+    """The same through load_config — the precedence quirk as an owner hits it."""
+    (project / "config.toml").write_text('[llm]\nmodel = "gpt-4.1-mini"\n', encoding="utf-8")
+    monkeypatch.setenv("OPENAI_MODEL", "nemotron-3-nano-reasoning")
+    assert load_config(project).llm.model_of() == "gpt-4.1-mini"
+
+
+def test_model_falls_back_to_the_builtin_default(config, monkeypatch) -> None:
+    config.llm.model = ""
+    monkeypatch.delenv("OPENAI_MODEL", raising=False)
+    assert config.llm.model_of() == "gpt-4.1-mini"
 
 
 # --------------------------------------------------------------------------- #
