@@ -29,7 +29,15 @@ from typing import Any
 from ..config import OPENAI_DEFAULT_BASE_URL, LLMConfig
 from ..util.log import get_logger
 from ..util.text import format_error
-from .base import LLMClient, LLMError, LLMReply, ToolCall
+from .base import (
+    USAGE_COMPLETION,
+    USAGE_PROMPT,
+    USAGE_REASONING,
+    LLMClient,
+    LLMError,
+    LLMReply,
+    ToolCall,
+)
 from .keypool import KeyPool, is_retryable, mask
 from .reasoning import (
     completion_ceiling,
@@ -386,16 +394,17 @@ class OpenAICompatClient(LLMClient):
 
         usage = {}
         if getattr(completion, "usage", None):
+            # Under the USAGE_* names the rest of the package reads them by.
             usage = {
-                "prompt": getattr(completion.usage, "prompt_tokens", 0) or 0,
-                "completion": getattr(completion.usage, "completion_tokens", 0) or 0,
+                USAGE_PROMPT: getattr(completion.usage, "prompt_tokens", 0) or 0,
+                USAGE_COMPLETION: getattr(completion.usage, "completion_tokens", 0) or 0,
             }
             # Not every provider reports the split, and a missing one is simply
             # absent rather than zero, so read it defensively.
             details = getattr(completion.usage, "completion_tokens_details", None)
             thinking = getattr(details, "reasoning_tokens", 0) or 0
             if thinking:
-                usage["reasoning"] = int(thinking)
+                usage[USAGE_REASONING] = int(thinking)
 
         return LLMReply(
             text=text,

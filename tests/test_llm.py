@@ -12,8 +12,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from lumi.context import ContextWindow
 from lumi.llm import build_llm
-from lumi.llm.base import LLMError
+from lumi.llm.base import USAGE_PROMPT, USAGE_REASONING, LLMError
 from lumi.llm.keypool import mask
 from lumi.llm.openai_compat import OpenAICompatClient
 
@@ -174,6 +175,24 @@ async def test_parses_plain_text(config) -> None:
     assert result.tool_calls == []
     assert result.wants_tools is False
     assert result.usage == {"prompt": 11, "completion": 7}
+
+
+async def test_the_usage_block_reaches_the_context_window(config) -> None:
+    """The adapter fills ``usage`` under the keys the context window reads —
+    the ``USAGE_*`` contract in :mod:`lumi.llm.base`. A rename on either side
+    would silently disable token calibration, so the seam is pinned end to
+    end: a real parse fed into a real :meth:`ContextWindow.observe`."""
+    completions = StubCompletions(reply("the answer", reasoning_tokens=7))
+    result = await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+
+    assert result.usage[USAGE_PROMPT] == 11
+    assert result.usage[USAGE_REASONING] == 7
+
+    messages = [{"role": "user", "content": "q"}]
+    window = ContextWindow(config)
+    window.observe(result.usage, messages)
+    conv = SimpleNamespace(messages=messages, summarised=0, elided=0, dropped=0, truncated=False)
+    assert window.report(conv).calibrated is True
 
 
 async def test_parses_tool_calls_with_json_arguments(config) -> None:

@@ -2,9 +2,7 @@
 
 [← Back to README](README.md) · [CONFIGURATION.md](CONFIGURATION.md) · [TOOLS.md](TOOLS.md)
 
-Two things about the Telegram side trip people up: when the bot is allowed to
-answer in a group, and getting a TCP connection to `api.telegram.org` at all.
-Both are configuration; nothing here needs a code change.
+Two things about the Telegram side trip people up: when the bot is allowed to answer in a group, and getting a TCP connection to `api.telegram.org` at all. Both are configuration; nothing here needs a code change.
 
 ## Group chats
 
@@ -38,9 +36,7 @@ always_reply_chats = ["-1001234567890"]
 
 ## Reaching api.telegram.org
 
-If the bot dies at startup with `telegram.error.TimedOut` / `ConnectTimeout`,
-the TCP connection to `api.telegram.org` failed. Three knobs under `[bot]`
-address it:
+If the bot dies at startup with `telegram.error.TimedOut` / `ConnectTimeout`, the TCP connection to `api.telegram.org` failed. Three knobs under `[bot]` address it:
 
 - `proxy_url` — route the Bot API through a SOCKS5 or HTTP proxy (e.g.
   `socks5://127.0.0.1:9050`). The usual fix where Telegram is throttled or

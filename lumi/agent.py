@@ -31,7 +31,7 @@ from .artifacts import Artifact
 from .config import Config
 from .context import ContextReport, ContextWindow
 from .llm import LLMClient, ToolCall, build_llm
-from .llm.base import LLMError, LLMReply
+from .llm.base import USAGE_REASONING, LLMError, LLMReply
 from .memory import History, MemoryFile
 from .paths import relative_to_root
 from .personality import Personality
@@ -115,6 +115,12 @@ say the link's text and put the URL in <code></code>, or just describe it.
 """
 
 
+#: How long an unanswered approval stays answerable. An inline button nobody
+#: presses must not pin its conversation in memory forever — after this the
+#: action is cancelled, the model is told, and the chat becomes evictable.
+APPROVAL_TTL_SECONDS = 12 * 3600
+
+
 @dataclass(slots=True)
 class PendingAction:
     """A tool call waiting on the owner's yes or no."""
@@ -124,6 +130,12 @@ class PendingAction:
     arguments: dict[str, Any]
     reason: str
     preview: str
+    #: Monotonic clock of when the question was asked; see APPROVAL_TTL_SECONDS.
+    created: float = field(default_factory=time.monotonic)
+
+    def expired(self, now: float | None = None) -> bool:
+        """True once the owner has left this question unanswered for too long."""
+        return (time.monotonic() if now is None else now) - self.created > APPROVAL_TTL_SECONDS
 
 
 @dataclass(slots=True)
@@ -274,8 +286,12 @@ class Agent:
         which is the same code path a restart takes.
 
         A chat with a pending approval is never evicted, because the owner has
-        to be able to answer it and the state lives only in memory.
+        to be able to answer it and the state lives only in memory. "Never"
+        becomes "not while it is still answerable": before picking victims the
+        stale approvals are cancelled (:meth:`_expire_approvals`), so one
+        dangling button cannot hold the cache open without limit.
         """
+        self._expire_approvals()
         while len(self._conversations) > self._max_conversations:
             candidates = [
                 conv for chat_id, conv in self._conversations.items()
@@ -290,6 +306,43 @@ class Agent:
                 "it replays from its transcript on the next message",
                 quietest.chat_id, len(self._conversations),
             )
+
+    def _expire_approvals(self) -> None:
+        """Cancel pending actions the owner has left unanswered for too long.
+
+        Runs before eviction chooses its victims: a pending action is the one
+        thing that keeps a conversation out of the candidates, so without a
+        deadline a single dangling approval would let ``max_conversations`` be
+        exceeded without limit. Each expiry is written into the conversation,
+        so the model hears that the wait ended instead of assuming the owner is
+        still deciding.
+        """
+        now = time.monotonic()
+        for conv in self._conversations.values():
+            stale = [p for p in conv.pending if p.expired(now)]
+            if not stale:
+                continue
+            conv.pending = [p for p in conv.pending if not p.expired(now)]
+            for action in stale:
+                self._note_approval_expired(conv, action)
+            log.info(
+                "cancelled %d unanswered approval(s) for chat %s",
+                len(stale), conv.chat_id,
+            )
+
+    def _note_approval_expired(self, conv: Conversation, action: PendingAction) -> None:
+        """Tell the model an unanswered approval was cancelled.
+
+        The conversation already holds the tool message saying the call was
+        waiting for the owner; without this note the model would never learn
+        that the wait ended.
+        """
+        note = (
+            f"[The owner never answered the request to {action.tool}; it expired "
+            "and was cancelled without running. Do not run it or retry it.]"
+        )
+        conv.messages.append({"role": "user", "content": note})
+        self.history.append(conv.chat_id, "user", note, session=conv.session, tool=action.tool)
 
     def reset(self, chat_id: int | str) -> None:
         self._conversations.pop(chat_id, None)
@@ -408,7 +461,7 @@ class Agent:
             # throwing that away would hide the most interesting part.
             if reply.reasoning:
                 result.reasoning = f"{result.reasoning}\n\n{reply.reasoning}".strip()
-            result.reasoning_tokens += reply.usage.get("reasoning", 0)
+            result.reasoning_tokens += reply.usage.get(USAGE_REASONING, 0)
 
             if not reply.wants_tools:
                 result.text = reply.text
@@ -439,14 +492,21 @@ class Agent:
                 result.elapsed = time.monotonic() - started
                 return result
 
-        # Iteration cap: something is looping. Report it instead of hanging.
-        result.text = result.text or (
+        # Iteration cap: something is looping. Report it instead of hanging —
+        # and say it *in* the conversation, not only to the caller. The last
+        # thing the model saw was a tool result, so without this assistant turn
+        # the next turn would open on a half-finished exchange it was never
+        # told had ended.
+        cut_off = result.text or (
             "I hit my tool-call limit for this message and stopped. "
             "Try asking for one thing at a time."
         )
+        conv.messages.append({"role": "assistant", "content": cut_off})
+        result.text = cut_off
         result.error = f"tool iteration limit ({self.config.llm.max_tool_iterations}) reached"
         result.tools_used = tools
         result.elapsed = time.monotonic() - started
+        self.history.append(conv.chat_id, "assistant", cut_off, session=conv.session)
         log.warning("tool iteration cap hit for chat %s", conv.chat_id)
         return result
 
@@ -523,6 +583,13 @@ class Agent:
         if action is None:
             log.info("approval %s is no longer pending for chat %s", action_id, chat_id)
             return TurnResult(error="That request has already been handled or cancelled.")
+
+        if action.expired():
+            # A tap on a day-old button must not run the day-old command.
+            conv.pending = [p for p in conv.pending if p.id != action_id]
+            self._note_approval_expired(conv, action)
+            log.info("approval %s expired before it was answered (chat %s)", action_id, chat_id)
+            return TurnResult(error="That request expired before it was answered, so it was cancelled.")
 
         if approved:
             log.info("owner approved %s: %s", action.tool, action.preview[:120])

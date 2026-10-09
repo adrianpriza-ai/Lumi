@@ -12,26 +12,16 @@
 
 ## File delivery (documents)
 
-The bot exchanges files with the chat through one small harness
-(`lumi/artifacts.py`). Tools never talk to Telegram: a tool that produces a file
-registers it with the harness, the agent loop collects the registrations onto
-the turn, and the presentation layer delivers them — Telegram as documents, the
-CLI as printed paths.
+The bot exchanges files with the chat through one small harness (`lumi/artifacts.py`). Tools never talk to Telegram: a tool that produces a file registers it with the harness, the agent loop collects the registrations onto the turn, and the presentation layer delivers them — Telegram as documents, the CLI as printed paths.
 
 **Outgoing.** The model has two ways to hand you a file:
 
 - `files` with `upload: true` on a write — for anything it generates directly.
-- the `files` action `upload` — for a file that already exists, e.g. one a shell
-  command produced. The file is not modified.
+- the `files` action `upload` — for a file that already exists, e.g. one a shell command produced. The file is not modified.
 
-Each delivered file is copied into `data/outbox/` first, so it survives even if
-the original is later deleted or overwritten. A staged copy is deduplicated on
-(name, size, mtime), so re-sending an unchanged file does not pile up copies.
+Each delivered file is copied into `data/outbox/` first, so it survives even if the original is later deleted or overwritten. A staged copy is deduplicated on (name, size, mtime), so re-sending an unchanged file does not pile up copies.
 
-**Incoming.** Send the bot a document and it is stored under
-`workspace/uploads/<chat_id>/` (filename sanitised, never overwritten), and the
-model gets a prompt naming the path and the caption. From there it is an
-ordinary project file — read it, process it with the shell, rename it.
+**Incoming.** Send the bot a document and it is stored under `workspace/uploads/<chat_id>/` (filename sanitised, never overwritten), and the model gets a prompt naming the path and the caption. From there it is an ordinary project file — read it, process it with the shell, rename it.
 
 **Limits, all enforced with a model-readable reason:** files must have an
 extension from an allowlist (text, code, data, documents, images, common
@@ -54,16 +44,9 @@ Three tiers, resolved in order, strictest wins:
   redirects into a file.
 - **allow** — everything else runs immediately.
 
-On top of that: writes outside the project are blocked, `HOME` is pinned to the
-project, the child environment is scrubbed of anything matching
-`*KEY*|*TOKEN*|*SECRET*|*PASSWORD*` (so a command cannot exfiltrate your API
-keys), and every command runs in its own process group and is killed on timeout.
+On top of that: writes outside the project are blocked, `HOME` is pinned to the project, the child environment is scrubbed of anything matching `*KEY*|*TOKEN*|*SECRET*|*PASSWORD*` (so a command cannot exfiltrate your API keys), and every command runs in its own process group and is killed on timeout.
 
-Output is not truncated. `tools.shell.max_output_chars` is `0` by default, so the
-model sees the whole thing; what gets dropped instead is *old* output, when the
-conversation outgrows the context window — at which point the model is told a
-command ran and that its output is no longer in front of it. Set the cap to a
-number if you would rather always see a short version.
+Output is not truncated. `tools.shell.max_output_chars` is `0` by default, so the model sees the whole thing; what gets dropped instead is *old* output, when the conversation outgrows the context window — at which point the model is told a command ran and that its output is no longer in front of it. Set the cap to a number if you would rather always see a short version.
 
 The checks read the token stream, not just the raw text, so a few things are
 caught that a regex over the command line would miss: `cd .. && rm -rf data` is
@@ -107,35 +90,17 @@ a handler filter, and as an explicit check in every privileged handler.
 
 ## Web providers
 
-`tools.web.provider_order` is tried left to right; the first available provider
-answers, and one that fails at call time falls through to the next.
+`tools.web.provider_order` is tried left to right; the first available provider answers, and one that fails at call time falls through to the next.
 
 ```toml
 [tools.web]
 provider_order = ["firecrawl", "exa", "tavily", "mcp"]
 ```
 
-- **firecrawl** — best for reading a specific page. Renders JavaScript,
-  returns clean markdown. No keyless tier — a `FIRECRAWL_API_KEY` is
-  required, but a comma-separated pool with the same three strategies
-  (`tools.web.firecrawl.key_strategy`) keeps the bot up when one key is
-  rate-limited.
-- **exa** — neural search built for agents: natural-language queries in,
-  semantically ranked pages out, with highlights or full text per hit. Needs
-  an `EXA_API_KEY` (no keyless tier); same rotation rules as the others
-  (`tools.web.exa.key_strategy`). Optional `search_type` (`auto` / `neural` /
-  `keyword`) and `category` (`news`, `github`, `paper`, `pdf`, ...) knobs in
-  `[tools.web.providers.exa]`.
-- **tavily** — best for agentic search. LLM-ready snippets, optional bundled
-  answer. **Works without an API key** — the SDK runs in its free tier
-  (low rate limit; `search` and `extract` only) when `TAVILY_API_KEY` is
-  unset. With one or more keys, a failed key is parked for a minute and the
-  next one answers; `tools.web.tavily.key_strategy` picks
-  `fallback` / `round_robin` / `random`.
-- **mcp** — reads `.mcp.json` from the project root, expands `${VAR}` from the
-  environment, and speaks MCP over streamable HTTP or stdio. It discovers each
-  server's tools and reads their input schemas, so it works with a server whose
-  parameter is called `q` instead of `query`.
+- **firecrawl** — best for reading a specific page. Renders JavaScript, returns clean markdown. No keyless tier — a `FIRECRAWL_API_KEY` is required, but a comma-separated pool with the same three strategies (`tools.web.firecrawl.key_strategy`) keeps the bot up when one key is rate-limited.
+- **exa** — neural search built for agents: natural-language queries in, semantically ranked pages out, with highlights or full text per hit. Needs an `EXA_API_KEY` (no keyless tier); same rotation rules as the others (`tools.web.exa.key_strategy`). Optional `search_type` (`auto` / `neural` / `keyword`) and `category` (`news`, `github`, `paper`, `pdf`, ...) knobs in `[tools.web.providers.exa]`.
+- **tavily** — best for agentic search. LLM-ready snippets, optional bundled answer. **Works without an API key** — the SDK runs in its free tier (low rate limit; `search` and `extract` only) when `TAVILY_API_KEY` is unset. With one or more keys, a failed key is parked for a minute and the next one answers; `tools.web.tavily.key_strategy` picks `fallback` / `round_robin` / `random`.
+- **mcp** — reads `.mcp.json` from the project root, expands `${VAR}` from the environment, and speaks MCP over streamable HTTP or stdio. It discovers each server's tools and reads their input schemas, so it works with a server whose parameter is called `q` instead of `query`.
 
 ```json
 {
@@ -161,29 +126,15 @@ Local servers work too:
 
 ### How much comes back
 
-A search returns `tools.web.max_results` hits (10 by default) and page text is
-not truncated: `tools.web.max_content_chars` is `0`, so a hit the model can
-actually read is a hit it will not have to search for again. The model is told
-it may ask for more than the default, up to 50.
+A search returns `tools.web.max_results` hits (10 by default) and page text is not truncated: `tools.web.max_content_chars` is `0`, so a hit the model can actually read is a hit it will not have to search for again. The model is told it may ask for more than the default, up to 50.
 
-A thin result set is topped up rather than answered — if the first provider
-returns fewer than `min_results` hits, the next provider in the order fills the
-gap (deduplicated by URL) before the model sees it. Every result carries the
-date it was searched and, where the provider knows it, the publish date, so a
-stale page cannot pass for a current one.
+A thin result set is topped up rather than answered — if the first provider returns fewer than `min_results` hits, the next provider in the order fills the gap (deduplicated by URL) before the model sees it. Every result carries the date it was searched and, where the provider knows it, the publish date, so a stale page cannot pass for a current one.
 
 ## Context7 (library docs)
 
-A separate tool from `web`. Where `web` finds pages on the open internet,
-`context7` returns version-specific documentation and code examples for a
-named library. The training data the model runs on is older than most
-libraries; this is how it catches up.
+A separate tool from `web`. Where `web` finds pages on the open internet, `context7` returns version-specific documentation and code examples for a named library. The training data the model runs on is older than most libraries; this is how it catches up.
 
-The tool is **auto-validated**: the moment `CONTEXT7_API_KEY` is set in `.env`,
-the tool appears in the model's tool list; if the variable is unset, the tool
-is hidden from the system prompt and `available()` returns a clear reason. The
-same `OPENAI_API_KEY` rotation pattern applies — a comma-separated pool with
-one of `fallback` (default), `round_robin`, or `random`:
+The tool is **auto-validated**: the moment `CONTEXT7_API_KEY` is set in `.env`, the tool appears in the model's tool list; if the variable is unset, the tool is hidden from the system prompt and `available()` returns a clear reason. The same `OPENAI_API_KEY` rotation pattern applies — a comma-separated pool with one of `fallback` (default), `round_robin`, or `random`:
 
 ```bash
 # .env

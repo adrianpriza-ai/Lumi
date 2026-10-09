@@ -1,9 +1,6 @@
 # Code review — handoff
 
-Written 2026-10-06 after a full read-through of `lumi/` (~11.6k lines) plus the
-tool, LLM, and Telegram layers. Every item marked **VERIFIED** was reproduced
-with a throwaway test against the real test harness before it was written down;
-the repro is included so it can be turned into a regression test as-is.
+Written 2026-10-06 after a full read-through of `lumi/` (~11.6k lines) plus the tool, LLM, and Telegram layers. Every item marked **VERIFIED** was reproduced with a throwaway test against the real test harness before it was written down; the repro is included so it can be turned into a regression test as-is.
 
 **Baseline (unchanged by this review):**
 
@@ -40,24 +37,17 @@ client = httpx.AsyncClient(
     ...
 ```
 
-`Context7Client.__init__` (line 81) only assigns `self.config`. `self.settings`
-exists on `Context7Tool` (line 366), not on `Context7Client`, so the first HTTP
-call raises:
+`Context7Client.__init__` (line 81) only assigns `self.config`. `self.settings` exists on `Context7Tool` (line 366), not on `Context7Client`, so the first HTTP call raises:
 
 ```
 AttributeError: 'Context7Client' object has no attribute 'settings'
 ```
 
-The registry turns it into `ToolResult.failure("context7 crashed: …")`, so the
-model sees a broken tool rather than a stack trace — and with
-`CONTEXT7_API_KEY` set the tool *is* advertised to the model (`available()`
-passes), which is exactly when this fires.
+The registry turns it into `ToolResult.failure("context7 crashed: …")`, so the model sees a broken tool rather than a stack trace — and with `CONTEXT7_API_KEY` set the tool *is* advertised to the model (`available()` passes), which is exactly when this fires.
 
-Why it has never been noticed: `tests/test_context7.py:95` monkeypatches
-`client._client_for` with its own factory, so the real body is never executed.
+Why it has never been noticed: `tests/test_context7.py:95` monkeypatches `client._client_for` with its own factory, so the real body is never executed.
 
-An AST sweep of the whole package for `self.<attr>` reads with no matching
-assignment reports exactly one hit: this one.
+An AST sweep of the whole package for `self.<attr>` reads with no matching assignment reports exactly one hit: this one.
 
 **Fix:** `self.config.timeout_seconds` (one word).
 
@@ -81,15 +71,9 @@ for call in reply.tool_calls:
         return result
 ```
 
-The comment is right about the side effects but the loop stops *mid-set*: if the
-model returns three `tool_calls` and the second one raises `NeedsApproval`, only
-the second gets a `role: "tool"` message. The third has none.
+The comment is right about the side effects but the loop stops *mid-set*: if the model returns three `tool_calls` and the second one raises `NeedsApproval`, only the second gets a `role: "tool"` message. The third has none.
 
-Every provider validates this strictly — an assistant message carrying
-`tool_calls` must be followed by one `tool` message per `tool_call_id`. So the
-*next* `llm.complete()` 400s, the turn dies with `LLMError`, and because the
-malformed pair stays in `conv.messages`, **every subsequent turn fails too** until
-the owner types `/reset`.
+Every provider validates this strictly — an assistant message carrying `tool_calls` must be followed by one `tool` message per `tool_call_id`. So the *next* `llm.complete()` 400s, the turn dies with `LLMError`, and because the malformed pair stays in `conv.messages`, **every subsequent turn fails too** until the owner types `/reset`.
 
 **VERIFIED** (`run_shell` `rm x.txt` = CONFIRM tier, `ls` = ALLOW):
 
@@ -98,13 +82,7 @@ TOOL MESSAGES: [('c1', "Not executed. It deleting files, so it needs the owner's
 MISSING TOOL RESPONSES: ['c2']
 ```
 
-**Fix:** when a call needs approval, still dispatch the *remaining* calls in the
-same reply (they have no approval requirement of their own — or record each that
-does), appending a `role: "tool"` message for every one before returning. The
-invariant to enforce is "one tool message per tool_call_id, always", which the
-comment on `lumi/agent.py:465` already states ("Exactly one tool message per
-tool_call, or the next request 400s"); the early `return` is the only thing that
-violates it.
+**Fix:** when a call needs approval, still dispatch the *remaining* calls in the same reply (they have no approval requirement of their own — or record each that does), appending a `role: "tool"` message for every one before returning. The invariant to enforce is "one tool message per tool_call_id, always", which the comment on `lumi/agent.py:465` already states ("Exactly one tool message per tool_call, or the next request 400s"); the early `return` is the only thing that violates it.
 
 **Regression test:** one scripted reply with two tool calls, the first needing
 approval; after the turn, assert every `tool_call_id` in the last assistant
@@ -116,21 +94,15 @@ message has a matching `role: "tool"` message.
 
 `README.md:73` promises:
 
-> Send the bot a photo and it looks at it. **The caption becomes your question**;
-> a photo with no caption gets a default "what's in this image?".
+> Send the bot a photo and it looks at it. **The caption becomes your question**; a photo with no caption gets a default "what's in this image?".
 
-It doesn't. PTB's `filters.TEXT` is `bool(message.text)` (checked against
-`telegram/ext/filters.py:2777` in v22.8) and a photo message has `text = None`,
-`caption = …` — so a captioned photo matches `~filters.TEXT` and lands in
-`on_non_text` (`lumi/bot.py:1329`), which builds the prompt itself:
+It doesn't. PTB's `filters.TEXT` is `bool(message.text)` (checked against `telegram/ext/filters.py:2777` in v22.8) and a photo message has `text = None`, `caption = …` — so a captioned photo matches `~filters.TEXT` and lands in `on_non_text` (`lumi/bot.py:1329`), which builds the prompt itself:
 
 ```python
 await run_agent(update, context, "what's in this image?", image_b64=image_b64)
 ```
 
-The caption handling that *does* exist in `on_text` (`lumi/bot.py:1275`,
-`if message.photo:`) is unreachable dead code — `on_text` only ever fires for
-real text messages.
+The caption handling that *does* exist in `on_text` (`lumi/bot.py:1275`, `if message.photo:`) is unreachable dead code — `on_text` only ever fires for real text messages.
 
 **VERIFIED:**
 
@@ -146,8 +118,7 @@ prompt = (message.caption or "").strip() or "what's in this image?"
 await run_agent(update, context, prompt, image_b64=image_b64)
 ```
 
-and delete the dead branch in `on_text`. (Documents already do this correctly in
-`on_document`.)
+and delete the dead branch in `on_text`. (Documents already do this correctly in `on_document`.)
 
 **Regression test:** update carrying `photo` + `caption`; assert the caption text
 reaches the model.
@@ -167,14 +138,9 @@ for uid in config.bot.whitelisted_users:
 owner_filter = filters.User(user_id=allowed_user_ids) if allowed_user_ids else filters.User(user_id=0)
 ```
 
-`owner_filter` is a snapshot taken once when handlers are built. The handler
-appends to `config.bot.whitelisted_users` and persists it, but PTB's filter —
-which runs *before* every handler — still has the old id list, so the new user
-falls through to `MessageHandler(on_stranger, filters=~owner_filter)` and gets
-"this bot is private".
+`owner_filter` is a snapshot taken once when handlers are built. The handler appends to `config.bot.whitelisted_users` and persists it, but PTB's filter — which runs *before* every handler — still has the old id list, so the new user falls through to `MessageHandler(on_stranger, filters=~owner_filter)` and gets "this bot is private".
 
-Removal works (the handlers re-check `_is_allowed` against live config); only
-*addition* is broken. Asymmetric, which is what makes it confusing.
+Removal works (the handlers re-check `_is_allowed` against live config); only *addition* is broken. Asymmetric, which is what makes it confusing.
 
 **VERIFIED** on one long-lived application:
 
@@ -184,9 +150,7 @@ ADD RESULT: added <code>777</code> to the user whitelist.
 ```
 
 **Fix options (pick one):**
-- Replace the static `filters.User(...)` with a custom `UpdateFilter` that calls
-  `_is_allowed(update.effective_user, config)` at match time (preferred — one
-  source of truth), or
+- Replace the static `filters.User(...)` with a custom `UpdateFilter` that calls `_is_allowed(update.effective_user, config)` at match time (preferred — one source of truth), or
 - keep a mutable id set in `bot_data` that `build_handlers` reads through, or
 - document loudly that a restart is required and have the command say so.
 
@@ -205,10 +169,7 @@ cap = int(arguments.get("max_bytes") or self.settings.max_read_chars)
 body = handle.read(cap)          # read(0) == ""
 ```
 
-`0` is documented as "no cap" in three places — `lumi/config.py:352`,
-`config.toml:212` and `CONFIGURATION.md:98` — and `/config` even renders it as
-`read no cap` (`lumi/bot.py:279`). In practice the read returns nothing and the
-header claims the file was truncated:
+`0` is documented as "no cap" in three places — `lumi/config.py:352`, `config.toml:212` and `CONFIGURATION.md:98` — and `/config` even renders it as `read no cap` (`lumi/bot.py:279`). In practice the read returns nothing and the header claims the file was truncated:
 
 **VERIFIED:**
 
@@ -246,10 +207,7 @@ elif result.text:
     print(result.text)
 ```
 
-`agent.resolve()` returns the *resumed* turn — i.e. the model's actual reply to
-the command it just ran — and that value is assigned to `result` inside the
-branch that owns the `elif`, so `result.text` is never printed. The whole point
-of approving a command in a REPL is to see what happened next.
+`agent.resolve()` returns the *resumed* turn — i.e. the model's actual reply to the command it just ran — and that value is assigned to `result` inside the branch that owns the `elif`, so `result.text` is never printed. The whole point of approving a command in a REPL is to see what happened next.
 
 **VERIFIED** (scripted turn → `rm x.txt` needs approval → `y` → resumed reply):
 
@@ -260,29 +218,20 @@ CLI OUTPUT >>> … lumi >   needs approval — deleting files: rm x.txt
 AssertionError: approved turn's answer was never printed
 ```
 
-**Fix:** after the approval loop, print the final result the same way the normal
-path does — restructure so both branches fall through to a shared
-`if result.text: print(result.text)`.
+**Fix:** after the approval loop, print the final result the same way the normal path does — restructure so both branches fall through to a shared `if result.text: print(result.text)`.
 
 ---
 
 ### 1.7 `/whitelist_*` can corrupt `config.local.toml` — **MEDIUM**
 
-`lumi/bot.py:1483` (`_save_whitelist`) → `lumi/bot.py:732/746`
-(`_toml_value` / `_write_toml`)
+`lumi/bot.py:1483` (`_save_whitelist`) → `lumi/bot.py:732/746` (`_toml_value` / `_write_toml`)
 
-The whole file is parsed, mutated in memory and rewritten with a hand-rolled
-TOML writer. Two ways this loses data:
+The whole file is parsed, mutated in memory and rewritten with a hand-rolled TOML writer. Two ways this loses data:
 
-1. **`except Exception: existing = {}`** (line 1491) — if the file is already
-   unparseable, it is *silently replaced* by the whitelist alone. Whatever was in
-   there is gone.
-2. **`_toml_value` cannot round-trip a string containing a newline** (it only
-   escapes `\` and `"`), multi-line `"""` strings, inline tables, arrays of
-   tables, datetimes or integers-with-expressions.
+1. **`except Exception: existing = {}`** (line 1491) — if the file is already unparseable, it is *silently replaced* by the whitelist alone. Whatever was in there is gone.
+2. **`_toml_value` cannot round-trip a string containing a newline** (it only escapes `\` and `"`), multi-line `"""` strings, inline tables, arrays of tables, datetimes or integers-with-expressions.
 
-**VERIFIED** — a `config.local.toml` containing one multi-line string, passed
-through `_write_toml`:
+**VERIFIED** — a `config.local.toml` containing one multi-line string, passed through `_write_toml`:
 
 ```
 [bot]
@@ -292,50 +241,34 @@ line two"
 REPARSE FAILED: Illegal character '\n' (at line 4, column 17)
 ```
 
-The consequence is worse than a lost value: `_read_toml` raises `ConfigError` on
-the next boot, so `lumi run` refuses to start with
-`configuration error: … is not valid TOML`.
+The consequence is worse than a lost value: `_read_toml` raises `ConfigError` on the next boot, so `lumi run` refuses to start with `configuration error: … is not valid TOML`.
 
-**Fix (cheap and safe):** store the whitelist in its own small file
-(`data/whitelist.json`) instead of rewriting the user's config; or, if it must
-stay in `config.local.toml`, only patch the two known keys textually and abort
-loudly (rather than `existing = {}`) when the file cannot be re-serialised.
+**Fix (cheap and safe):** store the whitelist in its own small file (`data/whitelist.json`) instead of rewriting the user's config; or, if it must stay in `config.local.toml`, only patch the two known keys textually and abort loudly (rather than `existing = {}`) when the file cannot be re-serialised.
 
 ---
 
 ### 1.8 Tapping a stale inline button raises an unhandled `BadRequest` — **MEDIUM**
 
-`lumi/bot.py:1230, 1241, 1430, 1435, 1443, 1446` — every `query.answer(...)`
-call is unguarded, unlike `query.edit_message_text`, which `_edit_thinking`
-wraps carefully.
+`lumi/bot.py:1230, 1241, 1430, 1435, 1443, 1446` — every `query.answer(...)` call is unguarded, unlike `query.edit_message_text`, which `_edit_thinking` wraps carefully.
 
-Telegram expires callback queries quickly (and PTB processes updates
-sequentially, so a tap that queues behind a long agent turn can easily be
-answered late). `query.answer()` then raises:
+Telegram expires callback queries quickly (and PTB processes updates sequentially, so a tap that queues behind a long agent turn can easily be answered late). `query.answer()` then raises:
 
 ```
 telegram.error.BadRequest: Query is too old and response timeout expired
                            or query id is invalid
 ```
 
-which propagates to `_error_handler` and is logged as an unhandled error — and
-because it raises *before* the intended follow-up, the tap does nothing at all:
-`_expand_thinking` never expands, `button` never resolves the approval.
+which propagates to `_error_handler` and is logged as an unhandled error — and because it raises *before* the intended follow-up, the tap does nothing at all: `_expand_thinking` never expands, `button` never resolves the approval.
 
-This is not hypothetical — it is in the repo. `something.txt` (committed in
-`4dc53c5 somehing`) is a captured log of exactly this traceback twice, ending in
-`^C`.
+This is not hypothetical — it is in the repo. `something.txt` (committed in `4dc53c5 somehing`) is a captured log of exactly this traceback twice, ending in `^C`.
 
-**Fix:** wrap every `await query.answer(...)` in
-`contextlib.suppress(BadRequest, TelegramError)` (or a tiny local helper
-`async def _toast(query, text, **kw)`), and keep going: `edit_message_text` and
-the approval resolution do not depend on the toast succeeding.
+**Fix:** wrap every `await query.answer(...)` in `contextlib.suppress(BadRequest, TelegramError)` (or a tiny local helper `async def _toast(query, text, **kw)`), and keep going: `edit_message_text` and the approval resolution do not depend on the toast succeeding.
 
 ---
 
 ## 2. Worth a look
 
-These I did **not** reproduce; they need a decision or a second opinion.
+These I did not reproduce; they need a decision or a second opinion.
 
 | # | Where | Concern |
 |-|-|-|
@@ -387,11 +320,7 @@ These I did **not** reproduce; they need a decision or a second opinion.
 
 ---
 
-## 4. Test gaps
-
-837 tests, all green, and they genuinely cover a lot — but every bug above
-slipped through because the tests are shaped around the *happy path of each
-unit* rather than the seams between units:
+## 4. Test gaps837 tests, all green, and they genuinely cover a lot — but every bug above slipped through because the tests are shaped around the *happy path of each unit* rather than the seams between units:
 
 | Gap | Why the suite misses it |
 |-|-|
@@ -432,7 +361,7 @@ That single assertion would have caught 1.2.
 
 ## 6. What looked solid
 
-Worth knowing so a future reader does not "fix" these:
+So a future reader does not "fix" these:
 
 - **`lumi/context.py`** — the token budgeting, block grouping
   (`assistant+tool_calls` always move together), summary install/refresh and the

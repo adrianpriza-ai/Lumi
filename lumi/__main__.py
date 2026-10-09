@@ -129,7 +129,15 @@ async def _chat(config: Config) -> int:
     print(BANNER)
     print(f"model: {config.llm.model_of()} via {config.llm.base_url_of()}")
     print(f"tools: {', '.join(agent.registry.names()) or 'none'}\n")
+    try:
+        return await _repl(agent, config)
+    finally:
+        # Cached HTTP clients (context7) close on the way out, so a REPL
+        # session does not leave connections for the GC to complain about.
+        await agent.registry.aclose()
 
+
+async def _repl(agent: Any, config: Config) -> int:
     while True:
         try:
             line = (await _prompt("you > ")).strip()

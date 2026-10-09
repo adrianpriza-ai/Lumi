@@ -10,7 +10,7 @@ import json
 
 from conftest import FakeLLM, make_reply
 
-from lumi.agent import Agent
+from lumi.agent import APPROVAL_TTL_SECONDS, Agent
 from lumi.llm.base import LLMError
 from lumi.memory import History, MemoryFile
 from lumi.personality import Personality
@@ -344,6 +344,28 @@ async def test_iteration_cap_stops_a_runaway_loop(config) -> None:
     assert result.iterations == 3
     assert "tool iteration limit" in result.error
     assert "one thing at a time" in result.text
+
+    # The stop is recorded *in* the conversation as well as in the result:
+    # the next turn used to open on a dangling tool result with no sign the
+    # model had been cut off.
+    messages = agent.conversation(CHAT).messages
+    assert messages[-1]["role"] == "assistant"
+    assert messages[-1]["content"] == result.text
+
+    # And the invariant the cap must not break: one tool message per
+    # tool_call_id, even on the iteration that hit the cap.
+    asked = {
+        call["id"]
+        for message in messages
+        if message.get("role") == "assistant"
+        for call in (message.get("tool_calls") or [])
+    }
+    answered = {
+        message.get("tool_call_id")
+        for message in messages
+        if message.get("role") == "tool"
+    }
+    assert asked == answered
 
 
 # --------------------------------------------------------------------------- #
@@ -708,3 +730,56 @@ def test_specs_are_well_formed(config) -> None:
         assert function["name"]
         assert function["description"]
         assert function["parameters"]["type"] == "object"
+
+
+# --------------------------------------------------------------------------- #
+# stale approvals
+# --------------------------------------------------------------------------- #
+
+
+async def test_an_unanswered_approval_expires_and_a_late_tap_is_refused(config) -> None:
+    """A day-old button must not run the day-old command: the action expires,
+    is cancelled, and the model is told rather than left waiting."""
+    agent = make_agent(
+        config,
+        [make_reply("", [("c1", "run_shell", {"command": "rm -rf workspace/tmp"})])],
+    )
+    result = await agent.handle(CHAT, "delete the tmp folder")
+    assert result.needs_approval
+
+    conv = agent.conversation(CHAT)
+    conv.pending[0].created -= APPROVAL_TTL_SECONDS + 1
+
+    late = await agent.resolve(CHAT, "c1", True)
+
+    assert "expired" in late.error.lower()
+    assert conv.pending == []
+    # The model hears that the wait ended — a user note naming the expiry.
+    assert conv.messages[-1]["role"] == "user"
+    assert "expired" in conv.messages[-1]["content"]
+    # And the command did not run: no approval outcome was ever recorded.
+    assert not any("Approved by the owner" in str(m.get("content", "")) for m in conv.messages)
+
+
+async def test_a_dangling_approval_stops_pinning_the_conversation(config) -> None:
+    """A fresh approval protects its chat from eviction (the owner must be able
+    to answer it); once expired the chat is evictable like any other, so
+    ``max_conversations`` cannot be exceeded without limit."""
+    config.llm.max_conversations = 1
+    agent = make_agent(
+        config,
+        [make_reply("", [("c1", "run_shell", {"command": "rm -rf workspace/tmp"})])],
+    )
+    await agent.handle(CHAT, "delete the tmp folder")
+    assert agent.conversation_state(CHAT).pending  # sanity: it is waiting
+
+    agent.conversation(999)
+    # The pending approval still keeps its chat in memory…
+    assert agent.conversation_state(CHAT) is not None
+
+    agent.conversation(CHAT).pending[0].created -= APPROVAL_TTL_SECONDS + 1
+    agent.conversation(1000)
+
+    # …but once it has expired, the stale chat is evicted and the cap holds.
+    assert agent.conversation_state(CHAT) is None
+    assert agent.conversations_in_memory() == 1

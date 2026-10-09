@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import pytest
 
-from lumi.tools.base import NeedsApproval, ToolContext, ToolError
+from lumi.tools.base import NeedsApproval, Tool, ToolContext, ToolError, ToolResult
 from lumi.tools.files import FilesTool
 from lumi.tools.memory_tool import MemoryTool
+from lumi.tools.registry import ToolRegistry
 from lumi.tools.shell import SECRET_PATTERN, ShellTool
 
 
@@ -399,3 +400,42 @@ async def test_there_is_no_forget_action(memory_tool: MemoryTool) -> None:
     """The model must not be able to erase what the owner told it."""
     with pytest.raises(ToolError, match="unknown action"):
         await memory_tool.invoke({"action": "forget", "fact": "the security rules"}, ctx())
+
+
+# --------------------------------------------------------------------------- #
+# shutdown
+# --------------------------------------------------------------------------- #
+
+
+async def test_registry_close_releases_every_tool() -> None:
+    """Shutdown goes through the registry so nothing is left to the GC — and
+    one tool failing to close must not stop the others or mask the exit."""
+    closed: list[str] = []
+
+    class Chatty(Tool):
+        name = "chatty"
+        description = "Records its own close."
+
+        async def invoke(self, arguments, ctx):
+            return ToolResult(text="ok")
+
+        async def aclose(self) -> None:
+            closed.append(self.name)
+
+    class Broken(Tool):
+        name = "broken"
+        description = "Raises on close."
+
+        async def invoke(self, arguments, ctx):
+            return ToolResult(text="ok")
+
+        async def aclose(self) -> None:
+            raise RuntimeError("already gone")
+
+    registry = ToolRegistry()
+    registry.register(Broken())
+    registry.register(Chatty())
+
+    await registry.aclose()  # must not raise
+
+    assert closed == ["chatty"]

@@ -440,3 +440,48 @@ def test_describe_available_only_hides_every_disabled_tool(config, monkeypatch) 
     description = registry.describe(available_only=True)
     assert "always-on" in description
     assert "needs-key" not in description
+
+
+# --------------------------------------------------------------------------- #
+# shutdown
+# --------------------------------------------------------------------------- #
+
+
+async def test_aclose_closes_every_cached_client(monkeypatch) -> None:
+    """The cached ``httpx.AsyncClient``s are the only state the client holds;
+    ``aclose`` is how they reach the network stack's own shutdown."""
+    monkeypatch.setenv("CONTEXT7_API_KEY", "ctx7sk-91")
+    client = Context7Client(Context7Config())
+    closed: list[str] = []
+
+    class FakeClient:
+        def __init__(self, key: str) -> None:
+            self.key = key
+
+        async def aclose(self) -> None:
+            closed.append(self.key)
+
+    client._clients = {"k1": FakeClient("k1"), "k2": FakeClient("k2")}
+    await client.aclose()
+
+    assert closed == ["k1", "k2"]
+    # Nothing left to close a second time.
+    client._clients = {}
+    await client.aclose()
+
+
+async def test_the_tool_delegates_aclose_to_its_client(monkeypatch) -> None:
+    """The registry reaches the httpx stack through the tool, so the chain
+    registry → tool → client must be intact."""
+    monkeypatch.setenv("CONTEXT7_API_KEY", "ctx7sk-91")
+    tool = Context7Tool(_full_config())
+    closed: list[bool] = []
+
+    class FakeClient:
+        async def aclose(self) -> None:
+            closed.append(True)
+
+    tool._client._clients["k"] = FakeClient()
+    await tool.aclose()
+
+    assert closed == [True]

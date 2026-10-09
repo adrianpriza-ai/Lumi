@@ -1,12 +1,8 @@
 # Memory
 
-Long-term notes that survive restarts. Lumi reads this file before every
-message and can append to it via the `remember` tool. You can also edit it by
-hand — the bot never rewrites lines you wrote, it only appends.
+Long-term notes that survive restarts. Lumi reads this file before every message and can append to it via the `remember` tool. You can also edit it by hand — the bot never rewrites lines you wrote, it only appends.
 
-Format: one fact per line, as a markdown bullet. Keep them short and
-declarative; a line that starts with `-` and a date is treated as a managed
-memory (see `/forget`). Anything else is free-form context.
+Format: one fact per line, as a markdown bullet. Keep them short and declarative; a line that starts with `-` and a date is treated as a managed memory (see `/forget`). Anything else is free-form context.
 
 ## Facts
 

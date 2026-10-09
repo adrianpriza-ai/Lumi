@@ -2,8 +2,7 @@
 
 [← Back to README](README.md) · [TOOLS.md](TOOLS.md) · [TELEGRAM.md](TELEGRAM.md)
 
-`config.toml` is committed and holds no secrets. `.env` holds the secrets and is
-gitignored. Every config value can also be set as an environment variable:
+`config.toml` is committed and holds no secrets. `.env` holds the secrets and is gitignored. Every config value can also be set as an environment variable:
 
 ```bash
 LUMI__LLM__MODEL=qwen3:8b
@@ -35,12 +34,7 @@ model = "anthropic/claude-sonnet-4.5"
 api_key_env = "OPENROUTER_API_KEY"   # this provider's own key variable
 ```
 
-Images sent in Telegram are passed through the standard OpenAI multimodal
-content array, so any endpoint that accepts `image_url` parts works. Set
-`vision_model` to a vision-capable id (`gpt-4o`, `claude-3.5+`, `gemini-2.*`,
-`llama-3.2-vision`, `qwen2-vl`, …) and photo turns go to it while everything
-else stays on `model` — same endpoint, same keys. Leave it empty and photos go
-to `model` too, which then has to be vision-capable or they will fail.
+Images sent in Telegram are passed through the standard OpenAI multimodal content array, so any endpoint that accepts `image_url` parts works. Set `vision_model` to a vision-capable id (`gpt-4o`, `claude-3.5+`, `gemini-2.*`, `llama-3.2-vision`, `qwen2-vl`, …) and photo turns go to it while everything else stays on `model` — same endpoint, same keys. Leave it empty and photos go to `model` too, which then has to be vision-capable or they will fail.
 
 Resolution order, most specific wins:
 
@@ -64,9 +58,7 @@ lumi config --key llm.key_strategy  # -> fallback
 lumi doctor | grep llm              # -> model via endpoint (from OPENAI_BASE_URL), keys: fallback
 ```
 
-If a call fails, the error names the endpoint, model and key variable it used, so
-a key rejected by the wrong host is obvious immediately. `temperature = null`
-omits the parameter, which some reasoning models require.
+If a call fails, the error names the endpoint, model, and key variable it used, so a key rejected by the wrong host is obvious immediately. `temperature = null` omits the parameter, which some reasoning models require.
 
 ## No output ceiling
 
@@ -74,8 +66,7 @@ omits the parameter, which some reasoning models require.
 `max_completion_tokens` parameter at all. The provider's own output limit
 applies, and the model writes as long as it has something to say.
 
-A number here is not a "generous default", it is a wall the model stops at — a
-2000-token answer is not a long answer, it is an answer cut off mid-sentence.
+A number here is not a "generous default"; it is a wall the model stops at. A 2000-token answer is not a long answer; it is an answer cut off mid-sentence.
 If your provider needs a specific limit, set it:
 
 ```toml
@@ -106,12 +97,7 @@ conversation actually outgrows the model — see
 
 ## The context window
 
-History is budgeted in **tokens against the model's window**, not counted in
-messages. A message count is what makes a bot forget: sixty messages is a busy
-afternoon, and the moment the count is exceeded the oldest prefix is deleted, so
-the model is later asked about something it has never seen and answers from
-imagination. With a 200k window you get the last 200k tokens instead, which on a
-normal day is *everything*.
+History is budgeted in **tokens against the model's window**, not counted in messages. A message count is what makes a bot forget: sixty messages is a busy afternoon, and the moment the count is exceeded the oldest prefix is deleted, so the model is later asked about something it has never seen and answers from imagination. With a 200k window you get the last 200k tokens instead, which on a normal day is *everything*.
 
 ```toml
 [llm]
@@ -123,20 +109,12 @@ history_turns = 0              # replay as much as fits
 max_conversations = 32         # chats held in memory at once
 ```
 
-When the window fills, the oldest part is condensed rather than deleted, in
-this order:
+When the window fills, the oldest part is condensed rather than deleted. The order is:
 
-1. **Old tool output is elided** to one line saying what ran. It is the
-   bulkiest and least conversational thing in any context, and the model
-   already has what it needed from it.
-2. **The oldest turns are summarised** by the model itself, with instructions to
-   keep decisions, facts about you, files and versions, and anything unfinished
-   — and to leave out the sequence of tool calls. The record replaces the turns
-   it covers.
-3. **Only if that is not enough** are turns dropped verbatim, and only if the
-   model would not write a record.
-4. **Last resort**, a single message too big for the window on its own gets cut.
-   The system prompt and the turn being answered are never cut.
+1. **Old tool output is elided** to one line saying what ran. It is the bulkiest and least conversational thing in any context, and the model already has what it needed from it.
+2. **The oldest turns are summarised** by the model itself, with instructions to keep decisions, facts about you, files and versions, and anything unfinished — and to leave out the sequence of tool calls. The record replaces the turns it covers.
+3. **Only if that is not enough** are turns dropped verbatim, and only if the model would not write a record.
+4. **Last resort**, a single message too big for the window on its own gets cut. The system prompt and the turn being answered are never cut.
 
 The record is written to `data/history/<chat_id>.jsonl` as a `summary` row, so a
 restart inherits the thread instead of starting it over. `/context` shows the
@@ -241,29 +219,15 @@ whichever comes first — an unopened one is not worth keeping.
 trace for the running process. `lumi ask` prints the trace to **stderr**, so
 `lumi ask "..." > answer.md` still captures nothing but the answer.
 
-`/context` reports what the model is holding for this chat right now: the window
-and budget, the fill, what has been condensed, and the record itself when there
-is one. It exists because "the bot forgot" is otherwise impossible to argue
-with — a bot that forgets is usually a bot that deleted your history, and you
-should be able to see that rather than infer it.
+`/context` reports what the model is holding for this chat right now: the window and budget, the fill, what has been condensed, and the record itself when there is one. It exists because "the bot forgot" is otherwise impossible to argue with. A bot that forgets is usually a bot that deleted your history, and you should be able to see that rather than infer it.
 
 ## Owner-only introspection: `/config` and `/env`
 
-Two Telegram commands show what the running process is built on, and both are
-locked to `TELEGRAM_OWNER_ID` — whitelisted users get the bot but not the
-backend view.
+Two Telegram commands show what the running process is built on, and both are locked to `TELEGRAM_OWNER_ID` — whitelisted users get the bot but not the backend view.
 
-`/config` prints the resolved configuration: the model and endpoint in use,
-web provider order, shell and file limits, group mode. Nothing here is secret;
-it is owner-only because a shared group has no business reading the layout.
+`/config` prints the resolved configuration: the model and endpoint in use, web provider order, shell and file limits, group mode. Nothing here is secret; it is owner-only because a shared group has no business reading the layout.
 
-`/env` lists every credential variable with its value **masked** (`sk…efgh`,
-plus set/unset, pool size, and strategy), any `LUMI__` overrides, and a
-reminder that keys are read at startup — edit `.env` and restart. Full values
-are never sent to the chat on purpose: a Telegram chat lives on Telegram's
-servers and on every device logged into the account, so even an owner-only
-command keeps its secrets. Use `lumi doctor` in a terminal when you need the
-unchanged view of what is set.
+`/env` lists every credential variable with its value **masked** (`sk…efgh`, plus set/unset, pool size, and strategy), any `LUMI__` overrides, and a reminder that keys are read at startup — edit `.env` and restart. Full values are never sent to the chat on purpose: a Telegram chat lives on Telegram's servers and on every device logged into the account, so even an owner-only command keeps its secrets. Use `lumi doctor` in a terminal when you need the unchanged view of what is set.
 
 The trace is read from `reasoning_content`, `reasoning` or `thinking` depending
 on the provider, and a model that inlines `<think>` tags instead of using a
@@ -299,22 +263,10 @@ longest is probed anyway, and if all of them are dead the error says how many
 were tried. With a single key in the variable, every one of these is a no-op and
 the behaviour is unchanged.
 
-`CONTEXT7_API_KEY` accepts the same shape and the same three strategies via
-`tools.context7.key_strategy`, so the `context7` tool enjoys the same
-self-healing when one of a pool of keys is rate-limited.
+`CONTEXT7_API_KEY` accepts the same shape and the same three strategies via `tools.context7.key_strategy`, so the `context7` tool gets the same self-healing when one of a pool of keys is rate-limited.
 
-The web providers do too: `TAVILY_API_KEY`, `FIRECRAWL_API_KEY`, and
-`EXA_API_KEY` are all pools under the hood (`tools.web.tavily.key_strategy`,
-`tools.web.firecrawl.key_strategy`, `tools.web.exa.key_strategy`). Tavily
-additionally accepts a **keyless** mode — leave the variable unset and the SDK
-falls back to its free tier (lower rate limit; `search` and `extract` only).
-Firecrawl and Exa have no keyless tier, so an unset env var means the provider
-is unavailable, not a fallback option. All of them share one parser
-and one rotation policy — `lumi/util/keys.py` and `lumi/llm/keypool.py` — so
-the rules above hold for every one of them.
+The web providers do too: `TAVILY_API_KEY`, `FIRECRAWL_API_KEY`, and `EXA_API_KEY` are all pools under the hood (`tools.web.tavily.key_strategy`, `tools.web.firecrawl.key_strategy`, `tools.web.exa.key_strategy`). Tavily additionally accepts a **keyless** mode — leave the variable unset and the SDK falls back to its free tier (lower rate limit; `search` and `extract` only). Firecrawl and Exa have no keyless tier, so an unset env var means the provider is unavailable, not a fallback option. All of them share one parser and one rotation policy — `lumi/util/keys.py` and `lumi/llm/keypool.py` — so the rules above hold for every one of them.
 
-`TAVILY_API_KEY`, `FIRECRAWL_API_KEY`, and `EXA_API_KEY` take a single key
-each. A comma in any of them is not a pool; it is a broken key.
+`TAVILY_API_KEY`, `FIRECRAWL_API_KEY`, and `EXA_API_KEY` take a single key each. A comma in any of them is not a pool; it is a broken key.
 
-Keys are read at startup, so a pool is picked up by a restart. `lumi doctor`
-shows how many keys it found and which strategy is active.
+Keys are read at startup, so a pool is picked up by a restart. `lumi doctor` shows how many keys it found and which strategy is active.

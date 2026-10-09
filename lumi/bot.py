@@ -757,15 +757,34 @@ def _toml_value(value: Any) -> str:
     return f'"{value}"'
 
 
+def _toml_key(key: Any) -> str:
+    """Render a dict key so it round-trips as *that key*.
+
+    A bare TOML key cannot contain a dot, and writing one bare would make the
+    parser read it as a nested table — silently restructuring the file on the
+    next load. Anything that is not a bare key is quoted instead.
+    """
+    text = str(key)
+    if text and all(c.isascii() and (c.isalnum() or c in "_-") for c in text):
+        return text
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 def _write_toml(f: Any, data: dict[str, Any], prefix: str = "") -> None:
-    """Write a dict as TOML."""
+    """Write a dict as TOML that ``tomllib`` reads back unchanged.
+
+    Scalar keys are emitted before any table header (after a ``[table]`` line
+    a bare key would be read as belonging to that table), and every key goes
+    through :func:`_toml_key`, so a name containing a dot stays one key.
+    """
     for key, value in data.items():
         if isinstance(value, dict):
             continue
-        f.write(f"{key} = {_toml_value(value)}\n")
+        f.write(f"{_toml_key(key)} = {_toml_value(value)}\n")
     for key, value in data.items():
         if isinstance(value, dict):
-            section = f"{prefix}{key}"
+            section = f"{prefix}{_toml_key(key)}"
             f.write(f"\n[{section}]\n")
             _write_toml(f, value, prefix=f"{section}.")
 
@@ -1685,6 +1704,12 @@ async def _post_init(application: Application) -> None:
 
 
 async def _post_shutdown(application: Application) -> None:
+    agent: Agent | None = application.bot_data.get("agent")
+    if agent is not None:
+        # Cached HTTP clients (context7) close here rather than being left to
+        # the GC; the registry swallows per-tool failures, and shutdown is
+        # best-effort on this path anyway.
+        await agent.registry.aclose()
     log.info("shutting down")
 
 

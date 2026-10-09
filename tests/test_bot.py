@@ -9,8 +9,10 @@ the Confirm/Cancel keyboard for a risky command.
 from __future__ import annotations
 
 import base64
+import io
 import json
 import time
+import tomllib
 from typing import Any
 
 import pytest
@@ -18,7 +20,15 @@ from conftest import FakeLLM, make_reply
 from telegram import Bot, Update, User
 
 from lumi.agent import Agent, TurnResult
-from lumi.bot import CB_NO, CB_OK, CB_THINK, TraceStore, build_application, build_handlers
+from lumi.bot import (
+    CB_NO,
+    CB_OK,
+    CB_THINK,
+    TraceStore,
+    _write_toml,
+    build_application,
+    build_handlers,
+)
 from lumi.memory import History, MemoryFile
 from lumi.personality import Personality
 from lumi.tools import build_registry
@@ -2096,3 +2106,37 @@ async def test_env_leaks_nothing_to_a_stranger(config) -> None:
     assert "not whitelisted" in body.lower()
     for leak in ("OPENAI_API_KEY", "test-key", "sk…"):
         assert leak not in body, f"{leak!r} leaked to a stranger"
+
+
+# --------------------------------------------------------------------------- #
+# config writing (_write_toml)
+# --------------------------------------------------------------------------- #
+
+
+def test_write_toml_round_trips_dotted_keys() -> None:
+    """A key containing a dot must stay one key. Written bare, TOML reads it
+    as a nested table, so every rewrite would restructure the file."""
+    data = {
+        "a.b": 1,
+        "plain": True,
+        "bot": {"motd": "hi", "sub": {"x": 2}},
+    }
+    buf = io.StringIO()
+    _write_toml(buf, data)
+    text = buf.getvalue()
+
+    assert tomllib.loads(text) == data
+    # Quoted, not bare — `a.b = 1` would have parsed as nesting.
+    assert '"a.b" = 1' in text
+
+
+def test_write_toml_puts_top_level_keys_before_any_table() -> None:
+    """After a [table] header a bare key belongs to that table, so the scalar
+    pass must always come first — at every nesting level."""
+    buf = io.StringIO()
+    _write_toml(buf, {"z": 1, "a": {"y": 2, "b": {"x": 3}}})
+    text = buf.getvalue()
+
+    assert text.index("z = 1") < text.index("[a]")
+    assert text.index("y = 2") < text.index("[a.b]")
+    assert tomllib.loads(text) == {"z": 1, "a": {"y": 2, "b": {"x": 3}}}

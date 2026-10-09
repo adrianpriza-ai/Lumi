@@ -32,24 +32,13 @@ expected, and it is why the two steps above are always both needed.
 
 ## Why it is built this way
 
-**Everything is relative.** Paths resolve from the directory containing
-`pyproject.toml`. State goes in `./data`, the shell runs in `./workspace`, and
-the bot pins `HOME` to the project root so a stray `~/.something` cannot appear.
-Move the folder to another machine and it still works. The bot doesn't read from or write to your home directory unless you deliberately configure it.
+**Everything is relative.** Paths resolve from the directory containing `pyproject.toml`. State goes in `./data`, the shell runs in `./workspace`, and the bot pins `HOME` to the project root so a stray `~/.something` cannot appear. Move the folder to another machine and it still works. The bot does not read or write your home directory unless you deliberately configure it.
 
-**Markdown is the configuration.** There is no prompt DSL and no schema to
-learn. You paste PERSONALITY.md into the system prompt verbatim; edit it and
-send `/reload`. `MEMORY.md` is a bullet list you can hand-edit, with a managed
-region the bot appends to and `/forget` pops from.
+**Markdown is the configuration.** There is no prompt DSL and no schema to learn. You paste PERSONALITY.md into the system prompt verbatim; edit it and send `/reload`. `MEMORY.md` is a bullet list you can hand-edit, with a managed region the bot appends to and `/forget` pops from.
 
-**The safety layer is a file you can audit.** `lumi/tools/safety.py` contains one
-screen of `(regex, tier, reason)` triples. `lumi shell "rm -rf /"` prints the
-verdict and the reason, so you can check the policy without provoking it.
+**The safety layer is a file you can audit.** `lumi/tools/safety.py` is one screen of `(regex, tier, reason)` triples. `lumi shell "rm -rf /"` prints the verdict and the reason, so you can check the policy without provoking it.
 
-**Web access is pluggable four ways.** The Firecrawl SDK, the Exa SDK, the Tavily
-SDK, and a generic MCP client that reads `.mcp.json`. They normalise to the same
-interface, so adding a fifth is one file. The MCP path means a Tavily, Firecrawl,
-or Exa MCP server works with no code change at all — just add it to `.mcp.json`.
+**Web access is pluggable four ways.** The Firecrawl SDK, the Exa SDK, the Tavily SDK, and a generic MCP client that reads `.mcp.json`. They normalise to the same interface, so adding a fifth is one file. The MCP path means a Tavily, Firecrawl, or Exa MCP server works with no code change at all — just add it to `.mcp.json`.
 
 ## Commands
 
@@ -64,30 +53,14 @@ or Exa MCP server works with no code change at all — just add it to `.mcp.json
 | `lumi doctor` | Full environment check |
 | `lumi config [--key llm.model]` | Print the resolved configuration |
 
-In Telegram: `/help` `/run` `/search` `/fetch` `/memory` `/remember` `/forget`
-`/personality` `/tools` `/reasoning` `/status` `/config` `/env` `/doctor` `/reload`
-`/reset`, plus
-`/approve`, `/deny`, and the whitelist commands. Anything that is not a command
-is just a message to the agent.
+In Telegram: `/help`, `/run`, `/search`, `/fetch`, `/memory`, `/remember`, `/forget`, `/personality`, `/tools`, `/reasoning`, `/status`, `/config`, `/env`, `/doctor`, `/reload`, `/reset`, plus `/approve`, `/deny`, and the whitelist commands. Anything else is just a message to the agent.
 
 Send the bot a photo and it looks at it. The caption becomes your question; a
-photo with no caption gets a default "what's in this image?". Images go to
-`llm.vision_model` when one is set, so `llm.model` can stay text-only — unset,
-everything goes to `llm.model`, which then has to be vision-capable. See
-[CONFIGURATION.md](CONFIGURATION.md#the-llm) for the multimodal note and
-[Configuration](CONFIGURATION.md) for how the model is resolved.
+photo with no caption gets a default "what's in this image?". Images go to `llm.vision_model` when one is set, so `llm.model` can stay text-only. Unset, everything goes to `llm.model`, which then has to be vision-capable. See [CONFIGURATION.md](CONFIGURATION.md#the-llm) for the multimodal note and [Configuration](CONFIGURATION.md) for how the model is resolved.
 
-Files work in both directions. Send the bot a document and it is stored under
-`workspace/uploads/` and handed to the model with its path — read it, summarise
-it, run code against it. Ask the model to produce a file (a report, a CSV, a
-generated image) and it comes back to the chat as a downloadable document.
-See [File delivery](TOOLS.md#file-delivery-documents) for the harness and its
-limits.
+Files work in both directions. Send the bot a document and it is stored under `workspace/uploads/` and handed to the model with its path — read it, summarise it, run code against it. Ask the model to produce a file (a report, a CSV, a generated image) and it comes back as a downloadable document. See [File delivery](TOOLS.md#file-delivery-documents) for the harness and its limits.
 
-In group chats the bot only answers when **mentioned** (`@Lumi_a_bot ...`),
-**replied to**, or sent a slash command targeting it (`/help@Lumi_a_bot`). See
-[Group chats](TELEGRAM.md#group-chats) for the full rule and the
-`bot.group_reply_mode` config knob.
+In group chats the bot only answers when **mentioned** (`@Lumi_a_bot ...`), **replied to**, or sent a slash command targeting it (`/help@Lumi_a_bot`). See [Group chats](TELEGRAM.md#group-chats) for the full rule and the `bot.group_reply_mode` config knob.
 
 ## Documentation
 
@@ -98,7 +71,6 @@ In group chats the bot only answers when **mentioned** (`@Lumi_a_bot ...`),
 | [TELEGRAM.md](TELEGRAM.md) | Group chats and when the bot answers, and getting past `api.telegram.org` timeouts |
 
 Start with `lumi doctor`: it names whichever of these is misconfigured.
-
 ## Layout
 
 ```

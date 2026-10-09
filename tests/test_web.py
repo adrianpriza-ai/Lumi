@@ -655,3 +655,114 @@ async def test_web_tool_picks_the_mcp_provider_when_configured(config) -> None:
     # No .mcp.json in the fixture project, so it is correctly unavailable.
     assert not ok
     assert "no servers" in reason
+
+
+# --------------------------------------------------------------------------- #
+# MCP: session reuse
+# --------------------------------------------------------------------------- #
+
+
+class FakeSession:
+    """Enough of a ClientSession for the provider's two call sites."""
+
+    def __init__(self, search_payload: str) -> None:
+        self._payload = search_payload
+        self.listed = 0
+        self.called = 0
+
+    async def list_tools(self):
+        self.listed += 1
+        tool = type("T", (), {
+            "name": "tavily_search",
+            "description": "",
+            "inputSchema": {"properties": {"query": {"type": "string"}}},
+        })()
+        return type("R", (), {"tools": [tool]})()
+
+    async def call_tool(self, name, arguments, read_timeout_seconds=None):
+        self.called += 1
+        return Result([Block(self._payload)])
+
+
+def _mcp_project(config) -> str:
+    """One remote search server, and the payload its calls return."""
+    (config.root / ".mcp.json").write_text(json.dumps({
+        "mcpServers": {"tavily": {"url": "https://mcp.tavily.test/mcp/"}}
+    }), encoding="utf-8")
+    return json.dumps({"results": [{"url": "https://one.test", "content": "x"}]})
+
+
+async def test_a_server_is_spawned_once_per_query_not_once_per_step(config) -> None:
+    """Discovery and the call each used to boot the server; the session is
+    cached, so one search pays for one launch and the next pays for none."""
+    payload = _mcp_project(config)
+    provider = MCPProvider(config.tools.web.mcp, config.root)
+    session = FakeSession(payload)
+    opened: list[str] = []
+
+    async def fake_open(stack, spec):
+        opened.append(spec.name)
+        return session
+
+    provider._open = fake_open  # type: ignore[method-assign]
+
+    first = await provider.search("q", 5)
+    assert first.ok and len(first.hits) == 1
+    assert opened == ["tavily"]  # one spawn for discovery *and* the call
+
+    second = await provider.search("q again", 5)
+    assert second.ok
+    assert opened == ["tavily"]  # the second query reuses the same session
+    assert session.listed == 1  # and the tool list stays cached
+    await provider.aclose()
+
+
+async def test_a_dead_session_is_replaced_rather_than_poisoning_later_calls(config) -> None:
+    """A server that went away between queries must cost one extra launch,
+    not every later call: the dead session is dropped and the call retried."""
+    payload = _mcp_project(config)
+    provider = MCPProvider(config.tools.web.mcp, config.root)
+    opened: list[str] = []
+
+    class Flaky(FakeSession):
+        async def call_tool(self, name, arguments, read_timeout_seconds=None):
+            if len(opened) == 1:
+                raise RuntimeError("connection lost")
+            return await super().call_tool(
+                name, arguments, read_timeout_seconds=read_timeout_seconds
+            )
+
+    async def fake_open(stack, spec):
+        opened.append(spec.name)
+        return Flaky(payload)
+
+    provider._open = fake_open  # type: ignore[method-assign]
+
+    result = await provider.search("q", 5)
+
+    assert result.ok  # the retry on a fresh session made it through
+    assert len(opened) == 2
+    await provider.aclose()
+
+
+async def test_aclose_releases_every_cached_session(config) -> None:
+    """Shutdown reaches the cached sessions through the web tool's aclose."""
+    payload = _mcp_project(config)
+    provider = MCPProvider(config.tools.web.mcp, config.root)
+    closed: list[str] = []
+
+    async def fake_open(stack, spec):
+        async def close():
+            closed.append(spec.name)
+
+        stack.aclose = close  # stand in for the transport's own shutdown
+        return FakeSession(payload)
+
+    provider._open = fake_open  # type: ignore[method-assign]
+    await provider.search("q", 5)
+    assert closed == []  # still cached, still open
+
+    await provider.aclose()
+
+    assert closed == ["tavily"]
+    assert provider._sessions == {}

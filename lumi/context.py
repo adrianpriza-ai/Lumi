@@ -43,6 +43,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from .llm.base import USAGE_PROMPT
 from .util.log import get_logger
 from .util.text import truncate
 
@@ -284,8 +285,11 @@ class ContextWindow:
         Nudged rather than replaced, because one call's count includes provider
         framing the estimate has no model of, and a single odd reading must not
         be able to make the window look twice as large as it is.
+
+        The count is read under :data:`lumi.llm.base.USAGE_PROMPT` — the shared
+        contract with the adapter — rather than a key name of our own.
         """
-        reported = int(usage.get("prompt") or 0)
+        reported = int(usage.get(USAGE_PROMPT) or 0)
         if reported <= 0:
             return
         estimated = max(1, self.estimate(messages))

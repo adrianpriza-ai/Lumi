@@ -106,7 +106,8 @@ class Context7Client:
         return client
 
     async def aclose(self) -> None:
-        """Close every cached client. Called when the tool is garbage-collected."""
+        """Close every cached client. Called at shutdown via the tool registry
+        (:meth:`ToolRegistry.aclose` → :meth:`Context7Tool.aclose`)."""
         import contextlib
 
         for client in self._clients.values():

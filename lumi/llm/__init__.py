@@ -11,7 +11,15 @@ from collections.abc import Callable
 
 from ..config import Config, LLMConfig
 from ..util.log import get_logger
-from .base import LLMClient, LLMError, LLMReply, ToolCall
+from .base import (
+    USAGE_COMPLETION,
+    USAGE_PROMPT,
+    USAGE_REASONING,
+    LLMClient,
+    LLMError,
+    LLMReply,
+    ToolCall,
+)
 from .keypool import STRATEGIES, KeyPool
 from .openai_compat import OpenAICompatClient
 
@@ -45,6 +53,9 @@ __all__ = [
     "LLMReply",
     "LLMError",
     "ToolCall",
+    "USAGE_PROMPT",
+    "USAGE_COMPLETION",
+    "USAGE_REASONING",
     "KeyPool",
     "OpenAICompatClient",
     "build_llm",

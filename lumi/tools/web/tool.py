@@ -137,6 +137,17 @@ unfamiliar.
             return False, f"no provider is usable ({reasons})"
         return True, ""
 
+    async def aclose(self) -> None:
+        """Release providers holding cross-call state (MCP sessions)."""
+        for provider in self.providers.values():
+            close = getattr(provider, "aclose", None)
+            if close is None:
+                continue
+            try:
+                await close()
+            except Exception as exc:  # noqa: BLE001 - shutdown is best-effort
+                log.warning("web provider %s failed to close: %s", provider.name, exc)
+
     async def invoke(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         action = str(arguments.get("action", "")).strip().lower()
         if action == "search":

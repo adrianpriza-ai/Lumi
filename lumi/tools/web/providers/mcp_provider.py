@@ -24,7 +24,7 @@ import asyncio
 import json
 import os
 import re
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -134,6 +134,11 @@ class MCPProvider(WebProvider):
         self.config = config
         self.root = project_root
         self._tool_cache: dict[str, tuple[float, list[DiscoveredTool]]] = {}
+        #: Live session per server name: (stack owning the transport, session).
+        #: Discovery plus a call used to pay for two spawns — and a local
+        #: ``npx`` server spends most of that booting.
+        self._sessions: dict[str, tuple[AsyncExitStack, Any]] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
 
     # -- configuration ----------------------------------------------------- #
 
@@ -205,15 +210,76 @@ class MCPProvider(WebProvider):
         await session.initialize()
         return session
 
+    def _lock_for(self, name: str) -> asyncio.Lock:
+        lock = self._locks.get(name)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[name] = lock
+        return lock
+
+    async def _session_for(self, spec: ServerSpec) -> Any:
+        """The live session for *spec*, opened once and reused across calls.
+
+        One spawn per server rather than one per step. The entry's
+        :class:`AsyncExitStack` owns the transport, so the session and the
+        subprocess behind it live exactly as long as the cache entry.
+        """
+        entry = self._sessions.get(spec.name)
+        if entry is not None:
+            return entry[1]
+        async with self._lock_for(spec.name):
+            entry = self._sessions.get(spec.name)
+            if entry is None:
+                stack = AsyncExitStack()
+                try:
+                    session = await self._open(stack, spec)
+                except BaseException:
+                    await stack.aclose()
+                    raise
+                self._sessions[spec.name] = (stack, session)
+                log.debug("mcp session opened for server %r", spec.name)
+                return session
+        return self._sessions[spec.name][1]
+
+    async def _drop_session(self, name: str) -> None:
+        """Close and forget the cached session for *name*, if there is one."""
+        entry = self._sessions.pop(name, None)
+        if entry is None:
+            return
+        stack, _session = entry
+        with suppress(Exception):  # shutdown is best-effort
+            await stack.aclose()
+
+    async def _reuse(self, spec: ServerSpec, op: Any) -> Any:
+        """Run *op(session)* on the cached session, re-spawning once if it died.
+
+        A server that went away between queries must not poison every later
+        call: the dead session is dropped and the operation retried on a fresh
+        one, so the worst a dead server costs is one extra launch.
+        """
+        try:
+            return await op(await self._session_for(spec))
+        except Exception:
+            log.debug("mcp session for %r failed; re-spawning once", spec.name)
+            await self._drop_session(spec.name)
+            try:
+                return await op(await self._session_for(spec))
+            except Exception:
+                await self._drop_session(spec.name)
+                raise
+
+    async def aclose(self) -> None:
+        """Close every cached session. Called at shutdown via the web tool."""
+        for name in list(self._sessions):
+            await self._drop_session(name)
+
     async def _list_tools(self, spec: ServerSpec) -> list[DiscoveredTool]:
         cached = self._tool_cache.get(spec.name)
         now = asyncio.get_running_loop().time()
         if cached and now - cached[0] < TOOL_CACHE_TTL:
             return cached[1]
 
-        async with AsyncExitStack() as stack:
-            session = await self._open(stack, spec)
-            response = await session.list_tools()
+        response = await self._reuse(spec, lambda session: session.list_tools())
 
         tools = []
         for tool in getattr(response, "tools", []) or []:
@@ -258,11 +324,12 @@ class MCPProvider(WebProvider):
         timeout: float,  # noqa: ASYNC109 - a configured budget, not a per-call API knob
     ) -> str:
         """Call *tool* and flatten the result to text."""
-        async with AsyncExitStack() as stack:
-            session = await self._open(stack, spec)
-            result = await session.call_tool(
+        result = await self._reuse(
+            spec,
+            lambda session: session.call_tool(
                 tool.name, arguments, read_timeout_seconds=timeout
-            )
+            ),
+        )
         return _flatten(result)
 
     # -- WebProvider ------------------------------------------------------- #

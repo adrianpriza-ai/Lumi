@@ -136,6 +136,25 @@ class ToolRegistry:
         """Re-run a previously blocked call, this time flagged as approved."""
         return await self.invoke(pending.tool, pending.arguments, ctx.approve())
 
+    async def aclose(self) -> None:
+        """Release every tool's held resources. Called once at shutdown, by both
+        the bot and the CLI.
+
+        A tool that holds anything across calls — an HTTP client pool, open
+        files, a subprocess — implements ``async def aclose(self)``; the tools
+        that do not are simply skipped. Best effort, like any shutdown path:
+        one tool failing to close must neither stop the others from closing nor
+        mask the exit reason.
+        """
+        for tool in self.all():
+            close = getattr(tool, "aclose", None)
+            if close is None:
+                continue
+            try:
+                await close()
+            except Exception as exc:  # noqa: BLE001 - shutdown is best-effort
+                log.warning("tool %s failed to close: %s", tool.name, format_error(exc))
+
 
 def _preview_args(arguments: dict[str, Any]) -> str:
     parts = []

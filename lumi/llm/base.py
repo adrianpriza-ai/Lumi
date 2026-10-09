@@ -17,6 +17,16 @@ class LLMError(RuntimeError):
     """The model call failed in a way worth showing the owner."""
 
 
+#: Keys of ``LLMReply.usage`` — the client contract, not one adapter's habit.
+#: Adapters fill them from the provider's usage block; the agent loop and the
+#: context window read them back by these names. ``USAGE_PROMPT`` in particular
+#: feeds :meth:`lumi.context.ContextWindow.observe`'s calibration, which a
+#: rename on either side would silently disable.
+USAGE_PROMPT = "prompt"
+USAGE_COMPLETION = "completion"
+USAGE_REASONING = "reasoning"
+
+
 @dataclass(slots=True)
 class ToolCall:
     id: str
@@ -62,4 +72,12 @@ class LLMClient(abc.ABC):
         return self.name
 
 
-__all__ = ["LLMClient", "LLMReply", "ToolCall", "LLMError"]
+__all__ = [
+    "LLMClient",
+    "LLMReply",
+    "ToolCall",
+    "LLMError",
+    "USAGE_PROMPT",
+    "USAGE_COMPLETION",
+    "USAGE_REASONING",
+]
