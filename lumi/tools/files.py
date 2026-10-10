@@ -1,13 +1,19 @@
-"""The ``files`` tool: read and write inside the project.
+"""The ``files`` tool: read, write and edit inside the project.
 
 Reads are allowed anywhere under the project root (so the bot can inspect its
 own source), plus a small set of read-only system paths. Writes are confined to
 the directories listed in ``tools.files.writable``, and overwriting an existing
 non-empty file needs approval.
 
+``edit`` is the surgical path: an exact ``old_string``/``new_string`` swap that
+can only touch the text it names, so it runs without the approval prompt that a
+whole-file overwrite asks for.
+
 Path handling is the security boundary here, so it is done with
 ``Path.resolve()`` plus an ``is_within`` check — no string prefix matching,
-which is trivially bypassed by ``../`` or a symlink.
+which is trivially bypassed by ``../`` or a symlink. The shell's
+protected-path deny list applies here too (see :func:`protected_write`), so
+widening ``tools.files.writable`` cannot reopen what ``run_shell`` refuses.
 """
 
 from __future__ import annotations
@@ -22,6 +28,7 @@ from ..paths import is_within, relative_to_root
 from ..util.log import get_logger
 from ..util.text import truncate
 from .base import NeedsApproval, Tool, ToolContext, ToolError, ToolResult
+from .safety import protected_write
 
 log = get_logger(__name__)
 
@@ -41,11 +48,17 @@ MAX_LIST_ENTRIES = 500
 class FilesTool(Tool):
     name = "files"
     description = """
-Read, write, list, search and upload files inside this project.
+Read, write, edit, list, search and upload files inside this project.
 
 Paths are relative to the project root. Reads work anywhere in the project;
 writes only work inside the project's workspace directory, and overwriting an
 existing file needs the owner's approval.
+
+`edit` is how you change an existing file: give the exact `old_string` you
+found and the `new_string` that replaces it. It needs no approval (it can
+only touch the text it names), shows a diff, and leaves the rest of the file
+alone — prefer it over `write` whenever you are changing less than the whole
+file. The `old_string` must match exactly once unless `replace_all` is true.
 
 Set `upload: true` on a write to also send the finished file to the chat as a
 document — use it whenever the owner asked for "a file" they can download. The
@@ -62,7 +75,7 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["read", "write", "append", "list", "search", "stat", "upload"],
+                "enum": ["read", "write", "append", "edit", "list", "search", "stat", "upload"],
                 "description": "What to do.",
             },
             "path": {
@@ -72,6 +85,24 @@ it validates the path, caps the size, and shows a diff before it overwrites.
             "content": {
                 "type": "string",
                 "description": "New file contents. Required for write and append.",
+            },
+            "old_string": {
+                "type": "string",
+                "description": (
+                    "edit: the exact text to replace, copied verbatim from the file. "
+                    "Required for edit."
+                ),
+            },
+            "new_string": {
+                "type": "string",
+                "description": "edit: the replacement text. Required for edit.",
+            },
+            "replace_all": {
+                "type": "boolean",
+                "description": (
+                    "edit: replace every occurrence of old_string instead of requiring "
+                    "it to match exactly once."
+                ),
             },
             "overwrite": {
                 "type": "boolean",
@@ -143,6 +174,13 @@ it validates the path, caps the size, and shows a diff before it overwrites.
                     f"writing to {resolved} is not allowed. Writable locations: {allowed}. "
                     "Ask the owner to widen tools.files.writable in config.toml if this is intended."
                 )
+            guard = protected_write(resolved, self.root)
+            if guard is not None:
+                raise ToolError(
+                    f"writing to {resolved} is not allowed: {guard} holds credentials or "
+                    "runs code on someone else's command, and run_shell refuses it too. "
+                    "Ask the owner to do it by hand if it is really needed."
+                )
             return resolved
 
         if is_within(resolved, self.root):
@@ -162,6 +200,7 @@ it validates the path, caps the size, and shows a diff before it overwrites.
             "read": self._read,
             "write": self._write,
             "append": self._append,
+            "edit": self._edit,
             "list": self._list,
             "search": self._search,
             "stat": self._stat,
@@ -169,7 +208,8 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         }.get(action)
         if handler is None:
             raise ToolError(
-                f"unknown action {action!r}; use read, write, append, list, search, stat or upload"
+                f"unknown action {action!r}; use read, write, append, edit, "
+                "list, search, stat or upload"
             )
         return await handler(arguments, ctx)
 
@@ -226,10 +266,7 @@ it validates the path, caps the size, and shows a diff before it overwrites.
             )
 
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_name(path.name + ".lumi-tmp")
-            tmp.write_text(content, encoding="utf-8")
-            tmp.replace(path)  # atomic
+            self._atomic_write(path, content)
         except OSError as exc:
             return ToolResult.failure(f"could not write {self._display(path)}: {exc}")
 
@@ -314,6 +351,98 @@ it validates the path, caps the size, and shows a diff before it overwrites.
             summary=f"{verb} {self._display(path)}",
         )
 
+    # -- editing an existing file ------------------------------------------ #
+
+    async def _edit(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        """Replace exact text: a small change stays a small change.
+
+        Deliberately skips the approval prompt that a whole-file ``write``
+        asks for. The result is fully determined by ``old_string`` and
+        ``new_string`` — the tool cannot clobber what it does not name — and
+        a tap on every small fix would teach the owner to tap without
+        reading. Everything else still applies: writable roots, the
+        protected-path guard, a diff of what changed.
+        """
+        path = self._resolve(arguments.get("path"), for_write=True)
+        old = arguments.get("old_string")
+        new = arguments.get("new_string")
+        if not isinstance(old, str) or not old:
+            raise ToolError("old_string is required for an edit")
+        if not isinstance(new, str):
+            raise ToolError("new_string must be a string")
+        if old == new:
+            raise ToolError("old_string and new_string are identical; there is nothing to change")
+        if not path.exists():
+            return ToolResult.failure(
+                f"no such file: {self._display(path)} — edit only changes existing files; "
+                "use write to create one"
+            )
+        if path.is_dir():
+            raise ToolError(f"{self._display(path)} is a directory")
+
+        # The whole file has to fit in memory to swap a piece of it, so the
+        # same cap that bounds a write bounds an edit — with a reason the
+        # model can act on instead of a silent failure.
+        limit = self.settings.max_write_chars
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            return ToolResult.failure(f"could not read {self._display(path)}: {exc}")
+        if len(raw) > limit:
+            raise ToolError(
+                f"{self._display(path)} is {len(raw)} bytes, over the {limit}-byte limit for "
+                "the files tool (tools.files.max_write_chars). Edit it with a shell command "
+                "instead, or ask the owner to raise the limit."
+            )
+        if b"\x00" in raw:
+            return ToolResult.failure(
+                f"{self._display(path)} looks like a binary file; edit only works on text"
+            )
+        try:
+            previous = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return ToolResult.failure(f"{self._display(path)} is not valid UTF-8 text")
+
+        replace_all = bool(arguments.get("replace_all"))
+        count = previous.count(old)
+        if count == 0:
+            return ToolResult.failure(
+                f"old_string not found in {self._display(path)}. Read the file first and "
+                "copy the exact text — character for character, whitespace included."
+            )
+        if count > 1 and not replace_all:
+            return ToolResult.failure(
+                f"old_string matches {count} times in {self._display(path)}. Include a few "
+                "lines of surrounding context to make it unique, or set replace_all: true."
+            )
+
+        updated = previous.replace(old, new) if replace_all else previous.replace(old, new, 1)
+        made = count if replace_all else 1
+        try:
+            self._atomic_write(path, updated)
+        except OSError as exc:
+            return ToolResult.failure(f"could not edit {self._display(path)}: {exc}")
+
+        log.info("edited %s (%d replacement(s))", self._display(path), made)
+        result = ToolResult(
+            text=f"edited {self._display(path)} ({made} replacement(s))\n"
+            + _short_diff(previous, updated),
+            ok=True,
+            data={"path": str(path), "replacements": made, "bytes": len(updated)},
+            summary=f"edited {self._display(path)} ({made} replacement(s))",
+        )
+        if arguments.get("upload") and self.settings.uploads:
+            await self._attach(result, path)
+        return result
+
+    @staticmethod
+    def _atomic_write(path: Path, content: str) -> None:
+        """Write through a temp file and rename, so a crash cannot halve a file."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".lumi-tmp")
+        tmp.write_text(content, encoding="utf-8")
+        tmp.replace(path)
+
     async def _list(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         path = self._resolve(arguments.get("path") or ".", for_write=False)
         if not path.exists():
@@ -392,8 +521,8 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         allowed = ", ".join(relative_to_root(r) for r in self.writable_roots)
         delivery = "can send files to the chat" if self.settings.uploads else "delivery disabled"
         return (
-            f"`{self.name}` — read/write/list/search the project (writable: {allowed}), "
-            f"{delivery}"
+            f"`{self.name}` — read/write/edit/list/search the project "
+            f"(writable: {allowed}), {delivery}"
         )
 
 

@@ -349,6 +349,195 @@ async def test_write_size_limit(files: FilesTool, config) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# edit
+# --------------------------------------------------------------------------- #
+
+
+async def test_edit_replaces_exact_text(files: FilesTool, config) -> None:
+    target = config.shell_cwd / "note.md"
+    target.write_text("hello world\n", encoding="utf-8")
+
+    result = await files.invoke(
+        {
+            "action": "edit",
+            "path": "workspace/note.md",
+            "old_string": "world",
+            "new_string": "there",
+        },
+        ctx(),
+    )
+    assert result.ok
+    assert target.read_text(encoding="utf-8") == "hello there\n"
+    assert result.data["replacements"] == 1
+    assert "before" in result.text and "after" in result.text  # a diff is shown
+
+
+async def test_edit_needs_no_approval_even_on_an_existing_file(
+    files: FilesTool, config
+) -> None:
+    """An anchored edit cannot clobber what it does not name, so no tap.
+
+    The whole-file `write` to the same non-empty file must still ask — the
+    difference between the two actions is the whole point of edit.
+    """
+    target = config.shell_cwd / "exists.md"
+    target.write_text("original content", encoding="utf-8")
+
+    with pytest.raises(NeedsApproval):
+        await files.invoke(
+            {"action": "write", "path": "workspace/exists.md", "content": "replaced"}, ctx()
+        )
+
+    result = await files.invoke(
+        {
+            "action": "edit",
+            "path": "workspace/exists.md",
+            "old_string": "original",
+            "new_string": "edited",
+        },
+        ctx(),
+    )
+    assert result.ok
+    assert target.read_text(encoding="utf-8") == "edited content"
+
+
+async def test_edit_leaves_the_rest_of_the_file_untouched(files: FilesTool, config) -> None:
+    target = config.shell_cwd / "code.py"
+    original = "def add(a, b):\n    return a + b\n\n# keep me\n"
+    target.write_text(original, encoding="utf-8")
+
+    result = await files.invoke(
+        {
+            "action": "edit",
+            "path": "workspace/code.py",
+            "old_string": "a + b",
+            "new_string": "a + b + 0",
+        },
+        ctx(),
+    )
+    assert result.ok
+    updated = target.read_text(encoding="utf-8")
+    assert "a + b + 0" in updated
+    assert "# keep me" in updated
+
+
+async def test_edit_refuses_an_ambiguous_match_and_changes_nothing(
+    files: FilesTool, config
+) -> None:
+    target = config.shell_cwd / "dup.md"
+    target.write_text("x = 1\nx = 2\n", encoding="utf-8")
+
+    result = await files.invoke(
+        {"action": "edit", "path": "workspace/dup.md", "old_string": "x", "new_string": "y"},
+        ctx(),
+    )
+    assert not result.ok
+    assert "matches 2 times" in result.text
+    assert "replace_all" in result.text  # tells the model how to proceed
+    assert target.read_text(encoding="utf-8") == "x = 1\nx = 2\n"
+
+
+async def test_edit_replace_all_touches_every_occurrence(files: FilesTool, config) -> None:
+    target = config.shell_cwd / "dup.md"
+    target.write_text("x = 1\nx = 2\n", encoding="utf-8")
+
+    result = await files.invoke(
+        {
+            "action": "edit",
+            "path": "workspace/dup.md",
+            "old_string": "x",
+            "new_string": "y",
+            "replace_all": True,
+        },
+        ctx(),
+    )
+    assert result.ok
+    assert result.data["replacements"] == 2
+    assert target.read_text(encoding="utf-8") == "y = 1\ny = 2\n"
+
+
+async def test_edit_reports_a_match_that_is_not_there(files: FilesTool, config) -> None:
+    target = config.shell_cwd / "note.md"
+    target.write_text("hello world\n", encoding="utf-8")
+
+    result = await files.invoke(
+        {
+            "action": "edit",
+            "path": "workspace/note.md",
+            "old_string": "goodbye",
+            "new_string": "hi",
+        },
+        ctx(),
+    )
+    assert not result.ok
+    assert "not found" in result.text
+    assert target.read_text(encoding="utf-8") == "hello world\n"  # untouched
+
+
+async def test_edit_needs_old_and_new_strings(files: FilesTool) -> None:
+    with pytest.raises(ToolError, match="old_string"):
+        await files.invoke({"action": "edit", "path": "workspace/a.md"}, ctx())
+
+
+async def test_edit_cannot_create_a_file(files: FilesTool, config) -> None:
+    result = await files.invoke(
+        {
+            "action": "edit",
+            "path": "workspace/ghost.md",
+            "old_string": "x",
+            "new_string": "y",
+        },
+        ctx(),
+    )
+    assert not result.ok
+    assert "no such file" in result.text
+    assert not (config.shell_cwd / "ghost.md").exists()
+
+
+async def test_edit_refuses_a_binary_file(files: FilesTool, config) -> None:
+    target = config.shell_cwd / "blob.md"
+    target.write_bytes(b"\x00\x01\x02\x03")
+
+    result = await files.invoke(
+        {"action": "edit", "path": "workspace/blob.md", "old_string": "\x00", "new_string": ""},
+        ctx(),
+    )
+    assert not result.ok
+    assert "binary" in result.text
+    assert target.read_bytes() == b"\x00\x01\x02\x03"
+
+
+async def test_protected_paths_are_off_limits_here_too(files: FilesTool, config) -> None:
+    """A git hook is a program git runs later; run_shell refuses to write one,
+    and so must this tool — even with the file inside the writable roots."""
+    hooks = config.shell_cwd / ".git" / "hooks"
+    hooks.mkdir(parents=True)
+    (hooks / "pre-commit").write_text("#!/bin/sh\n", encoding="utf-8")
+
+    with pytest.raises(ToolError, match="runs code"):
+        await files.invoke(
+            {
+                "action": "edit",
+                "path": "workspace/.git/hooks/pre-commit",
+                "old_string": "#!/bin/sh",
+                "new_string": "#!/bin/bash",
+            },
+            ctx(),
+        )
+    with pytest.raises(ToolError, match="runs code"):
+        await files.invoke(
+            {
+                "action": "write",
+                "path": "workspace/.git/hooks/pre-commit",
+                "content": "pwned",
+                "overwrite": True,
+            },
+            ctx(),
+        )
+    assert (hooks / "pre-commit").read_text(encoding="utf-8") == "#!/bin/sh\n"
+
+
+# --------------------------------------------------------------------------- #
 # memory tool
 # --------------------------------------------------------------------------- #
 

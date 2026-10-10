@@ -5,10 +5,29 @@
 | Tool | Capability |
 |-|-|
 | `run_shell` | Shell commands, with the allow/confirm/deny engine |
-| `files` | Read anywhere in the project, write only in `workspace/`, send files to the chat |
+| `files` | Read anywhere in the project, write and edit only in `workspace/`, send files to the chat |
 | `memory` | Remember and recall; forgetting is human-only by design |
 | `web` | Search and fetch, across three interchangeable providers |
 | `context7` | Up-to-date library docs from https://context7.com; auto-enables on `CONTEXT7_API_KEY` |
+
+## Editing files
+
+The `files` tool is where edits happen, in three shapes:
+
+- `write` creates a file or replaces it wholesale. Replacing a non-empty file
+  asks the owner first and shows a diff of what would change (`overwrite: true`
+  skips the prompt once the owner has seen it).
+- `append` adds to the end and never asks — nothing is lost.
+- `edit` swaps an exact `old_string` for a `new_string`. It needs no approval,
+  because it can only touch the text it names: the rest of the file is
+  untouched by construction, and a `old_string` that matches more than once is
+  refused rather than guessed at (add context to make it unique, or set
+  `replace_all`). It shows the same diff `write` does, and refuses binary files.
+
+`edit` is the right default for a change to an existing file; `write` is for
+creating one or replacing all of it. Both are confined to `tools.files.writable`
+(default: `workspace/`) and both refuse the shell policy's protected paths —
+a `.git/hooks` file or an ssh key is off-limits through either tool.
 
 ## File delivery (documents)
 
@@ -39,10 +58,17 @@ Three tiers, resolved in order, strictest wins:
   download into a shell, writing to `/dev/sda`, touching `.bashrc` or `.ssh`,
   writing to a `.git/hooks` file, persistent `git config --global`, reverse
   shells, `find / -delete`, power state changes, fork bombs.
-- **confirm** — the owner gets a Confirm/Cancel button in the chat. Anything that
-  deletes, moves, overwrites, changes permissions, installs, commits, or
-  redirects into a file.
-- **allow** — everything else runs immediately.
+- **confirm** — the owner gets a Confirm/Cancel button in the chat. Anything
+  that destroys or overwrites state: deleting, clobbering a file that already
+  exists (whether the clobber arrives as `mv`, `cp`, `tee`, or a `>` onto a
+  live name), changing permissions, installing, committing, or writing
+  outside the workspace.
+- **allow** — everything else runs immediately, and creating is not
+  clobbering: `mkdir`, `touch`, a move or copy onto a name that does not exist
+  yet, a `>` that only creates a file, a `>>` append inside the workspace, and
+  `2>/dev/null` all run without a tap. There is nothing to lose, so there is
+  nothing to confirm — and asking on every harmless command would only teach
+  the owner to stop reading the prompt.
 
 On top of that: writes outside the project are blocked, `HOME` is pinned to the project, the child environment is scrubbed of anything matching `*KEY*|*TOKEN*|*SECRET*|*PASSWORD*` (so a command cannot exfiltrate your API keys), and every command runs in its own process group and is killed on timeout.
 
@@ -56,6 +82,13 @@ until it is handed `-delete` or `-exec`, and a path inside an interpreter's
 quoted string — `python3 -c "open('/etc/passwd','w')"` — is treated as the write
 target it is. Paths are resolved before they are judged, so a symlink is
 classified by what it points at.
+
+A target the classifier cannot follow does not get guessed at: anything built
+from a variable or a substitution — `mv a $DEST`, `echo x > $OUT`,
+`python3 -c "open('$OUT','w')"` — is escalated to a prompt, because the path
+written on the command line and the path used at run time are not the same
+path. Guessing "it is probably in the project" is how a guardrail silently
+becomes decoration.
 
 Set `tools.shell.writable = ["workspace"]` to confine writes to the scratch
 folder; anything outside it then asks first, and a recursive delete outside it

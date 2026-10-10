@@ -6,8 +6,11 @@ What this module does buy you:
 
 * a hard ``DENY`` list for the commands that destroy machines, so a prompt
   injection or a hallucinated command cannot reboot, reformat, or escalate;
-* a ``CONFIRM`` tier for anything that mutates state, so a mistake becomes a
-  two-tap undo in the chat instead of a filesystem incident;
+* a ``CONFIRM`` tier for anything that destroys or overwrites state — deleting,
+  clobbering a file that already exists, writing outside the workspace — so a
+  mistake becomes a two-tap undo in the chat instead of a filesystem incident.
+  *Creating* something new inside the project just runs; it costs the owner
+  nothing to redo and nothing to keep;
 * path zoning, so writes stay inside the configured workspace;
 * timeouts and output caps, applied by the shell tool on top of this.
 
@@ -177,7 +180,6 @@ DENY_RULES: list[DenyRule] = [
 #: Mutates state. Allowed, but the owner taps Confirm first.
 CONFIRM_RULES: list[ConfirmRule] = [
     (re.compile(r"\brm\b"), "deleting files"),
-    (re.compile(r"\b(mv|cp|rsync|install)\b"), "moving or overwriting files"),
     (re.compile(r"\btruncate\b"), "truncating a file"),
     (re.compile(r"\b(sed|perl|ruby)\b[^;]*(\s-i\b|--in-place)"), "in-place edit"),
     (re.compile(r"\b(chmod|chown|chgrp|chattr)\b"), "changing permissions or ownership"),
@@ -212,7 +214,6 @@ CONFIRM_RULES: list[ConfirmRule] = [
         "extracting an archive can overwrite files",
     ),
     (re.compile(r"\bdd\b"), "raw device copy"),
-    (re.compile(r"\btee\b"), "writing through tee"),
     (
         re.compile(r"\b(curl|wget)\b[^;]*\s(-O|--output|--output-document|-o\s)\b"),
         "downloading to a file",
@@ -225,8 +226,7 @@ CONFIRM_RULES: list[ConfirmRule] = [
         re.compile(r"\bgit\b[^;]*\b(commit|push|merge|rebase|cherry-pick|tag|gc|repaint)\b"),
         "changing git history or the working tree",
     ),
-    (re.compile(r"\b(ln)\b"), "creating links"),
-    (re.compile(r"\b(touch|mkdir|rmdir)\b"), "creating or removing entries"),
+    (re.compile(r"\brmdir\b"), "removing a directory"),
     (
         re.compile(r"\bfind\b[^;]*\s-(delete|exec|execdir|ok|okdir)\b"),
         "find is about to unlink or rewrite what it finds",
@@ -580,7 +580,7 @@ PATH_OPERAND_COMMANDS: frozenset[str] = frozenset(
 )
 
 _OPERATORS = {";", "&&", "||", "|", "&", "(", ")", "{", "}", ">", ">>", "<<<", "<"}
-_REDIRECTS = {">", ">>", "<<<"}
+_REDIRECTS = {">", ">>"}
 _SEPARATORS = {";", "&&", "||", "|", "&", "(", ")", "{", "}", "\n"}
 
 
@@ -892,6 +892,109 @@ def _has_protected_subpath(path: Path) -> str | None:
     return None
 
 
+#: Sinks that destroy nothing, so writing to them is how you throw output
+#: away. Without this the zone check would deny `2>/dev/null` as a write to
+#: /dev, which is the single most common redirection there is.
+DEV_SINKS: frozenset[str] = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr"})
+
+
+def _is_dev_sink(path: Path) -> bool:
+    """True for /dev/null and friends, by literal name or after resolution."""
+    text = os.path.normpath(str(path))
+    if text in DEV_SINKS or text.startswith("/dev/fd/"):
+        return True
+    try:
+        text = os.path.normpath(str(path.resolve()))
+    except OSError:  # pragma: no cover - broken symlink loop
+        return False
+    return text in DEV_SINKS or text.startswith("/dev/fd/")
+
+
+def _exists(path: Path) -> bool:
+    """Does *path* name something that is already there?
+
+    Follows symlinks, and a broken symlink counts: writing through one lands
+    on its target, which is exactly the content the overwrite check protects.
+    An unstatable path counts too — when in doubt, ask.
+    """
+    try:
+        return path.exists() or path.is_symlink()
+    except OSError:  # pragma: no cover - unstatable path
+        return True
+
+
+def _redirect_destinations(tokens: list[str]) -> list[str]:
+    """Every token sitting on the right of a ``>`` or ``>>``."""
+    out: list[str] = []
+    for index, token in enumerate(tokens):
+        if token not in _REDIRECTS:
+            continue
+        if index > 0 and tokens[index - 1] == "-":
+            continue  # `ls -> f` is an arrow, not a redirection
+        out.append(tokens[index + 1] if index + 1 < len(tokens) else "")
+    return out
+
+
+#: Programs where a destination operand clobbers whatever is already at that
+#: name. The check runs against the filesystem, not the command line:
+#: ``mv a b`` is only an overwrite when ``b`` exists, and asking on every
+#: move would train the owner to tap Confirm without reading.
+OVERWRITE_COMMANDS: frozenset[str] = frozenset(
+    {"cp", "mv", "ln", "install", "rsync", "gcp", "ditto", "tee"}
+)
+
+#: For these, an existing *directory* destination does not mean a clobber:
+#: ``mv a existing-dir/`` writes ``existing-dir/a``, and only that name
+#: decides. Anything else with an existing directory destination (rsync's
+#: merge, ``install -d``) is judged conservatively and asked about.
+SINGLE_SOURCE_DEST_COMMANDS: frozenset[str] = frozenset({"cp", "mv", "ln", "install"})
+
+
+def protected_write(path: Path, project_root: Path | None = None) -> str | None:
+    """What a write to *path* trips, if anything, under the protected-path rules.
+
+    Returns the protected basename (``.bashrc``, ``id_rsa``, …) or subpath
+    (``.git/hooks``, …) that makes the write a deny, else ``None``.
+
+    :class:`lumi.tools.files.FilesTool` calls this so both write paths agree
+    on what is sacred: a hook file is off-limits through ``run_shell``, so it
+    has to be off-limits through the files tool too — otherwise widening
+    ``tools.files.writable`` would quietly reopen what the deny list closed.
+    *project_root* keeps the shell's scoping rule: a ``.ssh`` directory
+    *inside* the project is the owner's own business, one outside it is not.
+    """
+    if path.name in PROTECTED_BASENAMES:
+        return path.name
+    subpath = _has_protected_subpath(path)
+    if subpath is not None:
+        return subpath
+    if project_root is not None and not _is_within(path, project_root):
+        return next((name for name in path.parts if name in PROTECTED_BASENAMES), None)
+    return None
+
+
+def _clobbered(program: str, tokens: list[str], destinations: list[Path]) -> list[Path]:
+    """The subset of *destinations* that already exist and would lose content."""
+    hits: list[Path] = []
+    for dest in destinations:
+        try:
+            resolved = dest.resolve()
+        except OSError:  # pragma: no cover - broken symlink loop
+            resolved = dest
+        if not _exists(resolved):
+            continue
+        if resolved.is_dir() and program in SINGLE_SOURCE_DEST_COMMANDS:
+            sources = _operands(tokens)[:-1]  # the last operand is the destination
+            for source in sources:
+                name = Path(source).name
+                candidate = resolved / name if name else resolved
+                if _exists(candidate):
+                    hits.append(candidate)
+        else:
+            hits.append(resolved)
+    return hits
+
+
 # --------------------------------------------------------------------------- #
 # The classifier
 # --------------------------------------------------------------------------- #
@@ -962,22 +1065,10 @@ def explain(
         if target in PIPE_TARGETS:
             verdicts.append(Verdict(Tier.DENY, f"piping into {target}", "pipe-to-interpreter"))
 
-    for index, token in enumerate(tokens):
-        if token not in _REDIRECTS:
-            continue
-        # shlex splits "->" into "-" and ">", so an arrow in a human-written
-        # command would otherwise look like a redirection. `2>file` is a real
-        # redirect and is preceded by the fd number, not by a bare dash.
-        if index > 0 and tokens[index - 1] == "-":
-            continue
-        destination = tokens[index + 1] if index + 1 < len(tokens) else "(stdout)"
-        verdicts.append(
-            Verdict(Tier.CONFIRM, f"redirecting output into {destination}", "redirect-write")
-        )
-
     # 4. Resolve the directory the command really runs in. `cd .. && rm -rf data`
     #    is the whole reason this exists: judging `data` against the workspace
-    #    would miss that the shell is one level up when it is deleted.
+    #    would miss that the shell is one level up when it is deleted. The
+    #    redirection and zoning checks below both judge targets against it.
     base = effective_cwd(tokens, cwd, home)
     if base is None:
         verdicts.append(
@@ -989,7 +1080,64 @@ def explain(
         )
         base = cwd
 
-    # 5. Path zoning, one segment at a time. Judging the whole line as a single
+    # 5. Redirections write files too, and this is where "creates" and
+    #    "clobbers" part ways: `> new.txt` inside the workspace just runs,
+    #    `> existing.txt` asks, and anything aimed out of the workspace asks
+    #    (or denies) exactly like a path operand would.
+    for index, token in enumerate(tokens):
+        if token not in _REDIRECTS:
+            continue
+        # shlex splits "->" into "-" and ">", so an arrow in a human-written
+        # command would otherwise look like a redirection. `2>file` is a real
+        # redirect and is preceded by the fd number, not by a bare dash.
+        if index > 0 and tokens[index - 1] == "-":
+            continue
+        destination = tokens[index + 1] if index + 1 < len(tokens) else ""
+        if not destination:
+            verdicts.append(
+                Verdict(Tier.CONFIRM, "redirect with no destination", "redirect-write")
+            )
+            continue
+        target_path = _absolute(destination, base, home)
+        if _is_dev_sink(target_path):
+            continue  # /dev/null destroys nothing
+        try:
+            resolved = target_path.resolve()
+        except OSError:  # pragma: no cover - broken symlink loop
+            resolved = target_path
+        zone = _zone(target_path, project_root, home)
+        if zone == "system":
+            verdicts.append(
+                Verdict(
+                    Tier.DENY, f"would modify the system path {target_path}", "zone:system-write"
+                )
+            )
+        elif not _is_within(resolved, write_root):
+            if zone == "home":
+                reason = f"would write inside your home directory ({target_path})"
+                rule = "zone:home-write"
+            elif zone == "outside":
+                reason = f"would write outside the project ({target_path})"
+                rule = "zone:outside-write"
+            else:
+                reason = (
+                    f"would write outside the workspace ({target_path}); the workspace is "
+                    f"{write_root.name or write_root}"
+                )
+                rule = "zone:outside-workspace"
+            verdicts.append(Verdict(Tier.CONFIRM, reason, rule))
+        elif token == ">" and _exists(resolved):
+            verdicts.append(
+                Verdict(
+                    Tier.CONFIRM,
+                    f"overwriting {target_path.name} by redirecting output into it",
+                    "redirect-write",
+                )
+            )
+        # `>>` (append) and a `>` onto a name that does not exist yet, both
+        # inside the workspace: nothing to lose, so nothing to ask.
+
+    # 6. Path zoning, one segment at a time. Judging the whole line as a single
     #    command is what lets `cd ..` look like a write target and what makes
     #    `cp a b` ambiguous about which operand is the destination.
     for segment in _segments(tokens):
@@ -1013,6 +1161,27 @@ def explain(
             token.startswith("-") and "r" in token for token in segment
         )
 
+        # A target built from a variable or command substitution resolves to
+        # something this policy never sees: `mv a $DEST` and
+        # `python3 -c "open('$OUT','w')"` both name an in-project path on the
+        # command line and a different one at run time. Guessing here would
+        # wave them through; escalating costs one tap, the same as an
+        # unfollowable `cd`. Read-only segments never reach this, so
+        # `grep -r $PATTERN .` still runs free.
+        segment_redirects = any(token in _REDIRECTS for token in segment)
+        if segment_program in PATH_OPERAND_COMMANDS or segment_redirects:
+            for word in [*_operands(segment), *_redirect_destinations(segment)]:
+                if "$" in word or "`" in word:
+                    verdicts.append(
+                        Verdict(
+                            Tier.CONFIRM,
+                            "the target is built from a variable, so where it writes "
+                            "cannot be determined",
+                            "target:variable",
+                        )
+                    )
+                    break
+
         targets = referenced_paths(segment, base, home)
         # Bare operands: `rm -rf data` names its target with no separator in it,
         # so the path-shapedness test above cannot see it. Gated on the program,
@@ -1033,7 +1202,25 @@ def explain(
         if segment_program in DESTINATION_LAST_COMMANDS and targets:
             targets = [targets[-1]]
 
+        # Overwrite, not creation, is what asks. `mv a b` clobbers only when
+        # `b` is already there; a name that does not exist yet costs the owner
+        # nothing to lose, so it runs without a tap.
+        if segment_program in OVERWRITE_COMMANDS and targets:
+            appending = segment_program == "tee" and bool({"-a", "--append"} & set(segment))
+            if not appending:
+                destinations = [p for p in targets if not _is_dev_sink(p)]
+                for hit in _clobbered(segment_program, segment, destinations):
+                    verdicts.append(
+                        Verdict(
+                            Tier.CONFIRM,
+                            f"would overwrite an existing file ({hit})",
+                            "overwrite:existing",
+                        )
+                    )
+
         for path in dict.fromkeys(targets):
+            if _is_dev_sink(path):
+                continue  # /dev/null and friends destroy nothing
             zone = _zone(path, project_root, home)
             protected_subpath = _has_protected_subpath(path)
             # The protected-name check runs against the *resolved* path as well
@@ -1176,6 +1363,7 @@ __all__ = [
     "explain",
     "tokenize",
     "describe_policy",
+    "protected_write",
     "referenced_paths",
     "quoted_paths",
     "effective_cwd",

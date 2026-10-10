@@ -91,6 +91,30 @@ async def test_system_prompt_teaches_telegram_html(config) -> None:
     assert "Never use backticks" in content
 
 
+async def test_conduct_and_boundaries_are_hardcoded(config) -> None:
+    """Behaviour rules live in the code, not in PERSONALITY.md.
+
+    The voice file is the owner's to edit; the rules that stop the bot from
+    destroying something have to hold regardless — including when the file is
+    missing and the fallback voice is in use.
+    """
+    agent = make_agent(config, [make_reply("ok")])
+    content = agent.system_prompt()
+
+    assert "## How you work" in content
+    assert "## Boundaries" in content
+    assert "writes outside this project directory" in content
+    assert "or commit anything unless the" in content
+
+    # None of that came from the personality file: it is voice only now.
+    personality = config.personality_file.read_text(encoding="utf-8")
+    assert "Boundaries" not in personality
+
+    # ...and it survives the file going missing entirely.
+    config.personality_file.unlink()
+    assert "## Boundaries" in make_agent(config, []).system_prompt()
+
+
 async def test_system_prompt_hides_tools_without_a_key(config, monkeypatch) -> None:
     """An API-key-gated tool is invisible to the model when its key is unset.
 
@@ -452,28 +476,34 @@ async def test_approval_in_a_parallel_set_answers_every_tool_call(config) -> Non
 
 
 async def test_approving_runs_the_command_and_continues(config) -> None:
+    target = config.shell_cwd / "made.txt"
+    target.write_text("scratch", encoding="utf-8")
+
     agent = make_agent(
         config,
         [
-            make_reply("", [("c1", "run_shell", {"command": "mkdir -p made"})]),
-            make_reply("that directory exists now"),
+            make_reply("", [("c1", "run_shell", {"command": "rm made.txt"})]),
+            make_reply("it is gone"),
         ],
     )
     first = await agent.handle(CHAT, "make it")
     action = first.pending[0]
     second = await agent.resolve(CHAT, action.id, approved=True)
 
-    assert second.text == "that directory exists now"
+    assert second.text == "it is gone"
     assert second.tools_used == ["run_shell"]
-    assert (config.shell_cwd / "made").is_dir(), "the approved command must really run"
+    assert not target.exists(), "the approved command must really run"
     assert "Approved by the owner" in last_user_message(agent)
 
 
 async def test_denying_records_the_refusal_and_continues(config) -> None:
+    target = config.shell_cwd / "denied.txt"
+    target.write_text("still here", encoding="utf-8")
+
     agent = make_agent(
         config,
         [
-            make_reply("", [("c1", "run_shell", {"command": "mkdir -p denied"})]),
+            make_reply("", [("c1", "run_shell", {"command": "rm denied.txt"})]),
             make_reply("fair enough, i left it alone"),
         ],
     )
@@ -482,10 +512,30 @@ async def test_denying_records_the_refusal_and_continues(config) -> None:
 
     assert "left it alone" in second.text
     assert second.tools_used == []  # nothing ran
-    assert not (config.shell_cwd / "denied").exists()
+    assert target.exists(), "a declined command must leave the file alone"
     outcome = last_user_message(agent)
     assert "declined" in outcome
     assert "do not retry" in outcome
+
+
+async def test_a_non_destructive_command_runs_without_asking(config) -> None:
+    """Creating something inside the project is free: no Confirm tap needed.
+
+    The confirm tier is for state the owner would lose, and a directory that
+    did not exist a second ago is not that.
+    """
+    agent = make_agent(
+        config,
+        [
+            make_reply("", [("c1", "run_shell", {"command": "mkdir -p made"})]),
+            make_reply("directory created"),
+        ],
+    )
+    result = await agent.handle(CHAT, "make it")
+
+    assert not result.needs_approval, "mkdir must not stop the turn for a tap"
+    assert (config.shell_cwd / "made").is_dir()
+    assert result.text == "directory created"
 
 
 async def test_denied_command_really_does_not_run(config) -> None:

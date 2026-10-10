@@ -21,6 +21,25 @@ def verdict(command: str, **kwargs) -> safety.Verdict:
     return safety.classify(command, cwd=CWD, project_root=ROOT, home=HOME, **kwargs)
 
 
+def _project(tmp_path: Path) -> tuple[Path, Path]:
+    """A real on-disk project, for the rules that ask the filesystem."""
+    root = tmp_path / "proj"
+    (root / "workspace").mkdir(parents=True)
+    home = tmp_path / "home"
+    home.mkdir()
+    return root, home
+
+
+def _verdict(command: str, root: Path, home: Path) -> safety.Verdict:
+    return safety.classify(
+        command,
+        cwd=root / "workspace",
+        project_root=root,
+        home=home,
+        write_root=root / "workspace",
+    )
+
+
 # --------------------------------------------------------------------------- #
 # allow
 # --------------------------------------------------------------------------- #
@@ -39,6 +58,21 @@ ALLOWED = [
     "find . -name '*.py'",
     "cat /etc/passwd",  # reading a system path is fine
     "head -5 /proc/meminfo",
+    # Creating is not clobbering: these name destinations that do not exist
+    # yet in this (deliberately empty) project, so there is nothing to lose.
+    "mkdir -p a/b/c",
+    "touch notes.md",
+    "ln -s a b",
+    "mv a b",
+    "cp a b",
+    "echo hi > new-file.txt",
+    "echo hi >> log.txt",
+    "cat a | tee new-file.txt",
+    # Throwing output away destroys nothing.
+    "echo x > /dev/null",
+    "echo x 2>/dev/null",
+    "cat a | tee /dev/null",
+    "cat file <<< hi",
 ]
 
 
@@ -55,10 +89,7 @@ def test_allow_tier(command: str) -> None:
 CONFIRM = [
     "rm -rf workspace/tmp",
     "rm notes.md",
-    "mv a b",
-    "cp a b",
-    "cat foo > out.txt",
-    "echo x >> log.txt",
+    "rmdir old-dir",
     "sed -i s/a/b/ file",
     "chmod +x script.sh",
     "chown me:me file",
@@ -69,9 +100,6 @@ CONFIRM = [
     "git push",
     "git reset --hard HEAD~1",
     "git clean -fdx",
-    "touch notes.md",
-    "mkdir -p a/b/c",
-    "ln -s a b",
     "systemctl restart nginx",
     "tar -xf archive.tar",
     "curl -o file https://example.com",
@@ -79,7 +107,6 @@ CONFIRM = [
     "echo x > /tmp/out",  # outside the project
     "rm -rf ../secrets",  # escaping the project
     "cp a ~/.notes",  # inside home
-    "cp /etc/hosts .",  # system file as *source*: still a write, so confirm
 ]
 
 
@@ -188,20 +215,32 @@ def test_tokenize_survives_unbalanced_quotes() -> None:
     assert safety.tokenize("echo 'unclosed") == ["echo", "'unclosed"]
 
 
-def test_arrow_is_not_a_redirect() -> None:
+def test_arrow_is_not_a_redirect(tmp_path: Path) -> None:
     """`ls -> f` must not trip the redirection check, but `2>f` must."""
-    assert not any(
-        v.rule == "redirect-write"
-        for v in safety.explain("ls -> f", cwd=CWD, project_root=ROOT, home=HOME)
-    )
-    assert any(
-        v.rule == "redirect-write"
-        for v in safety.explain("ls 2>f", cwd=CWD, project_root=ROOT, home=HOME)
-    )
+    root, home = _project(tmp_path)
+    (root / "workspace" / "f").write_text("x", encoding="utf-8")
+
+    def rules(command: str) -> set[str]:
+        return {
+            v.rule
+            for v in safety.explain(
+                command, cwd=root / "workspace", project_root=root, home=home
+            )
+        }
+
+    assert "redirect-write" not in rules("ls -> f")
+    assert "redirect-write" in rules("ls 2>f")  # f exists: this clobbers it
 
 
-def test_redirect_still_caught() -> None:
-    assert verdict("cat a > b").needs_approval
+def test_redirect_over_an_existing_file_asks(tmp_path: Path) -> None:
+    root, home = _project(tmp_path)
+    (root / "workspace" / "b").write_text("precious", encoding="utf-8")
+    assert _verdict("cat a > b", root, home).needs_approval
+
+
+def test_redirect_creating_a_new_file_runs(tmp_path: Path) -> None:
+    root, home = _project(tmp_path)
+    assert _verdict("cat a > b", root, home).tier is safety.Tier.ALLOW
 
 
 # --------------------------------------------------------------------------- #
@@ -217,12 +256,14 @@ def test_read_from_system_is_allowed() -> None:
     assert verdict("cat /etc/lumi-test").tier is safety.Tier.ALLOW
 
 
-def test_cp_destination_not_source_decides() -> None:
-    # The source is a system path, the destination is local: this is a read.
-    assert verdict("cp /etc/hosts .").needs_approval  # cp is a write command
+def test_cp_destination_not_source_decides(tmp_path: Path) -> None:
+    root, home = _project(tmp_path)
+    # The source is a system path, the destination is local: reading /etc is
+    # fine, and creating ./hosts costs nothing to redo.
+    assert _verdict("cp /etc/hosts .", root, home).tier is safety.Tier.ALLOW
     assert verdict("cat /etc/hosts").tier is safety.Tier.ALLOW
     # ...but the reverse direction is a write to a system path.
-    assert verdict("cp ./hosts /etc/hosts").blocked
+    assert _verdict("cp ./hosts /etc/hosts", root, home).blocked
 
 
 def test_project_relative_paths_are_not_flagged() -> None:
@@ -242,6 +283,107 @@ def test_env_assignment_prefix_is_skipped() -> None:
     # FOO=bar cat file should be judged as `cat`, not as a program named FOO.
     result = verdict("FOO=bar cat /etc/passwd")
     assert result.tier is safety.Tier.ALLOW
+
+
+# --------------------------------------------------------------------------- #
+# creating vs clobbering
+# --------------------------------------------------------------------------- #
+#
+# The confirm tier is for state the owner would lose, not for state the bot
+# makes: a destination that does not exist yet costs nothing to redo, so it
+# runs without a tap — and a destination that does exist asks, whether the
+# write arrives as `mv`, as `cp`, or as a `>`.
+
+
+def test_creating_something_new_runs_without_a_tap(tmp_path: Path) -> None:
+    root, home = _project(tmp_path)
+    for command in [
+        "mkdir -p build/x",
+        "touch notes.md",
+        "mv fresh.txt other.txt",
+        "cp fresh.txt other.txt",
+        "ln -s fresh.txt link.txt",
+        "echo hi > new.txt",
+        "echo hi >> new-or-old.txt",
+        "cat fresh.txt | tee new.txt",
+    ]:
+        assert _verdict(command, root, home).tier is safety.Tier.ALLOW, command
+
+
+def test_overwriting_an_existing_file_asks(tmp_path: Path) -> None:
+    root, home = _project(tmp_path)
+    workspace = root / "workspace"
+    for name in ("taken.txt", "existing.txt"):
+        (workspace / name).write_text("precious", encoding="utf-8")
+    for command in [
+        "mv fresh.txt taken.txt",
+        "cp fresh.txt taken.txt",
+        "echo hi > existing.txt",
+        "cat fresh.txt | tee existing.txt",
+    ]:
+        result = _verdict(command, root, home)
+        assert result.needs_approval, f"{command!r} -> {result}"
+
+
+def test_tee_append_does_not_ask_about_a_file_it_only_appends_to(tmp_path: Path) -> None:
+    root, home = _project(tmp_path)
+    (root / "workspace" / "log.txt").write_text("line one\n", encoding="utf-8")
+    assert _verdict("echo line two | tee -a log.txt", root, home).tier is safety.Tier.ALLOW
+
+
+def test_moving_into_a_directory_asks_only_when_the_name_is_taken(tmp_path: Path) -> None:
+    root, home = _project(tmp_path)
+    workspace = root / "workspace"
+    (workspace / "dir").mkdir()
+    assert _verdict("mv fresh.txt dir", root, home).tier is safety.Tier.ALLOW
+    (workspace / "dir" / "taken.txt").write_text("x", encoding="utf-8")
+    assert _verdict("mv taken.txt dir", root, home).needs_approval
+
+
+def test_dev_sink_writes_are_allowed(tmp_path: Path) -> None:
+    # `2>/dev/null` is how every command silences its noise. It destroys
+    # nothing, so it must not be judged as a write to /dev.
+    root, home = _project(tmp_path)
+    for command in ["echo x > /dev/null", "echo x 2>/dev/null", "cat a | tee /dev/null"]:
+        assert _verdict(command, root, home).tier is safety.Tier.ALLOW, command
+
+
+# --------------------------------------------------------------------------- #
+# targets the policy cannot follow
+# --------------------------------------------------------------------------- #
+
+
+def test_a_variable_target_escalates_instead_of_slipping_through(tmp_path: Path) -> None:
+    # Each of these names an in-project path on the command line and a
+    # different one at run time. Guessing in-project would wave it through;
+    # the threat model says escalate to a prompt instead.
+    root, home = _project(tmp_path)
+    for command in [
+        "mv notes.md $DEST",
+        "echo hi > $OUT",
+        """python3 -c "open('$OUT','w')" """,
+        "mkdir -p $DIR/build",
+    ]:
+        result = _verdict(command, root, home)
+        assert result.needs_approval, f"{command!r} -> {result}"
+        assert any(
+            v.rule == "target:variable"
+            for v in safety.explain(
+                command,
+                cwd=root / "workspace",
+                project_root=root,
+                home=home,
+                write_root=root / "workspace",
+            )
+        ), command
+
+
+def test_a_variable_in_a_read_only_command_is_not_a_write(tmp_path: Path) -> None:
+    # The escalation is about *writes*. `grep -r $PATTERN .` has no write
+    # target at all and must keep running free.
+    root, home = _project(tmp_path)
+    assert _verdict("grep -r $PATTERN .", root, home).tier is safety.Tier.ALLOW
+    assert _verdict("cat $FILE", root, home).tier is safety.Tier.ALLOW
 
 
 # --------------------------------------------------------------------------- #
@@ -289,6 +431,7 @@ ESCAPES_THE_WORKSPACE = [
     "cd .. && touch notes.md",
     "mv notes.md ../notes.md",
     "sed -i s/a/b/ ../config.toml",
+    "cd .. && echo hi > out.txt",  # a redirect walks out just like an operand
 ]
 
 

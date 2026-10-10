@@ -34,7 +34,7 @@ expected, and it is why the two steps above are always both needed.
 
 **Everything is relative.** Paths resolve from the directory containing `pyproject.toml`. State goes in `./data`, the shell runs in `./workspace`, and the bot pins `HOME` to the project root so a stray `~/.something` cannot appear. Move the folder to another machine and it still works. The bot does not read or write your home directory unless you deliberately configure it.
 
-**Markdown is the configuration.** There is no prompt DSL and no schema to learn. You paste PERSONALITY.md into the system prompt verbatim; edit it and send `/reload`. `MEMORY.md` is a bullet list you can hand-edit, with a managed region the bot appends to and `/forget` pops from.
+**Markdown is the configuration.** There is no prompt DSL and no schema to learn. You paste PERSONALITY.md into the system prompt verbatim; edit it and send `/reload`. It is the *voice* — how the bot talks. What it is allowed to do (the boundaries, the approval rules) is hardcoded in `lumi/agent.py`, so editing the voice file cannot quietly turn the safety rules off. `MEMORY.md` is a bullet list you can hand-edit, with a managed region the bot appends to and `/forget` pops from.
 
 **The safety layer is a file you can audit.** `lumi/tools/safety.py` is one screen of `(regex, tier, reason)` triples. `lumi shell "rm -rf /"` prints the verdict and the reason, so you can check the policy without provoking it.
 
@@ -94,7 +94,7 @@ lumi/
 │   ├── registry.py    dispatch, error containment
 │   ├── safety.py      the command policy — read this one
 │   ├── shell.py       execution: scrubbed env, timeouts, output caps
-│   ├── files.py       path-confined read/write
+│   ├── files.py       path-confined read/write/edit
 │   ├── memory_tool.py
 │   ├── context7.py    version-specific library docs
 │   └── web/           tool + providers/{firecrawl,exa,tavily,mcp}

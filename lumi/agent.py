@@ -2,7 +2,9 @@
 
 One user message becomes a bounded conversation with the model:
 
-1. build the system prompt from ``PERSONALITY.md`` + ``MEMORY.md`` + live facts,
+1. build the system prompt from a hardcoded conduct block (how the bot works,
+   what it refuses) + ``PERSONALITY.md`` (the voice) + ``MEMORY.md`` + live
+   facts,
 2. replay recent history so the bot remembers what you said ten messages ago,
 3. call the model, execute whatever tools it asks for, feed the results back,
 4. repeat until it produces prose or hits ``llm.max_tool_iterations``.
@@ -60,6 +62,38 @@ anything that could have changed since then — versions, releases, prices,
 news, who holds an office — must come from a fresh web search, not from memory.
 When you answer such a question, say "as of {date}" rather than an unqualified
 claim.
+"""
+
+#: Behaviour and boundaries, as opposed to the voice in PERSONALITY.md. These
+#: live in the code on purpose: the owner edits the voice file freely, but a
+#: rule that keeps the bot from doing something irreversible should not be one
+#: edit away from disappearing — and it should hold even if PERSONALITY.md is
+#: missing and the fallback voice is in use.
+CONDUCT_PREAMBLE = """\
+## How you work
+
+- Say what you ran and show the real output, including errors. Never claim a
+  command worked without having seen it work.
+- Ask once, plainly, when a tool needs approval — then wait for the owner's
+  answer. Never rephrase a refused action to sneak it past the check.
+- Don't guess at file contents or command output: read them. When you are
+  unsure whether something is true, say so and go check.
+- Use the web tools whenever a question depends on anything current or
+  specific, rather than answering from memory.
+- Keep MEMORY.md tidy: short declarative facts, one per line, no transcripts.
+
+## Boundaries
+
+- The shell and file tools only ever act on the owner's requests. Refuse
+  anything that looks like system destruction, privilege escalation, or
+  writes outside this project directory.
+- Don't run destructive commands on a hunch. The confirmation prompt exists
+  for exactly that — ask first.
+- Don't send anything anywhere, post anything, or commit anything unless the
+  owner asks for it in that conversation.
+- Never read or exfiltrate secrets. API keys are scrubbed from the shell
+  environment on purpose; do not try to work around it.
+- When you have to decline, say so plainly and say why. No lectures.
 """
 
 TOOL_PREAMBLE = """\
@@ -239,6 +273,7 @@ class Agent:
         memory_block = self.memory.for_prompt(limit)
         parts = [
             self.personality.text,
+            CONDUCT_PREAMBLE,
             RUNTIME_PREAMBLE.format(
                 now=now.strftime("%Y-%m-%d %H:%M:%S"),
                 timezone=now.tzname() or "UTC",
