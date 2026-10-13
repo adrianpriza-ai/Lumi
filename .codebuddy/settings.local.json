@@ -1,0 +1,7 @@
+{
+  "enabledMcpjsonServers": [
+    "tavily-remote",
+    "firecrawl-remote"
+  ],
+  "disabledMcpjsonServers": []
+}
