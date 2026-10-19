@@ -13,18 +13,19 @@ import io
 import json
 import time
 import tomllib
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from conftest import FakeLLM, make_reply
-from telegram import Bot, Update, User
+from telegram import Bot, Chat, Message, Update, User
+from telegram.error import TelegramError
 
-from lumi.agent import Agent, TurnResult
+from lumi.agent import Agent
 from lumi.bot import (
     CB_NO,
     CB_OK,
-    CB_THINK,
-    TraceStore,
+    StepFeed,
     _write_toml,
     build_application,
     build_handlers,
@@ -91,7 +92,16 @@ class FakeBot(Bot):
 
     async def send_message(self, chat_id: Any, text: str, **kwargs: Any) -> Any:
         self._sent.append({"chat_id": chat_id, "text": text, **kwargs})
-        return None
+        # A real Bot returns the sent Message; the step feed needs its id to
+        # edit in place, so the stub has to hand one back too.
+        message = Message(
+            message_id=len(self._sent),
+            date=datetime.now(UTC),
+            chat=Chat(id=chat_id, type="private"),
+            text=text,
+        )
+        message.set_bot(self)
+        return message
 
     async def edit_message_text(self, text: str, **kwargs: Any) -> Any:
         self._edits.append({"text": text, **kwargs})
@@ -136,6 +146,36 @@ class StaleToastBot(FakeBot):
         raise BadRequest(
             "Query is too old and response timeout expired or query id is invalid"
         )
+
+
+class FlakySendBot(FakeBot):
+    """A FakeBot whose first send of a marked message fails like a transient
+    Telegram error, then succeeds — a retryable outage, not a dead chat.
+
+    The regression this exists for: the live ``on_message`` hook swallowed
+    ``TelegramError`` inside ``reply()``, so a failed live send disappeared
+    before the agent's ``TurnResult.messages`` fallback could see it. With
+    strict delivery the failure surfaces, the agent keeps the message, and the
+    turn-tail flush retries it.
+    """
+
+    def __init__(self, needle: str) -> None:
+        super().__init__()
+        self._needle = needle
+        self._failed = False
+
+    async def send_message(self, chat_id: Any, text: str, **kwargs: Any) -> Any:
+        if not self._failed and self._needle in text:
+            self._failed = True
+            raise TelegramError("simulate: Telegram hiccup")
+        return await super().send_message(chat_id, text, **kwargs)
+
+
+class DeadBot(FakeBot):
+    """A FakeBot where every send fails — the chat is unreachable."""
+
+    async def send_message(self, chat_id: Any, text: str, **kwargs: Any) -> Any:
+        raise TelegramError("chat is gone")
 
 
 def make_update(bot: Bot, text: str | None = None, *, chat_id: int = CHAT, user_id: int = OWNER,
@@ -1687,165 +1727,72 @@ async def test_document_intake_respects_the_whitelist(config) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# reasoning
+# reasoning / the step feed
 # --------------------------------------------------------------------------- #
 
 
 THINKING = "first I checked the spelling, then the plural, so four"
 
 
-async def test_the_trace_is_not_spelled_out_in_the_chat(config) -> None:
-    """The whole point of collapsing it: the answer reads the same whether or
-    not anyone ever opens the trace."""
+async def test_the_thinking_trace_is_never_spelled_out_in_the_chat(config) -> None:
+    """The trace stays internal — not shown, not behind a button. What the
+    chat sees is the answer and, on tool turns, the step list."""
     bot, _ = await send(config, [make_reply("four", reasoning=THINKING)], "how many r's?")
     assert THINKING not in texts(bot)
     assert "four" in texts(bot)
 
 
-async def test_the_collapsed_line_comes_before_the_answer(config) -> None:
-    """The order it happened in: the model thought, then it spoke."""
-    bot, _ = await send(config, [make_reply("four", reasoning=THINKING)], "how many r's?")
-    assert "🧠" in texts(bot)
-    assert "🧠" in bot.sent[0]["text"]
-    assert bot.sent[1]["text"] == "four"
-
-
-async def test_the_collapsed_line_carries_a_button_that_fits_callback_data(config) -> None:
-    bot, _ = await send(config, [make_reply("four", reasoning=THINKING)], "how many r's?")
-    keyboard = next(m["reply_markup"] for m in bot.sent if m.get("reply_markup"))
-    button = keyboard.inline_keyboard[0][0]
-    assert button.text == "show thinking"
-    assert button.callback_data.startswith(CB_THINK)
-    assert len(button.callback_data) <= 64  # Telegram's hard limit
-
-
-async def test_the_collapsed_line_reports_the_effort(config) -> None:
+async def test_a_tool_turn_shows_the_steps_it_took(config) -> None:
+    """The live note reads like a receipt of the turn: thinking, then each
+    tool — and it sits above the answer, in the order it happened."""
     bot, _ = await send(
         config,
-        [make_reply("four", reasoning=THINKING, reasoning_tokens=1200)],
-        "how many r's?",
+        [
+            make_reply("", [("c1", "run_shell", {"command": "echo hi"})]),
+            make_reply("it said hi"),
+        ],
+        "run echo hi",
     )
-    assert "1,200 reasoning tokens" in texts(bot)
+    body = texts(bot)
+    step_message = next(m for m in bot.sent if "Run Bash" in m["text"])
+    assert step_message["text"].splitlines() == ["🧠 Thinking", "💻 Run Bash"]
+    assert body.index("Run Bash") < body.index("it said hi")
 
 
-async def test_no_button_when_the_model_did_not_reason(config) -> None:
+async def test_the_step_list_is_edited_in_place(config) -> None:
+    """One message that grows, not a new message per step: a chat scrolled
+    back to an old turn must not fill with progress chatter."""
+    application, bot, _ = build(
+        config,
+        [
+            make_reply("", [("c1", "run_shell", {"command": "echo hi"})]),
+            make_reply("it said hi"),
+        ],
+    )
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "run echo hi"))
+    finally:
+        await application.shutdown()
+
+    step_messages = [m for m in bot.sent if "Thinking" in m["text"]]
+    assert len(step_messages) == 1
+    assert bot.edits, "subsequent steps must edit that message, not re-send"
+    assert "🧠 Thinking" in bot.edits[0]["text"]
+    assert "💻 Run Bash" in bot.edits[0]["text"]
+
+
+async def test_a_turn_without_tools_posts_no_step_message(config) -> None:
+    """A plain answer is just the answer — the step note earns its place by
+    reporting work, not by being there."""
     bot, _ = await send(config, [make_reply("four")], "how many r's?")
     assert "🧠" not in texts(bot)
     assert not [m for m in bot.sent if m.get("reply_markup")]
 
 
-async def test_traces_can_be_turned_off(config) -> None:
-    config.llm.show_reasoning = False
-    bot, _ = await send(config, [make_reply("four", reasoning=THINKING)], "how many r's?")
-    assert "🧠" not in texts(bot)
-
-
-async def test_tapping_show_edits_the_message_in_place(config) -> None:
-    """In place, not as a new message: a chat scrolled back to an old turn
-    should not gain a second copy of the trace below it."""
-    application, bot, _ = build(config, [make_reply("four", reasoning=THINKING)])
-    await application.initialize()
-    try:
-        await application.process_update(make_update(bot, "how many r's?"))
-        posted = len(bot.sent)  # the answer and the collapsed stub
-        stub = next(m for m in bot.sent if m.get("reply_markup"))
-        token = stub["reply_markup"].inline_keyboard[0][0].callback_data
-        await application.process_update(make_callback(bot, token))
-    finally:
-        await application.shutdown()
-
-    assert len(bot.sent) == posted  # tapping added no new message
-    assert THINKING in bot.edits[0]["text"]
-    assert "thinking" in bot.edits[0]["text"].lower()
-
-
-async def test_a_stale_thinking_tap_still_expands(config) -> None:
-    """Same staleness, other button: the expired toast must not prevent the
-    trace from being edited into the message."""
-    application, bot, _ = build(
-        config, [make_reply("four", reasoning=THINKING)], bot=StaleToastBot()
-    )
-    await application.initialize()
-    try:
-        await application.process_update(make_update(bot, "how many r's?"))
-        stub = next(m for m in bot.sent if m.get("reply_markup"))
-        token = stub["reply_markup"].inline_keyboard[0][0].callback_data
-        await application.process_update(make_callback(bot, token))
-    finally:
-        await application.shutdown()
-
-    assert THINKING in bot.edits[0]["text"], "the expired toast ate the tap"
-
-
-async def test_the_expanded_trace_offers_a_way_back(config) -> None:
-    application, bot, _ = build(config, [make_reply("four", reasoning=THINKING)])
-    await application.initialize()
-    try:
-        await application.process_update(make_update(bot, "how many r's?"))
-        stub = next(m for m in bot.sent if m.get("reply_markup"))
-        token = stub["reply_markup"].inline_keyboard[0][0].callback_data
-        await application.process_update(make_callback(bot, token))
-        keyboard = bot.edits[0]["reply_markup"]
-        assert keyboard.inline_keyboard[0][0].text == "hide"
-    finally:
-        await application.shutdown()
-
-
-async def test_tapping_hide_collapses_it_again(config) -> None:
-    application, bot, _ = build(config, [make_reply("four", reasoning=THINKING)])
-    await application.initialize()
-    try:
-        await application.process_update(make_update(bot, "how many r's?"))
-        stub = next(m for m in bot.sent if m.get("reply_markup"))
-        token = stub["reply_markup"].inline_keyboard[0][0].callback_data
-        await application.process_update(make_callback(bot, token))
-        await application.process_update(make_callback(bot, f"{CB_THINK}hide:"))
-    finally:
-        await application.shutdown()
-
-    assert THINKING not in bot.edits[-1]["text"]
-
-
-async def test_an_expired_trace_does_not_edit_the_message(config) -> None:
-    """Editing it to something meaningless looks like a broken button; saying so
-    in the toast is honest and leaves the message alone."""
-    application, bot, _ = build(config, [make_reply("four", reasoning=THINKING)])
-    await application.initialize()
-    try:
-        await application.process_update(make_update(bot, "how many r's?"))
-        await application.process_update(make_callback(bot, f"{CB_THINK}show:deadbeef1234"))
-    finally:
-        await application.shutdown()
-
-    assert bot.edits == []
-
-
-async def test_a_stranger_cannot_read_someone_elses_trace(config) -> None:
-    application, bot, _ = build(config, [make_reply("four", reasoning=THINKING)])
-    await application.initialize()
-    try:
-        await application.process_update(make_update(bot, "how many r's?"))
-        stub = next(m for m in bot.sent if m.get("reply_markup"))
-        token = stub["reply_markup"].inline_keyboard[0][0].callback_data
-        await application.process_update(make_callback(bot, token, user_id=STRANGER))
-    finally:
-        await application.shutdown()
-
-    assert THINKING not in texts(bot)
-    assert bot.edits == []
-
-
-async def test_a_malformed_think_button_is_ignored(config) -> None:
-    application, bot, _ = build(config, [])
-    await application.initialize()
-    try:
-        await application.process_update(make_callback(bot, CB_THINK))
-    finally:
-        await application.shutdown()
-    assert bot.edits == []
-
-
-async def test_a_tool_turn_still_shows_one_collapsed_line(config) -> None:
+async def test_repeated_model_calls_do_not_stack_thinking_lines(config) -> None:
+    """Every iteration starts with a model call; the header belongs on screen
+    once."""
     bot, _ = await send(
         config,
         [
@@ -1854,98 +1801,242 @@ async def test_a_tool_turn_still_shows_one_collapsed_line(config) -> None:
         ],
         "run echo hi",
     )
-    assert texts(bot).count("🧠") == 1
+    assert texts(bot).count("🧠 Thinking") == 1
 
 
-async def test_the_stub_reports_the_models_time_not_the_turns(config) -> None:
-    """On a turn that spent most of itself waiting on a tool, "thought for Ns"
-    would be a lie — the number has to be the model's."""
-    from lumi.bot import thinking_stub
+async def test_steps_can_be_turned_off(config) -> None:
+    config.llm.show_reasoning = False
+    bot, _ = await send(
+        config,
+        [
+            make_reply("", [("c1", "run_shell", {"command": "echo hi"})]),
+            make_reply("it said hi"),
+        ],
+        "run echo hi",
+    )
+    assert "🧠" not in texts(bot)
+    assert "it said hi" in texts(bot)
 
-    result = TurnResult(text="done", reasoning="x" * 10)
-    result.elapsed = 30.0
-    result.thinking_seconds = 4.0
-    assert "thought for 4s" in thinking_stub(result)
 
-    # And it falls back to the turn total when nothing timed the model.
-    result.thinking_seconds = 0.0
-    assert "thought for 30s" in thinking_stub(result)
+async def test_step_feed_caps_rendered_body_at_ten_lines() -> None:
+    bot = FakeBot()
+    feed = StepFeed(bot, CHAT)
+
+    for index in range(11):
+        await feed.step("tool", f"tool-{index}")
+
+    rendered = bot.edits[-1]["text"]
+    assert rendered.splitlines() == [
+        "… (+2 earlier)",
+        *(f"🔧 tool-{index}" for index in range(2, 11)),
+    ]
+    assert len(rendered.splitlines()) == 10
 
 
-async def test_a_turn_paused_for_approval_still_offers_its_trace(config) -> None:
-    """Both keyboards on the same turn, and neither shadowing the other."""
+async def test_the_step_message_never_carries_a_button(config) -> None:
+    bot, _ = await send(config, [make_reply("four", reasoning=THINKING)], "how many r's?")
+    assert not [m for m in bot.sent if m.get("reply_markup")]
+
+
+async def test_a_turn_paused_for_approval_keeps_its_step_list(config) -> None:
     bot, _ = await send(
         config,
         [
             make_reply(
                 "",
                 [("c1", "run_shell", {"command": "rm -rf workspace/tmp"})],
-                reasoning="this deletes things",
             )
         ],
         "clean up",
     )
     assert "needs your approval" in texts(bot)
-    assert "🧠" in texts(bot)
-    assert len([m for m in bot.sent if m.get("reply_markup")]) == 2
+    assert "🧠 Thinking" in texts(bot)
+    # Exactly one keyboard on the turn: the Confirm/Cancel pair, not a
+    # second button riding on the step message.
+    assert len([m for m in bot.sent if m.get("reply_markup")]) == 1
 
 
-async def test_a_huge_trace_is_truncated_rather_than_spamming_the_chat(config) -> None:
-    application, bot, _ = build(config, [make_reply("four", reasoning="x" * 40_000)])
+async def test_the_send_tool_delivers_before_the_final_answer(config) -> None:
+    """One turn, several messages: the mid-turn one arrives while the turn is
+    still running, and the final answer still lands after it."""
+    bot, _ = await send(
+        config,
+        [
+            make_reply("", [("c1", "send", {"message": "phase 1 done"})]),
+            make_reply("all done"),
+        ],
+        "do the whole thing",
+    )
+    body = texts(bot)
+    assert "phase 1 done" in body
+    assert body.index("phase 1 done") < body.index("all done")
+    # The tool's own receipt is for the model, not the chat.
+    assert "Sent to the owner" not in body
+
+
+async def test_the_send_step_shows_up_in_the_step_list(config) -> None:
+    bot, _ = await send(
+        config,
+        [
+            make_reply("", [("c1", "send", {"message": "halfway"})]),
+            make_reply("done"),
+        ],
+        "go",
+    )
+    assert "✉️ Send" in texts(bot)
+
+
+async def test_a_failed_live_send_is_flushed_after_the_turn(config) -> None:
+    """A transient Telegram failure on a mid-turn send must not swallow the
+    message. The live hook surfaces the error, the agent keeps the message on
+    the result, and the turn-tail flush delivers it — before the final answer.
+    """
+    application, bot, agent = build(
+        config,
+        [
+            make_reply("", [("c1", "send", {"message": "phase 1 done"})]),
+            make_reply("all done"),
+        ],
+        bot=FlakySendBot("phase 1 done"),
+    )
     await application.initialize()
     try:
-        await application.process_update(make_update(bot, "how many r's?"))
-        stub = next(m for m in bot.sent if m.get("reply_markup"))
-        token = stub["reply_markup"].inline_keyboard[0][0].callback_data
-        await application.process_update(make_callback(bot, token))
+        await application.process_update(make_update(bot, "do the whole thing"))
     finally:
         await application.shutdown()
 
-    assert len(bot.edits) == 1
-    assert len(bot.edits[0]["text"]) < 4096  # still one Telegram message
-    assert "truncated" in bot.edits[0]["text"]
+    assert bot._failed, "the live send must actually have failed once"
+    body = texts(bot)
+    assert "phase 1 done" in body, "the failed live send must not vanish"
+    assert body.index("phase 1 done") < body.index("all done")
 
 
-# --------------------------------------------------------------------------- #
-# the store behind the button
-# --------------------------------------------------------------------------- #
+async def test_a_permanently_dead_chat_still_finishes_the_turn(config) -> None:
+    """When even the flush cannot deliver, the turn must still complete: the
+    message is lost to the log, but the final answer is not."""
+    application, bot, agent = build(
+        config,
+        [
+            make_reply("", [("c1", "send", {"message": "into the void"})]),
+            make_reply("all done"),
+        ],
+        bot=DeadBot(),
+    )
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "do the whole thing"))
+    finally:
+        await application.shutdown()
+
+    # DeadBot rejects every send, so nothing lands in the chat — the point is
+    # the update was processed without raising: the model still got its send
+    # receipt and produced the final answer.
+    conv = agent.conversation(CHAT)
+    assert any(
+        m.get("role") == "tool" and "Sent to the owner" in str(m.get("content", ""))
+        for m in conv.messages
+    ), "the turn must continue past a dead delivery channel"
+    assert conv.messages[-1]["role"] == "assistant"  # the answer was produced
 
 
-def test_a_stored_trace_comes_back() -> None:
-    store = TraceStore()
-    assert store.get(store.put("the thinking")) == "the thinking"
+async def test_reply_strict_raises_when_no_target_available() -> None:
+    """When an update has no message and no chat, strict delivery raises."""
+    from telegram import Update
+    from telegram.error import TelegramError
+
+    from lumi.bot import reply
+
+    update = Update(update_id=1)
+    with pytest.raises(TelegramError, match="effective_message and effective_chat are None"):
+        await reply(update, "important message", strict=True)
 
 
-def test_an_unknown_token_is_simply_absent() -> None:
-    assert TraceStore().get("nope") is None
+async def test_reply_falls_back_to_bot_send_message_when_effective_message_is_none() -> None:
+    """When effective_message is missing, reply sends directly to effective_chat."""
+    from telegram import Chat, Update
+
+    from lumi.bot import reply
+
+    bot = FakeBot()
+    update = Update(update_id=1)
+    update.set_bot(bot)
+    object.__setattr__(update, "_effective_chat", Chat(id=42, type="private"))
+
+    await reply(update, "sent to chat directly", strict=True)
+    assert len(bot.sent) == 1
+    assert bot.sent[0]["chat_id"] == 42
+    assert bot.sent[0]["text"] == "sent to chat directly"
 
 
-def test_tokens_are_short_enough_for_callback_data() -> None:
-    assert len(TraceStore().put("x")) <= 64
+async def test_reply_falls_back_to_bot_send_message_when_message_reply_raises_bad_request() -> None:
+    """When replying to a deleted message raises BadRequest, reply falls back to direct chat send."""
+    from telegram.error import BadRequest
+
+    from lumi.bot import reply
+
+    class DeletedMessageBot(FakeBot):
+        async def send_message(self, chat_id: Any, text: str, **kwargs: Any) -> Any:
+            if kwargs.get("reply_to_message_id") is not None:
+                raise BadRequest("Message to be replied not found")
+            return await super().send_message(chat_id, text, **kwargs)
+
+    bot = DeletedMessageBot()
+    update = make_update(bot, "hello")
+
+    await reply(update, "still delivered to chat", strict=True)
+    assert len(bot.sent) == 1
+    assert bot.sent[0]["text"] == "still delivered to chat"
 
 
-def test_an_expired_trace_is_gone() -> None:
-    store = TraceStore(ttl=0.0)
-    token = store.put("the thinking")
-    assert store.get(token) is None
+async def test_the_run_command_shows_up_in_the_step_list(config) -> None:
+    """`/run` executes the tool outside the model loop — the feed still owes
+    the chat the "each thing i run" it promises in /help."""
+    bot, _ = await send(config, [make_reply("it printed hi")], "/run echo hi")
+    body = texts(bot)
+    assert "💻 Run Bash" in body
+    assert "it printed hi" in body
 
 
-def test_the_store_is_bounded() -> None:
-    """A tap that never comes must not keep a model's reasoning alive forever."""
-    store = TraceStore(limit=3)
-    tokens = [store.put(f"trace {i}") for i in range(10)]
-    assert len(store) == 3
-    assert store.get(tokens[-1]) == "trace 9"
-    assert store.get(tokens[0]) is None  # the oldest went first
+async def test_an_approved_run_shows_up_in_the_step_list(config) -> None:
+    """The tap on "run it" runs the tool after the turn ended — its step
+    belongs to the resolve turn's feed, not the vanished one."""
+    application, bot, agent = build(
+        config,
+        [
+            make_reply("", [("c1", "run_shell", {"command": "rm -rf workspace/tmp"})]),
+            make_reply("it is gone"),
+        ],
+    )
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "clean up the workspace"))
+        keyboard = next(m["reply_markup"] for m in bot.sent if m.get("reply_markup"))
+        approve = keyboard.inline_keyboard[0][0]
+        bot._sent.clear()  # only the resolve turn's feed is under test
+        await application.process_update(make_callback(bot, approve.callback_data))
+    finally:
+        await application.shutdown()
+
+    body = texts(bot)
+    assert "💻 Run Bash" in body
+    assert "it is gone" in body
 
 
-def test_stale_traces_are_pruned_on_the_way_in() -> None:
-    store = TraceStore(ttl=60.0)
-    token = store.put("old")
-    store._ttl = 0.0  # as if the entry had aged out
-    store.put("new")
-    assert store.get(token) is None
-    assert len(store) == 1
+async def test_double_asterisk_bold_renders_as_bold(config) -> None:
+    """Markdown **bold** is not formatting in Telegram's HTML mode — it used
+    to show up as literal asterisks. Now it always renders."""
+    bot, _ = await send(config, [make_reply("this is **bold** text")], "hi")
+    answer = next(m for m in bot.sent if "bold" in m.get("text", ""))
+    assert "<b>bold</b>" in answer["text"]
+    assert "**" not in answer["text"]
+
+
+async def test_bold_conversion_leaves_code_alone(config) -> None:
+    """Inside <code>/<pre>, asterisks are frequently real (globs, pointers) —
+    the bold pass must not touch them."""
+    bot, _ = await send(config, [make_reply("run `ls **/*.py` first")], "hi")
+    answer = next(m for m in bot.sent if "ls" in m.get("text", ""))
+    assert "<code>ls **/*.py</code>" in answer["text"]
 
 
 # --------------------------------------------------------------------------- #
@@ -1960,15 +2051,19 @@ async def test_reasoning_reports_the_setup(config) -> None:
     assert "off" in body
 
 
-async def test_reasoning_off_hides_the_trace(config) -> None:
+async def test_reasoning_off_hides_the_step_list(config) -> None:
     bot, _ = await send(config, [], "/reasoning off")
-    assert "trace in chat: off" in texts(bot)
+    assert "live steps in chat: off" in texts(bot)
 
-    bot, _ = await send(config, [make_reply("four", reasoning=THINKING)], "how many r's?")
+    bot, _ = await send(
+        config,
+        [make_reply("", [("c1", "run_shell", {"command": "echo hi"})]), make_reply("four")],
+        "how many r's?",
+    )
     assert "🧠" not in texts(bot)
 
 
-async def test_reasoning_on_brings_the_trace_back(config) -> None:
+async def test_reasoning_on_brings_the_step_list_back(config) -> None:
     application, bot, _ = build(config, [])
     await application.initialize()
     try:
@@ -1978,7 +2073,7 @@ async def test_reasoning_on_brings_the_trace_back(config) -> None:
     finally:
         await application.shutdown()
 
-    assert "trace in chat: on" in texts(bot)
+    assert "live steps in chat: on" in texts(bot)
 
 
 async def test_reasoning_rejects_nonsense(config) -> None:
@@ -1991,10 +2086,10 @@ async def test_status_mentions_reasoning(config) -> None:
     assert "reasoning: off" in texts(bot)
 
 
-async def test_help_mentions_the_thinking_toggle(config) -> None:
+async def test_help_mentions_the_step_list(config) -> None:
     bot, _ = await send(config, [], "/help")
     assert "/reasoning" in texts(bot)
-    assert "show thinking" in texts(bot)
+    assert "live note" in texts(bot)
 
 
 # --------------------------------------------------------------------------- #
@@ -2017,7 +2112,7 @@ async def test_config_reflects_live_toggles(config) -> None:
     config.bot.group_reply_mode = "always"
     bot, _ = await send(config, [], "/config")
     body = texts(bot)
-    assert "trace in chat: off" in body
+    assert "live steps in chat: off" in body
     assert "group mode: always" in body
 
 

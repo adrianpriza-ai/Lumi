@@ -67,7 +67,7 @@ In group chats the bot only answers when **mentioned** (`@Lumi_a_bot ...`), **re
 | Document | Covers |
 |-|-|
 | [CONFIGURATION.md](CONFIGURATION.md) | `config.toml` and precedence, picking an endpoint, reasoning models and thinking traces, key pools and rotation |
-| [TOOLS.md](TOOLS.md) | The five tools, shell safety and its threat model, web providers (Firecrawl / Exa / Tavily / MCP), Context7, and how to add a tool |
+| [TOOLS.md](TOOLS.md) | The tools, shell safety and its threat model, web providers (Firecrawl / Exa / Tavily / MCP), Context7, mid-turn messages, and how to add a tool |
 | [TELEGRAM.md](TELEGRAM.md) | Group chats and when the bot answers, and getting past `api.telegram.org` timeouts |
 
 Start with `lumi doctor`: it names whichever of these is misconfigured.
@@ -97,6 +97,7 @@ lumi/
 │   ├── files.py       path-confined read/write/edit
 │   ├── memory_tool.py
 │   ├── context7.py    version-specific library docs
+│   ├── send.py        mid-turn owner messages
 │   └── web/           tool + providers/{firecrawl,exa,tavily,mcp}
 ├── util/
 │   ├── keys.py        comma-separated key parsing

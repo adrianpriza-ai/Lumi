@@ -90,6 +90,11 @@ async def _ask_once(config: Config, question: str, chat_id: str = "cli") -> int:
         return 3
     for artifact in result.artifacts:
         print(f"[file: {artifact.path} ({artifact.size} bytes)]")
+    # Messages the model sent mid-turn via the `send` tool: `lumi ask` has no
+    # live channel, so they were collected on the result and go out now, in
+    # the order the model sent them, just like in the chat.
+    for message in result.messages:
+        print(message)
     # The thinking trace goes to stderr so `lumi ask "..." > answer.md` still
     # captures nothing but the answer. In a terminal there is no button to
     # collapse it behind, and a terminal is where you go to look at this.
@@ -137,6 +142,26 @@ async def _chat(config: Config) -> int:
         await agent.registry.aclose()
 
 
+async def _note_message(text: str) -> None:
+    """A mid-turn message from the `send` tool, printed the moment it arrives."""
+    print(f"\nlumi > {text}", flush=True)
+
+
+async def _note_step(kind: str, detail: str) -> None:
+    """One turn step on stderr, so it never mixes into a piped answer."""
+    label = detail if kind == "tool" else kind
+    print(f"  [{label}]", file=sys.stderr, flush=True)
+
+
+def _hooks_for(config: Config) -> Any:
+    from .agent import TurnHooks
+
+    return TurnHooks(
+        on_message=_note_message,
+        on_step=_note_step if config.llm.show_reasoning else None,
+    )
+
+
 async def _repl(agent: Any, config: Config) -> int:
     while True:
         try:
@@ -161,7 +186,7 @@ async def _repl(agent: Any, config: Config) -> int:
             continue
         if lowered in {"/help", "/?"}:
             print(BANNER)
-            print("/quit  /reset  /context\n")
+            print("/quit  /reset  /context  /tools  /memory  /personality  /reasoning\n")
             continue
         if lowered == "/tools":
             print(agent.registry.describe(), "\n")
@@ -174,10 +199,37 @@ async def _repl(agent: Any, config: Config) -> int:
         if lowered == "/personality":
             print(agent.personality.text, "\n")
             continue
+        if lowered.startswith("/reasoning"):
+            parts = line.split(maxsplit=1)
+            arg = parts[1].strip().lower() if len(parts) > 1 else ""
+            if arg in {"on", "off"}:
+                config.llm.show_reasoning = arg == "on"
+                print(f"live steps {'on' if config.llm.show_reasoning else 'off'}\n")
+            elif arg:
+                print("usage: /reasoning or /reasoning on|off\n")
+            else:
+                llm = config.llm
+                effort = llm.effort_of() or "provider default"
+                budget = (
+                    f"{llm.reasoning_tokens:,} tokens on top of {llm.max_tokens:,}"
+                    if llm.max_tokens > 0
+                    else "none — no output ceiling is sent, the provider decides"
+                )
+                temp = "omitted" if llm.reasoning and llm.temperature is not None else llm.temperature
+                print(
+                    "reasoning:\n"
+                    f"  model mode: {'on' if llm.reasoning else 'off'}\n"
+                    f"  effort: {effort}\n"
+                    f"  thinking budget: {budget}\n"
+                    f"  temperature: {temp}\n"
+                    f"  live steps: {'on' if llm.show_reasoning else 'off'}\n"
+                )
+            continue
 
+        hooks = _hooks_for(config)
         print("lumi > ", end="", flush=True)
         try:
-            result = await agent.handle("cli", line, source="cli")
+            result = await agent.handle("cli", line, source="cli", hooks=hooks)
         except Exception as exc:  # noqa: BLE001
             print(f"\ni broke: {format_error(exc)}\n")
             continue
@@ -188,7 +240,11 @@ async def _repl(agent: Any, config: Config) -> int:
             for action in list(result.pending):
                 approved = answer in {"y", "yes"}
                 print("  working…", flush=True)
-                result = await agent.resolve("cli", action.id, approved, source="cli")
+                result = await agent.resolve(
+                    "cli", action.id, approved, source="cli", hooks=hooks
+                )
+        for message in result.messages:
+            print(message)
         if result.text:
             print(result.text)
         for artifact in result.artifacts:

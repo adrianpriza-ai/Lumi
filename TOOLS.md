@@ -9,6 +9,19 @@
 | `memory` | Remember and recall; forgetting is human-only by design |
 | `web` | Search and fetch, across three interchangeable providers |
 | `context7` | Up-to-date library docs from https://context7.com; auto-enables on `CONTEXT7_API_KEY` |
+| `send` | Send the owner a message *mid-turn*, so one reply can arrive in parts |
+
+## Mid-turn messages (`send`)
+
+One turn produces one answer, which is wrong for long work: you would rather
+hear "phase 1 done, starting phase 2" when it happens than read it three
+minutes later as part of a wall of text. The `send` tool is how the model says
+that out loud. It reaches the chat the moment the model calls it — the agent
+loop delivers it, the tool itself never touches Telegram — and then the turn
+keeps going; the final answer still arrives when the turn ends.
+
+Like every other tool it is a file: `lumi/tools/send.py`. Remove `"send"` from
+`tools.enabled` to take it away from the model.
 
 ## Editing files
 

@@ -7,6 +7,7 @@ from lumi.util.text import (
     escape_html,
     escape_markdown,
     format_error,
+    markdown_bold_to_html,
     markdown_code_to_html,
     sanitize_html,
     split_message,
@@ -228,6 +229,45 @@ def test_sanitize_plus_bridge_is_idempotent() -> None:
     twice = sanitize_html(once)
     assert once == twice
     assert "&amp;amp;" not in twice
+
+
+# --------------------------------------------------------------------------- #
+# **bold** bridging
+# --------------------------------------------------------------------------- #
+
+
+def test_double_asterisk_becomes_bold() -> None:
+    """The one Markdown habit models keep: rendered as real bold instead of
+    literal asterisks that only "sometimes work"."""
+    assert markdown_bold_to_html("this is **bold** text") == "this is <b>bold</b> text"
+
+
+def test_bold_is_bridged_after_the_code_pass() -> None:
+    out = markdown_bold_to_html(markdown_code_to_html("**run** then `ls **`"))
+    assert "<b>run</b>" in out
+    assert "<code>ls **</code>" in out  # asterisks in code are real ones
+
+
+def test_pre_blocks_are_left_alone() -> None:
+    text = "<pre>a**b</pre> and **c**"
+    assert markdown_bold_to_html(text) == "<pre>a**b</pre> and <b>c</b>"
+
+
+def test_uppercase_code_tags_are_left_alone() -> None:
+    """Telegram accepts any letter case, so the code exclusion must too:
+    ``<PRE>**text**</PRE>`` is code, not prose to bold."""
+    assert markdown_bold_to_html("<PRE>**text**</PRE> and **c**") == (
+        "<PRE>**text**</PRE> and <b>c</b>"
+    )
+    assert markdown_bold_to_html("<Code>a**b</Code>") == "<Code>a**b</Code>"
+
+
+def test_globs_and_lone_asterisks_stay_literal() -> None:
+    assert markdown_bold_to_html("ls **/*.py and * star") == "ls **/*.py and * star"
+
+
+def test_an_unclosed_pair_stays_literal() -> None:
+    assert markdown_bold_to_html("**open forever") == "**open forever"
 
 
 # --------------------------------------------------------------------------- #

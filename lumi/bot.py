@@ -19,7 +19,6 @@ import contextlib
 import json
 import os
 import time
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +35,7 @@ from telegram.ext import (
     filters,
 )
 
-from .agent import Agent, PendingAction, TurnResult
+from .agent import Agent, PendingAction, TurnHooks, TurnResult
 from .artifacts import Artifact, ArtifactError, ArtifactStore
 from .config import Config, ConfigError, validate
 from .doctor import platform_line, run_checks
@@ -46,6 +45,7 @@ from .util.log import get_logger
 from .util.text import (
     escape_html,
     format_error,
+    markdown_bold_to_html,
     markdown_code_to_html,
     sanitize_html,
     split_message,
@@ -57,8 +57,6 @@ log = get_logger(__name__)
 #: Callback data prefix; keeps our buttons from colliding with anything else.
 CB_OK = "lumi:ok:"
 CB_NO = "lumi:no:"
-#: Second segment is "show" or "hide"; the rest is a token from :class:`TraceStore`.
-CB_THINK = "lumi:think:"
 
 TYPING_INTERVAL = 4.0
 
@@ -68,12 +66,10 @@ TYPING_INTERVAL = 4.0
 #: proxies"). One extra connection is harmless without a proxy.
 GET_UPDATES_POOL_SIZE = 2
 
-#: How long a collapsed thinking trace stays expandable. Long enough to come
-#: back to a message you scrolled past, short enough that scrolling back through
-#: old turns does not resurrect a model's entire reasoning.
-TRACE_TTL = 30 * 60.0
-#: Ceiling on stored traces, so a busy day cannot grow without bound.
-TRACE_CACHE_MAX = 64
+#: How many step lines the live progress message keeps visible before it
+#: starts collapsing the oldest under an "… earlier" marker. A long turn can
+#: call twenty tools; the list is a glance at what is happening, not a log.
+STEP_MAX_LINES = 10
 
 # All bot-authored strings are Telegram HTML: <b>…</b> for headers, <code>…</code>
 # around commands and paths, <i>…</i> for asides. HTML only reserves < > & —
@@ -89,8 +85,9 @@ send me a photo and i'll look at it. add a caption to tell me what to look for.
 send me a document and i'll read it — it lands in workspace/uploads/ and i can
 work with it from there. ask me to make a file and i'll send it back as one.
 
-if i'm running on a reasoning model i'll think first, then say a small grey line
-above my answer. tap <i>show thinking</i> if you want to see how i got there.
+while i'm working you'll see a small live note above my answer — thinking, then
+each thing i run. the thinking itself stays in my head; the note only shows the
+steps.
 
 <b>slash commands</b>
 <code>/help</code> — this list
@@ -98,7 +95,7 @@ above my answer. tap <i>show thinking</i> if you want to see how i got there.
 <code>/run &lt;command&gt;</code> — run a shell command directly
 <code>/search &lt;query&gt;</code> — web search
 <code>/fetch &lt;url&gt;</code> — read a page
-<code>/reasoning</code> — reasoning setup, or <code>on</code>/<code>off</code> to show or hide traces
+<code>/reasoning</code> — reasoning setup, or <code>on</code>/<code>off</code> to show or hide the live step list
 <code>/memory</code> — show what i remember
 <code>/remember &lt;fact&gt;</code> — save a fact
 <code>/forget [n]</code> — drop the last n saved facts
@@ -253,7 +250,7 @@ def _render_config(config: Config, memory_limit: int) -> str:
             ),
             f"- temperature: {escape_html(temperature)} · max_tokens: {escape_html(ceiling)} · keys: {escape_html(llm.strategy_of())}",
             f"- reasoning: {'on at ' + escape_html(llm.effort_of() or 'provider default') if llm.reasoning else 'off'}"
-            f" · trace in chat: {'on' if llm.show_reasoning else 'off'}",
+            f" · live steps in chat: {'on' if llm.show_reasoning else 'off'}",
             f"- context: {llm.context_window:,} token window, {llm.context_headroom:,} held back"
             f" · keep {llm.context_keep_recent} recent"
             f" · compaction {'on' if llm.compaction else 'off'}"
@@ -399,7 +396,7 @@ def _is_addressed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 # --------------------------------------------------------------------------- #
 
 
-async def reply(update: Update, text: str, **kwargs: Any) -> None:
+async def reply(update: Update, text: str, *, strict: bool = False, **kwargs: Any) -> None:
     """Send *text*, splitting it and degrading gracefully on bad HTML.
 
     *text* is arbitrary — model prose, shell output, web results — so it goes
@@ -408,31 +405,83 @@ async def reply(update: Update, text: str, **kwargs: Any) -> None:
     into literal text. That is the whole reason the bot speaks HTML rather than
     legacy Markdown: an underscore in a filename cannot fail the parse, and the
     fallback below is paranoia rather than a load-bearing path.
+
+    With ``strict=True`` a chunk that cannot be delivered after the raw-text
+    fallback re-raises, so the caller (the live ``on_message`` hook) can hand
+    the failure back to the agent: the agent then appends the message to
+    ``TurnResult.messages`` and the turn-tail flush re-sends it instead of the
+    message vanishing into a log line.
     """
-    message = update.effective_message
-    if message is None or not text.strip():
+    if not text.strip():
         return
-    # Models are coached to write Telegram HTML, but they slip into Markdown
-    # code fences and spans out of habit. Bridge those to HTML first; the
-    # sanitizer then keeps Telegram's tags and escapes everything else, so the
-    # send cannot fail on stray angle brackets or a bare ampersand.
-    for chunk in split_message(markdown_code_to_html(text)):
-        try:
+
+    message = update.effective_message
+    chat = update.effective_chat
+    bot = getattr(update, "_bot", None)
+    if bot is None and hasattr(update, "get_bot"):
+        with contextlib.suppress(Exception):
+            bot = update.get_bot()
+
+    if message is None and chat is None:
+        if strict:
+            raise TelegramError("cannot deliver reply: effective_message and effective_chat are None")
+        return
+
+    async def _send_chunk(chunk: str, *, formatted: bool) -> None:
+        parse_mode = ParseMode.HTML if formatted else None
+        body = sanitize_html(chunk) if formatted else chunk
+        if message is not None:
             await message.reply_text(
-                sanitize_html(chunk),
-                parse_mode=ParseMode.HTML,
+                body,
+                parse_mode=parse_mode,
                 disable_web_page_preview=True,
                 **kwargs,
             )
+        elif chat is not None and bot is not None:
+            await bot.send_message(
+                chat_id=chat.id,
+                text=body,
+                parse_mode=parse_mode,
+                disable_web_page_preview=True,
+                **kwargs,
+            )
+        else:
+            raise TelegramError("no target to deliver chunk to")
+
+    for chunk in split_message(markdown_bold_to_html(markdown_code_to_html(text))):
+        try:
+            await _send_chunk(chunk, formatted=True)
         except BadRequest:
-            # Unreachable when the text is sanitised, kept as a safety net:
-            # send it raw and, failing that, stripped of all markup.
+            # First try raw text if markup was rejected
             try:
-                await message.reply_text(chunk, disable_web_page_preview=True, **kwargs)
-            except TelegramError as exc:
+                await _send_chunk(chunk, formatted=False)
+            except BadRequest:
+                # If replying to the message failed (e.g. original message was deleted),
+                # fall back to sending directly to the chat without reply_to_message_id.
+                if chat is not None and bot is not None and message is not None:
+                    try:
+                        await bot.send_message(
+                            chat_id=chat.id,
+                            text=chunk,
+                            disable_web_page_preview=True,
+                            **kwargs,
+                        )
+                    except (TelegramError, OSError) as exc:
+                        log.warning("could not deliver a chunk to chat: %s", exc)
+                        if strict:
+                            raise
+                else:
+                    log.warning("could not deliver a chunk: rejected by Telegram")
+                    if strict:
+                        raise
+            except (TelegramError, OSError) as exc:
                 log.warning("could not deliver a chunk: %s", exc)
-        except TelegramError as exc:
+                if strict:
+                    raise
+        except (TelegramError, OSError) as exc:
             log.warning("could not deliver a chunk: %s", exc)
+            if strict:
+                raise
 
 
 async def reply_html(update: Update, text: str, **kwargs: Any) -> None:
@@ -523,82 +572,109 @@ def render_approval(action: PendingAction) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Thinking traces
+# Step feed (live progress)
 # --------------------------------------------------------------------------- #
 
+#: How each step kind reads in the chat. The thinking line is the header —
+#: it is there from the first model call and stays while the steps stack
+#: under it. An unknown tool falls back to a wrench and its raw name, so a
+#: newly added tool still shows up rather than silently not.
+STEP_LABELS = {
+    "thinking": "🧠 Thinking",
+    "run_shell": "💻 Run Bash",
+    "files": "📁 Files",
+    "web": "🌐 Web",
+    "memory": "📌 Memory",
+    "context7": "📚 Context7",
+    "send": "✉️ Send",
+}
 
-class TraceStore:
-    """Thinking traces waiting behind a collapsed message.
 
-    Telegram has no way to hide text, so the collapsed line carries only a
-    summary and the trace itself lives here, keyed by a short token that fits in
-    the button's callback data. That is the whole reason this exists: a model
-    can think for a long time and produce more than fits in one message, and
-    none of it should sit in the chat until someone asks for it.
+def step_label(kind: str, detail: str = "") -> str:
+    """One step of a turn as a line of chat: ``🧠 Thinking``, ``💻 Run Bash``…"""
+    if kind == "thinking":
+        return STEP_LABELS["thinking"]
+    if kind == "tool":
+        return STEP_LABELS.get(detail, f"🔧 {detail}")
+    return f"· {kind}{f' {detail}' if detail else ''}"
 
-    Evicted by age and by count, so a tap that never comes cannot keep a
-    conversation's reasoning alive for the life of the process.
+
+class StepFeed:
+    """The live progress message: one message, edited in place as the turn runs.
+
+    This replaces the old collapsed-thinking button. The thinking trace itself
+    stays internal — never shown, not behind a button — and what the chat sees
+    is the steps the turn actually took:
+
+        🧠 Thinking
+        💻 Run Bash
+        🌐 Web
+
+    Sent on the first step and edited after that, so a turn reads as one
+    growing note above the answer. Every failure degrades the same way: if the
+    message cannot be edited (or a test's Bot stub returns nothing to edit),
+    each step falls back to a fresh message carrying the list so far — noisy
+    but never wrong, and never an exception into the turn.
     """
 
-    def __init__(self, ttl: float = TRACE_TTL, limit: int = TRACE_CACHE_MAX) -> None:
-        self._ttl = ttl
-        self._limit = limit
-        self._traces: dict[str, tuple[float, str]] = {}
+    def __init__(self, bot: Any, chat_id: int | str) -> None:
+        self._bot = bot
+        self._chat_id = chat_id
+        self._steps: list[str] = []
+        self._message: Any = None
 
-    def put(self, trace: str) -> str:
-        """Store *trace* and return the token that retrieves it."""
-        self._prune()
-        token = uuid.uuid4().hex[:12]
-        self._traces[token] = (time.monotonic(), trace)
-        while len(self._traces) > self._limit:
-            self._traces.pop(next(iter(self._traces)))
-        return token
+    @property
+    def steps(self) -> list[str]:
+        return list(self._steps)
 
-    def get(self, token: str) -> str | None:
-        entry = self._traces.get(token)
-        if entry is None:
+    async def step(self, kind: str, detail: str = "") -> None:
+        """Append one step (deduplicated against the previous line) and render."""
+        label = step_label(kind, detail)
+        if kind == "thinking" and not self._steps:
+            # The header. Not worth a message of its own: a turn that never
+            # touches a tool just answers, as it always did. It goes on screen
+            # the moment there is a step to sit above.
+            self._steps.append(label)
+            return
+        if self._steps and self._steps[-1] == label:
+            # A second model call after a tool result would otherwise stack
+            # identical lines.
+            return
+        self._steps.append(label)
+        await self._render()
+
+    def _body(self) -> str:
+        if len(self._steps) <= STEP_MAX_LINES:
+            return "\n".join(self._steps)
+        hidden = len(self._steps) - (STEP_MAX_LINES - 1)
+        return f"… (+{hidden} earlier)\n" + "\n".join(self._steps[-(STEP_MAX_LINES - 1) :])
+
+    async def _render(self) -> None:
+        text = sanitize_html(self._body())
+        if self._message is not None:
+            try:
+                await self._bot.edit_message_text(
+                    chat_id=self._chat_id,
+                    message_id=self._message.message_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+            except (BadRequest, TelegramError) as exc:
+                log.debug("could not edit the step message, sending a fresh one: %s", exc)
+        sent = await self._send(text)
+        if sent is not None:
+            self._message = sent
+
+    async def _send(self, text: str) -> Any:
+        """Best effort: a progress message must never fail the turn it reports."""
+        try:
+            return await self._bot.send_message(
+                chat_id=self._chat_id, text=text, parse_mode=ParseMode.HTML
+            )
+        except (Forbidden, TelegramError) as exc:
+            log.debug("could not send a step message: %s", exc)
             return None
-        stored_at, trace = entry
-        if time.monotonic() - stored_at > self._ttl:
-            self._traces.pop(token, None)
-            return None
-        return trace
-
-    def _prune(self) -> None:
-        cutoff = time.monotonic() - self._ttl
-        for token in [t for t, (at, _) in self._traces.items() if at < cutoff]:
-            self._traces.pop(token, None)
-
-    def __len__(self) -> int:
-        return len(self._traces)
-
-
-def thinking_stub(result: TurnResult) -> str:
-    """The collapsed one-liner shown above an answer.
-
-    Deliberately says how long the model thought rather than what about, so
-    reading the chat stays cheap and the button is the only way in. The duration
-    is the model's own time, not the turn's: on a turn that spent most of itself
-    waiting on a web search, "thought for 20s" would be a lie.
-    """
-    seconds = result.thinking_seconds or result.elapsed
-    parts = [f"thought for {seconds:.0f}s"] if seconds else []
-    if result.reasoning_tokens:
-        parts.append(f"{result.reasoning_tokens:,} reasoning tokens")
-    parts.append(f"{len(result.reasoning):,} chars")
-    return "<i>🧠 " + " · ".join(parts) + "</i>"
-
-
-def thinking_keyboard(token: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("show thinking", callback_data=f"{CB_THINK}show:{token}")]]
-    )
-
-
-def thinking_keyboard_hide() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("hide", callback_data=f"{CB_THINK}hide:")]]
-    )
 
 
 async def _toast(query: Any, text: str = "", **kwargs: Any) -> None:
@@ -611,42 +687,6 @@ async def _toast(query: Any, text: str = "", **kwargs: Any) -> None:
     """
     with contextlib.suppress(BadRequest, TelegramError):
         await query.answer(text, **kwargs)
-
-
-async def _edit_thinking(
-    query: Any, text: str, *, keyboard: InlineKeyboardMarkup | None = None
-) -> None:
-    """Replace the collapsed stub in place, degrading on bad HTML.
-
-    Same contract as :func:`reply`: our own markup first, escaped text if the
-    Bot API will not take it, and silence if even that fails — a failed edit
-    must never surface as an error to someone who just wanted to read a reply.
-    """
-    for kwargs in (
-        {"parse_mode": ParseMode.HTML, "reply_markup": keyboard},
-        {"reply_markup": keyboard},
-    ):
-        try:
-            await query.edit_message_text(text, **kwargs)
-            return
-        except BadRequest:
-            continue
-        except TelegramError as exc:
-            log.warning("could not edit the thinking message: %s", exc)
-            return
-    log.warning("the thinking message was rejected as HTML and as plain text")
-
-
-def render_thinking(trace: str) -> str:
-    """The expanded trace, wrapped in ``<pre>`` so its shape survives.
-
-    The trace is model output, so it is escaped before wrapping: a stray ``<``
-    in a thought must become visible text, not a parse error or a swallowed
-    tag. Truncated to what one message can hold — an expanded trace is a
-    curiosity, and a 40,000-character wall is not, so the rest is dropped
-    rather than split across a dozen messages nobody asked for.
-    """
-    return f"🧠 <b>thinking</b>\n\n<pre>{escape_html(truncate(trace.strip(), 3600))}</pre>"
 
 
 # --------------------------------------------------------------------------- #
@@ -685,10 +725,13 @@ async def send_artifact(update: Update, artifact: Artifact) -> None:
 # --------------------------------------------------------------------------- #
 
 
-async def deliver(
-    update: Update, result: TurnResult, config: Config, traces: TraceStore | None = None
-) -> None:
-    """Turn an agent result into messages, documents included."""
+async def deliver(update: Update, result: TurnResult, config: Config) -> None:
+    """Turn an agent result into messages, documents included.
+
+    The live step message is already on screen by the time this runs — the
+    runner owns its lifecycle — so this is only the tail: messages the model
+    sent mid-turn but that found no channel, the answer, files, approvals.
+    """
     if result.error and not result.text:
         await reply(update, f"that didn't work: {escape_html(result.error)}")
         # A crashed turn can still have staged files (e.g. the model wrote with
@@ -697,12 +740,11 @@ async def deliver(
             await send_artifact(update, artifact)
         return
 
-    # Before the answer, because that is the order it happened in: the model
-    # thought, then it spoke. The line stays collapsed either way, so the answer
-    # below is still what you read.
-    if result.has_reasoning and config.llm.show_reasoning and traces is not None:
-        token = traces.put(result.reasoning)
-        await reply(update, thinking_stub(result), reply_markup=thinking_keyboard(token))
+    # Mid-turn messages (the `send` tool) normally go out live through the
+    # hooks; anything still sitting on the result got there because the live
+    # channel failed, so flush it here rather than dropping it.
+    for message in result.messages:
+        await reply(update, message)
 
     if result.text:
         await reply(update, result.text)
@@ -844,14 +886,26 @@ def build_handlers(config: Config) -> list[Any]:
         chat = update.effective_chat
         return chat.id if chat else 0
 
-    def traces_of(context: ContextTypes.DEFAULT_TYPE) -> TraceStore:
-        """The store behind the collapsed thinking messages.
+    def hooks_for(update: Update, context: ContextTypes.DEFAULT_TYPE) -> TurnHooks:
+        """Wire one turn to the chat: mid-turn messages reply live, and the
+        step feed (unless the owner turned traces off) grows above the answer.
 
-        Read from bot_data rather than captured, so a test can build an
-        application without a real one and still exercise the whole path.
+        Built per turn because both close over *update* — the reply target —
+        and because a turn that never touches a tool never creates a message.
         """
-        store: TraceStore = context.application.bot_data["traces"]
-        return store
+        feed = StepFeed(context.bot, chat_of(update)) if config.llm.show_reasoning else None
+
+        async def _on_message(text: str) -> None:
+            await reply(update, text, strict=True)
+
+        return TurnHooks(
+            # strict: a failed live send must surface to the agent, which then
+            # appends the message to TurnResult.messages so the turn-tail flush
+            # in deliver() re-sends it. Without strict the error is swallowed
+            # here and the message is lost.
+            on_message=_on_message,
+            on_step=feed.step if feed is not None else None,
+        )
 
     def artifacts_of(context: ContextTypes.DEFAULT_TYPE) -> ArtifactStore:
         """The store that stages incoming document uploads."""
@@ -1005,12 +1059,14 @@ def build_handlers(config: Config) -> list[Any]:
         await reply(update, f"<b>tools</b>\n\n{registry.describe(html=True)}")
 
     async def reasoning_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Report the reasoning setup, and toggle the visible trace.
+        """Report the reasoning setup, and toggle the live step list.
 
         ``/reasoning`` with no argument only reports. ``on`` and ``off`` flip
         ``llm.show_reasoning`` for this process, which is the same scope as
         every other config change here: a restart restores config.toml, and that
-        is the right time to make it stick.
+        is the right time to make it stick. The thinking trace itself is never
+        shown either way — the toggle only controls the step list above the
+        answer (🧠 Thinking / 💻 Run Bash …).
         """
         if not await authorised(update):
             return
@@ -1019,7 +1075,7 @@ def build_handlers(config: Config) -> list[Any]:
 
         if argument in ("on", "off"):
             llm.show_reasoning = argument == "on"
-            log.info("thinking traces turned %s by chat %s", argument, chat_of(update))
+            log.info("the step feed turned %s by chat %s", argument, chat_of(update))
         elif argument:
             await reply(update, "usage: <code>/reasoning</code> or <code>/reasoning on|off</code>")
             return
@@ -1037,7 +1093,8 @@ def build_handlers(config: Config) -> list[Any]:
             f"effort: {escape_html(effort)}\n"
             f"thinking budget: {escape_html(budget)}\n"
             f"temperature: {'omitted' if llm.reasoning and llm.temperature is not None else llm.temperature}\n"
-            f"trace in chat: {'on' if llm.show_reasoning else 'off'}",
+            f"live steps in chat: {'on' if llm.show_reasoning else 'off'}"
+            f" (the thinking trace itself is never shown)",
         )
 
     async def context_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1282,9 +1339,6 @@ def build_handlers(config: Config) -> list[Any]:
             await _toast(query, "not authorised", show_alert=True)
             return
         data = query.data or ""
-        if data.startswith(CB_THINK):
-            await _expand_thinking(update, context, data[len(CB_THINK) :])
-            return
         approved = data.startswith(CB_OK)
         action_id = data[len(CB_OK) :] if approved else data[len(CB_NO) :]
         if not action_id:
@@ -1430,63 +1484,36 @@ def build_handlers(config: Config) -> list[Any]:
     ) -> None:
         agent = agent_of(context)
         chat_id = chat_of(update)
+        hooks = hooks_for(update, context)
         async with _Typing(context.bot, chat_id):
             try:
-                result = await agent.handle(chat_id, text, image_b64=image_b64, image_mime=image_mime)
+                result = await agent.handle(
+                    chat_id,
+                    text,
+                    image_b64=image_b64,
+                    image_mime=image_mime,
+                    hooks=hooks,
+                )
             except Exception as exc:  # noqa: BLE001 - a crash must not kill the bot
                 log.exception("agent turn failed")
                 await reply(update, f"i broke on that: {format_error(exc)}")
                 return
-        await deliver(update, result, config, traces_of(context))
+        await deliver(update, result, config)
 
     async def run_tool(
         update: Update, context: ContextTypes.DEFAULT_TYPE, tool: str, arguments: dict[str, Any]
     ) -> None:
         agent = agent_of(context)
         chat_id = chat_of(update)
+        hooks = hooks_for(update, context)
         async with _Typing(context.bot, chat_id):
             try:
-                result = await agent.run_tool(chat_id, tool, arguments)
+                result = await agent.run_tool(chat_id, tool, arguments, hooks=hooks)
             except Exception as exc:  # noqa: BLE001
                 log.exception("tool %s failed", tool)
                 await reply(update, f"i broke on that: {format_error(exc)}")
                 return
-        await deliver(update, result, config, traces_of(context))
-
-    async def _expand_thinking(
-        update: Update, context: ContextTypes.DEFAULT_TYPE, payload: str
-    ) -> None:
-        """Show or hide a collapsed thinking trace, in place.
-
-        Toggles rather than expanding once, because a chat that is being
-        scrolled back through is exactly where you want to close it again.
-        """
-        query = update.callback_query
-        if query is None:
-            return
-        action, _, token = payload.partition(":")
-
-        if action == "hide":
-            # No token needed: collapsing does not read the trace, so it works
-            # even after the store has forgotten it.
-            await _toast(query, "hidden")
-            await _edit_thinking(query, "<i>thinking hidden</i>")
-            return
-
-        if action != "show" or not token:
-            await _toast(query, "malformed button", show_alert=True)
-            return
-
-        traces: TraceStore = context.application.bot_data["traces"]
-        trace = traces.get(token)
-        if trace is None:
-            # Expired or evicted. Say so in the toast rather than silently
-            # editing the message, which would look like a broken button.
-            await _toast(query, "that trace has expired — ask again to get a new one", show_alert=True)
-            return
-
-        await _toast(query, "ok")
-        await _edit_thinking(query, render_thinking(trace), keyboard=thinking_keyboard_hide())
+        await deliver(update, result, config)
 
     async def _resolve(
         update: Update,
@@ -1513,12 +1540,14 @@ def build_handlers(config: Config) -> list[Any]:
 
         async with _Typing(context.bot, chat_id):
             try:
-                result = await agent.resolve(chat_id, action_id, approved)
+                result = await agent.resolve(
+                    chat_id, action_id, approved, hooks=hooks_for(update, context)
+                )
             except Exception as exc:  # noqa: BLE001
                 log.exception("resolving approval failed")
                 await reply(update, f"i broke on that: {format_error(exc)}")
                 return
-        await deliver(update, result, config, traces_of(context))
+        await deliver(update, result, config)
 
     # -- whitelist persistence --------------------------------------------- #
 
@@ -1592,11 +1621,9 @@ def build_handlers(config: Config) -> list[Any]:
         CommandHandler("whitelist_remove_user", gated(whitelist_remove_user), filters=owner_filter),
         CommandHandler("whitelist_add_group", gated(whitelist_add_group), filters=owner_filter),
         CommandHandler("whitelist_remove_group", gated(whitelist_remove_group), filters=owner_filter),
-        # Inline buttons: the approval Confirm/Cancel pair and the "show
-        # thinking" toggle. One handler for both, because both are the same
-        # shape — a callback_data prefix that says which kind of button it is.
-        # Not wrapped in ``gated``: a tap is never a message in a group, so the
-        # mention rule does not apply, and ``button`` checks the sender itself.
+        # Inline buttons: the approval Confirm/Cancel pair. Taps are never
+        # messages in a group, so the mention rule does not apply, and
+        # ``button`` checks the sender itself.
         # (CallbackQueryHandler takes a ``pattern``, not ``filters``, in v22.)
         CallbackQueryHandler(button),
         # Keyword arguments on purpose: MessageHandler's parameter order changed
@@ -1672,7 +1699,6 @@ def build_application(config: Config, agent: Agent | None = None, *, bot: Any = 
     application.bot_data["memory"] = memory
     application.bot_data["personality"] = personality
     application.bot_data["history"] = history
-    application.bot_data["traces"] = TraceStore()
     application.bot_data["artifacts"] = ArtifactStore(
         config.root, max_bytes=max(1, config.bot.max_upload_mb) * 1024 * 1024
     )

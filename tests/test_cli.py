@@ -246,3 +246,162 @@ def test_search_reports_when_no_provider_is_configured(config, monkeypatch, caps
     monkeypatch.setenv("LUMI__TOOLS__WEB__PROVIDER_ORDER", "")
     assert main(["search", "anything"]) == 2
     assert "unavailable" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# chat reasoning & live steps
+# --------------------------------------------------------------------------- #
+
+
+def test_hooks_for_respects_show_reasoning(config) -> None:
+    from lumi import __main__ as cli
+
+    config.llm.show_reasoning = True
+    hooks = cli._hooks_for(config)
+    assert hooks.on_step is cli._note_step
+    assert hooks.on_message is cli._note_message
+
+    config.llm.show_reasoning = False
+    hooks = cli._hooks_for(config)
+    assert hooks.on_step is None
+    assert hooks.on_message is cli._note_message
+
+
+def test_chat_silences_live_steps_when_show_reasoning_is_false(config, capsys, monkeypatch) -> None:
+    """Turning show_reasoning off must suppress both live steps and post-turn trace."""
+    import asyncio
+
+    from conftest import FakeLLM, make_reply
+
+    from lumi import __main__ as cli
+    from lumi.agent import Agent
+    from lumi.memory import History, MemoryFile
+    from lumi.personality import Personality
+    from lumi.tools import build_registry
+
+    config.llm.show_reasoning = False
+
+    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
+    memory.load()
+    agent = Agent(
+        config=config,
+        personality=Personality.load(config.personality_file),
+        memory=memory,
+        history=History(config.history_dir),
+        registry=build_registry(config, memory),
+        llm=FakeLLM(
+            [
+                make_reply(
+                    tool_calls=[("c1", "run_shell", {"command": "echo hello"})],
+                    reasoning="thinking about echo",
+                ),
+                make_reply("done", reasoning="finished"),
+            ]
+        ),
+    )
+    monkeypatch.setattr(cli, "_build_agent", lambda cfg: agent)
+    scripted = iter(["echo hello", "y", "/quit"])
+
+    async def fake_prompt(message: str) -> str:
+        return next(scripted)
+
+    monkeypatch.setattr(cli, "_prompt", fake_prompt)
+    assert asyncio.run(cli._chat(config)) == 0
+
+    err = capsys.readouterr().err
+    assert "[thinking]" not in err
+    assert "[run_shell]" not in err
+    assert "[thought for" not in err
+
+
+def test_chat_prints_live_steps_when_show_reasoning_is_true(config, capsys, monkeypatch) -> None:
+    """When show_reasoning is on, live step lines and thought summary go to stderr."""
+    import asyncio
+
+    from conftest import FakeLLM, make_reply
+
+    from lumi import __main__ as cli
+    from lumi.agent import Agent
+    from lumi.memory import History, MemoryFile
+    from lumi.personality import Personality
+    from lumi.tools import build_registry
+
+    config.llm.show_reasoning = True
+
+    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
+    memory.load()
+    agent = Agent(
+        config=config,
+        personality=Personality.load(config.personality_file),
+        memory=memory,
+        history=History(config.history_dir),
+        registry=build_registry(config, memory),
+        llm=FakeLLM(
+            [
+                make_reply(
+                    tool_calls=[("c1", "run_shell", {"command": "echo hello"})],
+                    reasoning="thinking about echo",
+                ),
+                make_reply("done", reasoning="finished"),
+            ]
+        ),
+    )
+    monkeypatch.setattr(cli, "_build_agent", lambda cfg: agent)
+    scripted = iter(["echo hello", "y", "/quit"])
+
+    async def fake_prompt(message: str) -> str:
+        return next(scripted)
+
+    monkeypatch.setattr(cli, "_prompt", fake_prompt)
+    assert asyncio.run(cli._chat(config)) == 0
+
+    err = capsys.readouterr().err
+    assert "[thinking]" in err
+    assert "[run_shell]" in err
+    assert "[thought for" in err
+
+
+def test_chat_reasoning_command_in_repl(config, capsys, monkeypatch) -> None:
+    """/reasoning reports status and on|off flips config.llm.show_reasoning live."""
+    import asyncio
+
+    from conftest import FakeLLM
+
+    from lumi import __main__ as cli
+    from lumi.agent import Agent
+    from lumi.memory import History, MemoryFile
+    from lumi.personality import Personality
+    from lumi.tools import build_registry
+
+    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
+    memory.load()
+    agent = Agent(
+        config=config,
+        personality=Personality.load(config.personality_file),
+        memory=memory,
+        history=History(config.history_dir),
+        registry=build_registry(config, memory),
+        llm=FakeLLM([]),
+    )
+    monkeypatch.setattr(cli, "_build_agent", lambda cfg: agent)
+
+    scripted = iter([
+        "/reasoning",
+        "/reasoning off",
+        "/reasoning on",
+        "/reasoning invalid",
+        "/quit",
+    ])
+
+    async def fake_prompt(message: str) -> str:
+        return next(scripted)
+
+    monkeypatch.setattr(cli, "_prompt", fake_prompt)
+    assert asyncio.run(cli._chat(config)) == 0
+
+    out = capsys.readouterr().out
+    assert "reasoning:" in out
+    assert "live steps: on" in out
+    assert "live steps off" in out
+    assert "live steps on" in out
+    assert "usage: /reasoning or /reasoning on|off" in out

@@ -262,6 +262,37 @@ def markdown_code_to_html(text: str) -> str:
     return _MD_CODE_RE.sub(_convert, text)
 
 
+#: ``**bold**`` — the Markdown habit the format prompt cannot fully break.
+#: Left alone it shows up as literal asterisks (Telegram's HTML mode has no
+#: Markdown), which is why it "sometimes works": only when the model happened
+#: to write ``<b>`` instead. Converted on the way out so it always renders.
+#: Demands non-space edges and no inner asterisks, so a glob like
+#: ``**/*.py`` or a stray ``**`` stays literal, and it never runs inside
+#: ``<pre>``/``<code>`` content, where asterisks are frequently real.
+_MD_BOLD_RE = re.compile(r"\*\*(?!\s)([^*\n]+?)(?<!\s)\*\*")
+
+#: Code segments produced by :func:`markdown_code_to_html`; splitting on them
+#: is what keeps the bold pass out of code, where ``**`` must not be touched.
+#: Case-insensitive because Telegram's HTML mode is: ``<PRE>**t**</PRE>`` is a
+#: valid code block, and converting the asterisks inside it to bold would
+#: corrupt real code.
+_CODE_SEGMENT_RE = re.compile(r"(<pre>[\s\S]*?</pre>|<code>[\s\S]*?</code>)", re.IGNORECASE)
+
+
+def markdown_bold_to_html(text: str) -> str:
+    """Convert ``**bold**`` in *text* to ``<b>bold</b>``.
+
+    Only outside ``<pre>``/``<code>`` segments, matched in any letter case
+    (split first, convert the plain parts), and only pairs on a single line —
+    an unclosed ``**`` or one spanning a code block is left as written rather
+    than guessed at.
+    """
+    parts = _CODE_SEGMENT_RE.split(text)
+    for index in range(0, len(parts), 2):
+        parts[index] = _MD_BOLD_RE.sub(lambda m: f"<b>{m.group(1)}</b>", parts[index])
+    return "".join(parts)
+
+
 def format_error(exc: BaseException) -> str:
     """One-line, human-readable error description."""
     name = type(exc).__name__

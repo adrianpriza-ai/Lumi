@@ -10,7 +10,7 @@ import json
 
 from conftest import FakeLLM, make_reply
 
-from lumi.agent import APPROVAL_TTL_SECONDS, Agent
+from lumi.agent import APPROVAL_TTL_SECONDS, Agent, TurnHooks
 from lumi.llm.base import LLMError
 from lumi.memory import History, MemoryFile
 from lumi.personality import Personality
@@ -179,6 +179,24 @@ async def test_llm_error_is_reported_not_raised(config) -> None:
 
     assert not result.ok
     assert "on fire" in result.error
+
+
+async def test_empty_llm_reply_is_reported_not_silently_dropped(config) -> None:
+    agent = make_agent(
+        config,
+        [make_reply("", reasoning="the model never finished its answer")],
+    )
+
+    result = await agent.handle(CHAT, "hi")
+
+    assert not result.ok
+    assert result.text == ""
+    assert result.error == "the model returned an empty response"
+    dialogue = History(config.history_dir).recent_dialogue(CHAT)
+    assert not any(
+        message["role"] == "assistant" and not message["content"]
+        for message in dialogue.messages
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -833,3 +851,168 @@ async def test_a_dangling_approval_stops_pinning_the_conversation(config) -> Non
     # …but once it has expired, the stale chat is evicted and the cap holds.
     assert agent.conversation_state(CHAT) is None
     assert agent.conversations_in_memory() == 1
+
+
+# --------------------------------------------------------------------------- #
+# presentation hooks: steps and mid-turn messages
+# --------------------------------------------------------------------------- #
+
+
+async def test_steps_are_announced_in_order(config) -> None:
+    """The raw material of the chat's live step list: thinking before every
+    model call, the tool name the moment a call starts."""
+    agent = make_agent(
+        config,
+        [
+            make_reply("", [("c1", "run_shell", {"command": "echo hi"})]),
+            make_reply("it said hi"),
+        ],
+    )
+    steps: list[tuple[str, str]] = []
+
+    async def on_step(kind: str, detail: str) -> None:
+        steps.append((kind, detail))
+
+    result = await agent.handle(CHAT, "run it", hooks=TurnHooks(on_step=on_step))
+    assert result.text == "it said hi"
+    assert steps == [("thinking", ""), ("tool", "run_shell"), ("thinking", "")]
+
+
+async def test_a_step_hook_that_fails_does_not_fail_the_turn(config) -> None:
+    """Progress reporting is expendable; the turn is not."""
+    agent = make_agent(config, [make_reply("ok")])
+
+    async def on_step(kind: str, detail: str) -> None:
+        raise RuntimeError("the chat window is gone")
+
+    result = await agent.handle(CHAT, "hi", hooks=TurnHooks(on_step=on_step))
+    assert result.ok
+    assert result.text == "ok"
+
+
+async def test_send_messages_go_out_live_through_the_hook(config) -> None:
+    """With a live channel, a mid-turn message is delivered the moment the
+    model sends it — not batched into the end of the turn."""
+    agent = make_agent(
+        config,
+        [
+            make_reply("", [("c1", "send", {"message": "phase one done"})]),
+            make_reply("all done"),
+        ],
+    )
+    delivered: list[str] = []
+
+    async def on_message(text: str) -> None:
+        delivered.append(text)
+
+    result = await agent.handle(CHAT, "go", hooks=TurnHooks(on_message=on_message))
+    assert delivered == ["phase one done"]
+    assert result.messages == []  # nothing held back when there is a channel
+    assert result.text == "all done"
+    # The model gets its receipt back like any other tool result.
+    seen = [m for m in agent.llm.calls[-1] if m.get("role") == "tool"]
+    assert any("Sent to the owner" in str(m.get("content", "")) for m in seen)
+
+
+async def test_send_messages_land_on_the_result_without_a_channel(config) -> None:
+    agent = make_agent(
+        config,
+        [
+            make_reply("", [("c1", "send", {"message": "on its own"})]),
+            make_reply("done"),
+        ],
+    )
+    result = await agent.handle(CHAT, "go")
+    assert result.messages == ["on its own"]
+
+
+async def test_a_dead_delivery_channel_does_not_kill_the_turn(config) -> None:
+    """A chat that vanished mid-turn must not take the turn with it: the
+    message is kept on the result so the caller can still show it."""
+    agent = make_agent(
+        config,
+        [
+            make_reply("", [("c1", "send", {"message": "into the void"})]),
+            make_reply("done"),
+        ],
+    )
+
+    async def on_message(text: str) -> None:
+        raise RuntimeError("chat is gone")
+
+    result = await agent.handle(CHAT, "go", hooks=TurnHooks(on_message=on_message))
+    assert result.ok
+    assert result.text == "done"
+    assert result.messages == ["into the void"]
+
+
+async def test_direct_tool_invocation_announces_its_step(config) -> None:
+    """``/run``, ``/search`` and ``/fetch`` bypass the model loop, but not the
+    feed: the chat promises to show each tool the bot runs, and a direct
+    invocation is one of those tools."""
+    agent = make_agent(config, [make_reply("it printed hello")])
+    steps: list[tuple[str, str]] = []
+
+    async def on_step(kind: str, detail: str) -> None:
+        steps.append((kind, detail))
+
+    result = await agent.run_tool(
+        CHAT, "run_shell", {"command": "echo hello"}, hooks=TurnHooks(on_step=on_step)
+    )
+    assert result.text
+    assert steps[0] == ("tool", "run_shell")
+
+
+async def test_an_approved_action_announces_its_step(config) -> None:
+    """The tap on "run it" executes the tool outside the loop too — the feed
+    must show it there just as it shows a model-driven call."""
+    agent = make_agent(
+        config,
+        [
+            make_reply("", [("c1", "run_shell", {"command": "rm -rf workspace/x"})]),
+            make_reply("gone"),
+        ],
+    )
+    first = await agent.handle(CHAT, "delete x")
+    action = first.pending[0]
+    steps: list[tuple[str, str]] = []
+
+    async def on_step(kind: str, detail: str) -> None:
+        steps.append((kind, detail))
+
+    resumed = await agent.resolve(
+        CHAT, action.id, approved=True, hooks=TurnHooks(on_step=on_step)
+    )
+    assert resumed.text == "gone"
+    assert steps[0] == ("tool", "run_shell")
+
+
+async def test_a_declined_action_announces_no_tool_step(config) -> None:
+    """Declining runs nothing, so the feed stays silent about tools — only the
+    narrating model call that follows is announced."""
+    agent = make_agent(
+        config,
+        [
+            make_reply("", [("c1", "run_shell", {"command": "rm -rf workspace/x"})]),
+            make_reply("left alone"),
+        ],
+    )
+    first = await agent.handle(CHAT, "delete x")
+    steps: list[tuple[str, str]] = []
+
+    async def on_step(kind: str, detail: str) -> None:
+        steps.append((kind, detail))
+
+    resumed = await agent.resolve(
+        CHAT, first.pending[0].id, approved=False, hooks=TurnHooks(on_step=on_step)
+    )
+    assert resumed.text == "left alone"
+    assert ("tool", "run_shell") not in steps
+
+
+async def test_the_format_prompt_forbids_double_asterisk_bold(config) -> None:
+    """The model is told outright: **bold** is not formatting here."""
+    agent = make_agent(config, [make_reply("ok")])
+    content = agent.system_prompt()
+    assert "**bold**" in content
+    assert "Never write" in content

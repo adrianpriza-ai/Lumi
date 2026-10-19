@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -118,6 +119,10 @@ When you use a tool:
   arrives in the chat as a document automatically — never paste file contents
   into the message as a substitute.
 - Save durable facts about the owner with the `memory` tool, sparingly.
+- To say something to the owner *while you are still working* — a progress
+  update on long work, or an answer you want to deliver in parts — call
+  `send`. It reaches the chat immediately; your final reply is still
+  delivered when the turn ends. Use it a handful of times at most per turn.
 - Only the tools listed above are available right now. If a capability is
   missing here it is because an API key is unset or the tool was disabled in
   config — say so plainly rather than trying to call it.
@@ -135,6 +140,10 @@ Telegraph-style HTML tags — they are the only thing that renders:
   formatting — in this chat they show up literally, and stray `_` or `*`
   characters look like noise. Write file paths, shell commands, model names,
   versions and URLs inside <code></code>.
+- Never write <b>**bold**</b>. Markdown double asterisks are not formatting
+  here — they render as literal ** stars scattered through your text. If you
+  want emphasis, write <b>like this</b>; if you are not sure, write plain
+  text. The same goes for *single* asterisks and __underscores__.
 - Escape <, > and & outside tags as &lt; &gt; &amp; when you mean them as text,
   e.g. "a &lt; b" or "M&amp;Ms". A bare < followed by a letter starts a tag and
   can swallow the rest of your message.
@@ -173,6 +182,26 @@ class PendingAction:
 
 
 @dataclass(slots=True)
+class TurnHooks:
+    """Presentation callbacks for one turn.
+
+    The agent loop is transport-agnostic: it knows a turn is producing steps
+    and messages, not that a Telegram chat is watching. The presentation layer
+    wires these — the bot edits a live step message and replies in the chat,
+    the CLI prints, a test appends to a list — and an unwired hook changes
+    nothing about what the model can do.
+    """
+
+    #: Called the moment the model sends a message mid-turn via the ``send``
+    #: tool. Awaited, so delivery order matches the model's intent.
+    on_message: Callable[[str], Awaitable[None]] | None = None
+    #: Called with ``("thinking", "")`` before every model call and
+    #: ``("tool", <tool name>)`` when a tool call starts — the raw material
+    #: for the chat's live step list (🧠 Thinking / 💻 Run Bash).
+    on_step: Callable[[str, str], Awaitable[None]] | None = None
+
+
+@dataclass(slots=True)
 class TurnResult:
     """What one turn produced."""
 
@@ -197,6 +226,12 @@ class TurnResult:
     #: during the turn; the presentation layer delivers them (Telegram as
     #: documents). The CLI prints their paths instead.
     artifacts: list[Artifact] = field(default_factory=list)
+    #: Messages the model sent mid-turn through the ``send`` tool, when no
+    #: live channel was wired (:class:`TurnHooks.on_message` unset — e.g.
+    #: ``lumi ask``) — or when the live channel failed and the message needs
+    #: the turn-tail flush instead of vanishing. With a working live channel
+    #: they go out the moment the model sends them and this stays empty.
+    messages: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -397,8 +432,18 @@ class Agent:
     def conversations_in_memory(self) -> int:
         return len(self._conversations)
 
-    def _context(self, source: str, chat_id: int | str) -> ToolContext:
-        return ToolContext(cwd=self.config.shell_cwd, source=source, chat_id=chat_id)
+    def _context(
+        self,
+        source: str,
+        chat_id: int | str,
+        hooks: TurnHooks | None = None,
+    ) -> ToolContext:
+        return ToolContext(
+            cwd=self.config.shell_cwd,
+            source=source,
+            chat_id=chat_id,
+            emit=hooks.on_message if hooks else None,
+        )
 
     def _refresh_system_prompt(self, conv: Conversation) -> None:
         """Keep the system prompt current without losing the message history."""
@@ -415,11 +460,14 @@ class Agent:
         source: str = "chat",
         image_b64: str | None = None,
         image_mime: str = "image/jpeg",
+        hooks: TurnHooks | None = None,
     ) -> TurnResult:
         """Run one full turn for *text*, optionally with an image.
 
         When *image_b64* is provided the user message is sent as a multimodal
         content array (text + image_url) so vision-capable models can see it.
+        *hooks* wire the turn to a live presentation channel; see
+        :class:`TurnHooks`.
         """
         conv = self.conversation(chat_id)
         self._refresh_system_prompt(conv)
@@ -433,13 +481,14 @@ class Agent:
             content = text
         conv.messages.append({"role": "user", "content": content})
         self.history.append(chat_id, "user", text, session=conv.session)
-        return await self._loop(conv, self._context(source, chat_id))
+        return await self._loop(conv, self._context(source, chat_id, hooks), hooks=hooks)
 
     async def _loop(
         self,
         conv: Conversation,
         ctx: ToolContext,
         tools_used: list[str] | None = None,
+        hooks: TurnHooks | None = None,
     ) -> TurnResult:
         """Run a turn, and leave the conversation inside its window afterwards.
 
@@ -451,7 +500,7 @@ class Agent:
         front of us.
         """
         await self.context.prepare(conv)
-        result = await self._turn(conv, ctx, tools_used)
+        result = await self._turn(conv, ctx, tools_used, hooks)
         await self.context.prepare(conv)
         return result
 
@@ -460,6 +509,7 @@ class Agent:
         conv: Conversation,
         ctx: ToolContext,
         tools_used: list[str] | None = None,
+        hooks: TurnHooks | None = None,
     ) -> TurnResult:
         started = time.monotonic()
         tools = list(tools_used or [])
@@ -474,6 +524,7 @@ class Agent:
             await self.context.prepare(conv)
 
             try:
+                await self._step(hooks, "thinking")
                 asked = time.monotonic()
                 reply = await self.llm.complete(conv.messages, tools=specs or None)
             except LLMError as exc:
@@ -488,8 +539,6 @@ class Agent:
             # so it is fed straight back into the estimator for the next call.
             self.context.observe(reply.usage, conv.messages)
 
-            conv.messages.append(_assistant_message(reply))
-
             # Accumulate onto the result rather than a local, so every exit from
             # this loop reports the same thinking: a turn that stops to ask for
             # approval has already thought through the first attempt, and
@@ -497,6 +546,20 @@ class Agent:
             if reply.reasoning:
                 result.reasoning = f"{result.reasoning}\n\n{reply.reasoning}".strip()
             result.reasoning_tokens += reply.usage.get(USAGE_REASONING, 0)
+
+            # Some local OpenAI-compatible servers return HTTP 200 with only a
+            # reasoning trace and no final answer. The adapter retries that
+            # shape, but keep the invariant here too for alternate LLM clients:
+            # a no-tool turn must never look successful while sending nothing.
+            if not reply.wants_tools and not reply.text.strip():
+                result.error = "the model returned an empty response"
+                result.elapsed = time.monotonic() - started
+                self.history.append(
+                    conv.chat_id, "assistant", f"[error] {result.error}", session=conv.session
+                )
+                return result
+
+            conv.messages.append(_assistant_message(reply))
 
             if not reply.wants_tools:
                 result.text = reply.text
@@ -518,7 +581,7 @@ class Agent:
             # on its own, so a sibling that needs nothing still runs.
             needs_owner = False
             for call in reply.tool_calls:
-                if await self._handle_tool_call(conv, call, ctx, tools, result):
+                if await self._handle_tool_call(conv, call, ctx, tools, result, hooks):
                     needs_owner = True
             if needs_owner:
                 # Stop rather than start another round of side effects while the
@@ -552,8 +615,10 @@ class Agent:
         ctx: ToolContext,
         tools_used: list[str],
         result: TurnResult,
+        hooks: TurnHooks | None = None,
     ) -> bool:
         """Run one tool call. Returns True if it needs owner approval."""
+        await self._step(hooks, "tool", call.name)
         try:
             tool_result = await self.registry.invoke(call.name, call.arguments, ctx)
         except NeedsApproval as exc:
@@ -589,6 +654,12 @@ class Agent:
                 "content": tool_result.for_model(),
             }
         )
+        # Messages the model asked to send right now, mid-turn (the `send`
+        # tool): delivered the moment they arrive when a live channel is
+        # wired, collected on the result otherwise — never held back to the
+        # end of the turn when they could have been sent already.
+        if tool_result.messages:
+            await self._deliver_messages(conv, ctx, tool_result.messages, result)
         # Stage any files this call produced for the chat. Collected on the
         # result, delivered by the presentation layer — the loop stays
         # transport-agnostic.
@@ -605,14 +676,60 @@ class Agent:
         )
         return False
 
+    # -- presentation hooks ------------------------------------------------ #
+
+    async def _step(self, hooks: TurnHooks | None, kind: str, detail: str = "") -> None:
+        """Announce a progress step (a model call, a tool call) to the chat.
+
+        Best effort by construction: a presentation channel that fails must
+        not fail the turn. """
+        if hooks is None or hooks.on_step is None:
+            return
+        try:
+            await hooks.on_step(kind, detail)
+        except Exception:  # noqa: BLE001 - progress reporting is expendable
+            log.warning("on_step hook failed", exc_info=True)
+
+    async def _deliver_messages(
+        self,
+        conv: Conversation,
+        ctx: ToolContext,
+        messages: list[str],
+        result: TurnResult,
+    ) -> None:
+        """Deliver the model's mid-turn messages (``send`` tool).
+
+        With a live channel (:attr:`ToolContext.emit`) each message goes out
+        now, while the turn is still working — that is the whole point. Without
+        one they land on the TurnResult for the caller to show after the fact.
+        Either way the transcript records them, so a replayed conversation
+        still contains what the owner was told.
+        """
+        for text in messages:
+            if ctx.emit is not None:
+                try:
+                    await ctx.emit(text)
+                except Exception:  # noqa: BLE001 - a dead channel must not kill the turn
+                    log.warning("mid-turn message delivery failed", exc_info=True)
+                    result.messages.append(text)
+            else:
+                result.messages.append(text)
+            self.history.append(conv.chat_id, "assistant", text, session=conv.session, tool="send")
+
     # -- approval resolution ----------------------------------------------- #
 
     async def resolve(
-        self, chat_id: int | str, action_id: str, approved: bool, *, source: str = "chat"
+        self,
+        chat_id: int | str,
+        action_id: str,
+        approved: bool,
+        *,
+        source: str = "chat",
+        hooks: TurnHooks | None = None,
     ) -> TurnResult:
         """Run a pending action for real, or record the refusal, then continue."""
         conv = self.conversation(chat_id)
-        ctx = self._context(source, chat_id)
+        ctx = self._context(source, chat_id, hooks)
 
         action = next((p for p in conv.pending if p.id == action_id), None)
         if action is None:
@@ -628,6 +745,7 @@ class Agent:
 
         if approved:
             log.info("owner approved %s: %s", action.tool, action.preview[:120])
+            await self._step(hooks, "tool", action.tool)
             tool_result = await self.registry.invoke_approved(action, ctx)
             outcome = f"[Approved by the owner. {action.tool} ran and returned:]\n{tool_result.text}"
             used = [action.tool]
@@ -639,7 +757,7 @@ class Agent:
         conv.pending = [p for p in conv.pending if p.id != action_id]
         conv.messages.append({"role": "user", "content": outcome})
         self.history.append(conv.chat_id, "user", outcome, session=conv.session, tool=action.tool)
-        resumed = await self._loop(conv, ctx, tools_used=used)
+        resumed = await self._loop(conv, ctx, tools_used=used, hooks=hooks)
         if approved and tool_result.artifacts:
             # An approved write can carry artifacts too (files written with
             # upload: true that needed an overwrite confirmation). _loop only
@@ -651,7 +769,13 @@ class Agent:
     # -- direct invocation (used by /run, /search, /fetch) ----------------- #
 
     async def run_tool(
-        self, chat_id: int | str, tool: str, arguments: dict[str, Any], *, source: str = "chat"
+        self,
+        chat_id: int | str,
+        tool: str,
+        arguments: dict[str, Any],
+        *,
+        source: str = "chat",
+        hooks: TurnHooks | None = None,
     ) -> TurnResult:
         """Call one tool outside the model loop and continue the conversation.
 
@@ -661,8 +785,11 @@ class Agent:
         """
         conv = self.conversation(chat_id)
         self._refresh_system_prompt(conv)
-        ctx = self._context(source, chat_id)
+        ctx = self._context(source, chat_id, hooks)
 
+        # Announced like any model-driven call: the feed promises to show each
+        # tool the bot runs, and a direct /run is one of those.
+        await self._step(hooks, "tool", tool)
         try:
             tool_result = await self.registry.invoke(tool, arguments, ctx)
         except NeedsApproval as exc:
@@ -689,7 +816,7 @@ class Agent:
             }
         )
         # Seed the counter so the caller can see the direct call happened.
-        return await self._loop(conv, ctx, tools_used=[tool])
+        return await self._loop(conv, ctx, tools_used=[tool], hooks=hooks)
 
     # -- maintenance ------------------------------------------------------- #
 
@@ -730,6 +857,7 @@ def _assistant_message(reply: LLMReply) -> dict[str, Any]:
 
 __all__ = [
     "Agent",
+    "TurnHooks",
     "TurnResult",
     "PendingAction",
     "Conversation",

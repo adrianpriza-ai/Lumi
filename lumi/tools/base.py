@@ -11,6 +11,7 @@ change.
 from __future__ import annotations
 
 import abc
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -49,10 +50,20 @@ class ToolContext:
     #: Who asked: "model", "chat", or "cli".
     source: str = "model"
     chat_id: int | str | None = None
+    #: Delivery channel for mid-turn chat messages (the ``send`` tool). Set by
+    #: the presentation layer — the Telegram bot sends, the CLI prints — and
+    #: ``None`` when there is no live channel, in which case the agent loop
+    #: collects the messages on the TurnResult instead. Tools never talk to
+    #: Telegram directly; they declare, the loop delivers.
+    emit: Callable[[str], Awaitable[None]] | None = None
 
     def approve(self) -> ToolContext:
         return ToolContext(
-            confirmed=True, cwd=self.cwd, source=self.source, chat_id=self.chat_id
+            confirmed=True,
+            cwd=self.cwd,
+            source=self.source,
+            chat_id=self.chat_id,
+            emit=self.emit,
         )
 
 
@@ -70,6 +81,12 @@ class ToolResult:
     #: presentation layer (Telegram as documents, the CLI as paths) decides how
     #: to deliver them. Tools never talk to Telegram directly.
     artifacts: list[Artifact] = field(default_factory=list)
+    #: Chat messages the model asked to deliver *now*, mid-turn, instead of
+    #: waiting for the final answer. The agent loop sends each one through
+    #: :attr:`ToolContext.emit` the moment it arrives — that is what makes the
+    #: owner see progress while the turn is still running — and falls back to
+    #: :attr:`lumi.agent.TurnResult.messages` when no live channel is wired.
+    messages: list[str] = field(default_factory=list)
 
     @classmethod
     def failure(cls, text: str, **data: Any) -> ToolResult:

@@ -32,6 +32,8 @@ OPENAI_MODEL=nemotron-3-nano-reasoning
 base_url = "https://openrouter.ai/api/v1"
 model = "anthropic/claude-sonnet-4.5"
 api_key_env = "OPENROUTER_API_KEY"   # this provider's own key variable
+inference_retries = 4                 # extra attempts; 5 requests total
+inference_retry_delay = 0.5           # seconds before the first retry
 ```
 
 Images sent in Telegram are passed through the standard OpenAI multimodal content array, so any endpoint that accepts `image_url` parts works. Set `vision_model` to a vision-capable id (`gpt-4o`, `claude-3.5+`, `gemini-2.*`, `llama-3.2-vision`, `qwen2-vl`, …) and photo turns go to it while everything else stays on `model` — same endpoint, same keys. Leave it empty and photos go to `model` too, which then has to be vision-capable or they will fail.
@@ -43,10 +45,11 @@ Resolution order, most specific wins:
 3. `OPENAI_BASE_URL` (or `OPENAI_API_BASE`), `OPENAI_MODEL`, `OPENAI_VISION_MODEL`, and the key named by `api_key_env`
 4. OpenAI and `gpt-4.1-mini`
 
-The reasoning settings (`reasoning`, `reasoning_effort`, `reasoning_tokens`,
-`show_reasoning`) are Lumi's own, so they resolve from `config.toml` and
-`LUMI__LLM__*` only — no bare environment variable. See
-[Reasoning models](#reasoning-models).
+The inference retry settings (`inference_retries`,
+`inference_retry_delay`) and reasoning settings (`reasoning`,
+`reasoning_effort`, `reasoning_tokens`, `show_reasoning`) are Lumi's own, so
+they resolve from `config.toml` and `LUMI__LLM__*` only — no bare environment
+variable. See [Reasoning models](#reasoning-models).
 
 Always check what actually took effect:
 
@@ -58,7 +61,7 @@ lumi config --key llm.key_strategy  # -> fallback
 lumi doctor | grep llm              # -> model via endpoint (from OPENAI_BASE_URL), keys: fallback
 ```
 
-If a call fails, the error names the endpoint, model, and key variable it used, so a key rejected by the wrong host is obvious immediately. `temperature = null` omits the parameter, which some reasoning models require.
+If a call fails, the error names the endpoint, model, and key variable it used, so a key rejected by the wrong host is obvious immediately. Transient connection, timeout, 408/409/429, 5xx and empty-answer failures get the configured bounded retry budget with exponential backoff. Permanent request errors such as 400, 404 and 422 are reported immediately. `temperature = null` omits the parameter, which some reasoning models require.
 
 ## No output ceiling
 
@@ -203,21 +206,24 @@ model thinking."*
 If a reasoning model 400s and you have not set the flag, the error says so and
 names the line to add.
 
-### Seeing the thinking
+### Watching it think
 
-When a model returns a trace, the chat gets one collapsed line above the answer,
-in the order it actually happened — the model thought, then it spoke:
+The thinking itself stays internal — it is never posted, not behind a button,
+not in a spoiler. What the chat shows is the steps the turn actually took, in
+one small message above the answer that grows while the turn runs:
 
-> 🧠 thought for 12s · 1,200 reasoning tokens · 2,140 chars — `[show thinking]`
+> 🧠 Thinking
+> 💻 Run Bash
+> 🌐 Web
 
-Tapping the button expands the trace in place, and collapses it again. Nothing
-is pre-typed into the message, so a chat scrolled back through stays readable
-unless you ask for the detail. Traces expire after 30 minutes or 64 turns,
-whichever comes first — an unopened one is not worth keeping.
+A turn that never touches a tool posts no step message at all — it just
+answers, as it always did. On a long turn the list keeps the last ten lines
+and collapses the rest under "… earlier".
 
 `/reasoning` reports the current setup; `/reasoning off` (or `on`) hides the
-trace for the running process. `lumi ask` prints the trace to **stderr**, so
-`lumi ask "..." > answer.md` still captures nothing but the answer.
+step list for the running process. `lumi ask` prints the raw trace to
+**stderr**, so `lumi ask "..." > answer.md` still captures nothing but the
+answer.
 
 `/context` reports what the model is holding for this chat right now: the window and budget, the fill, what has been condensed, and the record itself when there is one. It exists because "the bot forgot" is otherwise impossible to argue with. A bot that forgets is usually a bot that deleted your history, and you should be able to see that rather than infer it.
 

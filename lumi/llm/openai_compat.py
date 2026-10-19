@@ -18,11 +18,14 @@ what a reasoning model needs automatically; see :mod:`lumi.llm.reasoning`.
 The key variable may hold a pool of keys rather than one (see
 :mod:`lumi.llm.keypool`). One SDK client is built per key and the call is
 retried on the next key when the failure looks like a key problem, so a 429
-mid-conversation is invisible to the user.
+mid-conversation is invisible to the user. A successful but empty completion is
+also retried briefly on the same key, which helps local servers such as Ollama
+recover from a reasoning-only response without replaying any tools.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -49,6 +52,11 @@ from .reasoning import (
 )
 
 log = get_logger(__name__)
+
+# Ollama Cloud and other OpenAI-compatible endpoints occasionally return HTTP
+# 200 with only a thinking trace and no final message. The retry budget lives in
+# LLMConfig so it is visible and tunable rather than hidden in this adapter.
+MAX_RETRY_DELAY_SECONDS = 8.0
 
 
 def has_image_part(messages: list[dict[str, Any]]) -> bool:
@@ -113,7 +121,10 @@ class OpenAICompatClient(LLMClient):
             client = AsyncOpenAI(
                 api_key=key,
                 base_url=self.config.base_url_of(),
-                max_retries=2,
+                # The adapter owns the retry budget so empty responses and SDK
+                # transport errors follow the same policy instead of multiplying
+                # two independent retry loops.
+                max_retries=0,
                 timeout=120.0,
             )
             self._clients[key] = client
@@ -224,6 +235,31 @@ class OpenAICompatClient(LLMClient):
             return completion, None, False
         raise LLMError("no parameter variant left to try")  # pragma: no cover
 
+    def _retry_same_key(self, error: BaseException) -> bool:
+        """Whether a retry should wait and use this key again.
+
+        Authentication failures should rotate to another configured key rather
+        than retrying the same bad credential. A pooled 429 likewise moves to
+        the next key immediately; a single-key Ollama Cloud setup waits and
+        retries because there is nowhere else to go.
+        """
+        if not is_retryable(error):
+            return False
+        status = getattr(error, "status_code", None) or getattr(error, "status", None)
+        if status in {401, 403}:
+            return False
+        name = type(error).__name__
+        if "Authentication" in name or "Permission" in name:
+            return False
+        return not (status == 429 and len(self._pool) > 1)
+
+    def _retry_delay(self, attempt: int) -> float:
+        """Exponential delay before retry number *attempt* (1-based)."""
+        return min(
+            max(0.0, self.config.inference_retry_delay) * (2 ** (attempt - 1)),
+            MAX_RETRY_DELAY_SECONDS,
+        )
+
     async def complete(
         self,
         messages: list[dict[str, Any]],
@@ -245,27 +281,76 @@ class OpenAICompatClient(LLMClient):
         )
         tried: list[str] = []
         failure: BaseException | None = None
-        # One attempt per key, never more: a single key must behave exactly as
-        # it did before pools existed.
+        # The adapter owns one bounded retry budget for transient provider
+        # failures and empty completions. No request here can have emitted a
+        # tool call yet, so retrying inference cannot duplicate a side effect.
         while (key := self._pool.pick(exclude=tried)) is not None:
             tried.append(key)
-            completion, error, retryable = await self._try(key, variants)
-            if error is not None:
+            retry_number = 0
+            stop_after_key = False
+            while True:
+                completion, error, retryable = await self._try(key, variants)
+                empty = False
+                if error is None:
+                    if completion is None:
+                        error = LLMError("the model returned no completion")
+                    else:
+                        parsed = self._parse(completion)
+                        if parsed.wants_tools or parsed.text.strip():
+                            self._pool.report(key, ok=True)
+                            return parsed
+
+                        # A successful HTTP response is not necessarily a usable
+                        # model response. Reasoning-capable Ollama Cloud models
+                        # can spend the whole response budget thinking and leave
+                        # content empty. Treat it as transient, but never rotate
+                        # the key.
+                        error = LLMError("the model returned an empty response")
+                    empty = True
+                    retryable = True
+
                 failure = error
+                assert error is not None  # noqa: S101 - set above when successful-but-empty
+                can_retry = empty or self._retry_same_key(error)
+                if can_retry and retry_number < self.config.inference_retries:
+                    retry_number += 1
+                    delay = self._retry_delay(retry_number)
+                    log.warning(
+                        "%s from %s; retrying inference in %.1fs (%d/%d)",
+                        "empty response" if empty else format_error(error),
+                        self.config.base_url_of(),
+                        delay,
+                        retry_number,
+                        self.config.inference_retries,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                if empty:
+                    failure = LLMError(
+                        "the model returned an empty response after "
+                        f"{retry_number + 1} attempts"
+                    )
+                    # An empty completion is not evidence that the credential is
+                    # bad, so do not park the key or rotate a pool for it.
+                    self._pool.report(key, ok=True)
+                    stop_after_key = True
+                    break
+
                 self._pool.report(key, ok=False, retryable=retryable)
                 log.error(
                     "llm call to %s failed on key %s: %s",
                     self.config.base_url_of(), mask(key), format_error(error),
                 )
                 if not retryable:
+                    stop_after_key = True
                     break
                 log.warning(
                     "retrying on the next key (%d/%d tried)", len(tried), len(self._pool)
                 )
-                continue
-            self._pool.report(key, ok=True)
-            assert completion is not None  # noqa: S101 - guaranteed by the tuple contract
-            return self._parse(completion)
+                break
+            if stop_after_key:
+                break
 
         raise LLMError(self._explain(failure, tried))
 

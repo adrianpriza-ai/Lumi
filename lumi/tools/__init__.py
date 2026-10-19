@@ -20,6 +20,7 @@ from .context7 import Context7Tool
 from .files import FilesTool
 from .memory_tool import MemoryTool
 from .registry import ToolRegistry
+from .send import SendTool
 from .shell import ShellTool
 from .web import WebTool
 
@@ -43,6 +44,7 @@ def build_registry(config: Config, memory: MemoryFile) -> ToolRegistry:
         "memory": lambda: MemoryTool(config, memory),
         "web": lambda: WebTool(config),
         "context7": lambda: Context7Tool(config),
+        "send": lambda: SendTool(config),
     }
 
     for name, factory in candidates.items():
@@ -75,5 +77,6 @@ __all__ = [
     "MemoryTool",
     "WebTool",
     "Context7Tool",
+    "SendTool",
     "build_registry",
 ]

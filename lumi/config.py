@@ -134,6 +134,13 @@ class LLMConfig:
     api_key_env: str = "OPENAI_API_KEY"
     #: How to spend the keys in ``api_key_env``. See :meth:`api_keys`.
     key_strategy: str = "fallback"
+    #: Extra attempts after the first inference request when the provider
+    #: reports a transient failure or returns no final answer. 4 means at most
+    #: five requests for one key; 0 disables the outer retry loop.
+    inference_retries: int = 4
+    #: Initial delay for the inference retry backoff, in seconds. The delay
+    #: doubles after each retry, so 0.5 means 0.5, 1, 2 and 4 seconds.
+    inference_retry_delay: float = 0.5
     temperature: float | None = 0.7
     #: Ceiling on output tokens. 0 (the default) sends no ceiling at all, so
     #: the provider's own limit stands. A number here is a wall the model stops
@@ -194,8 +201,8 @@ class LLMConfig:
     #: ``max_tokens`` implies: with no ceiling sent, the provider's own output
     #: limit applies and there is nothing to add to.
     reasoning_tokens: int = 0
-    #: Post the thinking trace in Telegram as a collapsed line with a button to
-    #: expand it, rather than dumping it above the answer.
+    #: Show the live step list in chat (🧠 Thinking / 💻 Run Bash …) while a
+    #: turn runs. The thinking trace itself is never shown — only the steps.
     show_reasoning: bool = True
 
     def effort_of(self) -> str:
@@ -599,7 +606,7 @@ class WebConfig:
 @dataclass(slots=True)
 class ToolsConfig:
     enabled: list[str] = field(
-        default_factory=lambda: ["shell", "files", "memory", "web", "context7"]
+        default_factory=lambda: ["shell", "files", "memory", "web", "context7", "send"]
     )
     shell: ShellConfig = field(default_factory=ShellConfig)
     files: FilesConfig = field(default_factory=FilesConfig)
@@ -889,6 +896,10 @@ def validate(config: Config) -> list[str]:
         )
     if config.llm.reasoning and config.llm.reasoning_tokens < 0:
         problems.append("llm.reasoning_tokens cannot be negative")
+    if config.llm.inference_retries < 0:
+        problems.append("llm.inference_retries cannot be negative")
+    if config.llm.inference_retry_delay < 0:
+        problems.append("llm.inference_retry_delay cannot be negative")
     # 0 is the "no limit" state for every one of these, so only a negative
     # number is a mistake — a limit is something you opt into here, not
     # something the defaults impose on you.
@@ -942,7 +953,7 @@ def validate(config: Config) -> list[str]:
         problems.append(f"MEMORY.md not found at {config.memory_file}")
 
     for name in config.tools.enabled:
-        if name not in {"shell", "files", "memory", "web", "context7"}:
+        if name not in {"shell", "files", "memory", "web", "context7", "send"}:
             problems.append(f"unknown tool {name!r} in tools.enabled")
 
     if config.bot.max_upload_mb <= 0:

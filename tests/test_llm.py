@@ -32,6 +32,8 @@ class StubCompletions:
             raise self.error.pop(0)
         if self.error and not isinstance(self.error, list):
             raise self.error
+        if isinstance(self.reply, list):
+            return self.reply.pop(0)
         return self.reply
 
 
@@ -47,6 +49,8 @@ def client_with(config, completions: StubCompletions) -> OpenAICompatClient:
     rotation tests below see the pool at work without a network.
     """
     client = OpenAICompatClient(config.llm)
+    # Keep retry-focused tests fast; production defaults retain the backoff.
+    config.llm.inference_retry_delay = 0
     stub = StubClient(completions)
     client.used_keys: list[str] = []
 
@@ -252,6 +256,48 @@ async def test_missing_usage_is_tolerated(config) -> None:
     assert result.usage == {}
 
 
+async def test_an_empty_completion_is_retried_before_it_reaches_the_agent(config, monkeypatch) -> None:
+    async def no_wait(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("lumi.llm.openai_compat.asyncio.sleep", no_wait)
+    completions = StubCompletions([reply("", reasoning="still thinking"), reply("the answer")])
+    client = client_with(config, completions)
+
+    result = await client.complete([{"role": "user", "content": "q"}])
+
+    assert result.text == "the answer"
+    assert len(completions.requests) == 2
+
+
+async def test_repeated_empty_completions_become_a_visible_error(config, monkeypatch) -> None:
+    async def no_wait(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("lumi.llm.openai_compat.asyncio.sleep", no_wait)
+    completions = StubCompletions(reply("", reasoning="only thinking"))
+    client = client_with(config, completions)
+
+    with pytest.raises(LLMError, match="empty response after 5 attempts"):
+        await client.complete([{"role": "user", "content": "q"}])
+
+    assert len(completions.requests) == 5
+
+
+async def test_a_transient_provider_error_is_retried(config, monkeypatch) -> None:
+    async def no_wait(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("lumi.llm.openai_compat.asyncio.sleep", no_wait)
+    completions = StubCompletions(reply("recovered"), error=[RuntimeError("503 overloaded")])
+    client = client_with(config, completions)
+
+    result = await client.complete([{"role": "user", "content": "q"}])
+
+    assert result.text == "recovered"
+    assert len(completions.requests) == 2
+
+
 # --------------------------------------------------------------------------- #
 # failures
 # --------------------------------------------------------------------------- #
@@ -318,7 +364,7 @@ async def test_a_single_key_is_the_only_key_tried(config) -> None:
     with pytest.raises(LLMError):
         await client.complete([{"role": "user", "content": "q"}])
 
-    assert client.used_keys == ["test-key"]  # no rotation without a pool
+    assert client.used_keys == ["test-key"] * 5  # no rotation without a pool
 
 
 async def test_a_failing_key_falls_through_to_the_next(config, monkeypatch) -> None:

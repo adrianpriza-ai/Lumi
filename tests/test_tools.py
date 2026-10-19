@@ -8,6 +8,7 @@ from lumi.tools.base import NeedsApproval, Tool, ToolContext, ToolError, ToolRes
 from lumi.tools.files import FilesTool
 from lumi.tools.memory_tool import MemoryTool
 from lumi.tools.registry import ToolRegistry
+from lumi.tools.send import SendTool
 from lumi.tools.shell import SECRET_PATTERN, ShellTool
 
 
@@ -628,3 +629,42 @@ async def test_registry_close_releases_every_tool() -> None:
     await registry.aclose()  # must not raise
 
     assert closed == ["chatty"]
+
+
+# --------------------------------------------------------------------------- #
+# send
+# --------------------------------------------------------------------------- #
+
+
+def send_tool(config) -> SendTool:
+    return SendTool(config)
+
+
+async def test_send_hands_the_message_to_the_loop(config) -> None:
+    """The tool never talks to a chat itself: it declares the message on the
+    result and the agent loop delivers it."""
+    result = await send_tool(config).invoke({"message": "phase one done"}, ctx())
+    assert result.ok
+    assert result.messages == ["phase one done"]
+    # The text is the receipt, written for the model — not the message itself,
+    # which must not be sent twice.
+    assert "phase one done" not in result.text
+
+
+async def test_send_refuses_an_empty_message(config) -> None:
+    result = await send_tool(config).invoke({"message": "   "}, ctx())
+    assert not result.ok
+    assert result.messages == []
+
+
+async def test_send_truncates_a_message_that_would_not_fit(config) -> None:
+    result = await send_tool(config).invoke({"message": "x" * 10_000}, ctx())
+    assert result.ok
+    assert len(result.messages[0]) <= 3500
+    assert "truncated" in result.messages[0]
+
+
+async def test_send_ignores_extra_arguments(config) -> None:
+    result = await send_tool(config).invoke({"message": "hi", "surprise": 1}, ctx())
+    assert result.ok
+    assert result.messages == ["hi"]

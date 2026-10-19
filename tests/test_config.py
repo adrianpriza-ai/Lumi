@@ -90,7 +90,7 @@ def test_defaults_apply_with_no_config_file(project) -> None:
     config = load_config(project)
     assert isinstance(config, Config)
     assert config.llm.provider == "openai"
-    assert config.tools.enabled == ["shell", "files", "memory", "web", "context7"]
+    assert config.tools.enabled == ["shell", "files", "memory", "web", "context7", "send"]
 
 
 def test_dotenv_is_read_from_the_project_root(project) -> None:
@@ -404,6 +404,18 @@ def test_an_empty_variable_has_no_keys(config, monkeypatch) -> None:
 
 def test_the_key_strategy_defaults_to_fallback(config) -> None:
     assert config.llm.strategy_of() == "fallback"
+
+
+def test_inference_retries_default_to_four_extra_attempts(config) -> None:
+    assert config.llm.inference_retries == 4
+    assert config.llm.inference_retry_delay == 0.5
+    assert not [p for p in validate(config) if "inference_retry" in p]
+
+
+@pytest.mark.parametrize("field", ["inference_retries", "inference_retry_delay"])
+def test_negative_inference_retry_settings_are_reported(config, field: str) -> None:
+    setattr(config.llm, field, -1)
+    assert any(field in problem for problem in validate(config))
 
 
 @pytest.mark.parametrize("strategy", ["fallback", "round_robin", "random"])
