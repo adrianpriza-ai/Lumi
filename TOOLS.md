@@ -6,7 +6,7 @@
 |-|-|
 | `run_shell` | Shell commands, with the allow/confirm/deny engine |
 | `files` | Read anywhere in the project, write and edit only in `workspace/`, send files to the chat |
-| `memory` | Remember and recall; forgetting is human-only by design |
+| `memory` | Remember and recall, scoped to the chat it is used in; forgetting is human-only by design |
 | `web` | Search and fetch, across three interchangeable providers |
 | `context7` | Up-to-date library docs from https://context7.com; auto-enables on `CONTEXT7_API_KEY` |
 | `send` | Send the owner a message *mid-turn*, so one reply can arrive in parts |
@@ -225,6 +225,6 @@ class WeatherTool(Tool):
 ```
 
 Register it in `lumi/tools/__init__.py:build_registry`. It is now in the model's
-tool list, and `/tools` will show it. To make it ask permission first, raise
+tool list, and `lumi chat`'s `/tools` will show it. To make it ask permission first, raise
 `NeedsApproval` from `invoke` when `ctx.confirmed` is false — the agent loop
 already turns that into a Confirm/Cancel pair.

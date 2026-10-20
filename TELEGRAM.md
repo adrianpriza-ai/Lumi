@@ -11,7 +11,7 @@ supergroup it follows `bot.group_reply_mode` (default `mention`):
 
 - **`mention`** — the bot only responds when it is **mentioned**
   (`@Lumi_a_bot`), **replied to**, or sent a **slash command that targets it**
-  (`/help@Lumi_a_bot`). Plain `/help` in a group is left alone because Telegram
+  (`/start@Lumi_a_bot`). Plain `/start` in a group is left alone because Telegram
   routes commands without `@botname` to whichever bot claims them first.
 - **`always`** — replies to every owner message regardless of chat type.
 - **`off`** — never replies in groups; private chats still work as normal.
@@ -33,6 +33,16 @@ specific group (e.g. a private "Lumi lab"):
 group_reply_mode = "mention"
 always_reply_chats = ["-1001234567890"]
 ```
+
+## Memory per chat
+
+Long-term memory is scoped to the chat it was learned in:
+`data/memory/<chat_id>/MEMORY.md`. Your private chat gets its own file (your
+telegram id), each group gets one shared file for the group, and none of them
+see each other. `/memory`, `/remember` and `/forget` in a chat act on that
+chat's file — run them in a group to manage the group's memory. From the
+terminal, `lumi memory` edits your own scope and `lumi memory --scope
+<chat_id>` reaches any chat's, including a group's negative id.
 
 ## Reaching api.telegram.org
 

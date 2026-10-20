@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import json
 
-from conftest import FakeLLM, make_reply
+from conftest import FakeLLM, make_reply, make_store
 
 from lumi.agent import APPROVAL_TTL_SECONDS, Agent, TurnHooks
 from lumi.llm.base import LLMError
-from lumi.memory import History, MemoryFile
+from lumi.memory import History
 from lumi.personality import Personality
 from lumi.tools import build_registry
 
@@ -42,8 +42,7 @@ class CondensingLLM(FakeLLM):
 
 
 def make_agent(config, replies, llm=None) -> Agent:
-    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    memory.load()
+    memory = make_store(config)
     return Agent(
         config=config,
         personality=Personality.load(config.personality_file),
@@ -78,6 +77,22 @@ async def test_system_prompt_carries_personality_and_memory(config) -> None:
     assert "You are Lumi" in system["content"]  # PERSONALITY.md
     assert "lumi:managed" in system["content"]  # MEMORY.md
     assert "run_shell" in system["content"]  # tool list
+
+
+async def test_system_prompt_memory_is_scoped_to_the_chat(config) -> None:
+    """Each chat's prompt carries its own memory file, and only its own."""
+    agent = make_agent(config, [make_reply("ok"), make_reply("ok")])
+    agent.memory_for(1).remember("fact for chat one")
+    agent.memory_for(-100).remember("fact for the group")
+
+    await agent.handle(1, "hi")
+    await agent.handle(-100, "hi")
+
+    first, second = agent.llm.calls[0][0]["content"], agent.llm.calls[1][0]["content"]
+    assert "fact for chat one" in first
+    assert "fact for the group" not in first
+    assert "fact for the group" in second
+    assert "fact for chat one" not in second
 
 
 async def test_system_prompt_teaches_telegram_html(config) -> None:
@@ -171,8 +186,7 @@ async def test_llm_error_is_reported_not_raised(config) -> None:
         async def complete(self, messages, *, tools=None):
             raise LLMError("upstream is on fire")
 
-    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    memory.load()
+    memory = make_store(config)
     agent = Agent(config, Personality.load(config.personality_file), memory,
                   History(config.history_dir), build_registry(config, memory), Broken([]))
     result = await agent.handle(CHAT, "hi")
@@ -613,7 +627,7 @@ async def test_pending_queue_drains(config) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# direct tool invocation (the /run, /search, /fetch path)
+# direct tool invocation (Agent.run_tool, the no-model-turn path)
 # --------------------------------------------------------------------------- #
 
 
@@ -783,15 +797,13 @@ async def test_memory_of_chats_in_is_bounded(config) -> None:
 
 def test_disabled_tools_are_not_registered(config) -> None:
     config.tools.enabled = ["memory"]
-    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    memory.load()
+    memory = make_store(config)
     registry = build_registry(config, memory)
     assert registry.names() == ["memory"]
 
 
 def test_specs_are_well_formed(config) -> None:
-    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    memory.load()
+    memory = make_store(config)
     for spec in build_registry(config, memory).specs():
         function = spec["function"]
         assert spec["type"] == "function"
@@ -947,7 +959,7 @@ async def test_a_dead_delivery_channel_does_not_kill_the_turn(config) -> None:
 
 
 async def test_direct_tool_invocation_announces_its_step(config) -> None:
-    """``/run``, ``/search`` and ``/fetch`` bypass the model loop, but not the
+    """``Agent.run_tool`` bypasses the model loop, but not the
     feed: the chat promises to show each tool the bot runs, and a direct
     invocation is one of those tools."""
     agent = make_agent(config, [make_reply("it printed hello")])
@@ -961,6 +973,41 @@ async def test_direct_tool_invocation_announces_its_step(config) -> None:
     )
     assert result.text
     assert steps[0] == ("tool", "run_shell")
+
+
+async def test_direct_web_invocation_announces_its_step(config) -> None:
+    """Direct web searches and page fetches announce the web step."""
+    agent = make_agent(config, [make_reply("found it")])
+    steps: list[tuple[str, str]] = []
+
+    async def on_step(kind: str, detail: str) -> None:
+        steps.append((kind, detail))
+
+    result = await agent.run_tool(
+        CHAT, "web", {"action": "search", "query": "python"}, hooks=TurnHooks(on_step=on_step)
+    )
+    assert result.text
+    assert steps[0] == ("tool", "web")
+
+
+async def test_direct_tool_invocation_preserves_artifacts(config) -> None:
+    """A direct tool call that generates artifacts (e.g. file upload) must
+    preserve them onto the final TurnResult just like approved actions do."""
+    from pathlib import Path
+
+    from lumi.artifacts import Artifact
+    from lumi.tools.base import ToolResult
+
+    agent = make_agent(config, [make_reply("uploaded file")])
+    artifact = Artifact(path="doc.pdf", absolute=Path("/tmp/doc.pdf"), size=1234, mime="application/pdf")
+
+    async def fake_invoke(name, args, ctx):
+        return ToolResult(text="uploaded", summary="uploaded doc", artifacts=[artifact])
+
+    agent.registry.invoke = fake_invoke  # type: ignore[method-assign]
+    result = await agent.run_tool(CHAT, "files", {"action": "upload", "path": "doc.pdf"})
+    assert result.ok
+    assert artifact in result.artifacts
 
 
 async def test_an_approved_action_announces_its_step(config) -> None:

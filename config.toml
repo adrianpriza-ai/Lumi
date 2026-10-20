@@ -15,7 +15,7 @@ require_owner = true
 # unaffected — the bot always replies 1:1.
 #   mention  (default) - reply only when the bot is mentioned (@Lumi_a_bot),
 #                        replied to, or sent a slash command targeting it
-#                        specifically (e.g. /help@Lumi_a_bot).
+#                        specifically (e.g. /start@Lumi_a_bot).
 #   always             - reply to every owner message regardless of chat type.
 #   off                - never reply in groups; private chats still work.
 group_reply_mode = "mention"
@@ -111,13 +111,14 @@ max_tool_iterations = 20
 # point of budgeting history in tokens rather than in turn counts: a fixed count
 # is forty messages on a quiet day and four on a busy one.
 history_turns = 0
-# Cap on the MEMORY.md block injected into the system prompt. This is the one
-# limit that is not optional: the file goes into the part of the prompt that
-# nothing can condense away, so an unbounded one would grow into the window and
-# quietly push the conversation out of it. 0 means "no explicit cap" — the file
-# still gets an eighth of the context window (about 64k chars at 200k tokens),
-# which is room for hundreds of facts. Set a number to cap it harder; the oldest
-# facts are what get elided, and the prompt says so when it happens.
+# Cap on each chat's MEMORY.md block injected into the system prompt. This is
+# the one limit that is not optional: the file goes into the part of the prompt
+# that nothing can condense away, so an unbounded one would grow into the window
+# and quietly push the conversation out of it. 0 means "no explicit cap" — the
+# file still gets an eighth of the context window (about 64k chars at 200k
+# tokens), which is room for hundreds of facts. Set a number to cap it harder;
+# the oldest facts are what get elided, and the prompt says so when it happens.
+# Memory is per chat (data/memory/<chat_id>/MEMORY.md); the cap is per file.
 max_memory_chars = 0
 
 # --- Context window ---------------------------------------------------------
@@ -231,7 +232,8 @@ uploads = true
 [tools.memory]
 enabled = true
 # Let the model call remember() on its own. It can never delete memories;
-# erasing is a human action via /forget.
+# erasing is a human action via /forget. Memory is scoped per chat: what is
+# remembered in one chat (or group) is invisible to every other.
 auto_remember = true
 
 [tools.web]

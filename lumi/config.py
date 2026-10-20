@@ -21,6 +21,7 @@ from pathlib import Path
 from types import UnionType
 from typing import Any, Union, get_args, get_origin, get_type_hints
 
+from .memory import MemoryStore
 from .paths import project_root, resolve
 from .util.keys import parse_env_var
 from .util.log import get_logger
@@ -53,7 +54,7 @@ class BotConfig:
     max_upload_mb: int = 20
     #: How the bot behaves in group chats. ``"mention"`` (default) only replies
     #: when the bot is mentioned, replied to, or sent a slash command targeting
-    #: it specifically (e.g. ``/help@Lumi_a_bot``). ``"always"`` replies to every
+    #: it specifically (e.g. ``/start@Lumi_a_bot``). ``"always"`` replies to every
     #: owner message regardless of chat type. ``"off"`` ignores group chats
     #: entirely (commands still work in private chats).
     group_reply_mode: str = "mention"
@@ -156,12 +157,13 @@ class LLMConfig:
     #: conversation. 0 means "as many as the context window holds" — which is
     #: the point of budgeting history by tokens instead of by turn count.
     history_turns: int = 0
-    #: Cap on the MEMORY.md block injected into the system prompt. 0 (the
-    #: default) means "no explicit cap" — which is not the same as unbounded:
-    #: the block is still held to an eighth of the context window, because this
-    #: is the one part of the prompt that nothing downstream can reclaim. A file
-    #: that grows into the window is a file that quietly crowds out the
-    #: conversation, and it does it silently. Set a number to cap it harder.
+    #: Cap on the per-chat memory file block injected into the system prompt.
+    #: 0 (the default) means "no explicit cap" — which is not the same as
+    #: unbounded: the block is still held to an eighth of the context window,
+    #: because this is the one part of the prompt that nothing downstream can
+    #: reclaim. A file that grows into the window is a file that quietly crowds
+    #: out the conversation, and it does it silently. Set a number to cap it
+    #: harder. The cap applies to each chat's memory independently.
     max_memory_chars: int = 0
     #: Size of the model's context window, in tokens. This is the one number
     #: conversation history is managed against — see :mod:`lumi.context`.
@@ -636,6 +638,10 @@ class Config:
     # Runtime-only, filled in by load_config().
     root: Path = field(default_factory=project_root)
     personality_file: Path = field(default_factory=lambda: project_root() / "PERSONALITY.md")
+    #: Legacy single-file memory at the project root. Since memory became
+    #: per-chat, its content is copied once into the default scope's file
+    #: (see :class:`lumi.memory.MemoryStore`); the file itself is no longer
+    #: read after that.
     memory_file: Path = field(default_factory=lambda: project_root() / "MEMORY.md")
     data_dir: Path = field(default_factory=lambda: project_root() / "data")
     config_path: Path | None = None
@@ -645,6 +651,46 @@ class Config:
     @property
     def history_dir(self) -> Path:
         return self.data_dir / "history"
+
+    @property
+    def memory_dir(self) -> Path:
+        """One subdirectory per memory scope: ``data/memory/<chat_id>/MEMORY.md``."""
+        return self.data_dir / "memory"
+
+    @property
+    def default_memory_scope(self) -> str:
+        """Memory scope when there is no chat to scope by.
+
+        The owner's Telegram id when configured — the same id as their private
+        chat with the bot, so the terminal (``lumi chat`` / ``lumi ask`` /
+        ``lumi memory``) and that chat share one memory. ``"cli"`` otherwise.
+        """
+        return str(self.owner_id) if self.owner_id else "cli"
+
+    def build_memory_store(self) -> MemoryStore:
+        """The per-chat memory store, wired identically everywhere.
+
+        One factory so the bot, the CLI and ``lumi doctor`` cannot disagree
+        about where scope files live or which scope is the default.
+        """
+        return MemoryStore(
+            self.memory_dir,
+            self.llm.max_memory_chars,
+            seed_file=self.memory_file,
+            default_scope=self.default_memory_scope,
+        )
+
+    def memory_scope_of(self, chat_id: int | str | None) -> str:
+        """The memory scope for *chat_id*.
+
+        Every Telegram chat scopes by its own id — a private chat's id is the
+        user's, a group's is the group's, so memories are isolated per chat.
+        ``None`` and the CLI's stand-in id ``"cli"`` fall back to
+        :attr:`default_memory_scope`.
+        """
+        if chat_id is None or chat_id == "cli":
+            return self.default_memory_scope
+        return str(chat_id)
 
     @property
     def log_file(self) -> Path:
@@ -949,8 +995,9 @@ def validate(config: Config) -> list[str]:
         )
     if not config.personality_file.is_file():
         problems.append(f"PERSONALITY.md not found at {config.personality_file}")
-    if not config.memory_file.is_file():
-        problems.append(f"MEMORY.md not found at {config.memory_file}")
+    # No MEMORY.md check: since memory became per-chat, every scope's file is
+    # created on demand under memory_dir. The legacy root file is an optional
+    # one-time seed, reported by `lumi doctor` at most.
 
     for name in config.tools.enabled:
         if name not in {"shell", "files", "memory", "web", "context7", "send"}:

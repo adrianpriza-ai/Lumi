@@ -545,17 +545,21 @@ async def test_protected_paths_are_off_limits_here_too(files: FilesTool, config)
 
 @pytest.fixture
 def memory_tool(config) -> MemoryTool:
-    from lumi.memory import MemoryFile
-
-    mem = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    mem.load()
-    return MemoryTool(config, mem)
+    return MemoryTool(config, config.build_memory_store())
 
 
 async def test_remember_appends(memory_tool: MemoryTool) -> None:
     result = await memory_tool.invoke({"action": "remember", "fact": "the owner likes tea"}, ctx())
     assert "remembered" in result.text
-    assert memory_tool.memory.managed() == ["the owner likes tea"]
+    assert memory_tool.memory_for(ctx()).managed() == ["the owner likes tea"]
+
+
+async def test_memories_are_scoped_to_the_chat(memory_tool: MemoryTool) -> None:
+    """A fact learned in one chat must be invisible from every other chat."""
+    await memory_tool.invoke({"action": "remember", "fact": "group secret"}, ctx(chat_id=-100))
+    assert memory_tool.memory_for(ctx(chat_id=-100)).managed() == ["group secret"]
+    assert memory_tool.memory_for(ctx(chat_id=7)).managed() == []
+    assert memory_tool.memory_for(ctx()).managed() == []  # the default scope too
 
 
 async def test_remember_requires_a_fact(memory_tool: MemoryTool) -> None:

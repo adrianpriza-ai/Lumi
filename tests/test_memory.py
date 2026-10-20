@@ -6,7 +6,14 @@ from pathlib import Path
 
 import pytest
 
-from lumi.memory import MANAGED_END, MANAGED_START, History, MemoryFile
+from lumi.memory import (
+    MANAGED_END,
+    MANAGED_START,
+    History,
+    MemoryFile,
+    MemoryStore,
+    scope_slug,
+)
 
 
 @pytest.fixture
@@ -406,3 +413,85 @@ def test_load_stamps_the_mtime_of_the_file_it_created(tmp_path: Path) -> None:
     memory = MemoryFile(tmp_path / "MEMORY.md")
     memory.load()
     assert memory._mtime == (tmp_path / "MEMORY.md").stat().st_mtime
+
+
+# --------------------------------------------------------------------------- #
+# scoped store: one MEMORY.md per chat
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def store(tmp_path: Path) -> MemoryStore:
+    return MemoryStore(tmp_path / "memory")
+
+
+def test_scope_slug_passes_telegram_ids_through() -> None:
+    assert scope_slug(42) == "42"
+    assert scope_slug(-1001234567890) == "-1001234567890"
+    assert scope_slug("cli") == "cli"
+    assert scope_slug("../../etc/passwd") == "%2E%2E%2F%2E%2E%2Fetc%2Fpasswd"
+    assert scope_slug("///") == "%2F%2F%2F"
+    assert scope_slug("") == "default"
+
+
+def test_scope_slug_does_not_merge_distinct_scope_ids() -> None:
+    assert scope_slug("a/b") != scope_slug("a_b")
+    assert scope_slug("a%2Fb") != scope_slug("a/b")
+
+
+def test_each_scope_gets_its_own_file(store: MemoryStore) -> None:
+    assert store.path_for(42) == store.directory / "42" / "MEMORY.md"
+    assert store.path_for(42) != store.path_for(-100)
+
+
+def test_scopes_cannot_see_each_other(store: MemoryStore) -> None:
+    store.get(42).remember("private fact")
+    store.get(-100).remember("group fact")
+    assert store.get(42).managed() == ["private fact"]
+    assert store.get(-100).managed() == ["group fact"]
+
+
+def test_get_returns_the_same_object_per_scope(store: MemoryStore) -> None:
+    assert store.get(7) is store.get(7)
+    assert store.get(7) is not store.get(8)
+
+
+def test_scopes_lists_what_is_on_disk(store: MemoryStore) -> None:
+    assert store.scopes() == []
+    store.get(5)
+    store.get(-100)
+    assert store.scopes() == ["-100", "5"]
+
+
+def test_the_default_scope_is_seeded_from_the_legacy_file(tmp_path: Path) -> None:
+    seed = tmp_path / "MEMORY.md"
+    seed.write_text("# Memory\n\nlegacy notes\n", encoding="utf-8")
+    store = MemoryStore(tmp_path / "memory", seed_file=seed, default_scope="42")
+    assert "legacy notes" in store.get("42").text
+    # Other scopes start empty: the owner's notes must not leak into a group.
+    assert "legacy notes" not in store.get(-100).text
+
+
+def test_an_empty_seed_is_not_copied(tmp_path: Path) -> None:
+    seed = tmp_path / "MEMORY.md"
+    seed.write_text("  \n", encoding="utf-8")
+    store = MemoryStore(tmp_path / "memory", seed_file=seed, default_scope="42")
+    assert "## Facts" in store.get("42").text  # the plain template, not the seed
+
+
+def test_reload_rereads_every_cached_scope(store: MemoryStore) -> None:
+    memory = store.get(1)
+    memory.path.write_text(
+        memory.path.read_text(encoding="utf-8").replace("## Facts", "## Edited"),
+        encoding="utf-8",
+    )
+    store.reload()
+    assert "## Edited" in memory.text
+
+
+def test_stats_count_the_scopes_on_disk(store: MemoryStore) -> None:
+    store.get(1)
+    store.get(2)
+    stats = store.stats()
+    assert stats["scopes"] == 2
+    assert stats["default_scope"] == "default"

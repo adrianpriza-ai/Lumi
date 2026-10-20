@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
-from conftest import FakeLLM, make_reply
+from conftest import FakeLLM, make_reply, make_store
 from telegram import Bot, Chat, Message, Update, User
 from telegram.error import TelegramError
 
@@ -30,7 +30,7 @@ from lumi.bot import (
     build_application,
     build_handlers,
 )
-from lumi.memory import History, MemoryFile
+from lumi.memory import History
 from lumi.personality import Personality
 from lumi.tools import build_registry
 
@@ -252,8 +252,7 @@ def make_callback(bot: Bot, data: str, *, chat_id: int = CHAT, user_id: int = OW
 
 
 def build(config, replies, bot: FakeBot | None = None) -> tuple[Any, FakeBot, Agent]:
-    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    memory.load()
+    memory = make_store(config)
     agent = Agent(
         config=config,
         personality=Personality.load(config.personality_file),
@@ -309,8 +308,8 @@ async def test_owner_filter_blocks_before_the_agent(config) -> None:
     assert agent.llm.calls == []
 
 
-async def test_tools_are_invisible_to_strangers(config) -> None:
-    bot, _ = await send(config, [], "/run rm -rf /", user_id=STRANGER)
+async def test_commands_are_invisible_to_strangers(config) -> None:
+    bot, _ = await send(config, [], "/status", user_id=STRANGER)
     assert "not whitelisted" in texts(bot).lower()
 
 
@@ -357,23 +356,39 @@ async def test_plain_text_gets_a_reply(config) -> None:
     assert "the answer is 42" in texts(bot)
 
 
-async def test_start_greets_and_lists_tools(config) -> None:
+async def test_start_greets_without_the_backend_details(config) -> None:
+    """``/start`` is a glance: greeting + commands — no model or tool dump."""
     bot, _ = await send(config, [], "/start")
     body = texts(bot)
     assert "i'm up" in body
-    assert "run_shell" in body
-    assert "test-model" in body
+    assert "/memory" in body
+    assert "test-model" not in body  # the model line is gone
+    assert "run_shell" not in body  # so is the tool inventory
 
 
-async def test_help_lists_commands(config) -> None:
-    bot, _ = await send(config, [], "/help")
-    for command in ("/run", "/search", "/memory", "/doctor", "/reset"):
-        assert command in texts(bot)
+async def test_start_lists_the_commands(config) -> None:
+    bot, _ = await send(config, [], "/start")
+    body = texts(bot)
+    for command in ("/memory", "/doctor", "/reset", "/status"):
+        assert command in body
+    for gone in ("/run", "/search", "/fetch", "/ask", "/tools", "/help"):
+        assert gone not in body
+    # Owner commands live behind /own_help, not in the greeting.
+    assert "/config" not in body
+    assert "/whitelist" not in body
 
 
-async def test_help_advertises_the_approval_flow(config) -> None:
-    bot, _ = await send(config, [], "/help")
+async def test_start_advertises_the_approval_flow(config) -> None:
+    bot, _ = await send(config, [], "/start")
     assert "confirmation" in texts(bot).lower()
+
+
+async def test_help_points_at_start(config) -> None:
+    """/help is no longer the list — it redirects instead of erroring."""
+    bot, _ = await send(config, [], "/help")
+    body = texts(bot)
+    assert "/start" in body
+    assert "/config" not in body  # it is not the old dump
 
 
 async def test_long_answer_is_split(config) -> None:
@@ -390,28 +405,26 @@ async def test_typing_indicator_is_sent(config) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# direct tool commands
+# removed commands (they fall through to the unknown-command reply)
 # --------------------------------------------------------------------------- #
 
 
-async def test_run_command_executes(config) -> None:
-    bot, _ = await send(config, [make_reply("it printed hello")], "/run echo hello")
-    assert "it printed hello" in texts(bot)
-
-
-async def test_run_without_arguments_explains_usage(config) -> None:
-    bot, _ = await send(config, [], "/run")
-    assert "usage" in texts(bot).lower()
-
-
-async def test_search_command(config) -> None:
-    bot, _ = await send(config, [make_reply("no provider was available")], "/search python")
-    assert "no provider" in texts(bot)
-
-
-async def test_fetch_command_requires_a_url(config) -> None:
-    bot, _ = await send(config, [], "/fetch")
-    assert "usage" in texts(bot).lower()
+async def test_removed_commands_are_gone(config) -> None:
+    """``/run``, ``/search``, ``/fetch``, ``/ask`` and ``/tools`` no longer
+    exist: each gets the unknown-command reply pointing at ``/start``, and no
+    model call is made along the way."""
+    for command in (
+        "/run echo hi",
+        "/search python",
+        "/fetch https://example.com",
+        "/ask what is the answer",
+        "/tools",
+    ):
+        bot, agent = await send(config, [], command)
+        body = texts(bot)
+        assert "don't know" in body, command
+        assert "/start" in body, command
+        assert agent.llm.calls == [], command
 
 
 # --------------------------------------------------------------------------- #
@@ -423,7 +436,7 @@ async def test_risky_command_renders_a_keyboard(config) -> None:
     bot, _ = await send(
         config,
         [make_reply("", [("c1", "run_shell", {"command": "rm -rf workspace/tmp"})])],
-        "/run rm -rf workspace/tmp",
+        "clean up the workspace",
     )
     body = texts(bot)
     assert "needs your approval" in body
@@ -441,7 +454,7 @@ async def test_approval_button_data_is_well_formed(config) -> None:
     bot, _ = await send(
         config,
         [make_reply("", [("c1", "run_shell", {"command": "rm -rf workspace/tmp"})])],
-        "/run rm -rf workspace/tmp",
+        "clean up the workspace",
     )
     keyboard = next(m["reply_markup"] for m in bot.sent if m.get("reply_markup"))
     approve, cancel = keyboard.inline_keyboard[0]
@@ -452,26 +465,26 @@ async def test_approval_button_data_is_well_formed(config) -> None:
 
 
 async def test_tapping_run_it_actually_runs_the_command(config) -> None:
-    """The whole approval flow, through the button rather than the slash command.
+    """The whole approval flow, through the button rather than plain prose.
 
     A handler that is defined but never registered is invisible to every other
     test here: the keyboard is drawn and the callback data is well formed, and
     the tap still goes nowhere. Only driving a real callback query catches it.
 
-    Note the script: ``/run`` invokes its tool directly and never calls the
-    model, so the first scripted reply is the model's turn *after* the approval
-    rather than the one that asked for it.
+    Scripted: the first reply is the model asking for the risky run — the turn
+    that ends in the keyboard — and the second is its narration *after* the
+    approval, because the tool itself runs on the tap, outside any model turn.
     """
     application, bot, agent = build(
         config,
         [
-            make_reply("", [("c1", "run_shell", {"command": "echo done"})]),
+            make_reply("", [("c1", "run_shell", {"command": "rm -rf workspace/tmp"})]),
             make_reply("it printed approved"),
         ],
     )
     await application.initialize()
     try:
-        await application.process_update(make_update(bot, "/run rm -rf workspace/tmp"))
+        await application.process_update(make_update(bot, "clean up the workspace"))
         keyboard = next(m["reply_markup"] for m in bot.sent if m.get("reply_markup"))
         approve = keyboard.inline_keyboard[0][0]
         await application.process_update(make_callback(bot, approve.callback_data))
@@ -483,13 +496,17 @@ async def test_tapping_run_it_actually_runs_the_command(config) -> None:
 
 
 async def test_tapping_cancel_declines_the_command(config) -> None:
-    """A refusal runs nothing, so the model's very next turn is its first."""
+    """A refusal runs nothing — the model's next turn only narrates that."""
     application, bot, agent = build(
-        config, [make_reply("understood, i left it alone")]
+        config,
+        [
+            make_reply("", [("c1", "run_shell", {"command": "rm -rf workspace/tmp"})]),
+            make_reply("understood, i left it alone"),
+        ],
     )
     await application.initialize()
     try:
-        await application.process_update(make_update(bot, "/run rm -rf workspace/tmp"))
+        await application.process_update(make_update(bot, "clean up the workspace"))
         keyboard = next(m["reply_markup"] for m in bot.sent if m.get("reply_markup"))
         cancel = keyboard.inline_keyboard[0][1]
         await application.process_update(make_callback(bot, cancel.callback_data))
@@ -497,7 +514,7 @@ async def test_tapping_cancel_declines_the_command(config) -> None:
         await application.shutdown()
 
     assert "left it alone" in texts(bot)
-    assert agent.llm.index == 1
+    assert agent.llm.index == 2  # one turn asked, one narrated the refusal
 
 
 async def test_a_stale_approval_tap_still_resolves(config) -> None:
@@ -510,14 +527,14 @@ async def test_a_stale_approval_tap_still_resolves(config) -> None:
     application, bot, agent = build(
         config,
         [
-            make_reply("", [("c1", "run_shell", {"command": "echo done"})]),
+            make_reply("", [("c1", "run_shell", {"command": "rm -rf workspace/tmp"})]),
             make_reply("it printed approved"),
         ],
         bot=StaleToastBot(),
     )
     await application.initialize()
     try:
-        await application.process_update(make_update(bot, "/run rm -rf workspace/tmp"))
+        await application.process_update(make_update(bot, "clean up the workspace"))
         keyboard = next(m["reply_markup"] for m in bot.sent if m.get("reply_markup"))
         approve = keyboard.inline_keyboard[0][0]
         await application.process_update(make_callback(bot, approve.callback_data))
@@ -553,7 +570,7 @@ async def test_remember_saves_a_fact(config) -> None:
     bot, _ = await send(config, [], "/remember the owner prefers dark mode")
     assert "remembered" in texts(bot).lower()
 
-    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
+    memory = make_store(config).get(CHAT)  # the private chat's own scope
     assert "the owner prefers dark mode" in memory.managed()
 
 
@@ -563,8 +580,7 @@ async def test_remember_requires_an_argument(config) -> None:
 
 
 async def test_forget_removes_the_newest(config) -> None:
-    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    memory.load()
+    memory = make_store(config).get(CHAT)
     memory.remember("first fact")
     memory.remember("second fact")
 
@@ -595,18 +611,12 @@ async def test_personality_command_shows_the_file(config) -> None:
     assert "You are Lumi" in texts(bot)
 
 
-async def test_tools_command(config) -> None:
-    bot, _ = await send(config, [], "/tools")
-    body = texts(bot)
-    assert "run_shell" in body
-    assert "files" in body
-
-
 async def test_status_command(config) -> None:
     bot, _ = await send(config, [], "/status")
     body = texts(bot)
     assert "uptime" in body
     assert "test-model" in body
+    assert "run_shell" in body  # tool inventory lives here now that /tools is gone
 
 
 async def test_context_command_reports_the_window(config) -> None:
@@ -678,12 +688,12 @@ async def test_unknown_command_is_explained(config) -> None:
     bot, _ = await send(config, [], "/nonsense")
     body = texts(bot)
     assert "don't know" in body
-    assert "/help" in body
+    assert "/start" in body
 
 
 async def test_stranger_gets_one_clear_sentence(config) -> None:
     """A stranger learns nothing about what this bot can reach."""
-    bot, _ = await send(config, [], "/tools", user_id=STRANGER)
+    bot, _ = await send(config, [], "/status", user_id=STRANGER)
     body = texts(bot)
     assert "not whitelisted" in body.lower()
     for leak in ("run_shell", "test-model", "workspace", "MEMORY.md"):
@@ -740,7 +750,9 @@ def test_owner_filter_is_applied_when_an_owner_is_set(config) -> None:
     handlers = application.handlers[0]
     # CommandHandler.commands is a frozenset in python-telegram-bot v22.
     names = {next(iter(h.commands)) for h in handlers if isinstance(h, CH) and h.commands}
-    assert {"start", "help", "run", "search", "memory", "doctor"} <= names
+    assert {"start", "help", "own_help", "memory", "doctor"} <= names
+    # The removed direct-invocation commands must not be registered either.
+    assert not ({"run", "search", "fetch", "ask", "tools"} & names)
 
 
 def test_the_stranger_handler_is_registered_last(config) -> None:
@@ -899,20 +911,20 @@ async def test_group_chat_does_not_reply_to_a_reply_to_a_human(config) -> None:
 
 
 async def test_group_chat_slash_command_targeting_the_bot(config) -> None:
-    """/help@lumi_test_bot in a group runs the command — it names the bot."""
-    bot, _ = await send(config, [], "/help@lumi_test_bot", chat_id=GROUP_CHAT, chat_type="supergroup")
+    """/start@lumi_test_bot in a group runs the command — it names the bot."""
+    bot, _ = await send(config, [], "/start@lumi_test_bot", chat_id=GROUP_CHAT, chat_type="supergroup")
     assert "confirmation" in texts(bot).lower()
 
 
 async def test_group_chat_plain_slash_command_is_silent(config) -> None:
-    """Plain /help in a group is dropped — Telegram routes that elsewhere."""
-    bot, _ = await send(config, [], "/help", chat_id=GROUP_CHAT, chat_type="supergroup")
+    """Plain /start in a group is dropped — Telegram routes that elsewhere."""
+    bot, _ = await send(config, [], "/start", chat_id=GROUP_CHAT, chat_type="supergroup")
     assert bot.sent == []
 
 
 async def test_group_chat_slash_command_targeting_another_bot_is_silent(config) -> None:
-    """/help@some_other_bot must not fire this bot's handlers."""
-    bot, _ = await send(config, [], "/help@some_other_bot", chat_id=GROUP_CHAT, chat_type="supergroup")
+    """/start@some_other_bot must not fire this bot's handlers."""
+    bot, _ = await send(config, [], "/start@some_other_bot", chat_id=GROUP_CHAT, chat_type="supergroup")
     assert bot.sent == []
 
 
@@ -1276,8 +1288,7 @@ async def test_photo_is_sent_to_the_model_as_base64(config) -> None:
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
     )
     bot = FakePhotoBot(image_bytes)
-    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    memory.load()
+    memory = make_store(config)
     agent = Agent(
         config=config,
         personality=Personality.load(config.personality_file),
@@ -1312,8 +1323,7 @@ async def test_photo_without_caption_gets_default_prompt(config) -> None:
     """A photo with no caption gets a default 'what's in this image?' prompt."""
     image_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
     bot = FakePhotoBot(image_bytes)
-    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    memory.load()
+    memory = make_store(config)
     agent = Agent(
         config=config,
         personality=Personality.load(config.personality_file),
@@ -1345,8 +1355,7 @@ async def test_photo_caption_reaches_the_model(config) -> None:
     silently dropped and the model gets the canned default instead.
     """
     bot = FakePhotoBot(b"\x89PNG\r\n\x1a\n" + b"\x00" * 50)
-    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    memory.load()
+    memory = make_store(config)
     agent = Agent(
         config=config,
         personality=Personality.load(config.personality_file),
@@ -1383,8 +1392,7 @@ async def test_photo_download_failure_gracefully(config) -> None:
             raise TelegramError("file unavailable")
 
     bot = FailingPhotoBot()
-    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    memory.load()
+    memory = make_store(config)
     agent = Agent(
         config=config,
         personality=Personality.load(config.personality_file),
@@ -1408,8 +1416,7 @@ async def test_photo_in_group_with_mention_replies(config) -> None:
     """A photo with a mention in a group triggers a vision reply."""
     image_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
     bot = FakePhotoBot(image_bytes)
-    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    memory.load()
+    memory = make_store(config)
     agent = Agent(
         config=config,
         personality=Personality.load(config.personality_file),
@@ -1435,8 +1442,7 @@ async def test_photo_in_group_without_mention_is_silent(config) -> None:
     """A photo without a mention in a group is ignored (mention mode)."""
     image_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 50
     bot = FakePhotoBot(image_bytes)
-    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    memory.load()
+    memory = make_store(config)
     agent = Agent(
         config=config,
         personality=Personality.load(config.personality_file),
@@ -1556,8 +1562,7 @@ async def test_a_failed_delivery_degrades_to_a_path(config, monkeypatch) -> None
         async def send_document(self, chat_id: Any, document: Any = None, **kwargs: Any) -> Any:
             raise TelegramError("attachment rejected")
 
-    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    memory.load()
+    memory = make_store(config)
     agent = Agent(
         config=config,
         personality=Personality.load(config.personality_file),
@@ -1599,8 +1604,7 @@ class FakeDocBot(FakeBot):
 
 async def test_a_document_message_is_stored_and_announced(config) -> None:
     """The in path: an owner uploads a file, it lands in workspace/uploads/."""
-    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    memory.load()
+    memory = make_store(config)
     agent = Agent(
         config=config,
         personality=Personality.load(config.personality_file),
@@ -1637,8 +1641,7 @@ async def test_a_document_message_is_stored_and_announced(config) -> None:
 
 
 async def test_a_document_without_a_caption_gets_a_default_prompt(config) -> None:
-    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    memory.load()
+    memory = make_store(config)
     agent = Agent(
         config=config,
         personality=Personality.load(config.personality_file),
@@ -1988,15 +1991,6 @@ async def test_reply_falls_back_to_bot_send_message_when_message_reply_raises_ba
     assert bot.sent[0]["text"] == "still delivered to chat"
 
 
-async def test_the_run_command_shows_up_in_the_step_list(config) -> None:
-    """`/run` executes the tool outside the model loop — the feed still owes
-    the chat the "each thing i run" it promises in /help."""
-    bot, _ = await send(config, [make_reply("it printed hi")], "/run echo hi")
-    body = texts(bot)
-    assert "💻 Run Bash" in body
-    assert "it printed hi" in body
-
-
 async def test_an_approved_run_shows_up_in_the_step_list(config) -> None:
     """The tap on "run it" runs the tool after the turn ended — its step
     belongs to the resolve turn's feed, not the vanished one."""
@@ -2020,6 +2014,29 @@ async def test_an_approved_run_shows_up_in_the_step_list(config) -> None:
     body = texts(bot)
     assert "💻 Run Bash" in body
     assert "it is gone" in body
+
+
+async def test_slash_approve_command_shows_up_in_the_step_list(config) -> None:
+    """Approving via `/approve` text command executes the pending action and
+    renders the step feed."""
+    application, bot, agent = build(
+        config,
+        [
+            make_reply("", [("c1", "run_shell", {"command": "rm -rf workspace/tmp"})]),
+            make_reply("cleaned up"),
+        ],
+    )
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "clean up the workspace"))
+        bot._sent.clear()
+        await application.process_update(make_update(bot, "/approve"))
+    finally:
+        await application.shutdown()
+
+    body = texts(bot)
+    assert "💻 Run Bash" in body
+    assert "cleaned up" in body
 
 
 async def test_double_asterisk_bold_renders_as_bold(config) -> None:
@@ -2086,8 +2103,8 @@ async def test_status_mentions_reasoning(config) -> None:
     assert "reasoning: off" in texts(bot)
 
 
-async def test_help_mentions_the_step_list(config) -> None:
-    bot, _ = await send(config, [], "/help")
+async def test_start_mentions_the_step_list(config) -> None:
+    bot, _ = await send(config, [], "/start")
     assert "/reasoning" in texts(bot)
     assert "live note" in texts(bot)
 
@@ -2177,12 +2194,28 @@ async def test_env_says_keys_need_a_restart(config) -> None:
     assert "restart" in texts(bot).lower()
 
 
-async def test_help_advertises_the_owner_introspection_commands(config) -> None:
-    bot, _ = await send(config, [], "/help")
+async def test_own_help_lists_the_owner_introspection_commands(config) -> None:
+    bot, _ = await send(config, [], "/own_help")
     body = texts(bot)
     assert "/config" in body
     assert "/env" in body
     assert "masked" in body
+
+
+async def test_own_help_accepts_the_hyphen_spelling(config) -> None:
+    """Telegram clients only autocomplete ``/own_help``, but ``/own-help`` is
+    the spelling from the docs — it must work when typed too."""
+    bot, _ = await send(config, [], "/own-help")
+    assert "/config" in texts(bot)
+
+
+async def test_own_help_is_owner_only(config) -> None:
+    """Whitelisted users may use the bot, but not the owner's inventory."""
+    config.bot.whitelisted_users = [str(WHITELISTED_USER)]
+    bot, _ = await send(config, [], "/own_help", user_id=WHITELISTED_USER)
+    body = texts(bot)
+    assert "only the owner can see that" in body.lower()
+    assert "/config" not in body
 
 
 async def test_env_and_config_are_owner_only(config) -> None:

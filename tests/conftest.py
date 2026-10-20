@@ -56,6 +56,16 @@ def config(project: Path):
     return load_config(project)
 
 
+def make_store(config):
+    """The per-chat memory store, wired the way the app wires it.
+
+    Scoped files are created on demand under ``data/memory/<scope>/MEMORY.md``;
+    the legacy root MEMORY.md seeds the default scope (the owner's) on first
+    use, exactly as a deployed bot migrating would.
+    """
+    return config.build_memory_store()
+
+
 class FakeLLM:
     """Scripted LLM client.
 

@@ -7,7 +7,7 @@ Commands
 ``ask``      one-shot question, prints the answer, exits
 ``shell``    run one command through the safety engine
 ``search``   web search from the terminal
-``memory``   show or edit MEMORY.md
+``memory``   show or edit a chat's MEMORY.md
 ``doctor``   diagnose the environment
 ``config``   print the resolved configuration
 
@@ -54,11 +54,10 @@ def _report_problems(config: Config, *, fatal: bool) -> bool:
 
 def _build_agent(config: Config) -> Any:
     from .agent import Agent
-    from .memory import History, MemoryFile
+    from .memory import History
     from .personality import Personality
 
-    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    memory.load()
+    memory = config.build_memory_store()
     personality = Personality.load(config.personality_file)
     history = History(config.history_dir)
     return Agent(config, personality, memory, history)
@@ -193,8 +192,10 @@ async def _repl(agent: Any, config: Config) -> int:
             continue
         if lowered.startswith("/memory"):
             # The same window share the bot's /memory and the system prompt
-            # apply, so the CLI shows what the model actually gets.
-            print(agent.memory.for_prompt(agent.memory_limit()), "\n")
+            # apply, so the CLI shows what the model actually gets. The scope
+            # is the owner's: with TELEGRAM_OWNER_ID set, the same memory their
+            # private chat with the bot uses.
+            print(agent.memory_for("cli").for_prompt(agent.memory_limit()), "\n")
             continue
         if lowered == "/personality":
             print(agent.personality.text, "\n")
@@ -317,10 +318,9 @@ def cmd_search(args: argparse.Namespace) -> int:
 
 def cmd_memory(args: argparse.Namespace) -> int:
     config = _config_and_log(args)
-    from .memory import MemoryFile
-
-    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    memory.load()
+    store = config.build_memory_store()
+    scope = args.scope if args.scope else config.default_memory_scope
+    memory = store.get(scope)
 
     if args.add:
         print(memory.remember(" ".join(args.add), source="cli"))
@@ -329,6 +329,7 @@ def cmd_memory(args: argparse.Namespace) -> int:
         removed = memory.forget(args.forget)
         print("\n".join(removed) if removed else "nothing to forget")
         return 0
+    print(f"# scope {scope} — {memory.path}\n")
     print(memory.text)
     return 0
 
@@ -432,9 +433,14 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--limit", type=int, default=0)
     search_parser.set_defaults(func=cmd_search)
 
-    memory_parser = sub.add_parser("memory", help="show or edit MEMORY.md")
+    memory_parser = sub.add_parser("memory", help="show or edit a chat's MEMORY.md")
     memory_parser.add_argument("--add", nargs="+", help="save a fact")
     memory_parser.add_argument("--forget", type=int, metavar="N", help="drop the newest N facts")
+    memory_parser.add_argument(
+        "--scope",
+        metavar="CHAT_ID",
+        help="memory scope to act on: a Telegram chat id (default: yours)",
+    )
     memory_parser.set_defaults(func=cmd_memory)
 
     doctor_parser = sub.add_parser("doctor", help="diagnose the environment")

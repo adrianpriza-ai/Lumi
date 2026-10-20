@@ -34,6 +34,42 @@ def test_paths_are_derived_from_the_project_root(project) -> None:
     assert config.log_file == project / "data" / "logs" / "lumi.log"
 
 
+def test_memory_is_scoped_per_chat_under_data_memory(project) -> None:
+    config = load_config(project)
+    assert config.memory_dir == project / "data" / "memory"
+    assert config.default_memory_scope == "42"  # the owner's Telegram id
+    assert config.memory_scope_of(42) == "42"  # private chat = the user
+    assert config.memory_scope_of(-100123) == "-100123"  # group = the group
+    assert config.memory_scope_of("cli") == "42"  # the terminal shares the owner's memory
+    assert config.memory_scope_of(None) == "42"
+
+
+def test_without_an_owner_id_the_cli_gets_its_own_scope(project, monkeypatch) -> None:
+    env = project / ".env"
+    env.write_text(
+        "\n".join(
+            line
+            for line in env.read_text(encoding="utf-8").splitlines()
+            if not line.startswith("TELEGRAM_OWNER_ID")
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("TELEGRAM_OWNER_ID", raising=False)
+    config = load_config(project)
+    assert config.default_memory_scope == "cli"
+    assert config.memory_scope_of("cli") == "cli"
+
+
+def test_build_memory_store_wires_the_scoped_paths(project) -> None:
+    config = load_config(project)
+    store = config.build_memory_store()
+    assert store.directory == project / "data" / "memory"
+    assert store.default_scope == "42"
+    assert store.seed_file == project / "MEMORY.md"
+    assert store.path_for(-100) == project / "data" / "memory" / "-100" / "MEMORY.md"
+
+
 def test_env_overrides_toml(project, monkeypatch) -> None:
     monkeypatch.setenv("LUMI__LLM__MODEL", "override-model")
     monkeypatch.setenv("LUMI__TOOLS__SHELL__TIMEOUT_SECONDS", "7")

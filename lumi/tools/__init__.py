@@ -13,7 +13,7 @@ description field honest about when *not* to use the tool.
 from __future__ import annotations
 
 from ..config import Config
-from ..memory import MemoryFile
+from ..memory import MemoryStore
 from ..util.log import get_logger
 from .base import NeedsApproval, Tool, ToolContext, ToolError, ToolResult
 from .context7 import Context7Tool
@@ -27,12 +27,12 @@ from .web import WebTool
 log = get_logger(__name__)
 
 
-def build_registry(config: Config, memory: MemoryFile) -> ToolRegistry:
+def build_registry(config: Config, memory: MemoryStore) -> ToolRegistry:
     """Construct the registry, honouring ``tools.enabled`` and the per-tool flags.
 
     Tools that fail ``available()`` (e.g. ``context7`` without an API key) are
-    still registered, so introspection commands like ``/tools`` and ``/doctor``
-    can show why they are off — but ``ToolRegistry.specs()`` excludes them, so
+    still registered, so introspection commands like ``/doctor`` (and
+    ``/tools`` in ``lumi chat``) can show why they are off — but ``ToolRegistry.specs()`` excludes them, so
     the model never sees a tool it cannot actually call. The system prompt
     follows the same rule via :meth:`ToolRegistry.describe` with
     ``available_only=True``.

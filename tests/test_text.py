@@ -262,6 +262,14 @@ def test_uppercase_code_tags_are_left_alone() -> None:
     assert markdown_bold_to_html("<Code>a**b</Code>") == "<Code>a**b</Code>"
 
 
+def test_code_tags_with_whitespace_are_left_alone() -> None:
+    """The bold pass and sanitizer agree on optional whitespace before ``>``."""
+    text = "<PrE >**inside pre**</pRe > and <cOdE\t>**inside code**</CoDe > and **out**"
+    assert markdown_bold_to_html(text) == (
+        "<PrE >**inside pre**</pRe > and <cOdE\t>**inside code**</CoDe > and <b>out</b>"
+    )
+
+
 def test_globs_and_lone_asterisks_stay_literal() -> None:
     assert markdown_bold_to_html("ls **/*.py and * star") == "ls **/*.py and * star"
 

@@ -44,14 +44,19 @@ Open findings from the review:
    if `effective_message` is missing or was deleted (handling message-deletion
    `BadRequest`), and raises when neither message nor chat is available.
    Covered by unit tests and `FlakySendBot` regression in `tests/test_bot.py`.
-2. Medium: direct `/run`, `/search`, and `/fetch` execution, plus approved
-   tool resolution, bypasses the `_step(hooks, "tool", ...)` path in
-   `lumi/agent.py`. The feed can therefore omit tools that the bot actually
-   runs, despite the feed copy saying it shows each run.
+2. Medium (fixed): direct `/run`, `/search`, and `/fetch` execution, plus approved
+   tool resolution, wires `hooks=hooks_for(...)` and calls `_step(hooks, "tool", ...)`.
+   In addition, `Agent.run_tool` now merges `tool_result.artifacts` onto the
+   returned `TurnResult` so direct tool artifacts are preserved just like approved
+   actions. Regression coverage covers direct `/run`, `/search`, `/fetch`,
+   approved runs, artifact preservation, and text `/approve` commands in
+   `tests/test_agent.py` and `tests/test_bot.py`.
 3. Medium (fixed): `lumi/util/text.py` protected lowercase `<code>` and
    `<pre>` segments only, so a valid uppercase `<PRE>**text**</PRE>` was
-   converted to bold. `_CODE_SEGMENT_RE` now compiles with `re.IGNORECASE`,
-   and `tests/test_text.py` covers the uppercase/mixed-case shapes.
+   converted to bold. `_CODE_SEGMENT_RE` now compiles with `re.IGNORECASE`
+   and accepts the same optional whitespace before `>` as the sanitizer;
+   `tests/test_text.py` covers uppercase, mixed-case, and whitespace-shaped
+   code tags.
 4. Medium (fixed): the CLI now gates the `on_step` callback on
    `llm.show_reasoning` via `_hooks_for(config)`. Turning `llm.show_reasoning` off
    disables live step lines to stderr in addition to the post-turn raw trace.
@@ -83,8 +88,7 @@ The feature work currently changes these groups of paths:
 - This file: `handoff.md`, updated to preserve the older review backlog while
   recording the current verification state.
 
-No source fix for finding 2 has been made. Findings 1 and 3 through 6 are
-fixed in the current working tree.
+All findings 1 through 6 are now fixed in the current working tree.
 
 ## Decisions
 
@@ -95,8 +99,8 @@ fixed in the current working tree.
   adjacent-step deduplication. Do not reintroduce a separate thinking trace or
   thinking keyboard.
 - Keep the no-bold prompt rule and the Telegram conversion bridge. The
-  code/pre protection is now case-insensitive, which was the stated
-  prerequisite for calling this complete.
+  code/pre protection is case-insensitive and aligned with the sanitizer's
+  accepted tag whitespace, which keeps real code out of the bold conversion.
 - Treat the existing source edits as working-tree changes, not merged or
   deployed changes. A commit is intentionally not created by this request.
 
@@ -129,15 +133,9 @@ Commands run from `/home/momoi/Github/Lumi` during this review:
 
 ## Next step
 
-The project environment is now usable and the real test suite is green (923
-passed). The remaining implementation work is finding 2:
-
-```bash
-./.venv/bin/pip install -e ".[dev]"
-./.venv/bin/pytest -q
-```
-
-Fix finding 2, add regression coverage, and rerun:
+All 6 findings from this review are now implemented, covered by tests, and
+verified green (944 passed, ruff clean, compileall clean). The working tree
+contains uncommitted changes ready for staging or review:
 
 ```bash
 ./.venv/bin/ruff check lumi tests

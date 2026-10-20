@@ -275,8 +275,12 @@ _MD_BOLD_RE = re.compile(r"\*\*(?!\s)([^*\n]+?)(?<!\s)\*\*")
 #: is what keeps the bold pass out of code, where ``**`` must not be touched.
 #: Case-insensitive because Telegram's HTML mode is: ``<PRE>**t**</PRE>`` is a
 #: valid code block, and converting the asterisks inside it to bold would
-#: corrupt real code.
-_CODE_SEGMENT_RE = re.compile(r"(<pre>[\s\S]*?</pre>|<code>[\s\S]*?</code>)", re.IGNORECASE)
+#: corrupt real code. Whitespace before ``>`` is accepted by the sanitizer too,
+#: so the two passes must agree on what counts as a code segment.
+_CODE_SEGMENT_RE = re.compile(
+    r"(<pre\s*>[\s\S]*?</pre\s*>|<code\s*>[\s\S]*?</code\s*>)",
+    re.IGNORECASE,
+)
 
 
 def markdown_bold_to_html(text: str) -> str:

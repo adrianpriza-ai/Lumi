@@ -39,7 +39,7 @@ from .agent import Agent, PendingAction, TurnHooks, TurnResult
 from .artifacts import Artifact, ArtifactError, ArtifactStore
 from .config import Config, ConfigError, validate
 from .doctor import platform_line, run_checks
-from .memory import History, MemoryFile
+from .memory import History, MemoryFile, MemoryStore
 from .personality import Personality
 from .util.log import get_logger
 from .util.text import (
@@ -81,40 +81,42 @@ HELP_TEXT = """\
 just talk to me. i remember you between sessions, look things up on the web,
 read and write files in this project, and run shell commands.
 
-send me a photo and i'll look at it. add a caption to tell me what to look for.
-send me a document and i'll read it — it lands in workspace/uploads/ and i can
-work with it from there. ask me to make a file and i'll send it back as one.
+send a photo (the caption tells me what to look for) or a document — it lands
+in workspace/uploads/ and i work with it from there. ask me to make a file and
+i'll send it back as one.
 
 while i'm working you'll see a small live note above my answer — thinking, then
 each thing i run. the thinking itself stays in my head; the note only shows the
 steps.
 
 <b>slash commands</b>
-<code>/help</code> — this list
-<code>/ask &lt;question&gt;</code> — same as just typing
-<code>/run &lt;command&gt;</code> — run a shell command directly
-<code>/search &lt;query&gt;</code> — web search
-<code>/fetch &lt;url&gt;</code> — read a page
-<code>/reasoning</code> — reasoning setup, or <code>on</code>/<code>off</code> to show or hide the live step list
-<code>/memory</code> — show what i remember
+<code>/memory</code> — show what i remember in this chat
 <code>/remember &lt;fact&gt;</code> — save a fact
 <code>/forget [n]</code> — drop the last n saved facts
 <code>/personality</code> — show the personality file
-<code>/tools</code> — list my tools
+<code>/reasoning</code> — reasoning setup, or <code>on</code>/<code>off</code> to show or hide the live step list
 <code>/context</code> — what i'm holding in my context window right now
 <code>/status</code> — model, tools and provider health
 <code>/doctor</code> — diagnose the whole setup
-<code>/config</code> — the resolved configuration this process runs on (owner only)
-<code>/env</code> — which credentials are set, values masked (owner only)
 <code>/reload</code> — re-read personality, memory and config
 <code>/reset</code> — forget this conversation (keeps long-term memory)
-<code>/whitelist</code> — show whitelisted users and groups (owner only)
-<code>/whitelist_add_user &lt;id&gt;</code> — add a user to the whitelist (owner only)
-<code>/whitelist_remove_user &lt;id&gt;</code> — remove a user from the whitelist (owner only)
-<code>/whitelist_add_group &lt;id&gt;</code> — add a group to the whitelist (owner only)
-<code>/whitelist_remove_group &lt;id&gt;</code> — remove a group from the whitelist (owner only)
 
 dangerous commands ask for confirmation first. i can't delete that, on purpose.
+owner commands live in <code>/own_help</code>.
+"""
+
+#: The owner-only commands, listed by ``/own_help`` and nowhere else. Kept
+#: out of :data:`HELP_TEXT` so ``/start`` stays a glance, not a manual — and
+#: so a whitelisted user in a shared group never sees the backend inventory.
+OWNER_HELP_TEXT = """\
+<b>owner commands</b>
+<code>/config</code> — the resolved configuration this process runs on
+<code>/env</code> — which credentials are set, values masked
+<code>/whitelist</code> — show whitelisted users and groups
+<code>/whitelist_add_user &lt;id&gt;</code> — add a user to the whitelist
+<code>/whitelist_remove_user &lt;id&gt;</code> — remove a user from the whitelist
+<code>/whitelist_add_group &lt;id&gt;</code> — add a group to the whitelist
+<code>/whitelist_remove_group &lt;id&gt;</code> — remove a group from the whitelist
 """
 
 NOT_AUTHORISED = "this bot is private. your id is not whitelisted."
@@ -302,7 +304,7 @@ def _should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, config: Co
 
     - ``"mention"`` (default): only respond when the bot is mentioned
       (``@Lumi_a_bot``), replied to, or sent a slash command targeting this bot
-      (``/help@Lumi_a_bot``). Plain ``/help`` in a group is left alone because
+      (``/start@Lumi_a_bot``). Plain ``/start`` in a group is left alone because
       Telegram routes commands without ``@botname`` to whichever bot claims
       them first.
     - ``"always"``: respond to every owner message regardless of chat type.
@@ -340,7 +342,7 @@ def _is_addressed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     Three positive signals, any one of which is enough:
 
     1. The text starts with a slash command that names this bot
-       (e.g. ``/help@Lumi_a_bot``). Plain ``/help`` is *not* enough — Telegram
+       (e.g. ``/start@Lumi_a_bot``). Plain ``/start`` is *not* enough — Telegram
        routes that to whichever bot owns the command, so acting on it would
        be presumptuous.
     2. The message is a reply to a message sent by this bot.
@@ -886,6 +888,18 @@ def build_handlers(config: Config) -> list[Any]:
         chat = update.effective_chat
         return chat.id if chat else 0
 
+    def memory_of(update: Update, context: ContextTypes.DEFAULT_TYPE) -> MemoryFile:
+        """The long-term memory scoped to the chat this update arrived in.
+
+        A private chat resolves to that user's own memory file and a group to
+        the group's — the same file the model's prompt and the `memory` tool
+        use for this chat, so /memory, /remember and /forget act on exactly
+        what the bot remembers *here*.
+        """
+        store: MemoryStore = context.application.bot_data["memory"]
+        cfg: Config = context.application.bot_data.get("config", config)
+        return store.get(cfg.memory_scope_of(chat_of(update) or None))
+
     def hooks_for(update: Update, context: ContextTypes.DEFAULT_TYPE) -> TurnHooks:
         """Wire one turn to the chat: mid-turn messages reply live, and the
         step feed (unless the owner turned traces off) grows above the answer.
@@ -925,65 +939,42 @@ def build_handlers(config: Config) -> list[Any]:
         user = update.effective_user
         name = escape_html(user.first_name) if user else "there"
         log.info("start from %s (%s)", name, user and user.id)
-        await reply(
-            update,
-            f"hey {name}. i'm up.\n\n{HELP_TEXT}\n\n"
-            f"model: <code>{escape_html(config.llm.model_of())}</code> via {escape_html(config.llm.base_url_of())}\n"
-            f"tools: {escape_html(', '.join(agent_of(context).registry.names()) or 'none')}",
-        )
+        await reply(update, f"hey {name}. i'm up.\n\n{HELP_TEXT}")
 
     async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """``/help`` is no longer the list — it points at ``/start`` instead.
+
+        The command itself stays one hop wide on purpose: anyone who types it
+        (muscle memory, an old message, a client with it in the menu) gets a
+        one-line redirect rather than "i don't know /help".
+        """
         if not await authorised(update):
             return
-        await reply(update, HELP_TEXT)
+        await reply(update, "the list lives on <code>/start</code> — send that.")
 
-    async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def own_help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """The owner-only commands, for the owner only.
+
+        Double-gated like ``/config`` and ``/env``: the handler filter admits
+        owner *and* whitelisted users, so the explicit ``_is_owner`` check
+        inside is what makes this owner-only. A whitelisted user in a shared
+        group must not collect the backend's command inventory from a help
+        text.
+        """
         if not await authorised(update):
             return
-        text = " ".join(context.args).strip() if context.args else ""
-        if not text:
-            await reply(update, "usage: <code>/ask &lt;question&gt;</code>")
+        user = update.effective_user
+        if user is None or not _is_owner(user, config):
+            await reply(update, NOT_OWNER_SENSITIVE)
             return
-        await run_agent(update, context, text)
-
-    # -- direct tool invocations ------------------------------------------- #
-
-    async def run_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await authorised(update):
-            return
-        command = " ".join(context.args).strip() if context.args else ""
-        if not command:
-            await reply(
-                update,
-                "usage: <code>/run &lt;command&gt;</code>\ne.g. <code>/run git status --short</code>",
-            )
-            return
-        await run_tool(update, context, "run_shell", {"command": command})
-
-    async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await authorised(update):
-            return
-        query = " ".join(context.args).strip() if context.args else ""
-        if not query:
-            await reply(update, "usage: <code>/search &lt;query&gt;</code>")
-            return
-        await run_tool(update, context, "web", {"action": "search", "query": query})
-
-    async def fetch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await authorised(update):
-            return
-        url = " ".join(context.args).strip() if context.args else ""
-        if not url:
-            await reply(update, "usage: <code>/fetch &lt;url&gt;</code>")
-            return
-        await run_tool(update, context, "web", {"action": "fetch", "url": url})
+        await reply(update, OWNER_HELP_TEXT)
 
     # -- memory ------------------------------------------------------------ #
 
     async def memory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await authorised(update):
             return
-        memory: MemoryFile = context.application.bot_data["memory"]
+        memory = memory_of(update, context)
         memory.ensure_loaded()
         stats = memory.stats()
         # The chat view is a window onto the file, so it shows what the model
@@ -1017,8 +1008,7 @@ def build_handlers(config: Config) -> list[Any]:
         if not fact:
             await reply(update, "usage: `/remember <fact>`")
             return
-        memory: MemoryFile = context.application.bot_data["memory"]
-        await reply(update, memory.remember(fact, source="chat"))
+        await reply(update, memory_of(update, context).remember(fact, source="chat"))
 
     async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await authorised(update):
@@ -1032,8 +1022,7 @@ def build_handlers(config: Config) -> list[Any]:
                     update, "usage: <code>/forget [count]</code> — count has to be a number"
                 )
                 return
-        memory: MemoryFile = context.application.bot_data["memory"]
-        removed = memory.forget(count)
+        removed = memory_of(update, context).forget(count)
         if not removed:
             await reply(update, "nothing to forget — there are no saved facts.")
             return
@@ -1051,12 +1040,6 @@ def build_handlers(config: Config) -> list[Any]:
             f"<b>PERSONALITY.md</b> — {len(personality.text)} chars\n\n"
             + sanitize_html(personality.text),
         )
-
-    async def tools_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await authorised(update):
-            return
-        registry = agent_of(context).registry
-        await reply(update, f"<b>tools</b>\n\n{registry.describe(html=True)}")
 
     async def reasoning_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Report the reasoning setup, and toggle the live step list.
@@ -1180,7 +1163,7 @@ def build_handlers(config: Config) -> list[Any]:
         """Owner-only credential status, masked.
 
         Deliberately never prints a full key: the double gate (owner filter on
-        the handler, explicit check inside) is the same defence as ``/run``,
+        the handler, explicit check inside) is the same defence as ``/own_help``,
         but the payload here would be credentials, so the values themselves are
         masked too. See :func:`_mask` for why.
         """
@@ -1461,7 +1444,7 @@ def build_handlers(config: Config) -> list[Any]:
         # context.args is None when a command was sent with no arguments, so the
         # name has to come from the text itself.
         command = text.split(maxsplit=1)[0] if text.strip() else "that"
-        await reply(update, f"i don't know <code>{escape_html(command)}</code>. try /help for what i can do.")
+        await reply(update, f"i don't know <code>{escape_html(command)}</code>. try /start for what i can do.")
 
     async def on_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Anyone who is not the owner gets one clear sentence and nothing else.
@@ -1496,21 +1479,6 @@ def build_handlers(config: Config) -> list[Any]:
                 )
             except Exception as exc:  # noqa: BLE001 - a crash must not kill the bot
                 log.exception("agent turn failed")
-                await reply(update, f"i broke on that: {format_error(exc)}")
-                return
-        await deliver(update, result, config)
-
-    async def run_tool(
-        update: Update, context: ContextTypes.DEFAULT_TYPE, tool: str, arguments: dict[str, Any]
-    ) -> None:
-        agent = agent_of(context)
-        chat_id = chat_of(update)
-        hooks = hooks_for(update, context)
-        async with _Typing(context.bot, chat_id):
-            try:
-                result = await agent.run_tool(chat_id, tool, arguments, hooks=hooks)
-            except Exception as exc:  # noqa: BLE001
-                log.exception("tool %s failed", tool)
                 await reply(update, f"i broke on that: {format_error(exc)}")
                 return
         await deliver(update, result, config)
@@ -1593,22 +1561,28 @@ def build_handlers(config: Config) -> list[Any]:
         # Every command is wrapped in ``gated`` so the group/mention rule
         # applies uniformly: in a group, only addressed commands run.
         CommandHandler("start", gated(start), filters=owner_filter),
+        # /help used to be the command list; it now points at /start.
         CommandHandler("help", gated(help_command), filters=owner_filter),
-        CommandHandler("ask", gated(ask), filters=owner_filter),
-        CommandHandler("run", gated(run_command), filters=owner_filter),
-        CommandHandler("search", gated(search_command), filters=owner_filter),
-        CommandHandler("fetch", gated(fetch_command), filters=owner_filter),
         CommandHandler("memory", gated(memory_command), filters=owner_filter),
         CommandHandler("remember", gated(remember_command), filters=owner_filter),
         CommandHandler("forget", gated(forget_command), filters=owner_filter),
         CommandHandler("personality", gated(personality_command), filters=owner_filter),
-        CommandHandler("tools", gated(tools_command), filters=owner_filter),
         CommandHandler("reasoning", gated(reasoning_command), filters=owner_filter),
         CommandHandler("context", gated(context_command), filters=owner_filter),
         CommandHandler("status", gated(status_command), filters=owner_filter),
         CommandHandler("doctor", gated(doctor_command), filters=owner_filter),
         # Owner only, checked inside each handler on top of the filter: these
         # expose the backend (endpoint, layout, credential inventory).
+        # Owner-only help: the backend commands, for the owner alone.
+        # ``/own-help`` is also accepted, but only via a regex match below:
+        # Telegram commands allow letters, digits and underscores only
+        # (clients autocomplete ``/own_help``), and PTB's CommandHandler
+        # rejects a hyphen outright with a ValueError at build time.
+        CommandHandler("own_help", gated(own_help_command), filters=owner_filter),
+        MessageHandler(
+            callback=gated(own_help_command),
+            filters=filters.Regex(r"^/own-help(?:\s|$|@)") & owner_filter,
+        ),
         CommandHandler("config", gated(config_command), filters=owner_filter),
         CommandHandler("env", gated(env_command), filters=owner_filter),
         CommandHandler("reload", gated(reload_command), filters=owner_filter),
@@ -1681,8 +1655,7 @@ def build_application(config: Config, agent: Agent | None = None, *, bot: Any = 
     if problems:
         log.error("configuration problems:\n  - %s", "\n  - ".join(problems))
 
-    memory = agent.memory if agent else MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    memory.load()
+    store = agent.memory if agent else config.build_memory_store()
     personality = agent.personality if agent else Personality.load(config.personality_file)
     history = agent.history if agent else History(config.history_dir)
 
@@ -1696,13 +1669,13 @@ def build_application(config: Config, agent: Agent | None = None, *, bot: Any = 
     application = builder.post_init(_post_init).post_shutdown(_post_shutdown).build()
 
     application.bot_data["config"] = config
-    application.bot_data["memory"] = memory
+    application.bot_data["memory"] = store
     application.bot_data["personality"] = personality
     application.bot_data["history"] = history
     application.bot_data["artifacts"] = ArtifactStore(
         config.root, max_bytes=max(1, config.bot.max_upload_mb) * 1024 * 1024
     )
-    application.bot_data["agent"] = agent or Agent(config, personality, memory, history)
+    application.bot_data["agent"] = agent or Agent(config, personality, store, history)
 
     for handler in build_handlers(config):
         application.add_handler(handler)

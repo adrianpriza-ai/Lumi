@@ -152,12 +152,11 @@ def test_chat_prints_the_answer_after_an_approval(config, capsys, monkeypatch) -
 
     from lumi import __main__ as cli
     from lumi.agent import Agent
-    from lumi.memory import History, MemoryFile
+    from lumi.memory import History
     from lumi.personality import Personality
     from lumi.tools import build_registry
 
-    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    memory.load()
+    memory = config.build_memory_store()
     agent = Agent(
         config=config,
         personality=Personality.load(config.personality_file),
@@ -194,7 +193,7 @@ def test_chat_memory_shares_the_window_with_the_prompt(config, capsys, monkeypat
 
     from lumi import __main__ as cli
     from lumi.agent import Agent
-    from lumi.memory import MANAGED_END, MANAGED_START, History, MemoryFile
+    from lumi.memory import MANAGED_END, MANAGED_START, History
     from lumi.personality import Personality
     from lumi.tools import build_registry
 
@@ -207,8 +206,7 @@ def test_chat_memory_shares_the_window_with_the_prompt(config, capsys, monkeypat
         encoding="utf-8",
     )
 
-    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    memory.load()
+    memory = config.build_memory_store()
     agent = Agent(
         config=config,
         personality=Personality.load(config.personality_file),
@@ -227,7 +225,7 @@ def test_chat_memory_shares_the_window_with_the_prompt(config, capsys, monkeypat
     assert asyncio.run(cli._chat(config)) == 0
     out = capsys.readouterr().out
     assert "elided" in out  # bounded by the window share, not printed whole
-    assert len(out) < len(memory.text)
+    assert len(out) < len(memory.get(config.default_memory_scope).text)
 
 
 def test_ask_without_a_question_is_rejected_by_argparse(config) -> None:
@@ -275,14 +273,13 @@ def test_chat_silences_live_steps_when_show_reasoning_is_false(config, capsys, m
 
     from lumi import __main__ as cli
     from lumi.agent import Agent
-    from lumi.memory import History, MemoryFile
+    from lumi.memory import History
     from lumi.personality import Personality
     from lumi.tools import build_registry
 
     config.llm.show_reasoning = False
 
-    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    memory.load()
+    memory = config.build_memory_store()
     agent = Agent(
         config=config,
         personality=Personality.load(config.personality_file),
@@ -322,14 +319,13 @@ def test_chat_prints_live_steps_when_show_reasoning_is_true(config, capsys, monk
 
     from lumi import __main__ as cli
     from lumi.agent import Agent
-    from lumi.memory import History, MemoryFile
+    from lumi.memory import History
     from lumi.personality import Personality
     from lumi.tools import build_registry
 
     config.llm.show_reasoning = True
 
-    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    memory.load()
+    memory = config.build_memory_store()
     agent = Agent(
         config=config,
         personality=Personality.load(config.personality_file),
@@ -369,12 +365,11 @@ def test_chat_reasoning_command_in_repl(config, capsys, monkeypatch) -> None:
 
     from lumi import __main__ as cli
     from lumi.agent import Agent
-    from lumi.memory import History, MemoryFile
+    from lumi.memory import History
     from lumi.personality import Personality
     from lumi.tools import build_registry
 
-    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    memory.load()
+    memory = config.build_memory_store()
     agent = Agent(
         config=config,
         personality=Personality.load(config.personality_file),

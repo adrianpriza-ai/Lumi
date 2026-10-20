@@ -3,8 +3,8 @@
 One user message becomes a bounded conversation with the model:
 
 1. build the system prompt from a hardcoded conduct block (how the bot works,
-   what it refuses) + ``PERSONALITY.md`` (the voice) + ``MEMORY.md`` + live
-   facts,
+   what it refuses) + ``PERSONALITY.md`` (the voice) + the chat's scoped
+   ``MEMORY.md`` + live facts,
 2. replay recent history so the bot remembers what you said ten messages ago,
 3. call the model, execute whatever tools it asks for, feed the results back,
 4. repeat until it produces prose or hits ``llm.max_tool_iterations``.
@@ -35,7 +35,7 @@ from .config import Config
 from .context import ContextReport, ContextWindow
 from .llm import LLMClient, ToolCall, build_llm
 from .llm.base import USAGE_REASONING, LLMError, LLMReply
-from .memory import History, MemoryFile
+from .memory import History, MemoryFile, MemoryStore
 from .paths import relative_to_root
 from .personality import Personality
 from .tools import NeedsApproval, ToolContext, ToolRegistry, build_registry
@@ -81,7 +81,8 @@ CONDUCT_PREAMBLE = """\
   unsure whether something is true, say so and go check.
 - Use the web tools whenever a question depends on anything current or
   specific, rather than answering from memory.
-- Keep MEMORY.md tidy: short declarative facts, one per line, no transcripts.
+- Keep your memory files tidy: short declarative facts, one per line, no
+  transcripts.
 
 ## Boundaries
 
@@ -118,7 +119,8 @@ When you use a tool:
   `upload: true` (or call the `upload` action on an existing file). The file
   arrives in the chat as a document automatically — never paste file contents
   into the message as a substitute.
-- Save durable facts about the owner with the `memory` tool, sparingly.
+- Save durable facts with the `memory` tool, sparingly. Memory is scoped to
+  this chat: what you learn here is not visible in any other chat.
 - To say something to the owner *while you are still working* — a progress
   update on long work, or an answer you want to deliver in parts — call
   `send`. It reaches the chat immediately; your final reply is still
@@ -276,13 +278,15 @@ class Agent:
         self,
         config: Config,
         personality: Personality,
-        memory: MemoryFile,
+        memory: MemoryStore,
         history: History,
         registry: ToolRegistry | None = None,
         llm: LLMClient | None = None,
     ) -> None:
         self.config = config
         self.personality = personality
+        #: Scoped long-term memory: one MEMORY.md per chat, handed out by
+        #: :class:`~lumi.memory.MemoryStore` — never a single shared file.
         self.memory = memory
         self.history = history
         self.registry = registry if registry is not None else build_registry(config, memory)
@@ -302,10 +306,19 @@ class Agent:
         """
         return self.context.memory_limit()
 
-    def system_prompt(self) -> str:
+    def memory_for(self, chat_id: int | str | None) -> MemoryFile:
+        """The long-term memory file scoped to *chat_id*.
+
+        A private chat resolves to that user's memory and a group chat to the
+        group's, so the prompt, the tools and the chat commands all read and
+        write the same file per chat — and never another chat's.
+        """
+        return self.memory.get(self.config.memory_scope_of(chat_id))
+
+    def system_prompt(self, chat_id: int | str | None = None) -> str:
         now = datetime.now(UTC)
         limit = self.memory_limit()
-        memory_block = self.memory.for_prompt(limit)
+        memory_block = self.memory_for(chat_id).for_prompt(limit)
         parts = [
             self.personality.text,
             CONDUCT_PREAMBLE,
@@ -321,11 +334,13 @@ class Agent:
             FORMAT_PREAMBLE,
             "## Long-term memory\n\n"
             + (
-                "This is your memory file. It persists across conversations. Anything "
-                "marked as elided below is still on disk, just too old to send — say so "
-                "rather than pretending you were never told.\n\n"
+                "This is the long-term memory for this chat. It persists across "
+                "conversations; other chats have their own memories that you cannot "
+                "see. Anything marked as elided below is still on disk, just too old "
+                "to send — say so rather than pretending you were never told.\n\n"
                 if "[older remembered fact" in memory_block or "[older memory elided]" in memory_block
-                else "This is your memory file. It persists across conversations.\n\n"
+                else "This is the long-term memory for this chat. It persists across "
+                "conversations; other chats have their own memories that you cannot see.\n\n"
             )
             + memory_block,
         ]
@@ -342,7 +357,7 @@ class Agent:
         conv.touched = time.monotonic()
         if not conv.seeded:
             conv.seeded = True
-            conv.messages.append({"role": "system", "content": self.system_prompt()})
+            conv.messages.append({"role": "system", "content": self.system_prompt(chat_id)})
             self.context.replay(conv)
         return conv
 
@@ -448,7 +463,7 @@ class Agent:
     def _refresh_system_prompt(self, conv: Conversation) -> None:
         """Keep the system prompt current without losing the message history."""
         if conv.messages and conv.messages[0].get("role") == "system":
-            conv.messages[0]["content"] = self.system_prompt()
+            conv.messages[0]["content"] = self.system_prompt(conv.chat_id)
 
     # -- the loop ---------------------------------------------------------- #
 
@@ -766,7 +781,7 @@ class Agent:
             resumed.artifacts.extend(tool_result.artifacts)
         return resumed
 
-    # -- direct invocation (used by /run, /search, /fetch) ----------------- #
+    # -- direct invocation (one tool outside the model loop) ---------------- #
 
     async def run_tool(
         self,
@@ -779,16 +794,16 @@ class Agent:
     ) -> TurnResult:
         """Call one tool outside the model loop and continue the conversation.
 
-        This is what ``/run``, ``/search`` and ``/fetch`` use: the owner asked for
-        a specific action, so it runs directly, and the model is then asked to
-        narrate the result so the chat still reads like a conversation.
+        For a caller that already knows the action: the tool runs without a
+        model turn first, and the model is then asked to narrate the result so
+        the chat still reads like a conversation.
         """
         conv = self.conversation(chat_id)
         self._refresh_system_prompt(conv)
         ctx = self._context(source, chat_id, hooks)
 
         # Announced like any model-driven call: the feed promises to show each
-        # tool the bot runs, and a direct /run is one of those.
+        # tool the bot runs, and a direct invocation is one of those.
         await self._step(hooks, "tool", tool)
         try:
             tool_result = await self.registry.invoke(tool, arguments, ctx)
@@ -816,15 +831,18 @@ class Agent:
             }
         )
         # Seed the counter so the caller can see the direct call happened.
-        return await self._loop(conv, ctx, tools_used=[tool], hooks=hooks)
+        resumed = await self._loop(conv, ctx, tools_used=[tool], hooks=hooks)
+        if tool_result.artifacts:
+            resumed.artifacts.extend(tool_result.artifacts)
+        return resumed
 
     # -- maintenance ------------------------------------------------------- #
 
     def reload(self) -> list[str]:
         """Re-read config-driven prompt sources. Returns human-readable notes."""
         notes = [self.personality.reload()]
-        self.memory.load()
-        notes.append(f"memory reloaded ({self.memory.stats()['bullet_count']} bullets)")
+        scopes = self.memory.reload()
+        notes.append(f"memory reloaded ({scopes} scope(s) in use)")
         for chat_id, conv in self._conversations.items():
             self._refresh_system_prompt(conv)
             self.history.append(chat_id, "system", "reloaded personality and memory")

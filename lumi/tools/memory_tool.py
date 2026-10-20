@@ -1,9 +1,13 @@
-"""The ``memory`` tool: let the model read and append to MEMORY.md.
+"""The ``memory`` tool: let the model read and append to its scoped MEMORY.md.
 
 Deliberately asymmetric. The model can ``remember`` and ``recall``, but it can
 never ``forget``: erasing something the owner told it is a human decision, made
 with ``/forget`` in the chat. A prompt injection that convinces the model to
 "forget the security rules" should not be able to rewrite the operator's notes.
+
+Scope is the chat the call came from: a group's memories stay in the group and
+a private chat's stay with that user, so nothing learned in one conversation is
+reachable from another.
 """
 
 from __future__ import annotations
@@ -11,7 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..config import Config
-from ..memory import MemoryFile
+from ..memory import MemoryFile, MemoryStore
 from ..util.log import get_logger
 from ..util.text import truncate
 from .base import Tool, ToolContext, ToolError, ToolResult
@@ -22,18 +26,18 @@ log = get_logger(__name__)
 class MemoryTool(Tool):
     name = "memory"
     description = """
-Your long-term memory, stored as a markdown file you can also read and edit by hand.
+Your long-term memory for this chat, stored as a markdown file you can also read and edit by hand.
 
 Actions:
-- `remember`: save one short, durable fact about the owner or their work. Phrase
-  it as a standalone statement, not a transcript. Do not save secrets, and do
-  not save anything the owner asked you to forget.
+- `remember`: save one short, durable fact about this chat, the owner or their
+  work. Phrase it as a standalone statement, not a transcript. Do not save
+  secrets, and do not save anything the owner asked you to forget.
 - `recall`: search existing memories. Useful when the owner refers to something
   you do not have in the conversation.
 - `show`: print the whole file.
 
 Saving is cheap and useful, but be selective: memories are injected into every
-future conversation, so trivia crowds out signal. One fact per call.
+future conversation in this chat, so trivia crowds out signal. One fact per call.
 """.strip()
 
     parameters = {
@@ -57,10 +61,14 @@ future conversation, so trivia crowds out signal. One fact per call.
         "additionalProperties": False,
     }
 
-    def __init__(self, config: Config, memory: MemoryFile) -> None:
+    def __init__(self, config: Config, memory: MemoryStore) -> None:
         self.config = config
         self.settings = config.tools.memory
-        self.memory = memory
+        self.store = memory
+
+    def memory_for(self, ctx: ToolContext) -> MemoryFile:
+        """The memory file scoped to the chat this call came from."""
+        return self.store.get(self.config.memory_scope_of(ctx.chat_id))
 
     def available(self) -> tuple[bool, str]:
         if not self.settings.enabled:
@@ -69,7 +77,8 @@ future conversation, so trivia crowds out signal. One fact per call.
 
     async def invoke(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         action = str(arguments.get("action", "")).strip().lower()
-        self.memory.ensure_loaded()
+        memory = self.memory_for(ctx)
+        memory.ensure_loaded()
 
         if action == "remember":
             if not self.settings.auto_remember:
@@ -80,14 +89,14 @@ future conversation, so trivia crowds out signal. One fact per call.
             fact = arguments.get("fact")
             if not isinstance(fact, str) or not fact.strip():
                 raise ToolError("fact is required when action is 'remember'")
-            message = self.memory.remember(fact, source=ctx.source)
+            message = memory.remember(fact, source=ctx.source)
             return ToolResult(text=message, data={"fact": fact}, summary=truncate(message, 100, "…"))
 
         if action == "recall":
             query = str(arguments.get("query") or "").strip()
             if not query:
                 raise ToolError("query is required when action is 'recall'")
-            hits = self.memory.search(query, limit=15)
+            hits = memory.search(query, limit=15)
             if not hits:
                 return ToolResult(text=f"no memories match {query!r}", data={"hits": []})
             body = "\n".join(f"- {hit}" for hit in hits)
@@ -98,11 +107,11 @@ future conversation, so trivia crowds out signal. One fact per call.
             )
 
         if action == "show":
-            managed = self.memory.managed()
-            body = self.memory.for_prompt()
+            managed = memory.managed()
+            body = memory.for_prompt()
             return ToolResult(
                 text=body,
-                data={"managed": managed, "stats": self.memory.stats()},
+                data={"managed": managed, "stats": memory.stats()},
                 summary=f"showed memory ({len(managed)} managed facts)",
             )
 
@@ -110,4 +119,4 @@ future conversation, so trivia crowds out signal. One fact per call.
 
     def summary_line(self) -> str:
         mode = "read + append" if self.settings.auto_remember else "read only"
-        return f"`{self.name}` — long-term memory in MEMORY.md ({mode}; forget is human-only)"
+        return f"`{self.name}` — long-term memory for this chat ({mode}; forget is human-only)"

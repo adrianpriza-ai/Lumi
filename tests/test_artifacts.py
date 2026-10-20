@@ -313,12 +313,11 @@ def test_the_schema_advertises_upload(files: FilesTool) -> None:
 
 async def test_the_agent_collects_artifacts_into_the_turn(config) -> None:
     from lumi.agent import Agent
-    from lumi.memory import History, MemoryFile
+    from lumi.memory import History
     from lumi.personality import Personality
     from lumi.tools import build_registry
 
-    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    memory.load()
+    memory = config.build_memory_store()
     agent = Agent(
         config,
         Personality.load(config.personality_file),
@@ -356,12 +355,11 @@ async def test_the_agent_collects_artifacts_into_the_turn(config) -> None:
 
 async def test_a_turn_without_uploads_collects_no_artifacts(config) -> None:
     from lumi.agent import Agent
-    from lumi.memory import History, MemoryFile
+    from lumi.memory import History
     from lumi.personality import Personality
     from lumi.tools import build_registry
 
-    memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-    memory.load()
+    memory = config.build_memory_store()
     agent = Agent(
         config,
         Personality.load(config.personality_file),

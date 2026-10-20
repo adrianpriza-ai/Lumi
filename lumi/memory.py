@@ -1,9 +1,14 @@
 """Two kinds of memory.
 
-``MEMORY.md``
-    Curated, human-readable long-term facts. The model sees all of it (up to a
-    character cap) before every message and can append to it. You can edit it by
-    hand; lines you wrote are never rewritten.
+Per-chat ``MEMORY.md`` files
+    Curated, human-readable long-term facts, one file per chat under
+    ``data/memory/<chat_id>/MEMORY.md``. A private chat's id is the user's id
+    and a group's id is the group's, so every conversation gets its own
+    memory: what the bot learns in one group stays there, and never leaks
+    into a private chat or another group. The model sees all of its current
+    chat's file (up to a character cap) before every message and can append
+    to it. You can edit any of them by hand; lines you wrote are never
+    rewritten. :class:`MemoryStore` hands out the per-scope files.
 
 ``data/history/<chat_id>.jsonl``
     Append-only transcripts. Prior turns are replayed into the prompt so the bot
@@ -26,6 +31,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 from uuid import uuid4
 
 from .util.log import get_logger
@@ -119,7 +125,7 @@ class MemoryFile:
         except OSError:
             current = 0.0
         if current != self._mtime:
-            log.debug("MEMORY.md changed on disk; reloading")
+            log.debug("%s changed on disk; reloading", self.path)
             self.load()
 
     # -- managed region ---------------------------------------------------- #
@@ -340,6 +346,117 @@ class MemoryFile:
             "budget": budget,
             "dropped": dropped,
             "over": bool(budget > 0 and len(self.text) > budget),
+        }
+
+
+# --------------------------------------------------------------------------- #
+# Scoped memory: one MEMORY.md per chat
+# --------------------------------------------------------------------------- #
+
+def scope_slug(scope: int | str) -> str:
+    """Return a filesystem-safe, collision-free directory name for a scope id.
+
+    Telegram ids stay readable (``-100123`` remains ``-100123``), while other
+    characters are percent-encoded instead of collapsed. Collapsing ``a/b``
+    and ``a_b`` into the same directory would make two otherwise distinct
+    scopes share memory, which is worse than a slightly less pretty path.
+    """
+    raw = str(scope).strip()
+    if not raw:
+        return "default"
+    # ``quote`` leaves ``.`` unescaped as an RFC 3986 unreserved character;
+    # encode it explicitly so neither ``.`` nor ``..`` can be path components.
+    return quote(raw, safe="-_~").replace(".", "%2E")
+
+
+@dataclass(slots=True)
+class MemoryStore:
+    """One ``MEMORY.md`` per scope, at ``<directory>/<scope>/MEMORY.md``.
+
+    A scope is a chat: a private chat's id is the user's id and a group's id
+    is the group's, so each conversation has its own long-term memory and
+    nothing learned in one chat is visible in another — the same isolation
+    the transcripts already have, extended to what the bot *remembers*.
+
+    Markdown over a database, deliberately: the file is the interface. You can
+    read it, edit it, grep it and diff it, and the safety rule still holds —
+    the bot may only ever append inside the managed region, so a hand-written
+    line is never rewritten no matter what a prompt injection asks for.
+
+    ``default_scope`` is the memory used when there is no chat to scope by —
+    the CLI — and it is also the only scope seeded from a legacy single-file
+    ``MEMORY.md``: the old file held the owner's notes, and copying those into
+    every new group's memory would be the exact leak this design exists to
+    prevent.
+    """
+
+    #: Directory holding one subdirectory per scope, e.g. ``data/memory``.
+    directory: Path
+    #: Cap on the block each scope injects into the system prompt (see
+    #: :class:`MemoryFile`); 0 means the window share decides.
+    max_chars: int = 0
+    #: Legacy single-file memory, copied into the default scope the first time
+    #: that scope is opened. ``None`` disables the migration.
+    seed_file: Path | None = None
+    #: Scope used when a caller has no chat id (CLI, doctor).
+    default_scope: str = "default"
+
+    _files: dict[str, MemoryFile] = field(default_factory=dict, init=False, repr=False)
+
+    def path_for(self, scope: int | str) -> Path:
+        return self.directory / scope_slug(scope) / "MEMORY.md"
+
+    def get(self, scope: int | str) -> MemoryFile:
+        """The memory file for *scope*, created (and seeded) on first use.
+
+        Cached per scope so the bot, the memory tool and the prompt all edit
+        and read the same object; external hand edits are still picked up
+        because :meth:`MemoryFile.ensure_loaded` watches the file's mtime.
+        """
+        slug = scope_slug(scope)
+        memory = self._files.get(slug)
+        if memory is None:
+            path = self.path_for(scope)
+            if not path.is_file() and slug == scope_slug(self.default_scope):
+                self._seed(path)
+            memory = MemoryFile(path, self.max_chars)
+            memory.load()
+            self._files[slug] = memory
+        return memory
+
+    def _seed(self, path: Path) -> None:
+        """Copy the legacy single-file memory into a scope that has no file yet."""
+        if self.seed_file is None or not self.seed_file.is_file():
+            return
+        try:
+            text = self.seed_file.read_text(encoding="utf-8")
+        except OSError as exc:
+            log.warning("could not read seed %s: %s", self.seed_file, exc)
+            return
+        if not text.strip():
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        log.info("seeded %s from legacy %s", path, self.seed_file)
+
+    def scopes(self) -> list[str]:
+        """Scope ids that already have a memory file on disk."""
+        if not self.directory.is_dir():
+            return []
+        return sorted(p.name for p in self.directory.iterdir() if (p / "MEMORY.md").is_file())
+
+    def reload(self) -> int:
+        """Re-read every memory file handed out so far. Returns how many."""
+        for memory in self._files.values():
+            memory.load()
+        return len(self._files)
+
+    def stats(self) -> dict[str, Any]:
+        scopes = self.scopes()
+        return {
+            "directory": str(self.directory),
+            "scopes": len(scopes),
+            "default_scope": self.default_scope,
         }
 
 

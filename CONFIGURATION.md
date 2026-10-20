@@ -130,7 +130,19 @@ turns is how a model starts contradicting the message it was replying to.
 
 ### Memory
 
-`MEMORY.md` is the one part of the prompt with no second chance: the system
+Long-term memory is **one file per chat**: `data/memory/<chat_id>/MEMORY.md`. A
+private chat's id is the user's id and a group's id is the group's, so each
+conversation gets its own memory and nothing learned in one chat is visible in
+another — the same isolation the transcripts already have, extended to what the
+bot remembers. In Telegram `/memory`, `/remember` and `/forget` act on the
+current chat's file; from the terminal `lumi memory` acts on yours (the owner's
+scope, shared with your private chat when `TELEGRAM_OWNER_ID` is set), with
+`--scope <chat_id>` to reach any other chat's file. A legacy single-file
+`MEMORY.md` at the project root is copied once into the owner's scope the first
+time it is opened, and is not read after that.
+
+A chat's memory file is the one part of the prompt with no second chance: the
+system
 prompt is never cut, so an oversized memory file would grow into the window with
 nothing able to reclaim it, and the conversation would quietly get smaller
 instead. It is therefore always bounded — at an eighth of the window by default,
@@ -141,7 +153,8 @@ which is room for hundreds of facts:
 max_memory_chars = 0    # 0 = an eighth of the window (~64k chars at 200k tokens)
 ```
 
-Set a number to cap it harder. When the file does not fit, the **oldest** of the
+Set a number to cap it harder; the cap applies to each chat's memory
+independently. When a file does not fit, the **oldest** of the
 bot's own facts are elided — the recent ones are what it is still acting on, and
 dropping them in favour of ancient ones is how a memory becomes useless while
 still looking full. The hand-written parts of the file (headings, prose, links)

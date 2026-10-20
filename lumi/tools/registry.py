@@ -52,7 +52,8 @@ class ToolRegistry:
         With ``available_only=True`` the list is filtered down to tools that
         can actually run right now — this is what the system prompt uses, so
         the model never sees a tool it cannot call. The default (everything)
-        is what ``/tools`` shows, so the owner can see *why* something is off.
+        is what ``/tools`` in ``lumi chat`` shows, so the owner can see *why*
+        something is off.
 
         With ``html=True`` the same list comes back as Telegram HTML —
         ``<code>`` around tool names, ``&lt;unavailable: …&gt;`` annotations —

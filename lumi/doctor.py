@@ -14,7 +14,6 @@ import sys
 from dataclasses import dataclass
 
 from .config import Config
-from .memory import MemoryFile
 from .paths import relative_to_root
 from .tools import safety
 from .tools.registry import ToolRegistry
@@ -100,15 +99,15 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
             str(config.config_path) if config.config_path else "no config.toml; using built-in defaults",
         )
     )
-    for label, path in (
-        ("PERSONALITY.md", config.personality_file),
-        ("MEMORY.md", config.memory_file),
-    ):
-        checks.append(Check(label, OK if path.is_file() else FAIL, relative_to_root(path)))
+    checks.append(
+        Check("PERSONALITY.md", OK if config.personality_file.is_file() else FAIL,
+              relative_to_root(config.personality_file))
+    )
 
     for label, path in (
         ("data dir", config.data_dir),
         ("history dir", config.history_dir),
+        ("memory dir", config.memory_dir),
         ("shell cwd", config.shell_cwd),
     ):
         exists = path.is_dir()
@@ -280,9 +279,7 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
         try:
             from .tools import build_registry
 
-            memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-            memory.load()
-            built = build_registry(config, memory)
+            built = build_registry(config, config.build_memory_store())
             for tool in built.all():
                 ok, reason = tool.available()
                 checks.append(Check(f"tool {tool.name}", OK if ok else WARN, reason or tool.summary_line()))
@@ -293,10 +290,14 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
     try:
         from .context import ContextWindow
 
-        memory = MemoryFile(config.memory_file, config.llm.max_memory_chars)
-        memory.load()
+        store = config.build_memory_store()
+        memory = store.get(config.default_memory_scope)
         size = memory.prompt_size(ContextWindow(config).memory_limit())
-        detail = f"{size['chars']:,} chars, {memory.stats()['managed_count']} remembered fact(s)"
+        scopes = store.scopes()
+        detail = (
+            f"{size['chars']:,} chars, {memory.stats()['managed_count']} remembered fact(s) "
+            f"in scope {config.default_memory_scope} · {len(scopes)} chat scope(s) on disk"
+        )
         if size["over"]:
             detail += (
                 f" — over the {size['budget']:,}-char budget, so the oldest "
