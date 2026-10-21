@@ -24,8 +24,11 @@ group_reply_mode = "mention"
 # without lifting the global rule. Telegram chat ids are negative for
 # supergroups; quotes keep them as strings.
 #   always_reply_chats = ["-1001234567890"]
-# Group chat ids allowed to use the bot. Members of these groups can
-# interact with the bot (subject to `group_reply_mode` for non-mentions).
+# Group chat ids allowed to use the bot. Every member of a whitelisted group
+# may talk to the bot there — they do not need to be on `whitelisted_users` —
+# but they still have to mention the bot: the `group_reply_mode` rule applies
+# to whitelisted groups too. Careful: a whitelisted group hands the bot's
+# tools, shell included, to every member of that room.
 # Telegram chat ids are negative for supergroups; quotes keep them as strings.
 #   whitelisted_groups = ["-1001234567890"]
 # User ids allowed to use the bot alongside the owner. These users can

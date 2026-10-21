@@ -59,10 +59,16 @@ class BotConfig:
     #: entirely (commands still work in private chats).
     group_reply_mode: str = "mention"
     #: Chat ids where the bot always replies, regardless of ``group_reply_mode``.
+    #: This is the "no mention ritual in this room" switch — it changes *when*
+    #: the bot answers, not *who* it answers.
     #: Strings to accommodate the negative supergroup ids Telegram hands out.
     always_reply_chats: list[str] = field(default_factory=list)
-    #: Group chat ids allowed to use the bot. Members of these groups can
-    #: interact with the bot (subject to ``group_reply_mode`` for non-mentions).
+    #: Group chat ids allowed to use the bot. Every member of a whitelisted
+    #: group may talk to the bot there (they do not have to be on
+    #: ``whitelisted_users``), but they still have to address it: the mention
+    #: rule of ``group_reply_mode`` applies to whitelisted groups too.
+    #: Note that a whitelisted group hands the bot's tools — including the
+    #: shell — to every member of that room.
     #: Strings to accommodate the negative supergroup ids Telegram hands out.
     whitelisted_groups: list[str] = field(default_factory=list)
     #: User ids allowed to use the bot alongside the owner. These users can

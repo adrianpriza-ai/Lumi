@@ -910,6 +910,113 @@ async def test_group_chat_does_not_reply_to_a_reply_to_a_human(config) -> None:
     assert bot.sent == []
 
 
+async def test_group_chat_does_not_reply_to_a_reply_to_another_bot(config) -> None:
+    """A reply to *another* bot in the room is not a reply to this bot.
+
+    "is a bot" is not enough: the reply has to be one of ours, matched by
+    username. Otherwise every bot in a group would answer every reply.
+    """
+    reply_to_other_bot = {
+        "message_id": 99,
+        "date": int(time.time()),
+        "chat": {"id": GROUP_CHAT, "type": "supergroup", "title": "Lab"},
+        "from": {
+            "id": 54321,
+            "is_bot": True,
+            "first_name": "Some Other Bot",
+            "username": "some_other_bot",
+        },
+        "text": "an earlier message from another bot",
+    }
+    bot, agent = await send(
+        config,
+        [make_reply("should never fire")],
+        "ok",
+        chat_id=GROUP_CHAT,
+        chat_type="supergroup",
+        reply_to_message=reply_to_other_bot,
+    )
+    assert bot.sent == []
+    assert agent.llm.calls == []
+
+
+async def test_group_chat_runs_a_command_sent_as_a_reply_to_the_bot(config) -> None:
+    """Quoting a command under the bot's own answer addresses the bot.
+
+    Telegram hands a replied-to command to the bot that wrote the message it
+    replies to, so the ``@botname`` suffix is not needed here.
+    """
+    reply_to_bot = {
+        "message_id": 99,
+        "date": int(time.time()),
+        "chat": {"id": GROUP_CHAT, "type": "supergroup", "title": "Lab"},
+        "from": {
+            "id": 12345,
+            "is_bot": True,
+            "first_name": "Lumi",
+            "username": "lumi_test_bot",
+        },
+        "text": "an earlier bot message",
+    }
+    bot, _ = await send(
+        config,
+        [],
+        "/start",
+        chat_id=GROUP_CHAT,
+        chat_type="supergroup",
+        reply_to_message=reply_to_bot,
+    )
+    assert "confirmation" in texts(bot).lower()
+
+
+async def test_a_stranger_replying_to_the_bot_is_told_it_is_private(config) -> None:
+    """A reply to the bot counts as addressing it — so it gets the refusal."""
+    reply_to_bot = {
+        "message_id": 99,
+        "date": int(time.time()),
+        "chat": {"id": GROUP_CHAT, "type": "supergroup", "title": "Lab"},
+        "from": {
+            "id": 12345,
+            "is_bot": True,
+            "first_name": "Lumi",
+            "username": "lumi_test_bot",
+        },
+        "text": "an earlier bot message",
+    }
+    bot, _ = await send(
+        config,
+        [],
+        "are you there?",
+        chat_id=GROUP_CHAT,
+        chat_type="supergroup",
+        reply_to_message=reply_to_bot,
+        user_id=STRANGER,
+    )
+    assert "not whitelisted" in texts(bot).lower()
+
+
+async def test_a_stranger_replying_to_another_stranger_is_ignored(config) -> None:
+    """A stranger talking to another stranger never reaches the bot at all."""
+    reply_to_stranger = {
+        "message_id": 99,
+        "date": int(time.time()),
+        "chat": {"id": GROUP_CHAT, "type": "supergroup", "title": "Lab"},
+        "from": {"id": 777, "is_bot": False, "first_name": "Other", "username": "other"},
+        "text": "an earlier human message",
+    }
+    bot, agent = await send(
+        config,
+        [make_reply("should never fire")],
+        "same here",
+        chat_id=GROUP_CHAT,
+        chat_type="supergroup",
+        reply_to_message=reply_to_stranger,
+        user_id=STRANGER,
+    )
+    assert bot.sent == []
+    assert agent.llm.calls == []
+
+
 async def test_group_chat_slash_command_targeting_the_bot(config) -> None:
     """/start@lumi_test_bot in a group runs the command — it names the bot."""
     bot, _ = await send(config, [], "/start@lumi_test_bot", chat_id=GROUP_CHAT, chat_type="supergroup")
@@ -1003,6 +1110,126 @@ async def test_photo_in_group_with_mention_reaches_the_agent(config) -> None:
     assert agent.llm.calls, "a mentioned photo in a group should reach the model"
 
 
+async def test_a_stranger_in_a_group_is_ignored_until_they_address_the_bot(config) -> None:
+    """An unaddressed group message from a stranger gets no answer at all.
+
+    Answering every stranger would make the bot announce itself in every
+    conversation the room happens to have — the opposite of "only reply when
+    mentioned".
+    """
+    bot, agent = await send(
+        config,
+        [make_reply("should never be sent")],
+        "just chatting",
+        chat_id=GROUP_CHAT,
+        chat_type="supergroup",
+        user_id=STRANGER,
+    )
+    assert bot.sent == []
+    assert agent.llm.calls == []
+
+
+async def test_a_stranger_who_mentions_the_bot_is_told_it_is_private(config) -> None:
+    """Addressing the bot does get an answer — the refusal, not silence."""
+    mention_text = "hi @lumi_test_bot"
+    entities = [{"type": "mention", "offset": 3, "length": len("@lumi_test_bot")}]
+    bot, _ = await send(
+        config,
+        [],
+        mention_text,
+        chat_id=GROUP_CHAT,
+        chat_type="supergroup",
+        entities=entities,
+        user_id=STRANGER,
+    )
+    assert "not whitelisted" in texts(bot).lower()
+
+
+# --------------------------------------------------------------------------- #
+# arriving in a group
+# --------------------------------------------------------------------------- #
+
+
+async def test_the_bot_is_silent_when_it_is_added_to_a_group(config) -> None:
+    """Telegram announces the bot's arrival as a service message.
+
+    There is nothing to answer there: the bot must not reply "i read text and
+    images only" to its own arrival, and must not greet the room either.
+    """
+    application, bot, agent = build(config, [make_reply("should never be sent")])
+    await application.initialize()
+    update = Update.de_json(
+        {
+            "update_id": 11,
+            "message": {
+                "message_id": 12,
+                "date": int(time.time()),
+                "chat": {"id": GROUP_CHAT, "type": "supergroup", "title": "Lab"},
+                "from": {"id": OWNER, "is_bot": False, "first_name": "Owner", "username": "owner"},
+                # The Bot API's newer name for the same service message.
+                "new_chat_participants": [
+                    {
+                        "id": 12345,
+                        "is_bot": True,
+                        "first_name": "Lumi",
+                        "username": "lumi_test_bot",
+                    }
+                ],
+            },
+        },
+        bot,
+    )
+    try:
+        await application.process_update(update)
+    finally:
+        await application.shutdown()
+
+    assert bot.sent == []
+    assert agent.llm.calls == []
+
+
+async def test_the_membership_update_itself_is_silent(config) -> None:
+    """The ``my_chat_member`` event is logged, never answered."""
+    application, bot, agent = build(config, [make_reply("should never be sent")])
+    await application.initialize()
+    update = Update.de_json(
+        {
+            "update_id": 13,
+            "my_chat_member": {
+                "chat": {"id": GROUP_CHAT, "type": "supergroup", "title": "Lab"},
+                "from": {"id": OWNER, "is_bot": False, "first_name": "Owner", "username": "owner"},
+                "date": int(time.time()),
+                "old_chat_member": {
+                    "user": {
+                        "id": 12345,
+                        "is_bot": True,
+                        "first_name": "Lumi",
+                        "username": "lumi_test_bot",
+                    },
+                    "status": "left",
+                },
+                "new_chat_member": {
+                    "user": {
+                        "id": 12345,
+                        "is_bot": True,
+                        "first_name": "Lumi",
+                        "username": "lumi_test_bot",
+                    },
+                    "status": "member",
+                },
+            },
+        },
+        bot,
+    )
+    try:
+        await application.process_update(update)
+    finally:
+        await application.shutdown()
+
+    assert bot.sent == []
+    assert agent.llm.calls == []
+
+
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
@@ -1070,16 +1297,40 @@ async def test_non_whitelisted_user_is_still_rejected(config) -> None:
     assert "should never be sent" not in texts(bot)
 
 
-async def test_whitelisted_group_replies_without_mention(config) -> None:
+async def test_whitelisted_group_still_requires_a_mention(config) -> None:
+    """A whitelisted group is still a group: no mention, no answer.
+
+    The whitelist says *who* the bot talks to, never *when* — a whitelisted
+    room is still answered only when the bot is addressed.
+    """
     config.bot.whitelisted_groups = [str(WHITELISTED_GROUP)]
-    bot, _ = await send(
+    bot, agent = await send(
         config,
-        [make_reply("group reply")],
+        [make_reply("should not fire")],
         "hello group",
         chat_id=WHITELISTED_GROUP,
         chat_type="supergroup",
     )
-    assert "group reply" in texts(bot)
+    assert bot.sent == []
+    assert agent.llm.calls == []
+
+
+async def test_whitelisted_group_answers_any_member_that_mentions_the_bot(config) -> None:
+    """In a whitelisted group the bot answers the room, not just the owner."""
+    config.bot.whitelisted_groups = [str(WHITELISTED_GROUP)]
+    mention_text = "hi @lumi_test_bot"
+    entities = [{"type": "mention", "offset": 3, "length": len("@lumi_test_bot")}]
+    bot, agent = await send(
+        config,
+        [make_reply("hello stranger")],
+        mention_text,
+        chat_id=WHITELISTED_GROUP,
+        chat_type="supergroup",
+        entities=entities,
+        user_id=STRANGER,
+    )
+    assert "hello stranger" in texts(bot)
+    assert agent.llm.calls
 
 
 async def test_non_whitelisted_group_still_requires_mention(config) -> None:

@@ -20,7 +20,7 @@ When you ask the bot to run a command, read or write a file, search the web, or 
 
 Four things happen to it: the reply is generated, the conversation stays continuous, the tasks you ask for get carried out, and notes you chose to save get recalled. Lumi does not build advertising profiles and does not sell personal information to anyone.
 
-Because the bot can act on your behalf, it also needs to know which instructions to trust. Only the account ID registered by the person running the instance may run programs, write files, or change stored notes. In a group chat the bot stays quiet unless you mention it, reply to it, or give it a command directly, so it does not answer every message in the room. Anyone else who tries gets a short refusal and nothing else.
+Because the bot can act on your behalf, it also needs to know which instructions to trust. Only the account ID registered by the person running the instance may run programs, write files, or change stored notes. In a group chat the bot stays quiet unless you mention it, reply to it, or give it a command directly, so it does not answer every message in the room. Anyone else who tries gets a short refusal and nothing else. The one exception is a group the operator has explicitly allowed: every member of such a group may use the bot there, and they reach the same tools — so allow only rooms whose members you trust with that.
 
 ### Services that receive your information
 

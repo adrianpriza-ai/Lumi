@@ -29,6 +29,7 @@ from telegram.ext import (
     Application,
     ApplicationBuilder,
     CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -282,7 +283,8 @@ def _render_config(config: Config, memory_limit: int) -> str:
             "",
             "<b>bot</b>",
             f"- group mode: {escape_html(bot.group_reply_mode)} · whitelisted users: {len(bot.whitelisted_users)}"
-            f" · groups: {len(bot.whitelisted_groups)}",
+            f" · groups: {len(bot.whitelisted_groups)}"
+            f" · always-reply chats: {len(bot.always_reply_chats)}",
             f"- file delivery: documents up to {bot.max_upload_mb} MB"
             f" · files tool: {'uploads on' if files.uploads else 'uploads off'}",
             f"- logging: {escape_html(config.logging.level)} → {escape_html(str(config.logging.file))}",
@@ -294,6 +296,51 @@ def _render_config(config: Config, memory_limit: int) -> str:
 # --------------------------------------------------------------------------- #
 # Group / private chat routing
 # --------------------------------------------------------------------------- #
+
+#: Message attributes that carry something a human actually sent. A message
+#: with none of them is a Telegram service notice — "X added the bot", "Y left",
+#: "the chat was renamed" — and there is nothing in it to answer. Telegram
+#: delivers the "the bot was added" notice as an ordinary message, so without
+#: this check the bot greets its own arrival with "i read text and images only".
+CONTENT_FIELDS = (
+    "text",
+    "caption",
+    "photo",
+    "document",
+    "video",
+    "audio",
+    "voice",
+    "animation",
+    "video_note",
+    "sticker",
+    "contact",
+    "location",
+    "venue",
+    "poll",
+    "dice",
+    "game",
+    "paid_media",
+    "story",
+)
+
+
+def _is_service_message(message: Any) -> bool:
+    """Whether *message* is a Telegram service notice rather than content.
+
+    Deliberately content-based instead of field-based: the Bot API keeps
+    adding service fields (``new_chat_members``, ``new_chat_participants``,
+    ``left_chat_member``, ``migrate_to_chat_id`` …) and a list of the known
+    ones would go stale. "Carries nothing a person wrote or sent" is the
+    property that actually matters.
+    """
+    if message is None:
+        return True
+    return not any(getattr(message, field, None) for field in CONTENT_FIELDS)
+
+
+def _is_group(chat: Any) -> bool:
+    """Whether *chat* is a group or supergroup (as opposed to a private chat)."""
+    return chat is not None and chat.type in (Chat.GROUP, Chat.SUPERGROUP)
 
 
 def _should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, config: Config) -> bool:
@@ -313,17 +360,21 @@ def _should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, config: Co
     ``bot.always_reply_chats`` is consulted first and overrides the mode, so a
     dedicated "Lumi lab" group can opt in by id without flipping the global
     setting.
+
+    Note what is *not* here: ``bot.whitelisted_groups``. Being whitelisted
+    decides *who* the bot talks to (see :func:`_is_allowed`), never *when* —
+    a whitelisted group is still a group, so the bot only answers when it is
+    addressed. The one exception is ``always_reply_chats``, which is exactly
+    the "answer me in this room without the mention ritual" switch.
     """
     chat = update.effective_chat
     if chat is None:
         return True
     if str(chat.id) in config.bot.always_reply_chats:
         return True
-    if str(chat.id) in config.bot.whitelisted_groups:
-        return True
     if chat.type == Chat.PRIVATE:
         return True
-    if chat.type not in (Chat.GROUP, Chat.SUPERGROUP):
+    if not _is_group(chat):
         # Channels are a corner case; stay quiet by default — there is no
         # good way to address a bot in a channel without an inline query.
         return False
@@ -336,16 +387,31 @@ def _should_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, config: Co
     return _is_addressed(update, context)
 
 
+def _entity_text(text: str, entity: MessageEntity) -> str:
+    """The slice of *text* that *entity* covers.
+
+    Telegram counts entity offsets in UTF-16 code units while Python counts
+    characters, and the two disagree as soon as an emoji sits in front of the
+    mention. Slicing the UTF-16 view and decoding it back is exact; slicing
+    the string directly would read the wrong characters.
+    """
+    units = text.encode("utf-16-le")
+    start = entity.offset * 2
+    end = (entity.offset + entity.length) * 2
+    return units[start:end].decode("utf-16-le", errors="ignore")
+
+
 def _is_addressed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Whether this message is aimed at *this* bot in a group context.
 
     Three positive signals, any one of which is enough:
 
-    1. The text starts with a slash command that names this bot
+    1. The message is a reply to a message sent by *this* bot. A reply to
+       somebody else's message — a human's, or another bot's — is not
+       addressed to the bot and is ignored.
+    2. The text starts with a slash command that names this bot
        (e.g. ``/start@Lumi_a_bot``). Plain ``/start`` is *not* enough — Telegram
-       routes that to whichever bot owns the command, so acting on it would
-       be presumptuous.
-    2. The message is a reply to a message sent by this bot.
+       routes commands without ``@botname`` to whichever bot claims them first.
     3. The message text contains a ``@Lumi_a_bot`` mention, either as a plain
        ``mention`` entity or as a ``text_mention`` entity pointing at the bot.
     """
@@ -360,16 +426,12 @@ def _is_addressed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 
     text = message.text or message.caption or ""
 
-    # 1. Slash command targeting this bot.
-    if text.startswith("/"):
-        cmd = text.split(maxsplit=1)[0]
-        if "@" in cmd:
-            target = cmd.split("@", 1)[1].lower().rstrip(",.;:!?")
-            if target == bot_username:
-                return True
-        return False  # command in a group with no @botname: assume different bot
-
-    # 2. Reply to a message from this bot.
+    # 1. Reply to a message from this bot. Checked before the command rule on
+    #    purpose: replying to the bot *is* addressing the bot, so a command
+    #    sent as a reply ("/start" quoted under the bot's answer) counts even
+    #    without the @botname suffix. The reply has to be one of ours — the
+    #    username has to match, so a reply to another bot in the room (or to
+    #    a person) leaves the bot alone.
     reply = message.reply_to_message
     if (
         reply is not None
@@ -379,11 +441,20 @@ def _is_addressed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     ):
         return True
 
+    # 2. Slash command targeting this bot.
+    if text.startswith("/"):
+        cmd = text.split(maxsplit=1)[0]
+        if "@" in cmd:
+            target = cmd.split("@", 1)[1].lower().rstrip(",.;:!?")
+            if target == bot_username:
+                return True
+        return False  # command in a group with no @botname: assume different bot
+
     # 3. Mention entity anywhere in the message (text or caption).
     entities = list(message.entities or []) + list(message.caption_entities or [])
     for entity in entities:
         if entity.type == MessageEntity.MENTION:
-            snippet = text[entity.offset : entity.offset + entity.length].lower().lstrip("@")
+            snippet = _entity_text(text, entity).lower().lstrip("@")
             if snippet == bot_username:
                 return True
         elif entity.type == MessageEntity.TEXT_MENTION and entity.user is not None:
@@ -773,12 +844,26 @@ async def deliver(update: Update, result: TurnResult, config: Config) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _is_allowed(user: Any, config: Config) -> bool:
-    """Whether *user* is authorised to use the bot (owner or whitelisted)."""
+def _is_allowed(user: Any, config: Config, chat: Any = None) -> bool:
+    """Whether *user* may talk to the bot in *chat*.
+
+    Three ways in:
+
+    1. the owner,
+    2. a user id on ``bot.whitelisted_users``,
+    3. anybody at all — in a group that is itself on ``bot.whitelisted_groups``.
+
+    The third one is what the group whitelist is for: it names the rooms where
+    the bot answers the *room* rather than one person. It grants nothing in a
+    private chat, and nothing outside the whitelisted group.
+    """
     owner = config.owner_id
     if owner is not None and user.id == owner:
         return True
-    return str(user.id) in config.bot.whitelisted_users
+    if str(user.id) in config.bot.whitelisted_users:
+        return True
+    # A whitelisted group opens the bot to every member of that room.
+    return _is_group(chat) and str(chat.id) in config.bot.whitelisted_groups
 
 
 def _is_owner(user: Any, config: Config) -> bool:
@@ -851,13 +936,13 @@ def build_handlers(config: Config) -> list[Any]:
 
         def filter(self, update: Update) -> bool:
             user = update.effective_user
-            return user is not None and _is_allowed(user, self.cfg)
+            return user is not None and _is_allowed(user, self.cfg, update.effective_chat)
 
     owner_filter = OwnerFilter(config)
 
     async def authorised(update: Update) -> bool:
         user = update.effective_user
-        if user is not None and _is_allowed(user, config):
+        if user is not None and _is_allowed(user, config, update.effective_chat):
             return True
         await reply(update, NOT_AUTHORISED)
         log.warning("rejected %s from user %s", update.effective_message and "message", user and user.id)
@@ -867,14 +952,15 @@ def build_handlers(config: Config) -> list[Any]:
         """Apply the group/mention gating to a command handler.
 
         Each command is wrapped so a group-chat message that is not addressed
-        to the bot is dropped before the handler runs. Private chats and
-        whitelisted chats bypass the gate.
+        to the bot is dropped before the handler runs — and before the
+        authorisation check, so an unaddressed command from a stranger stays
+        silent instead of announcing the bot's existence in the room.
         """
 
         async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-            if not await authorised(update):
-                return
             if not _should_reply(update, context, config):
+                return
+            if not await authorised(update):
                 return
             await handler(update, context)
 
@@ -1318,7 +1404,7 @@ def build_handlers(config: Config) -> list[Any]:
         if query is None:
             return
         user = update.effective_user
-        if user is None or not _is_allowed(user, config):
+        if user is None or not _is_allowed(user, config, update.effective_chat):
             await _toast(query, "not authorised", show_alert=True)
             return
         data = query.data or ""
@@ -1355,9 +1441,9 @@ def build_handlers(config: Config) -> list[Any]:
         message = update.effective_message
         if message is None or not message.text:
             return
-        if not await authorised(update):
-            return
         if not _should_reply(update, context, config):
+            return
+        if not await authorised(update):
             return
         await run_agent(update, context, message.text)
 
@@ -1408,12 +1494,19 @@ def build_handlers(config: Config) -> list[Any]:
         await run_agent(update, context, prompt)
 
     async def on_non_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await authorised(update):
+        message = update.effective_message
+        if message is None:
+            return
+        if _is_service_message(message):
+            # "X added the bot to the group", "Y left", "the chat was renamed":
+            # Telegram service notices. Nothing was said to the bot and there
+            # is nothing to answer — the bot stays silent instead of replying
+            # "i read text and images only" to its own arrival.
+            log.debug("ignoring a service message in chat %s", chat_of(update))
             return
         if not _should_reply(update, context, config):
             return
-        message = update.effective_message
-        if message is None:
+        if not await authorised(update):
             return
 
         # A document (with or without a caption): store it in the project so
@@ -1435,9 +1528,9 @@ def build_handlers(config: Config) -> list[Any]:
         await reply(update, "i read text and images only — send a message or a photo.")
 
     async def on_unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if not await authorised(update):
-            return
         if not _should_reply(update, context, config):
+            return
+        if not await authorised(update):
             return
         message = update.effective_message
         text = (message.text if message else "") or ""
@@ -1447,13 +1540,43 @@ def build_handlers(config: Config) -> list[Any]:
         await reply(update, f"i don't know <code>{escape_html(command)}</code>. try /start for what i can do.")
 
     async def on_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Anyone who is not the owner gets one clear sentence and nothing else.
+        """Anyone who is not allowed gets one clear sentence and nothing else.
 
         Deliberately does not enumerate tools, models, or the filesystem: a
         stranger should not be able to learn what this bot can reach.
+
+        In a group the sentence is only for a message that was *addressed* to
+        the bot. Answering a stranger's ordinary chatter would make the bot
+        interrupt every conversation in the room and announce that it is
+        there — the opposite of "only reply when mentioned".
         """
+        if _is_group(update.effective_chat) and not _is_addressed(update, context):
+            log.debug(
+                "ignoring an unaddressed group message from user %s",
+                update.effective_user and update.effective_user.id,
+            )
+            return
         log.warning("rejected a message from non-owner %s", update.effective_user and update.effective_user.id)
         await reply(update, NOT_AUTHORISED)
+
+    async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """The bot was added to — or removed from — a chat. Say nothing.
+
+        Telegram reports the bot's own membership change, and the room shows a
+        service message for it as well. Neither is a question, so the bot
+        stays silent: no greeting, no error, nothing in the chat. The event is
+        only written to the log, where the operator can see who added it.
+        """
+        member = update.my_chat_member
+        if member is None:
+            return
+        log.info(
+            "membership in chat %s changed: %s -> %s (by user %s)",
+            member.chat.id,
+            member.old_chat_member.status,
+            member.new_chat_member.status,
+            member.from_user.id if member.from_user else "?",
+        )
 
     # -- shared runners ---------------------------------------------------- #
 
@@ -1600,6 +1723,10 @@ def build_handlers(config: Config) -> list[Any]:
         # ``button`` checks the sender itself.
         # (CallbackQueryHandler takes a ``pattern``, not ``filters``, in v22.)
         CallbackQueryHandler(button),
+        # The bot's own membership changes ("the bot was added to this group").
+        # Handled so the event is logged instead of falling through to a
+        # handler that would answer it — the bot stays silent on arrival.
+        ChatMemberHandler(on_my_chat_member),
         # Keyword arguments on purpose: MessageHandler's parameter order changed
         # between python-telegram-bot v20 and v22, and the keyword form is stable.
         MessageHandler(
