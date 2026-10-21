@@ -13,6 +13,7 @@ import shutil
 import sys
 from dataclasses import dataclass
 
+from . import __version__
 from .config import Config
 from .paths import relative_to_root
 from .tools import safety
@@ -74,6 +75,7 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
     checks: list[Check] = []
 
     # -- python and packages ---------------------------------------------- #
+    checks.append(Check("lumi", OK, __version__))
     version = ".".join(str(part) for part in sys.version_info[:3])
     too_old = sys.version_info < (3, 11)
     checks.append(Check("python", FAIL if too_old else OK, f"{version} at {sys.executable}"))

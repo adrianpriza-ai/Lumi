@@ -137,6 +137,26 @@ def test_doctor_reports_the_exa_key(config, capsys) -> None:
     assert "EXA_API_KEY" in capsys.readouterr().out
 
 
+def test_doctor_names_the_running_version(config, capsys) -> None:
+    """Which build is running is the first question about a deployment."""
+    from lumi import __version__
+
+    assert main(["doctor"]) == 0
+    assert __version__ in capsys.readouterr().out
+
+
+def test_version_flag_prints_the_version(capsys) -> None:
+    """``lumi --version`` — the answer has to be on stdout and nothing else."""
+    from lumi import __version__
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--version"])
+    assert exit_info.value.code == 0
+    out = capsys.readouterr().out
+    assert __version__ in out
+    assert "lumi" in out
+
+
 def test_ask_reports_a_missing_model(config, monkeypatch, capsys) -> None:
     (config.root / ".env").unlink()
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)

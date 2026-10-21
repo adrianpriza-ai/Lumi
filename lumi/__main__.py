@@ -22,6 +22,7 @@ import asyncio
 import sys
 from typing import Any
 
+from . import __version__
 from .config import Config, ConfigError, load_config, validate
 from .util.log import get_logger, setup_logging
 from .util.text import format_error
@@ -407,6 +408,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"lumi {__version__}",
+        help="print the installed version and exit",
+    )
     sub = parser.add_subparsers(dest="command_name", required=True)
 
     run_parser = sub.add_parser("run", help="start the Telegram bot")
