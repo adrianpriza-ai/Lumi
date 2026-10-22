@@ -181,6 +181,16 @@ class LLMConfig:
     #: however full the window gets. Losing the newest turns is how a model
     #: starts contradicting the message it was replying to.
     context_keep_recent: int = 12
+    #: Fill target for the conversation, as a fraction of the usable budget
+    #: (0.0-1.0). Above this share the older messages are trimmed — oldest
+    #: first, and only ever messages: the system prompt (personality,
+    #: instructions, long-term memory) is never touched. 1.0 (the default)
+    #: keeps the old behaviour, trimming only against the hard
+    #: ``window - headroom`` floor. 0.7 is a good ceiling for long chats: it
+    #: leaves a third of the usable budget as slack, so a late turn is never
+    #: the one that tips the request over the provider's limit. Anything below
+    #: the hard floor wins; the target never raises it.
+    context_target: float = 1.0
     #: When the window fills up, ask the model to summarise the oldest part of
     #: the conversation before it is dropped. Off means the old part is dropped
     #: with a marker instead — cheaper, and the past is then simply gone.
@@ -614,7 +624,17 @@ class WebConfig:
 @dataclass(slots=True)
 class ToolsConfig:
     enabled: list[str] = field(
-        default_factory=lambda: ["shell", "files", "memory", "web", "context7", "send"]
+        default_factory=lambda: [
+            "shell",
+            "files",
+            "read_file",
+            "list_files",
+            "grep",
+            "memory",
+            "web",
+            "context7",
+            "send",
+        ]
     )
     shell: ShellConfig = field(default_factory=ShellConfig)
     files: FilesConfig = field(default_factory=FilesConfig)
@@ -980,6 +1000,11 @@ def validate(config: Config) -> list[str]:
         )
     if config.llm.chars_per_token <= 0:
         problems.append("llm.chars_per_token must be a positive number")
+    if not 0.0 < config.llm.context_target <= 1.0:
+        problems.append(
+            "llm.context_target must be a fraction in (0.0, 1.0] — the share of "
+            "llm.context_window the conversation tries to stay under"
+        )
     if config.tools.files.max_write_chars <= 0:
         problems.append("tools.files.max_write_chars must be a positive number of characters")
     if config.telegram_token is None:
@@ -1006,7 +1031,17 @@ def validate(config: Config) -> list[str]:
     # one-time seed, reported by `lumi doctor` at most.
 
     for name in config.tools.enabled:
-        if name not in {"shell", "files", "memory", "web", "context7", "send"}:
+        if name not in {
+            "shell",
+            "files",
+            "read_file",
+            "list_files",
+            "grep",
+            "memory",
+            "web",
+            "context7",
+            "send",
+        }:
             problems.append(f"unknown tool {name!r} in tools.enabled")
 
     if config.bot.max_upload_mb <= 0:

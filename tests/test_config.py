@@ -126,7 +126,17 @@ def test_defaults_apply_with_no_config_file(project) -> None:
     config = load_config(project)
     assert isinstance(config, Config)
     assert config.llm.provider == "openai"
-    assert config.tools.enabled == ["shell", "files", "memory", "web", "context7", "send"]
+    assert config.tools.enabled == [
+        "shell",
+        "files",
+        "read_file",
+        "list_files",
+        "grep",
+        "memory",
+        "web",
+        "context7",
+        "send",
+    ]
 
 
 def test_dotenv_is_read_from_the_project_root(project) -> None:
@@ -228,6 +238,18 @@ def test_validate_accepts_every_documented_group_reply_mode(config, mode: str) -
 def test_validate_flags_an_unknown_group_reply_mode(config) -> None:
     config.bot.group_reply_mode = "loud"  # not a real value
     assert any("group_reply_mode" in p for p in validate(config))
+
+
+def test_validate_flags_an_out_of_range_context_target(config) -> None:
+    config.llm.context_target = 0.0  # below the (0.0, 1.0] range
+    assert any("context_target" in p for p in validate(config))
+    config.llm.context_target = 1.5  # above the range
+    assert any("context_target" in p for p in validate(config))
+
+
+def test_validate_accepts_a_documented_context_target(config) -> None:
+    config.llm.context_target = 0.7
+    assert not [p for p in validate(config) if "context_target" in p]
 
 
 # --------------------------------------------------------------------------- #

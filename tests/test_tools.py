@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from lumi.tools.base import NeedsApproval, Tool, ToolContext, ToolError, ToolResult
+from lumi.tools.explore import GrepTool, ListFilesTool, ReadFileTool
 from lumi.tools.files import FilesTool
 from lumi.tools.memory_tool import MemoryTool
 from lumi.tools.registry import ToolRegistry
@@ -672,3 +673,214 @@ async def test_send_ignores_extra_arguments(config) -> None:
     result = await send_tool(config).invoke({"message": "hi", "surprise": 1}, ctx())
     assert result.ok
     assert result.messages == ["hi"]
+
+
+# --------------------------------------------------------------------------- #
+# read_file
+# --------------------------------------------------------------------------- #
+
+
+def _write(root, relative: str, content: str):
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+async def test_read_file_numbers_lines(config) -> None:
+    _write(config.root, "notes.md", "alpha\nbeta\ngamma\n")
+    result = await ReadFileTool(config).invoke({"path": "notes.md"}, ctx())
+    assert result.ok
+    assert "alpha" in result.text and "gamma" in result.text
+    # Line numbers are the point: they make files.edit calls unambiguous.
+    assert "     1  alpha" in result.text
+    assert "of 3" in result.text  # total line count is reported
+
+
+async def test_read_file_offset_and_limit_window(config) -> None:
+    _write(config.root, "lines.txt", "".join(f"line {i}\n" for i in range(1, 101)))
+    result = await ReadFileTool(config).invoke(
+        {"path": "lines.txt", "offset": 10, "limit": 5}, ctx()
+    )
+    assert result.ok
+    assert "line 10" in result.text and "line 14" in result.text
+    assert "line 9" not in result.text and "line 15" not in result.text
+    assert result.data["next_offset"] == 15  # where to continue from
+    assert "offset=15" in result.text  # and the model is told so
+
+
+async def test_read_file_refuses_a_whole_file_over_the_cap(config) -> None:
+    """An oversized read is refused with the remedy, never silently truncated —
+    a cut-off read looks like the whole truth to the model that asked."""
+    _write(config.root, "huge.txt", "x" * 200_000)  # ~50k tokens at 4 chars/token
+    result = await ReadFileTool(config).invoke({"path": "huge.txt"}, ctx())
+    assert not result.ok
+    assert "offset" in result.text and "limit" in result.text
+    assert "x" * 100 not in result.text  # nothing of the file leaked through
+
+
+async def test_read_file_accepts_an_oversized_file_with_a_window(config) -> None:
+    _write(config.root, "huge.txt", "".join(f"row {i}\n" for i in range(50_000)))
+    result = await ReadFileTool(config).invoke(
+        {"path": "huge.txt", "offset": 1, "limit": 10}, ctx()
+    )
+    assert result.ok
+    # The file is "row 0".."row 49999", so lines 1-10 are rows 0-9.
+    assert "row 0" in result.text and "row 9" in result.text
+    assert "row 10\n" not in result.text
+    assert "more lines remain" in result.text
+
+
+async def test_read_file_reports_an_offset_past_the_end(config) -> None:
+    _write(config.root, "short.md", "one\ntwo\n")
+    result = await ReadFileTool(config).invoke({"path": "short.md", "offset": 99}, ctx())
+    assert not result.ok
+    assert "past the end" in result.text
+    assert "2" in result.text  # tells the model the real line count
+
+
+async def test_read_file_rejects_binary_files(config) -> None:
+    (config.root / "blob.bin").write_bytes(b"\x00\x01\x02\x03" * 10)
+    result = await ReadFileTool(config).invoke({"path": "blob.bin"}, ctx())
+    assert not result.ok
+    assert "binary" in result.text
+
+
+async def test_read_file_on_a_directory_points_at_list_files(config) -> None:
+    result = await ReadFileTool(config).invoke({"path": "workspace"}, ctx())
+    assert not result.ok
+    assert "list_files" in result.text
+
+
+async def test_read_file_missing_file_fails_cleanly(config) -> None:
+    result = await ReadFileTool(config).invoke({"path": "ghost.md"}, ctx())
+    assert not result.ok
+    assert "no such file" in result.text
+
+
+async def test_read_file_outside_the_project_is_refused(config) -> None:
+    with pytest.raises(ToolError, match="outside the project"):
+        await ReadFileTool(config).invoke({"path": "/etc/shadow"}, ctx())
+
+
+async def test_read_file_rejects_a_non_integer_offset(config) -> None:
+    _write(config.root, "ok.md", "hi\n")
+    with pytest.raises(ToolError, match="offset"):
+        await ReadFileTool(config).invoke({"path": "ok.md", "offset": "soon"}, ctx())
+
+
+# --------------------------------------------------------------------------- #
+# list_files
+# --------------------------------------------------------------------------- #
+
+
+async def test_list_files_shows_directories_first(config) -> None:
+    _write(config.root, "sub/a.txt", "x")
+    _write(config.root, "zeta.md", "y")
+    result = await ListFilesTool(config).invoke({}, ctx())
+    assert result.ok
+    text = result.text
+    assert "sub/" in text and "zeta.md" in text
+    # Directories sort before files, the way ls does it.
+    assert text.index("sub/") < text.index("zeta.md")
+
+
+async def test_list_files_hides_noise(config) -> None:
+    _write(config.root, "node_modules/pkg/index.js", "x")
+    _write(config.root, "keep.md", "y")
+    result = await ListFilesTool(config).invoke({}, ctx())
+    assert "node_modules" not in result.text
+    assert "keep.md" in result.text
+
+
+async def test_list_files_on_a_subdirectory(config) -> None:
+    _write(config.root, "deep/nested/file.txt", "x")
+    result = await ListFilesTool(config).invoke({"path": "deep/nested"}, ctx())
+    assert result.ok
+    assert "file.txt" in result.text
+
+
+async def test_list_files_on_a_file_points_at_read_file(config) -> None:
+    _write(config.root, "single.md", "x")
+    result = await ListFilesTool(config).invoke({"path": "single.md"}, ctx())
+    assert not result.ok
+    assert "read_file" in result.text
+
+
+async def test_list_files_missing_directory_fails_cleanly(config) -> None:
+    result = await ListFilesTool(config).invoke({"path": "nowhere"}, ctx())
+    assert not result.ok
+    assert "no such directory" in result.text
+
+
+# --------------------------------------------------------------------------- #
+# grep
+# --------------------------------------------------------------------------- #
+
+
+async def test_grep_requires_all_words_on_one_line(config) -> None:
+    _write(config.root, "a.py", "def token_limit():  # the token limit config\n")
+    _write(config.root, "b.py", "# only token here\n# and limit on another line\n")
+    result = await GrepTool(config).invoke({"query": "token limit"}, ctx())
+    assert result.ok
+    assert "a.py:1" in result.text  # both words on one line -> match
+    assert "b.py" not in result.text  # split across lines -> not a match
+    assert result.data["files_matched"] == 1
+
+
+async def test_grep_is_case_insensitive_by_default(config) -> None:
+    _write(config.root, "x.txt", "Hello WORLD\n")
+    result = await GrepTool(config).invoke({"query": "world hello"}, ctx())
+    assert "x.txt:1" in result.text
+
+
+async def test_grep_case_sensitive_flag(config) -> None:
+    _write(config.root, "x.txt", "Hello world\n")
+    result = await GrepTool(config).invoke(
+        {"query": "hello", "case_sensitive": True}, ctx()
+    )
+    assert "no matches" in result.text
+
+
+async def test_grep_glob_scopes_the_search(config) -> None:
+    _write(config.root, "code.py", "# needle here\n")
+    _write(config.root, "doc.md", "# needle here\n")
+    result = await GrepTool(config).invoke({"query": "needle", "glob": "*.py"}, ctx())
+    assert "code.py" in result.text
+    assert "doc.md" not in result.text
+
+
+async def test_grep_skips_noise_and_binary(config) -> None:
+    _write(config.root, "node_modules/lib/index.js", "// needle\n")
+    (config.root / "blob.bin").write_bytes(b"needle\x00" * 4)
+    _write(config.root, "real.txt", "needle\n")
+    result = await GrepTool(config).invoke({"query": "needle"}, ctx())
+    assert "real.txt:1" in result.text
+    assert "node_modules" not in result.text
+    assert "blob.bin" not in result.text
+
+
+async def test_grep_reports_nothing_found_with_a_hint(config) -> None:
+    _write(config.root, "a.txt", "nothing interesting\n")
+    result = await GrepTool(config).invoke({"query": "zzzmissing"}, ctx())
+    assert result.ok  # no match is a result, not an error
+    assert "no matches" in result.text
+    assert "every word" in result.text
+
+
+async def test_grep_max_results_truncates_with_a_note(config) -> None:
+    _write(config.root, "many.txt", "".join(f"spam {i}\n" for i in range(100)))
+    result = await GrepTool(config).invoke({"query": "spam", "max_results": 5}, ctx())
+    assert result.data["truncated"] is True
+    assert len(result.data["matches"]) == 5
+    assert "narrow" in result.text
+
+
+async def test_grep_needs_a_query(config) -> None:
+    with pytest.raises(ToolError, match="query"):
+        await GrepTool(config).invoke({"query": "   "}, ctx())
+
+
+async def test_grep_outside_the_project_is_refused(config) -> None:
+    with pytest.raises(ToolError, match="outside the project"):
+        await GrepTool(config).invoke({"query": "root", "path": "/"}, ctx())

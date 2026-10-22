@@ -27,6 +27,19 @@ The newest ``llm.context_keep_recent`` messages are never touched, and an
 assistant's tool calls always move with their tool results, because a
 transcript holding half of either is a 400 rather than a shorter conversation.
 
+All of the above happens against two numbers. The **hard budget** is
+``context_window - context_headroom``: the request must fit this, no matter
+what. The **fill target** (``llm.context_target``, a fraction of that budget)
+is lower still when set, and is where the conversation is *trimmed back to* —
+so a 0.7 target keeps the conversation in the lower 70% of the usable budget
+and leaves the rest as slack, which is what absorbs a late turn, a big tool
+result, or a provider whose real limit is tighter than advertised. Trimming between
+the target and the hard budget only ever removes messages: the system prompt —
+personality, instructions, and the long-term memory block — is never a
+candidate, so a soft target can never cost the bot its identity or what it
+knows. With the default ``context_target = 1.0`` the target sits on the hard
+budget and behaviour is exactly what it was before the target existed.
+
 Memory is bounded by construction: a conversation cannot exceed the window it
 was assembled for, the transcript is read tail-first rather than whole, and
 only ``llm.max_conversations`` chats are held at once — an evicted chat
@@ -116,6 +129,10 @@ class ContextReport:
 
     tokens: int = 0
     budget: int = 0
+    #: Fill target: tokens the conversation is trimmed back to, as a fraction
+    #: of the window. 0 (or equal to ``budget``) means "no soft target" — the
+    #: hard floor is in charge, which is the pre-target behaviour.
+    target: int = 0
     window: int = 0
     messages: int = 0
     chars: int = 0
@@ -137,6 +154,13 @@ class ContextReport:
             f"in use {self.tokens:,} tokens ({self.fill:.0%}) · {self.messages} messages"
             f" · {self.chars:,} chars",
         ]
+        if 0 < self.target < self.budget:
+            out.insert(
+                1,
+                f"fill target {self.target:,} tokens ({self.target / self.window:.0%} of the "
+                "window) — older messages are trimmed back to here; the system prompt "
+                "and memory are never touched",
+            )
         if self.summarised or self.elided or self.dropped:
             out.append(
                 f"condensed: {self.summarised} message(s) summarised · "
@@ -231,9 +255,35 @@ class ContextWindow:
         return max(0, int(self.config.llm.context_headroom))
 
     @property
+    def target(self) -> int:
+        """Tokens the conversation *tries* to stay under: ``context_target`` of
+        the hard **budget** (``window - headroom``), not of the raw window.
+
+        This is the fill line — the older messages are trimmed back to here
+        whenever the conversation drifts above it. Derived from the budget so
+        it can only ever be *below* the floor, never above: 1.0 (the default)
+        puts the target exactly on the budget, which leaves the hard floor in
+        charge and preserves the pre-target behaviour exactly, and no value can
+        make the request exceed the provider's real limit.
+        """
+        fraction = min(1.0, max(0.0, float(getattr(self.config.llm, "context_target", 1.0) or 1.0)))
+        return max(256, int(self.budget * fraction))
+
+    @property
     def budget(self) -> int:
-        """Tokens available for what the conversation already holds."""
+        """Tokens available for what the conversation already holds.
+
+        The hard floor: the window minus the reply headroom. Trimming never
+        stops at the target if the floor is lower — the request still has to
+        fit the provider's real limit.
+        """
         return max(256, self.window - self.headroom)
+
+    @property
+    def effective_budget(self) -> int:
+        """What the conversation is actually trimmed to: the target, which is
+        never above the hard budget. Every trim pass measures against this."""
+        return self.target
 
     def tokens_for(self, text: str) -> int:
         return int(len(text) / self._chars_per_token)
@@ -318,7 +368,7 @@ class ContextWindow:
         """
         if self.history is None:
             return
-        budget = self.budget - self.estimate(conv.messages)
+        budget = self.effective_budget - self.estimate(conv.messages)
         if budget <= 0:
             return
 
@@ -401,28 +451,28 @@ class ContextWindow:
         is one pass over the messages, and only the model itself fills a
         context up.
         """
-        over = self.estimate(conv.messages) - self.budget
+        over = self.estimate(conv.messages) - self.effective_budget
         if over <= 0:
             return
 
         before = len(conv.messages)
         log.info(
             "context full for chat %s: ~%d tokens over a %d budget; condensing",
-            conv.chat_id, over + self.budget, self.budget,
+            conv.chat_id, over + self.effective_budget, self.effective_budget,
         )
         self._elide_tool_output(conv, over)
-        if self.estimate(conv.messages) > self.budget:
+        if self.estimate(conv.messages) > self.effective_budget:
             await self._condense(conv)
-        if self.estimate(conv.messages) > self.budget:
+        if self.estimate(conv.messages) > self.effective_budget:
             self._drop_oldest(conv)
-        if self.estimate(conv.messages) > self.budget:
+        if self.estimate(conv.messages) > self.effective_budget:
             self._shrink_largest(conv)
 
         self._refresh_note(conv)
         log.info(
             "context for chat %s: %d -> %d messages, ~%d of %d tokens, record is %d chars",
             conv.chat_id, before, len(conv.messages), self.estimate(conv.messages),
-            self.budget, len(conv.summary),
+            self.effective_budget, len(conv.summary),
         )
 
     def _tail_start(self, groups: list[list[dict[str, Any]]]) -> int:
@@ -505,9 +555,11 @@ class ContextWindow:
         if not middle:
             return
 
-        # The oldest turns, up to a third of the budget: enough to be worth a
-        # call, small enough that the record is cheap to carry afterwards.
-        allowance = self.budget // 3
+        # The oldest turns, up to a third of the effective budget: enough to be
+        # worth a call, small enough that the record is cheap to carry
+        # afterwards, and measured against the fill target rather than the hard
+        # floor so a soft target summarises only the surplus.
+        allowance = self.effective_budget // 3
         taken = 0
         used = 0
         while taken < len(middle):
@@ -518,7 +570,7 @@ class ContextWindow:
             taken += 1
         # Not worth a call — and not worth losing turns for a record barely
         # smaller than what it replaces. The drop below handles that case.
-        if not taken or used < self.budget // 8:
+        if not taken or used < self.effective_budget // 8:
             return
 
         prior = (conv.summary or "").strip()
@@ -534,7 +586,7 @@ class ContextWindow:
         # bound, so it is capped against the window rather than trusted.
         self._install_summary(
             conv,
-            truncate(summary, self.chars_for(self.budget // 4), marker="\n… [record cut]"),
+            truncate(summary, self.chars_for(self.effective_budget // 4), marker="\n… [record cut]"),
             remember=True,
         )
         log.info(
@@ -589,7 +641,12 @@ class ContextWindow:
         prose, so it is smaller than the turns it stands in for.
         """
         head, middle, tail = self._split(conv)
-        while middle and self.estimate(flatten([*head, *middle, *tail])) > self.budget:
+        # Trim to the effective budget: the soft fill target when one is set,
+        # otherwise the hard floor. Either way this only ever removes from the
+        # middle — the head (system prompt: personality, instructions, memory)
+        # and the protected tail are never candidates.
+        budget = self.effective_budget
+        while middle and self.estimate(flatten([*head, *middle, *tail])) > budget:
             conv.dropped += len(middle[0])
             middle = middle[1:]
         self._rejoin(conv, (head, middle, tail))
@@ -664,6 +721,7 @@ class ContextWindow:
         return ContextReport(
             tokens=self.estimate(conv.messages),
             budget=self.budget,
+            target=self.target,
             window=self.window,
             messages=len(conv.messages),
             chars=sum(content_chars(m) for m in conv.messages),

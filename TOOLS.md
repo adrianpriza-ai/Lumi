@@ -6,10 +6,34 @@
 |-|-|
 | `run_shell` | Shell commands, with the allow/confirm/deny engine |
 | `files` | Read anywhere in the project, write and edit only in `workspace/`, send files to the chat |
+| `read_file` | Read a file by line window (`offset`/`limit`), capped at ~30k tokens per call |
+| `list_files` | List one directory, like `ls` |
+| `grep` | Multi-word content search across the project |
 | `memory` | Remember and recall, scoped to the chat it is used in; forgetting is human-only by design |
 | `web` | Search and fetch, across three interchangeable providers |
 | `context7` | Up-to-date library docs from https://context7.com; auto-enables on `CONTEXT7_API_KEY` |
 | `send` | Send the owner a message *mid-turn*, so one reply can arrive in parts |
+
+## Reading and searching (`read_file`, `list_files`, `grep`)
+
+Three small read-only tools, separate from `files` because their job is only to
+*look* — they never ask for approval and never write anything. `files` stays the
+write/edit/upload tool.
+
+- `read_file` reads a window of lines (1-based `offset`, `limit`) and numbers
+  them. One call is capped at ~30k tokens; an oversized read is **refused with
+  the remedy** — "use offset and limit" — rather than silently truncated,
+  because a cut-off read looks like the whole truth to the model that asked.
+  The result reports the total line count and the next `offset` to continue from.
+- `list_files` is `ls`: one directory, directories first with entry counts,
+  files with sizes. Venvs, `node_modules` and caches stay hidden.
+- `grep` searches file contents. A multi-word query is an AND: every word must
+  appear on the same line (case-insensitive by default), so `config token
+  limit` returns lines containing all three. Results are
+  `path:line: content`, scoppable with `glob` and `path`; binary files and
+  files over 1 MB are skipped.
+
+Remove any of them from `tools.enabled` to take it away from the model.
 
 ## Mid-turn messages (`send`)
 

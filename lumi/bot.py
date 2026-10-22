@@ -257,7 +257,13 @@ def _render_config(config: Config, memory_limit: int) -> str:
             f"- context: {llm.context_window:,} token window, {llm.context_headroom:,} held back"
             f" · keep {llm.context_keep_recent} recent"
             f" · compaction {'on' if llm.compaction else 'off'}"
-            f" · {llm.max_conversations} chats in memory",
+            f" · {llm.max_conversations} chats in memory"
+            + (
+                f"\n- fill target: {llm.context_target:.0%} of the usable budget"
+                " — older messages trimmed back to it; system prompt and memory untouched"
+                if 0.0 < llm.context_target < 1.0
+                else ""
+            ),
             f"- agent: {llm.max_tool_iterations} tool iterations"
             f" · history: {'as much as fits' if not llm.history_turns else f'at least {llm.history_turns} turns'}"
             f" · memory {memory_cap}",
@@ -656,6 +662,9 @@ STEP_LABELS = {
     "thinking": "🧠 Thinking",
     "run_shell": "💻 Run Bash",
     "files": "📁 Files",
+    "read_file": "📖 Read File",
+    "list_files": "📂 List Files",
+    "grep": "🔍 Grep",
     "web": "🌐 Web",
     "memory": "📌 Memory",
     "context7": "📚 Context7",

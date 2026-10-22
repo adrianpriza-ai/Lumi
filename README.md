@@ -96,6 +96,7 @@ lumi/
 │   ├── safety.py      the command policy — read this one
 │   ├── shell.py       execution: scrubbed env, timeouts, output caps
 │   ├── files.py       path-confined read/write/edit
+│   ├── explore.py     read_file / list_files / grep — read-only exploration
 │   ├── memory_tool.py
 │   ├── context7.py    version-specific library docs
 │   ├── send.py        mid-turn owner messages

@@ -372,3 +372,118 @@ def test_personality_and_memory_still_build_a_prompt(config) -> None:
     memory.load()
     assert Personality.load(config.personality_file).text.strip()
     assert "Memory" in memory.for_prompt()
+
+
+# --------------------------------------------------------------------------- #
+# the fill target (llm.context_target)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_target_defaults_to_the_hard_budget(config) -> None:
+    """No target set: the fill line is the hard budget, as before."""
+    window = make_window(config)
+    assert window.target == window.budget  # context_target defaults to 1.0
+    assert window.effective_budget == window.budget
+
+
+def test_a_lower_target_pulls_the_fill_line_down(config) -> None:
+    window = make_window(config)
+    config.llm.context_target = 0.5
+    assert window.target == window.budget // 2
+    assert window.effective_budget == window.target
+
+
+def test_the_target_never_raises_the_hard_budget(config) -> None:
+    """A target of 1.0 on a window with headroom must not exceed the floor."""
+    window = make_window(config)
+    config.llm.context_target = 1.0
+    assert window.target == window.budget  # 1.0 of the budget, not of the window…
+    assert window.effective_budget == window.budget  # …and the floor is what holds
+
+
+def test_an_absurd_target_is_clamped_to_the_budget(config) -> None:
+    window = make_window(config)
+    config.llm.context_target = 5.0
+    assert window.target == window.budget
+    assert window.effective_budget == window.budget
+
+
+def test_a_tiny_target_still_has_a_floor(config) -> None:
+    """Even a 1% target keeps a few tokens, so the estimator never divides by 0."""
+    window = make_window(config)
+    config.llm.context_target = 0.01
+    assert window.target >= 256
+
+
+async def test_a_soft_target_trims_messages_back_to_the_fill_line(config) -> None:
+    """Above the target but below the hard budget, older *messages* are dropped
+    until the conversation is back under the fill line."""
+    window = make_window(config)  # window 4000, budget 3600
+    config.llm.context_target = 0.5  # fill line = half the budget = 1800
+    window.llm = ScriptedLLM()  # compaction may summarise, then drop the rest
+
+    system = {"role": "system", "content": "PERSONALITY INSTRUCTIONS" * 20}
+    messages = [system]
+    for i in range(12):
+        messages += [
+            {"role": "user", "content": f"old question {i} " + "detail " * 60},
+            {"role": "assistant", "content": f"old answer {i} " + "detail " * 60},
+        ]
+    recent = [
+        {"role": "user", "content": "the newest question"},
+        {"role": "assistant", "content": "the newest answer"},
+    ]
+    conv = FakeConv(messages + recent)
+
+    before = window.estimate(conv.messages)
+    assert window.budget >= before > window.target  # in the target→budget band
+    await window.prepare(conv)
+
+    assert window.estimate(conv.messages) <= window.target
+    # The system prompt survives untouched, and so do the newest turns.
+    assert conv.messages[0] is system
+    assert conv.messages[0]["content"] == "PERSONALITY INSTRUCTIONS" * 20
+    assert {m["content"] for m in conv.messages[-2:]} == {
+        "the newest question",
+        "the newest answer",
+    }
+    # Something was given up to get under the target.
+    assert conv.dropped + conv.summarised > 0
+
+
+async def test_the_system_prompt_is_never_a_shed_candidate(config) -> None:
+    """Even when the system prompt alone is large, trimming works around it —
+    the identity and memory are not negotiable, only the conversation is."""
+    window = make_window(config)
+    config.llm.context_target = 0.5
+    window.llm = ScriptedLLM()
+
+    system = {"role": "system", "content": "IDENTITY " * 400}  # ~big, on purpose
+    messages = [system]
+    for i in range(16):
+        messages += [
+            {"role": "user", "content": f"q{i} " + "bulk " * 50},
+            {"role": "assistant", "content": f"a{i} " + "bulk " * 50},
+        ]
+    conv = FakeConv(messages)
+    await window.prepare(conv)
+
+    assert conv.messages[0] is system
+    assert conv.messages[0]["content"] == "IDENTITY " * 400
+
+
+def test_the_report_names_the_target_when_one_is_set(config) -> None:
+    window = make_window(config)
+    config.llm.context_target = 0.7
+    conv = FakeConv([{"role": "system", "content": "s"}])
+    body = "\n".join(window.report(conv).lines())
+    assert window.report(conv).target == int(window.budget * 0.7)
+    assert "fill target" in body
+    assert "63%" in body  # 2520 of a 4000-token window
+
+
+def test_the_report_omits_the_target_line_by_default(config) -> None:
+    window = make_window(config)
+    conv = FakeConv([{"role": "system", "content": "s"}])
+    body = "\n".join(window.report(conv).lines())
+    assert "fill target" not in body

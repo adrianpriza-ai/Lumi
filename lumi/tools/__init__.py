@@ -17,6 +17,7 @@ from ..memory import MemoryStore
 from ..util.log import get_logger
 from .base import NeedsApproval, Tool, ToolContext, ToolError, ToolResult
 from .context7 import Context7Tool
+from .explore import GrepTool, ListFilesTool, ReadFileTool
 from .files import FilesTool
 from .memory_tool import MemoryTool
 from .registry import ToolRegistry
@@ -41,6 +42,9 @@ def build_registry(config: Config, memory: MemoryStore) -> ToolRegistry:
     candidates = {
         "shell": lambda: ShellTool(config),
         "files": lambda: FilesTool(config),
+        "read_file": lambda: ReadFileTool(config),
+        "list_files": lambda: ListFilesTool(config),
+        "grep": lambda: GrepTool(config),
         "memory": lambda: MemoryTool(config, memory),
         "web": lambda: WebTool(config),
         "context7": lambda: Context7Tool(config),
@@ -74,6 +78,9 @@ __all__ = [
     "ToolRegistry",
     "ShellTool",
     "FilesTool",
+    "ReadFileTool",
+    "ListFilesTool",
+    "GrepTool",
     "MemoryTool",
     "WebTool",
     "Context7Tool",

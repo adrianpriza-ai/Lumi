@@ -145,6 +145,16 @@ context_headroom = 16000
 # Losing the newest turns is how a model starts contradicting the message it
 # was replying to.
 context_keep_recent = 12
+# Fill target: the conversation tries to stay under this fraction of the
+# usable budget (context_window minus context_headroom). Above it, older
+# *messages* are trimmed back (elided, then summarised if compaction is on,
+# then dropped) — oldest first, and only ever messages: the system prompt
+# (personality, instructions) and the long-term memory block are never
+# touched. This is a soft ceiling, not the hard limit: the request must still
+# fit the real budget, so a value below 1.0 just leaves slack so a late turn
+# never tips it over the provider's limit. 1.0 (default) disables the target
+# and trims only against the hard budget, as before. Try 0.7 for long chats.
+context_target = 1.0
 # When the window fills, ask the model to write a record of the oldest part
 # before it is dropped, and keep that instead. Off means the old part is simply
 # dropped with a marker: cheaper, and the past is then gone.
@@ -192,7 +202,7 @@ show_reasoning = true
 
 [tools]
 # Remove any tool from this list to disable it everywhere.
-enabled = ["shell", "files", "memory", "web", "context7", "send"]
+enabled = ["shell", "files", "read_file", "list_files", "grep", "memory", "web", "context7", "send"]
 
 [tools.shell]
 enabled = true
