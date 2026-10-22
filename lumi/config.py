@@ -1002,8 +1002,9 @@ def validate(config: Config) -> list[str]:
         problems.append("llm.chars_per_token must be a positive number")
     if not 0.0 < config.llm.context_target <= 1.0:
         problems.append(
-            "llm.context_target must be a fraction in (0.0, 1.0] — the share of "
-            "llm.context_window the conversation tries to stay under"
+            "llm.context_target must be a fraction in (0.0, 1.0] — the share of the "
+            "usable budget (llm.context_window minus llm.context_headroom) the "
+            "conversation tries to stay under"
         )
     if config.tools.files.max_write_chars <= 0:
         problems.append("tools.files.max_write_chars must be a positive number of characters")

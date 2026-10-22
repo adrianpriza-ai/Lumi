@@ -17,8 +17,9 @@ the model that just asked for it.
 
 from __future__ import annotations
 
-import fnmatch
 import os
+import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +70,11 @@ GREP_MAX_RESULTS = 200
 #: point, and a minified bundle line is not something anyone wanted whole.
 GREP_LINE_CHARS = 300
 
+#: How much of a line that is too long to read is shown before the read is
+#: refused. Enough to recognise the file, small enough that the refusal costs
+#: nothing to carry in the conversation.
+OVERSIZE_PREVIEW_CHARS = 400
+
 
 def _resolve_read(root: Path, raw: Any) -> Path:
     """Resolve a read-only path: anywhere under *root*, plus whitelisted system files.
@@ -92,13 +98,17 @@ def _display(root: Path, path: Path) -> str:
     return relative_to_root(path)
 
 
-def _is_binary_head(path: Path) -> bool:
-    """True when the first 8 KB contain a NUL byte — the cheap binary sniff."""
+def _is_binary_head(path: Path) -> bool | None:
+    """True when the first 8 KB contain a NUL byte — the cheap binary sniff.
+
+    None when the file could not be opened at all: unreadable is not binary,
+    and the two deserve different answers.
+    """
     try:
         with path.open("rb") as handle:
             return b"\x00" in handle.read(8192)
     except OSError:
-        return True
+        return None
 
 
 class ReadFileTool(Tool):
@@ -114,8 +124,10 @@ Parameters:
 One call returns at most ~30k tokens. If a whole-file read would exceed that
 it is refused, not truncated — re-issue with `offset` and `limit` (start at
 `offset=1 limit=500`, then raise `offset` to the line after the last one you
-saw; the result tells you the next offset). The result also reports the file's
-total line count, so you can plan the windows.
+saw; the result tells you the next offset). A single line longer than the cap
+cannot be read this way at all: the refusal says so and names the line, and
+`run_shell` is the way to see it. The result also reports the file's total line
+count, so you can plan the windows.
 
 Prefer this over `run_shell cat/head/tail`: it is confined to the project,
 never hangs, and the line numbers make `files.edit` calls unambiguous. Use the
@@ -159,7 +171,10 @@ never hangs, and the line numbers make `files.edit` calls unambiguous. Use the
         limit = arguments.get("limit")
         limit = _positive_int(limit, default=None, name="limit") if limit is not None else None
 
-        size = path.stat().st_size
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            return ToolResult.failure(f"could not read {display}: {exc}")
         whole_file = offset == 1 and limit is None
         if whole_file and size > MAX_READ_BYTES:
             return ToolResult.failure(
@@ -169,7 +184,10 @@ never hangs, and the line numbers make `files.edit` calls unambiguous. Use the
                 "then keep raising offset until you have what you need."
             )
 
-        if _is_binary_head(path):
+        binary = _is_binary_head(path)
+        if binary is None:
+            return ToolResult.failure(f"could not read {display}.")
+        if binary:
             return ToolResult.failure(
                 f"{display} looks like a binary file. For its contents, describe it or "
                 "process it with run_shell instead."
@@ -180,6 +198,9 @@ never hangs, and the line numbers make `files.edit` calls unambiguous. Use the
         chars = 0
         last_line = 0
         stopped_at_cap = False
+        over_line = 0
+        over_chars = 0
+        over_preview = ""
         try:
             with path.open("r", encoding="utf-8", errors="replace") as handle:
                 for lineno, line in enumerate(handle, start=1):
@@ -190,12 +211,45 @@ never hangs, and the line numbers make `files.edit` calls unambiguous. Use the
                     text = line.rstrip("\n")
                     if chars + len(text) > cap_chars:
                         stopped_at_cap = True
+                        over_line = lineno
+                        over_chars = len(text)
+                        over_preview = text[:OVERSIZE_PREVIEW_CHARS]
                         break
                     collected.append((lineno, text))
                     chars += len(text)
                     last_line = lineno
         except OSError as exc:
             return ToolResult.failure(f"could not read {display}: {exc}")
+
+        if stopped_at_cap:
+            # Which kind of "too big" decides the remedy: a line that is longer
+            # than the cap on its own can never be reached with offset/limit,
+            # while a merely long window just needs a smaller limit. Getting
+            # this backwards is what made the tool claim a file had "no content"
+            # where it had a line it was unable to return.
+            if over_chars > cap_chars:
+                if collected:
+                    return ToolResult.failure(
+                        f"{display}: line {over_line} is {over_chars:,} characters — "
+                        f"over the {MAX_READ_TOKENS:,}-token read cap on its own — so "
+                        f"no window that includes it can ever fit. Read up to it "
+                        f"(limit={max(1, over_line - offset)}), or read that line with "
+                        "`run_shell`."
+                    )
+                return ToolResult.failure(
+                    f"{display}: line {over_line} is {over_chars:,} characters — over "
+                    f"the {MAX_READ_TOKENS:,}-token read cap on its own, so no "
+                    f"offset/limit window can include it. Its first {len(over_preview)} "
+                    f"characters: {over_preview!r}. Read it another way: `run_shell` "
+                    f"with `cut -c1-4000 {display}`, or `grep` for a token in it — "
+                    f"grep shows the matching line truncated to {GREP_LINE_CHARS} "
+                    "characters."
+                )
+            return ToolResult.failure(
+                f"{display}: the window starting at offset {offset} is over the "
+                f"{MAX_READ_TOKENS:,}-token read cap (line {over_line} would not fit). "
+                "Use a smaller limit (e.g. limit=200) and walk forward with offset."
+            )
 
         if not collected:
             total = _count_lines(path)
@@ -205,13 +259,6 @@ never hangs, and the line numbers make `files.edit` calls unambiguous. Use the
                     f"{total:,} line(s)."
                 )
             return ToolResult.failure(f"{display} has no content at offset {offset}.")
-
-        if stopped_at_cap:
-            return ToolResult.failure(
-                f"{display}: the window starting at offset {offset} is over the "
-                f"{MAX_READ_TOKENS:,}-token read cap. Use a smaller limit "
-                "(e.g. limit=200) and walk forward with offset."
-            )
 
         next_offset = last_line + 1
         more = limit is not None and _has_more_lines(path, next_offset)
@@ -367,8 +414,10 @@ to contain every word, so a distinctive multi-word phrase works as well."""
             "glob": {
                 "type": "string",
                 "description": (
-                    "Only search files whose relative path or name matches this "
-                    "fnmatch glob, e.g. `**/*.py` or `*.md`."
+                    "Only search files whose path matches this glob, e.g. `**/*.py` "
+                    "(every .py file, at any depth, the project root included) or "
+                    "`*.md` (every markdown file, at any depth). `**` spans "
+                    "directories, `*` and `?` do not."
                 ),
             },
             "case_sensitive": {
@@ -420,7 +469,8 @@ to contain every word, so a distinctive multi-word phrase works as well."""
             if too_big:
                 skipped_large += 1
                 continue
-            if _is_binary_head(file):
+            if _is_binary_head(file) is not False:
+                # Binary, or unreadable — either way there is nothing to grep.
                 continue
             files_scanned += 1
             hit_here = False
@@ -486,12 +536,24 @@ to contain every word, so a distinctive multi-word phrase works as well."""
     def _candidates(self, start: Path, glob: str = ""):
         """Every file to scan, deterministically ordered, noise pruned."""
         if start.is_file():
-            yield start
+            if not start.is_symlink() and is_within(start.resolve(), self.root):
+                yield start
             return
         for dirpath, dirnames, filenames in os.walk(start):
-            dirnames[:] = sorted(d for d in dirnames if d not in NOISE_DIRS)
+            dirnames[:] = sorted(
+                d
+                for d in dirnames
+                if d not in NOISE_DIRS and not (Path(dirpath) / d).is_symlink()
+            )
             for name in sorted(filenames):
                 file = Path(dirpath) / name
+                if file.is_symlink():
+                    continue
+                try:
+                    if not is_within(file.resolve(), self.root):
+                        continue
+                except OSError:
+                    continue
                 if glob and not _glob_matches(file, self.root, glob):
                     continue
                 yield file
@@ -505,17 +567,69 @@ def _line_matches(text: str, needles: list[str], case_sensitive: bool) -> bool:
     return all(needle in hay for needle in needles)
 
 
-def _glob_matches(file: Path, root: Path, glob: str) -> bool:
-    """fnmatch *glob* against the file's root-relative path and its bare name.
+@lru_cache(maxsize=32)
+def _glob_to_regex(glob: str) -> re.Pattern[str]:
+    """Compile *glob* the way a path glob is meant to work.
 
-    Both forms are accepted so `*.md` works at any depth while `docs/**` scopes
-    to a subtree, the way a person typing a glob expects it to behave.
+    ``**`` spans directories, ``*`` and ``?`` do not: ``**/*.py`` matches
+    ``main.py`` at the project root as well as ``pkg/inner.py``, which is what
+    everybody means by it — and what :meth:`pathlib.Path.glob` does, so the two
+    search tools answer the same question the same way. Plain ``fnmatch`` says
+    no to that, because there ``*`` is just "any characters, slashes included".
+    """
+    out: list[str] = []
+    index = 0
+    length = len(glob)
+    while index < length:
+        char = glob[index]
+        if char == "*":
+            if glob.startswith("**/", index):
+                # Zero or more directories: the thing after it may sit at the
+                # top level or in any subdirectory.
+                out.append("(?:[^/]+/)*")
+                index += 3
+                continue
+            if glob.startswith("**", index):
+                out.append(".*")
+                index += 2
+                continue
+            out.append("[^/]*")
+            index += 1
+            continue
+        if char == "?":
+            out.append("[^/]")
+            index += 1
+            continue
+        if char == "[":
+            close = glob.find("]", index + 1)
+            if close == -1:
+                out.append(re.escape(char))
+                index += 1
+                continue
+            body = glob[index + 1 : close]
+            if body.startswith("!"):
+                body = "^" + body[1:]
+            out.append(f"[{body}]")
+            index = close + 1
+            continue
+        out.append(re.escape(char))
+        index += 1
+    return re.compile("".join(out))
+
+
+def _glob_matches(file: Path, root: Path, glob: str) -> bool:
+    """True when *file*'s path matches *glob*.
+
+    The path is matched relative to the project root *and* by its bare name,
+    so ``*.md`` finds the markdown at any depth while ``docs/**`` scopes to a
+    subtree — the way a person typing a glob expects it to behave.
     """
     try:
-        rel = str(file.relative_to(root))
+        rel = file.relative_to(root).as_posix()
     except ValueError:
-        rel = str(file)
-    return fnmatch.fnmatch(rel, glob) or fnmatch.fnmatch(file.name, glob)
+        rel = file.as_posix()
+    pattern = _glob_to_regex(glob)
+    return bool(pattern.fullmatch(rel) or pattern.fullmatch(file.name))
 
 
 def _count_lines(path: Path) -> int | None:

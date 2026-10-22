@@ -106,6 +106,7 @@ History is budgeted in **tokens against the model's window**, not counted in mes
 [llm]
 context_window = 200000        # your model's real limit
 context_headroom = 16000       # kept free for the reply
+context_target = 1.0            # trim older turns to this share of the usable budget
 context_keep_recent = 12       # tail messages never condensed
 compaction = true              # summarise before dropping
 history_turns = 0              # replay as much as fits
@@ -122,6 +123,14 @@ When the window fills, the oldest part is condensed rather than deleted. The ord
 The record is written to `data/history/<chat_id>.jsonl` as a `summary` row, so a
 restart inherits the thread instead of starting it over. `/context` shows the
 window, what is in use, and the record itself.
+
+`context_target` is a soft fill line, expressed as a fraction of the usable
+budget (`context_window - context_headroom`). The default `1.0` preserves the
+hard-budget behaviour. For example, `0.7` trims older turns back to 70% of the
+usable budget, leaving slack for the next turn and its tool output. The target
+cannot go below the system prompt, summary note, and protected recent tail; if
+those already need more space, Lumi keeps the reachable floor and logs a
+warning rather than pretending the target was met.
 
 Two invariants worth knowing: an assistant's tool calls always move with their
 tool results (half of either is a 400, not a shorter conversation), and the
@@ -145,12 +154,14 @@ A chat's memory file is the one part of the prompt with no second chance: the
 system
 prompt is never cut, so an oversized memory file would grow into the window with
 nothing able to reclaim it, and the conversation would quietly get smaller
-instead. It is therefore always bounded — at an eighth of the window by default,
-which is room for hundreds of facts:
+instead. It is therefore always bounded at an eighth of the effective fill
+target by default, which is room for hundreds of facts. With a soft
+`context_target`, the default cap follows that target rather than the full model
+window:
 
 ```toml
 [llm]
-max_memory_chars = 0    # 0 = an eighth of the window (~64k chars at 200k tokens)
+max_memory_chars = 0    # 0 = an eighth of the effective fill target
 ```
 
 Set a number to cap it harder; the cap applies to each chat's memory

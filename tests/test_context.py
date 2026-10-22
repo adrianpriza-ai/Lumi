@@ -332,6 +332,24 @@ def test_replay_packs_as_much_of_the_transcript_as_fits(config) -> None:
     assert conv.messages[-1]["content"].startswith("answer 39")
 
 
+def test_replay_hands_back_to_the_soft_target_after_installing_a_record(config) -> None:
+    """The summary note is installed after transcript packing and counts too."""
+    history = make_history(config)
+    history.append(1, "summary", "record " + "important detail " * 40)
+    for i in range(20):
+        history.append(1, "user", f"question {i} " + "detail " * 100)
+        history.append(1, "assistant", f"answer {i} " + "detail " * 100)
+
+    window = make_window(config, history=history)
+    config.llm.context_target = 0.5
+    conv = FakeConv([{"role": "system", "content": "s" * 500}])
+    window.replay(conv)
+
+    assert window.estimate(conv.messages) <= window.target
+    assert conv.messages[1].get(SUMMARY_FLAG) is True
+    assert conv.messages[-1]["content"].startswith("answer 19")
+
+
 def test_replay_inherits_a_record_written_by_a_previous_process(config) -> None:
     history = make_history(config)
     history.append(1, "user", "old question")
@@ -415,6 +433,43 @@ def test_a_tiny_target_still_has_a_floor(config) -> None:
     assert window.target >= 256
 
 
+def test_a_nonsense_target_falls_back_to_the_budget(config) -> None:
+    """A target outside (0.0, 1.0] is a misconfiguration, and it falls back to
+    1.0 — the pre-target behaviour. Falling back to the floor instead would
+    crush the conversation to the system prompt and its tail."""
+    window = make_window(config)
+    for broken in (-1.0, 0.0, 5.0, "nonsense", None):
+        config.llm.context_target = broken
+        assert window.target == window.budget, broken
+        assert window.effective_budget == window.budget, broken
+
+
+async def test_a_negative_target_does_not_crush_the_conversation(config) -> None:
+    """The same fallback, seen from the conversation: a bad setting must not
+    cost the bot its history."""
+    window = make_window(config)
+    config.llm.context_target = -1.0
+    window.llm = ScriptedLLM()
+    messages = [{"role": "system", "content": "PERSONALITY " * 20}]
+    for i in range(8):
+        messages += [
+            {"role": "user", "content": f"q{i} " + "detail " * 60},
+            {"role": "assistant", "content": f"a{i} " + "detail " * 60},
+        ]
+    conv = FakeConv(messages)
+    await window.prepare(conv)
+
+    assert len(conv.messages) == len(messages)
+    assert conv.dropped == 0
+    assert conv.summarised == 0
+
+
+def test_memory_share_follows_the_soft_target(config) -> None:
+    window = make_window(config)
+    config.llm.context_target = 0.5
+    assert window.memory_limit() == window.chars_for(window.effective_budget // 8)
+
+
 async def test_a_soft_target_trims_messages_back_to_the_fill_line(config) -> None:
     """Above the target but below the hard budget, older *messages* are dropped
     until the conversation is back under the fill line."""
@@ -472,6 +527,69 @@ async def test_the_system_prompt_is_never_a_shed_candidate(config) -> None:
     assert conv.messages[0]["content"] == "IDENTITY " * 400
 
 
+async def test_the_protected_tail_never_swallows_the_system_prompt(config) -> None:
+    """``keep_recent`` larger than the whole conversation counts back past the
+    newest turn to the system prompt, which put the head inside the tail — the
+    same dict object twice — so the request carried the identity twice and the
+    last-resort shrink then cut it in place. The tail may never contain the
+    head."""
+    window = make_window(config)  # window 4000, budget 3600, keep_recent 4
+    config.llm.context_target = 0.5  # fill line 1800
+    window.llm = ScriptedLLM()
+
+    system = {"role": "system", "content": "IDENTITY " * 1_000}
+    conv = FakeConv(
+        [
+            system,  # the whole conversation: keep_recent reaches past it
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "a"},
+        ]
+    )
+    before = window.estimate(conv.messages)
+    assert window.budget > before > window.target  # over the fill line, inside the budget
+    await window.prepare(conv)
+
+    assert sum(m is system for m in conv.messages) == 1
+    assert [m["role"] for m in conv.messages] == ["system", "user", "assistant"]
+    assert conv.messages[0]["content"] == "IDENTITY " * 1_000
+    assert conv.elided == 0  # the shrink had nothing to cut
+
+
+async def test_an_unreachable_target_is_clamped_to_the_protected_tail(config, caplog) -> None:
+    """A soft target cannot be lower than the system prompt plus recent turns.
+
+    The old path dropped every middle turn, then quietly finished above the
+    configured target. The reachable floor should be used instead and named in
+    the log.
+    """
+    window = make_window(config)
+    config.llm.context_target = 0.5
+    window.llm = ScriptedLLM()
+
+    system = {"role": "system", "content": "IDENTITY " * 1_000}
+    recent = [
+        {"role": "user", "content": "recent question " + "detail " * 150},
+        {"role": "assistant", "content": "recent answer " + "detail " * 150},
+        {"role": "user", "content": "latest question " + "detail " * 150},
+        {"role": "assistant", "content": "latest answer " + "detail " * 150},
+    ]
+    middle = [
+        {"role": "user", "content": "older question " + "detail " * 80},
+        {"role": "assistant", "content": "older answer " + "detail " * 80},
+    ]
+    conv = FakeConv([system, *middle, *recent])
+
+    assert window.estimate(conv.messages) > window.target
+    assert window.estimate([system, *recent]) > window.target
+
+    with caplog.at_level("WARNING"):
+        await window.prepare(conv)
+
+    used = window.estimate(conv.messages)
+    assert window.target < used <= window.budget
+    assert any("context target" in record.message and "unreachable" in record.message for record in caplog.records)
+
+
 def test_the_report_names_the_target_when_one_is_set(config) -> None:
     window = make_window(config)
     config.llm.context_target = 0.7
@@ -479,6 +597,9 @@ def test_the_report_names_the_target_when_one_is_set(config) -> None:
     body = "\n".join(window.report(conv).lines())
     assert window.report(conv).target == int(window.budget * 0.7)
     assert "fill target" in body
+    # Both shares, because the setting is a share of the budget while the
+    # number the owner cares about is the window.
+    assert "70%" in body  # 2520 of a 3600-token budget
     assert "63%" in body  # 2520 of a 4000-token window
 
 

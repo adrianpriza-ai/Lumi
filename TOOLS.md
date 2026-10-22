@@ -25,13 +25,18 @@ write/edit/upload tool.
   the remedy** — "use offset and limit" — rather than silently truncated,
   because a cut-off read looks like the whole truth to the model that asked.
   The result reports the total line count and the next `offset` to continue from.
+  A *single* line longer than the cap is a dead end for `offset`/`limit` — no
+  window can include it — so the refusal names the line and points at
+  `run_shell` for that one line.
 - `list_files` is `ls`: one directory, directories first with entry counts,
   files with sizes. Venvs, `node_modules` and caches stay hidden.
 - `grep` searches file contents. A multi-word query is an AND: every word must
   appear on the same line (case-insensitive by default), so `config token
   limit` returns lines containing all three. Results are
   `path:line: content`, scoppable with `glob` and `path`; binary files and
-  files over 1 MB are skipped.
+  files over 1 MB are skipped. A `glob` behaves the way a path glob does:
+  `**` spans directories (`**/*.py` finds the root files too) while `*` and `?`
+  stop at a slash, and a bare `*.md` matches at any depth.
 
 Remove any of them from `tools.enabled` to take it away from the model.
 

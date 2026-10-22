@@ -129,9 +129,9 @@ class ContextReport:
 
     tokens: int = 0
     budget: int = 0
-    #: Fill target: tokens the conversation is trimmed back to, as a fraction
-    #: of the window. 0 (or equal to ``budget``) means "no soft target" — the
-    #: hard floor is in charge, which is the pre-target behaviour.
+    #: Fill target: tokens the conversation is trimmed back to — a fraction of
+    #: the usable budget. Equal to ``budget`` means "no soft target": the hard
+    #: floor is in charge, which is the pre-target behaviour.
     target: int = 0
     window: int = 0
     messages: int = 0
@@ -157,9 +157,10 @@ class ContextReport:
         if 0 < self.target < self.budget:
             out.insert(
                 1,
-                f"fill target {self.target:,} tokens ({self.target / self.window:.0%} of the "
-                "window) — older messages are trimmed back to here; the system prompt "
-                "and memory are never touched",
+                f"fill target {self.target:,} tokens ({self.target / self.budget:.0%} of "
+                f"the usable budget, {self.target / self.window:.0%} of the window) — "
+                "older messages are trimmed back to here; the system prompt and "
+                "memory are never touched",
             )
         if self.summarised or self.elided or self.dropped:
             out.append(
@@ -265,8 +266,19 @@ class ContextWindow:
         puts the target exactly on the budget, which leaves the hard floor in
         charge and preserves the pre-target behaviour exactly, and no value can
         make the request exceed the provider's real limit.
+
+        A value outside ``(0.0, 1.0]`` is a misconfiguration, and it falls back
+        to 1.0 — the pre-target behaviour. It must never fall back to the
+        floor: a negative target would otherwise crush the conversation down to
+        the system prompt and its tail, which is the one outcome a bad setting
+        should not be able to cause.
         """
-        fraction = min(1.0, max(0.0, float(getattr(self.config.llm, "context_target", 1.0) or 1.0)))
+        try:
+            fraction = float(getattr(self.config.llm, "context_target", 1.0))
+        except (TypeError, ValueError):
+            fraction = 1.0
+        if not 0.0 < fraction <= 1.0:
+            fraction = 1.0
         return max(256, int(self.budget * fraction))
 
     @property
@@ -310,7 +322,7 @@ class ContextWindow:
         cap = int(self.config.llm.max_memory_chars or 0)
         if cap > 0:
             return cap
-        return self.chars_for(self.budget // MEMORY_WINDOW_SHARE)
+        return self.chars_for(self.effective_budget // MEMORY_WINDOW_SHARE)
 
     def estimate(self, messages: list[dict[str, Any]]) -> int:
         """Tokens for *messages*, to the nearest token.
@@ -395,18 +407,18 @@ class ContextWindow:
         self._give_back(conv, first)
         log.info(
             "replayed %d message(s) for chat %s (~%d of %d tokens)%s",
-            len(replayed.messages), conv.chat_id, self.estimate(conv.messages), self.budget,
+            len(replayed.messages), conv.chat_id, self.estimate(conv.messages), self.effective_budget,
             " after a condensed record" if replayed.summary else "",
         )
 
     def _give_back(self, conv: Any, first: int) -> None:
-        """Drop replayed turns from *first* onwards until the window holds.
+        """Drop replayed turns from *first* onwards until the fill line holds.
 
         Only ever touches replayed history, and never leaves an answer without
         the question in front of it, so a seeded conversation is exactly as
         well-formed as a live one.
         """
-        while self.estimate(conv.messages) > self.budget and first < len(conv.messages):
+        while self.estimate(conv.messages) > self.effective_budget and first < len(conv.messages):
             del conv.messages[first]
             if (
                 first < len(conv.messages)
@@ -451,28 +463,50 @@ class ContextWindow:
         is one pass over the messages, and only the model itself fills a
         context up.
         """
-        over = self.estimate(conv.messages) - self.effective_budget
-        if over <= 0:
+        target_warning_logged = False
+
+        def trim_budget() -> int:
+            nonlocal target_warning_logged
+            head, _, tail = self._split(conv)
+            protected = self.estimate(flatten([*head, *tail]))
+            if protected > self.target and not target_warning_logged:
+                log.warning(
+                    "context target %d is unreachable for chat %s: protected prompt "
+                    "and recent turns need ~%d tokens; using that as the fill line",
+                    self.target,
+                    conv.chat_id,
+                    protected,
+                )
+                target_warning_logged = True
+            return max(self.target, protected)
+
+        effective_budget = trim_budget()
+        estimated = self.estimate(conv.messages)
+        trim_over = estimated - effective_budget
+        hard_over = estimated - self.budget
+        if trim_over <= 0 and hard_over <= 0:
             return
 
         before = len(conv.messages)
         log.info(
             "context full for chat %s: ~%d tokens over a %d budget; condensing",
-            conv.chat_id, over + self.effective_budget, self.effective_budget,
+            conv.chat_id, estimated, effective_budget,
         )
-        self._elide_tool_output(conv, over)
-        if self.estimate(conv.messages) > self.effective_budget:
-            await self._condense(conv)
-        if self.estimate(conv.messages) > self.effective_budget:
-            self._drop_oldest(conv)
-        if self.estimate(conv.messages) > self.effective_budget:
+        self._elide_tool_output(conv, max(0, trim_over, hard_over))
+        effective_budget = trim_budget()
+        if self.estimate(conv.messages) > effective_budget:
+            await self._condense(conv, budget=effective_budget)
+        effective_budget = trim_budget()
+        if self.estimate(conv.messages) > effective_budget:
+            self._drop_oldest(conv, budget=effective_budget)
+        if self.estimate(conv.messages) > self.budget:
             self._shrink_largest(conv)
 
         self._refresh_note(conv)
         log.info(
             "context for chat %s: %d -> %d messages, ~%d of %d tokens, record is %d chars",
             conv.chat_id, before, len(conv.messages), self.estimate(conv.messages),
-            self.effective_budget, len(conv.summary),
+            effective_budget, len(conv.summary),
         )
 
     def _tail_start(self, groups: list[list[dict[str, Any]]]) -> int:
@@ -494,12 +528,16 @@ class ContextWindow:
         recent turns, and *middle* everything that may be condensed or dropped.
         The note rides with the head rather than sitting in the middle:
         condensing it would be summarising a summary, and dropping it would
-        throw away the only version of the past that exists.
+        throw away the only version of the past that exists. The tail may never
+        contain the head: a ``keep_recent`` larger than the whole conversation
+        would otherwise count back to the first group and rebuild the system
+        prompt inside the tail — the same dict twice, which the last-resort
+        shrink would then cut in place.
         """
         groups = blocks(conv.messages)
-        cut = self._tail_start(groups)
         headed = bool(groups) and groups[0][0].get("role") == "system"
         start = 1 if headed else 0
+        cut = max(self._tail_start(groups), start)
         region = groups[start:cut]
         head = [group for group in groups[:start] if group]
         head += [group for group in region if any(m.get(SUMMARY_FLAG) for m in group)]
@@ -541,7 +579,7 @@ class ContextWindow:
                 )
                 return
 
-    async def _condense(self, conv: Any) -> None:
+    async def _condense(self, conv: Any, *, budget: int | None = None) -> None:
         """Summarise the oldest turns in one extra call, and keep the result.
 
         The record replaces the turns it covers, so the past survives as prose
@@ -554,12 +592,13 @@ class ContextWindow:
         head, middle, _ = parts
         if not middle:
             return
+        budget = self.effective_budget if budget is None else budget
 
         # The oldest turns, up to a third of the effective budget: enough to be
         # worth a call, small enough that the record is cheap to carry
         # afterwards, and measured against the fill target rather than the hard
         # floor so a soft target summarises only the surplus.
-        allowance = self.effective_budget // 3
+        allowance = budget // 3
         taken = 0
         used = 0
         while taken < len(middle):
@@ -570,7 +609,7 @@ class ContextWindow:
             taken += 1
         # Not worth a call — and not worth losing turns for a record barely
         # smaller than what it replaces. The drop below handles that case.
-        if not taken or used < self.effective_budget // 8:
+        if not taken or used < budget // 8:
             return
 
         prior = (conv.summary or "").strip()
@@ -586,7 +625,7 @@ class ContextWindow:
         # bound, so it is capped against the window rather than trusted.
         self._install_summary(
             conv,
-            truncate(summary, self.chars_for(self.effective_budget // 4), marker="\n… [record cut]"),
+            truncate(summary, self.chars_for(budget // 4), marker="\n… [record cut]"),
             remember=True,
         )
         log.info(
@@ -634,7 +673,7 @@ class ContextWindow:
             return ""
         return truncate(summary, SUMMARY_MAX_CHARS, marker="\n… [record cut]")
 
-    def _drop_oldest(self, conv: Any) -> None:
+    def _drop_oldest(self, conv: Any, *, budget: int | None = None) -> None:
         """Give up the oldest turns, condensed record notwithstanding.
 
         Normally a handful of messages rather than the conversation: a record is
@@ -645,11 +684,13 @@ class ContextWindow:
         # otherwise the hard floor. Either way this only ever removes from the
         # middle — the head (system prompt: personality, instructions, memory)
         # and the protected tail are never candidates.
-        budget = self.effective_budget
+        budget = self.effective_budget if budget is None else budget
+        before = len(middle)
         while middle and self.estimate(flatten([*head, *middle, *tail])) > budget:
             conv.dropped += len(middle[0])
             middle = middle[1:]
-        self._rejoin(conv, (head, middle, tail))
+        if len(middle) < before:
+            self._rejoin(conv, (head, middle, tail))
 
     def _shrink_largest(self, conv: Any) -> None:
         """Last resort: cut the biggest message until the window holds.

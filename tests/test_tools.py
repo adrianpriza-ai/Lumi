@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import pytest
 
 from lumi.tools.base import NeedsApproval, Tool, ToolContext, ToolError, ToolResult
@@ -794,6 +797,63 @@ async def test_read_file_rejects_a_non_integer_offset(config) -> None:
         await ReadFileTool(config).invoke({"path": "ok.md", "offset": "soon"}, ctx())
 
 
+async def test_read_file_names_the_line_it_cannot_read(config) -> None:
+    """A line longer than the cap is a dead end for offset/limit — no window can
+    ever include it — so the tool has to say that, instead of claiming the file
+    has nothing at that offset."""
+    _write(config.root, "bundle.js", "var small = 1;\n" + "x" * 300_000 + "\n")
+    result = await ReadFileTool(config).invoke(
+        {"path": "bundle.js", "offset": 2, "limit": 1}, ctx()
+    )
+    assert not result.ok
+    assert "no content at offset" not in result.text
+    assert "line 2" in result.text
+    # The remedy has to be real: no offset/limit pair gets past this line.
+    assert "offset/limit" in result.text
+    assert "run_shell" in result.text
+
+
+async def test_read_file_says_how_to_stop_before_an_over_long_line(config) -> None:
+    """The lines before it were fine, so the tool says where to stop."""
+    _write(config.root, "wide.js", "var small = 1;\n" + "x" * 300_000 + "\n")
+    result = await ReadFileTool(config).invoke(
+        {"path": "wide.js", "offset": 1, "limit": 10}, ctx()
+    )
+    assert not result.ok
+    assert "limit=1" in result.text
+    assert "run_shell" in result.text
+
+
+async def test_read_file_says_the_window_is_over_the_cap(config) -> None:
+    """A window that is merely too long is a smaller-limit problem, not a
+    dead end: the two are told apart."""
+    _write(config.root, "wide.txt", "y" * 100_000 + "\n" + "z" * 100_000 + "\n")
+    result = await ReadFileTool(config).invoke(
+        {"path": "wide.txt", "offset": 1, "limit": 10}, ctx()
+    )
+    assert not result.ok
+    assert "smaller limit" in result.text
+    assert "line 2" in result.text
+
+
+async def test_read_file_reports_an_unreadable_file_instead_of_crashing(config) -> None:
+    """A file that cannot be opened is a file that cannot be read — not a
+    crash, and not a claim that it is binary."""
+    if os.geteuid() == 0:  # root reads everything, so there is nothing to test
+        pytest.skip("running as root: permissions are not enforced")
+    locked = config.root / "locked.md"
+    locked.write_text("hi\n", encoding="utf-8")
+    locked.chmod(0o000)
+    try:
+        result = await ReadFileTool(config).invoke({"path": "locked.md"}, ctx())
+    finally:
+        locked.chmod(0o644)
+
+    assert not result.ok
+    assert "could not read" in result.text
+    assert "binary" not in result.text
+
+
 # --------------------------------------------------------------------------- #
 # list_files
 # --------------------------------------------------------------------------- #
@@ -901,6 +961,41 @@ async def test_grep_max_results_truncates_with_a_note(config) -> None:
     assert "narrow" in result.text
 
 
+async def test_grep_glob_double_star_matches_the_project_root(config) -> None:
+    """`**/*.py` means "every .py file, at any depth" — the project root
+    included. Plain fnmatch says otherwise, because there `*` is just "any
+    characters, slashes included", which quietly loses the root files."""
+    _write(config.root, "root_mod.py", "# NEEDLE in the root file\n")
+    _write(config.root, "pkg/inner.py", "# NEEDLE in the package\n")
+    result = await GrepTool(config).invoke({"query": "NEEDLE", "glob": "**/*.py"}, ctx())
+    assert "root_mod.py:1" in result.text
+    assert "pkg/inner.py:1" in result.text
+
+
+async def test_grep_glob_double_star_spans_any_number_of_directories(config) -> None:
+    _write(config.root, "src/top.py", "# NEEDLE\n")
+    _write(config.root, "src/pkg/deep.py", "# NEEDLE\n")
+    result = await GrepTool(config).invoke({"query": "NEEDLE", "glob": "src/**/*.py"}, ctx())
+    assert "src/top.py:1" in result.text
+    assert "src/pkg/deep.py:1" in result.text
+
+
+async def test_grep_glob_star_does_not_cross_directories(config) -> None:
+    """`*` stops at a slash, the way a path glob does — and the way
+    `files.search` already behaves."""
+    _write(config.root, "src/top.py", "# NEEDLE\n")
+    _write(config.root, "src/pkg/deep.py", "# NEEDLE\n")
+    result = await GrepTool(config).invoke({"query": "NEEDLE", "glob": "src/*.py"}, ctx())
+    assert "src/top.py:1" in result.text
+    assert "deep.py" not in result.text
+
+
+async def test_grep_glob_star_still_matches_at_any_depth(config) -> None:
+    _write(config.root, "pkg/inner.py", "# NEEDLE\n")
+    result = await GrepTool(config).invoke({"query": "NEEDLE", "glob": "*.py"}, ctx())
+    assert "pkg/inner.py:1" in result.text
+
+
 async def test_grep_needs_a_query(config) -> None:
     with pytest.raises(ToolError, match="query"):
         await GrepTool(config).invoke({"query": "   "}, ctx())
@@ -909,3 +1004,20 @@ async def test_grep_needs_a_query(config) -> None:
 async def test_grep_outside_the_project_is_refused(config) -> None:
     with pytest.raises(ToolError, match="outside the project"):
         await GrepTool(config).invoke({"query": "root", "path": "/"}, ctx())
+
+
+async def test_grep_skips_symlinks_that_leave_the_project(config, tmp_path: Path) -> None:
+    outside = tmp_path.parent / f"{tmp_path.name}-outside_secret.txt"
+    outside.write_text("TOPSECRETVAL lives out here\n", encoding="utf-8")
+    leak = config.root / "leak.txt"
+    try:
+        leak.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    result = await GrepTool(config).invoke({"query": "TOPSECRETVAL"}, ctx())
+
+    assert result.ok
+    assert result.data["matches"] == []
+    assert "leak.txt" not in result.text
+    assert "lives out here" not in result.text

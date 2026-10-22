@@ -237,7 +237,7 @@ def _render_config(config: Config, memory_limit: int) -> str:
     ceiling = f"{llm.max_tokens:,}" if llm.max_tokens > 0 else "provider default (no cap sent)"
     memory_cap = f"{memory_limit:,} chars"
     if llm.max_memory_chars <= 0:
-        memory_cap += " (an eighth of the window)"
+        memory_cap += " (an eighth of the effective context target)"
     web_content = f"{web.max_content_chars:,} chars" if web.max_content_chars > 0 else "uncapped"
     shell_output = f"{shell.max_output_chars:,} chars" if shell.max_output_chars > 0 else "uncapped"
     return "\n".join(
