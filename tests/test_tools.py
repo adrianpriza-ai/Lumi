@@ -636,6 +636,31 @@ async def test_registry_close_releases_every_tool() -> None:
     assert closed == ["chatty"]
 
 
+async def test_step_detail_falls_back_to_the_tool_name(config) -> None:
+    """The feed's detail key resolves through the tool, and never raises: an
+    unknown tool or a tool that trips over its own arguments degrades to the
+    plain name rather than breaking the turn it is announcing."""
+
+    class Grumpy(Tool):
+        name = "grumpy"
+        description = "Hates being asked for details."
+
+        def step_detail(self, arguments):
+            raise RuntimeError("no")
+
+        async def invoke(self, arguments, ctx):
+            return ToolResult(text="ok")
+
+    registry = ToolRegistry()
+    registry.register(GrepTool(config))
+    registry.register(Grumpy())
+
+    assert registry.step_detail("grep", {"query": "needle"}) == "grep"
+    assert registry.step_detail("grumpy", {}) == "grumpy"
+    assert registry.step_detail("missing", {}) == "missing"
+    assert registry.step_detail("grep") == "grep"  # no arguments at all
+
+
 # --------------------------------------------------------------------------- #
 # send
 # --------------------------------------------------------------------------- #

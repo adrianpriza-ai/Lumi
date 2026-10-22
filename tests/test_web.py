@@ -360,6 +360,16 @@ async def test_unknown_action(config) -> None:
         await tool.invoke({"action": "browse"}, None)
 
 
+def test_step_detail_names_the_action(config) -> None:
+    """The progress feed reads "Web Search" or "Web Fetch" — the detail key
+    carries which action ran, and anything else falls back to the plain name."""
+    tool = make_tool(config, StubProvider("tavily"))
+    assert tool.step_detail({"action": "search"}) == "web.search"
+    assert tool.step_detail({"action": "fetch"}) == "web.fetch"
+    assert tool.step_detail({"action": "browse"}) == "web"
+    assert tool.step_detail({}) == "web"
+
+
 def test_availability_reports_why_every_provider_is_unusable(config) -> None:
     tool = make_tool(config, StubProvider("tavily", ok=False, reason="no key"))
     ok, reason = tool.available()

@@ -2087,6 +2087,19 @@ async def test_step_feed_caps_rendered_body_at_ten_lines() -> None:
     assert len(rendered.splitlines()) == 10
 
 
+def test_step_labels_read_the_way_the_owner_sees_them() -> None:
+    """The feed names capabilities, not internals: a content search is a
+    Search, and the web step says which action ran."""
+    from lumi.bot import step_label
+
+    assert step_label("tool", "grep") == "🔍 Search"
+    assert step_label("tool", "web.search") == "🌐 Web Search"
+    assert step_label("tool", "web.fetch") == "🌐 Web Fetch"
+    assert step_label("tool", "web") == "🌐 Web"  # action unknown
+    assert step_label("tool", "brand_new_tool") == "🔧 brand_new_tool"
+    assert step_label("thinking") == "🧠 Thinking"
+
+
 async def test_the_step_message_never_carries_a_button(config) -> None:
     bot, _ = await send(config, [make_reply("four", reasoning=THINKING)], "how many r's?")
     assert not [m for m in bot.sent if m.get("reply_markup")]

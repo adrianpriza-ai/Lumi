@@ -990,12 +990,15 @@ async def test_direct_web_invocation_announces_its_step(config) -> None:
     assert result.text
     assert steps[0] == ("tool", "web.search")
 
+    # A fetch announces the other action — a separate agent so the two direct
+    # calls do not compete for the same one-reply queue.
+    fetch_agent = make_agent(config, [make_reply("read it")])
     fetch_steps: list[tuple[str, str]] = []
 
     async def on_fetch_step(kind: str, detail: str) -> None:
         fetch_steps.append((kind, detail))
 
-    await agent.run_tool(
+    await fetch_agent.run_tool(
         CHAT,
         "web",
         {"action": "fetch", "url": "https://example.com"},
