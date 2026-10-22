@@ -227,7 +227,7 @@ one small message above the answer that grows while the turn runs:
 
 > 🧠 Thinking
 > 💻 Run Bash
-> 🌐 Web
+> 🌐 Web Search
 
 A turn that never touches a tool posts no step message at all — it just
 answers, as it always did. On a long turn the list keeps the last ten lines

@@ -976,7 +976,8 @@ async def test_direct_tool_invocation_announces_its_step(config) -> None:
 
 
 async def test_direct_web_invocation_announces_its_step(config) -> None:
-    """Direct web searches and page fetches announce the web step."""
+    """Direct web searches and page fetches announce which web action ran, so
+    the feed reads "Web Search" or "Web Fetch" rather than just "Web"."""
     agent = make_agent(config, [make_reply("found it")])
     steps: list[tuple[str, str]] = []
 
@@ -987,7 +988,20 @@ async def test_direct_web_invocation_announces_its_step(config) -> None:
         CHAT, "web", {"action": "search", "query": "python"}, hooks=TurnHooks(on_step=on_step)
     )
     assert result.text
-    assert steps[0] == ("tool", "web")
+    assert steps[0] == ("tool", "web.search")
+
+    fetch_steps: list[tuple[str, str]] = []
+
+    async def on_fetch_step(kind: str, detail: str) -> None:
+        fetch_steps.append((kind, detail))
+
+    await agent.run_tool(
+        CHAT,
+        "web",
+        {"action": "fetch", "url": "https://example.com"},
+        hooks=TurnHooks(on_step=on_fetch_step),
+    )
+    assert fetch_steps[0] == ("tool", "web.fetch")
 
 
 async def test_direct_tool_invocation_preserves_artifacts(config) -> None:

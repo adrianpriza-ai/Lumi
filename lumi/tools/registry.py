@@ -86,6 +86,24 @@ class ToolRegistry:
 
     # -- dispatch ---------------------------------------------------------- #
 
+    def step_detail(self, name: str, arguments: dict[str, Any] | None = None) -> str:
+        """Presentation detail for a call about to be announced.
+
+        Resolves through :meth:`Tool.step_detail` so a tool with actions can
+        say which one ran (``web`` -> ``web.search``). Never raises: an
+        unknown tool or a tool that trips over its own arguments degrades to
+        the plain name, because the progress feed must not be able to break a
+        turn.
+        """
+        tool = self._tools.get(name)
+        if tool is None:
+            return name
+        try:
+            return tool.step_detail(arguments or {})
+        except Exception:  # noqa: BLE001 - presentation detail is expendable
+            log.warning("step_detail for tool %s failed", name, exc_info=True)
+            return name
+
     async def invoke(
         self, name: str, arguments: dict[str, Any] | str, ctx: ToolContext
     ) -> ToolResult:

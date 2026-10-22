@@ -137,5 +137,16 @@ class Tool(abc.ABC):
     def summary_line(self) -> str:
         return f"`{self.name}`"
 
+    def step_detail(self, arguments: dict[str, Any]) -> str:
+        """The detail key for this call in the live progress feed.
+
+        The tool name by default. A tool with distinct actions can name the
+        one it is about to run — ``web`` returns ``web.search`` / ``web.fetch``
+        so the chat reads "Web Search" or "Web Fetch" rather than just "Web".
+        Presentation only: nothing functional depends on it, and a bad value
+        degrades to the tool name, never to an error in the turn.
+        """
+        return self.name
+
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"<Tool {self.name}>"

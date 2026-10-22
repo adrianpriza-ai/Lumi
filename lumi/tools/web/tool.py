@@ -287,6 +287,13 @@ unfamiliar.
             + "\n".join(f"- {line}" for line in attempts)
         )
 
+    def step_detail(self, arguments: dict[str, Any]) -> str:
+        """``web.search`` / ``web.fetch`` so the feed can say which ran."""
+        action = str(arguments.get("action") or "").strip().lower()
+        if action in {"search", "fetch"}:
+            return f"{self.name}.{action}"
+        return self.name
+
     def summary_line(self) -> str:
         usable = [name for name, p in self.providers.items() if p.available()[0]]
         return f"`{self.name}` — search and page reads via {', '.join(usable) or 'no provider'}"

@@ -194,7 +194,7 @@ reasoning_effort = ""
 # provider's own output limit already covers the trace.
 reasoning_tokens = 0
 # Show the live step list in the chat while a turn runs — 🧠 Thinking, then
-# each tool as it happens (💻 Run Bash, 🌐 Web …). The thinking trace itself
+# each tool as it happens (💻 Run Bash, 🌐 Web Search …). The thinking trace itself
 # is never shown; `/reasoning off` hides the step list for the running process.
 # In `lumi ask` the trace goes to stderr instead, so redirecting stdout still
 # gives you nothing but the answer.

@@ -633,7 +633,7 @@ class Agent:
         hooks: TurnHooks | None = None,
     ) -> bool:
         """Run one tool call. Returns True if it needs owner approval."""
-        await self._step(hooks, "tool", call.name)
+        await self._step(hooks, "tool", self.registry.step_detail(call.name, call.arguments))
         try:
             tool_result = await self.registry.invoke(call.name, call.arguments, ctx)
         except NeedsApproval as exc:
@@ -760,7 +760,7 @@ class Agent:
 
         if approved:
             log.info("owner approved %s: %s", action.tool, action.preview[:120])
-            await self._step(hooks, "tool", action.tool)
+            await self._step(hooks, "tool", self.registry.step_detail(action.tool, action.arguments))
             tool_result = await self.registry.invoke_approved(action, ctx)
             outcome = f"[Approved by the owner. {action.tool} ran and returned:]\n{tool_result.text}"
             used = [action.tool]
@@ -804,7 +804,7 @@ class Agent:
 
         # Announced like any model-driven call: the feed promises to show each
         # tool the bot runs, and a direct invocation is one of those.
-        await self._step(hooks, "tool", tool)
+        await self._step(hooks, "tool", self.registry.step_detail(tool, arguments))
         try:
             tool_result = await self.registry.invoke(tool, arguments, ctx)
         except NeedsApproval as exc:

@@ -664,8 +664,12 @@ STEP_LABELS = {
     "files": "📁 Files",
     "read_file": "📖 Read File",
     "list_files": "📂 List Files",
-    "grep": "🔍 Grep",
+    "grep": "🔍 Search",
     "web": "🌐 Web",
+    # The web step says which action ran: a search reads one way in the feed,
+    # a page fetch another. Keys come from Tool.step_detail.
+    "web.search": "🌐 Web Search",
+    "web.fetch": "🌐 Web Fetch",
     "memory": "📌 Memory",
     "context7": "📚 Context7",
     "send": "✉️ Send",
@@ -690,7 +694,7 @@ class StepFeed:
 
         🧠 Thinking
         💻 Run Bash
-        🌐 Web
+        🌐 Web Search
 
     Sent on the first step and edited after that, so a turn reads as one
     growing note above the answer. Every failure degrades the same way: if the
