@@ -113,7 +113,7 @@ auto_remember = true
 [tools.web]
 enabled = true
 # Providers tried in order; the first available one answers.
-provider_order = ["firecrawl", "exa", "tavily", "mcp"]
+provider_order = ["firecrawl", "exa", "tavily", "you", "mcp"]
 # Hits per search. 0 = whatever the model asks for.
 max_results = 10
 # Top up from the next provider below this many hits.
@@ -154,6 +154,13 @@ search_type = "auto"
 category = ""
 # fallback | round_robin | random. No keyless tier.
 key_strategy = "fallback"
+
+[tools.web.providers.you]
+enabled = true
+# You.com's keyless MCP profile: no account, no key, low rate limit.
+url = "https://api.you.com/mcp?profile=free"
+# Optional; sent as an X-API-Key header when set.
+api_key_env = "YOU_API_KEY"
 
 [tools.web.providers.mcp]
 enabled = true

@@ -517,6 +517,38 @@ class ExaConfig:
 
 
 @dataclass(slots=True)
+class YouConfig:
+    """You.com search over its hosted MCP endpoint.
+
+    ``profile=free`` is You.com's keyless tier: no account, no API key, a low
+    rate limit. The provider is therefore *available* without a key, so the
+    web tool can fall through to it on a fresh clone and try something before
+    giving up. A ``YOU_API_KEY``, when set, is sent as an ``X-API-Key``
+    header on the same endpoint.
+    """
+
+    enabled: bool = True
+    #: The hosted MCP endpoint (streamable HTTP). ``profile=free`` selects the
+    #: keyless tier; point it elsewhere to use another profile.
+    url: str = "https://api.you.com/mcp?profile=free"
+    api_key_env: str = "YOU_API_KEY"
+
+    def api_key(self) -> str | None:
+        """The key, or None when the variable is unset or empty."""
+        keys = parse_env_var(self.api_key_env)
+        return keys[0] if keys else None
+
+    def api_keys(self) -> list[str]:
+        """The single key as a list, for the doctor's uniform reporting.
+
+        One key per endpoint: extra comma-separated values in ``api_key_env``
+        are ignored rather than rotated.
+        """
+        key = self.api_key()
+        return [key] if key else []
+
+
+@dataclass(slots=True)
 class MCPConfig:
     enabled: bool = True
     #: The project's own file. A relative path resolves against the project root.
@@ -605,7 +637,7 @@ class Context7Config:
 class WebConfig:
     enabled: bool = True
     provider_order: list[str] = field(
-        default_factory=lambda: ["firecrawl", "exa", "tavily", "mcp"]
+        default_factory=lambda: ["firecrawl", "exa", "tavily", "you", "mcp"]
     )
     #: How many hits a search returns. The ceiling is the provider's, not ours:
     #: 10 covers a hard question with room for the angles that do not pan out,
@@ -624,6 +656,7 @@ class WebConfig:
     tavily: TavilyConfig = field(default_factory=TavilyConfig)
     firecrawl: FirecrawlConfig = field(default_factory=FirecrawlConfig)
     exa: ExaConfig = field(default_factory=ExaConfig)
+    you: YouConfig = field(default_factory=YouConfig)
     mcp: MCPConfig = field(default_factory=MCPConfig)
 
 
@@ -1099,7 +1132,9 @@ def validate(config: Config) -> list[str]:
         problems.append("bot.max_upload_mb must be a positive number of megabytes")
 
     providers = [
-        p for p in config.tools.web.provider_order if p not in {"tavily", "firecrawl", "exa", "mcp"}
+        p
+        for p in config.tools.web.provider_order
+        if p not in {"tavily", "firecrawl", "exa", "you", "mcp"}
     ]
     if providers:
         problems.append(

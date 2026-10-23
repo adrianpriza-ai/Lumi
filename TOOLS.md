@@ -173,12 +173,13 @@ a handler filter, and as an explicit check in every privileged handler.
 
 ```toml
 [tools.web]
-provider_order = ["firecrawl", "exa", "tavily", "mcp"]
+provider_order = ["firecrawl", "exa", "tavily", "you", "mcp"]
 ```
 
 - **firecrawl** — best for reading a specific page. Renders JavaScript, returns clean markdown. No keyless tier — a `FIRECRAWL_API_KEY` is required, but a comma-separated pool with the same three strategies (`tools.web.firecrawl.key_strategy`) keeps the bot up when one key is rate-limited.
 - **exa** — neural search built for agents: natural-language queries in, semantically ranked pages out, with highlights or full text per hit. Needs an `EXA_API_KEY` (no keyless tier); same rotation rules as the others (`tools.web.exa.key_strategy`). Optional `search_type` (`auto` / `neural` / `keyword`) and `category` (`news`, `github`, `paper`, `pdf`, ...) knobs in `[tools.web.providers.exa]`.
 - **tavily** — best for agentic search. LLM-ready snippets, optional bundled answer. **Works without an API key** — the SDK runs in its free tier (low rate limit; `search` and `extract` only) when `TAVILY_API_KEY` is unset. With one or more keys, a failed key is parked for a minute and the next one answers; `tools.web.tavily.key_strategy` picks `fallback` / `round_robin` / `random`.
+- **you** — You.com's hosted MCP endpoint, `https://api.you.com/mcp?profile=free`. **Keyless by design**: no account and no API key, so a fresh clone still has a working search (low rate limit). A `YOU_API_KEY`, when set, is sent as an `X-API-Key` header. Disable it with `enabled = false` in `[tools.web.providers.you]`.
 - **mcp** — reads `.mcp.json` from the project root and `~/.agents/mcp.json` (for servers configured once for every project; the project file wins on a duplicate server name, and `tools.web.providers.mcp.user_config_file = ""` turns the user file off), expands `${VAR}` from the environment, and speaks MCP over streamable HTTP or stdio. It discovers each server's tools and reads their input schemas, so it works with a server whose parameter is called `q` instead of `query`.
 
 ```json

@@ -189,14 +189,15 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
     )
 
     # -- web providers ----------------------------------------------------- #
-    # Tavily has a keyless tier (provider stays available without a key);
-    # Firecrawl and Exa do not — an unset key means the provider is skipped.
-    # Each provider also takes a key pool, so the doctor reports the strategy
-    # when more than one key is configured.
+    # Tavily and You.com have keyless tiers (they stay available without a
+    # key); Firecrawl and Exa do not — an unset key means the provider is
+    # skipped. Each provider also takes a key pool, so the doctor reports the
+    # strategy when more than one key is configured.
     for provider_name, cfg in (
         ("tavily", config.tools.web.tavily),
         ("firecrawl", config.tools.web.firecrawl),
         ("exa", config.tools.web.exa),
+        ("you", config.tools.web.you),
     ):
         if not cfg.enabled:
             checks.append(Check(cfg.api_key_env, WARN, "provider disabled in config"))
@@ -204,12 +205,12 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
 
         keys = cfg.api_keys()
         if not keys:
-            if provider_name == "tavily":
+            if provider_name in {"tavily", "you"}:
                 checks.append(
                     Check(
                         cfg.api_key_env,
                         OK,
-                        "unset — using tavily's keyless tier (free, low rate limit)",
+                        f"unset — using {provider_name}'s keyless tier (free, low rate limit)",
                     )
                 )
             else:
