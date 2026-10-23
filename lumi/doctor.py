@@ -251,23 +251,26 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
             )
         )
 
-    mcp_path = config.root / config.tools.web.mcp.config_file
-    if mcp_path.is_file():
-        try:
-            from .tools.web.providers.mcp_provider import MCPProvider
+    # Both files are read (the project's .mcp.json and ~/.agents/mcp.json), so
+    # the check runs when either exists.
+    try:
+        from .tools.web.providers.mcp_provider import MCPProvider
 
-            provider = MCPProvider(config.tools.web.mcp, config.root)
-            servers = provider.servers()
+        mcp = MCPProvider(config.tools.web.mcp, config.root)
+        if any(path.is_file() for path in mcp.config_paths):
+            servers = mcp.servers()
             unresolved = [f"{s.name} (needs {s.unresolved()})" for s in servers if s.unresolved()]
             detail = f"{len(servers)} server(s): {', '.join(s.name for s in servers) or 'none'}"
             if unresolved:
                 checks.append(Check("mcp servers", WARN, f"{detail}; unset: {', '.join(unresolved)}"))
             else:
                 checks.append(Check("mcp servers", OK, detail))
-        except Exception as exc:  # noqa: BLE001
-            checks.append(Check("mcp servers", FAIL, format_error(exc)))
-    else:
-        checks.append(Check("mcp servers", WARN, f"no {mcp_path.name} in the project"))
+        else:
+            checks.append(
+                Check("mcp servers", WARN, f"no {' or '.join(mcp.sources)} found")
+            )
+    except Exception as exc:  # noqa: BLE001
+        checks.append(Check("mcp servers", FAIL, format_error(exc)))
 
     # -- tools ------------------------------------------------------------- #
     if registry is not None:

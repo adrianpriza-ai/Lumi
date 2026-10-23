@@ -274,7 +274,12 @@ def _render_config(config: Config, memory_limit: int) -> str:
             f"- exa: type {escape_html(web.exa.search_type)}"
             + (f", category {escape_html(web.exa.category)}" if web.exa.category else ""),
             f"- tavily: depth {escape_html(web.tavily.search_depth)}, topic {escape_html(web.tavily.topic)}",
-            f"- mcp: {escape_html(str(web.mcp.config_file))} · timeout {web.mcp.timeout_seconds}s",
+            "- mcp: "
+            + escape_html(
+                " + ".join(v for v in (web.mcp.user_config_file, web.mcp.config_file) if v)
+                or "none"
+            )
+            + f" · timeout {web.mcp.timeout_seconds}s",
             f"- call timeout {web.timeout_seconds}s · page content {web_content}",
             "",
             f"<b>shell</b> — cwd {escape_html(str(shell.cwd))} · timeout {shell.timeout_seconds}s"

@@ -1,7 +1,8 @@
 """Web provider contract.
 
 Four implementations ship: the Firecrawl SDK, the Exa SDK, the Tavily SDK, and
-a generic MCP client that reads ``.mcp.json``. They all normalise to
+a generic MCP client that reads ``.mcp.json`` and ``~/.agents/mcp.json``. They
+all normalise to
 :class:`SearchHit` and :class:`Page` so the tool layer never has to care which
 one answered.
 """

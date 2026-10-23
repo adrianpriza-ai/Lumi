@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from lumi.config import (
@@ -84,6 +86,60 @@ def test_env_overrides_toml(project, monkeypatch) -> None:
 def test_env_override_of_a_list(project, monkeypatch) -> None:
     monkeypatch.setenv("LUMI__TOOLS__WEB__PROVIDER_ORDER", "mcp, tavily ,firecrawl")
     assert load_config(project).tools.web.provider_order == ["mcp", "tavily", "firecrawl"]
+
+
+# --------------------------------------------------------------------------- #
+# [tools.web.providers.*] maps onto the flat web fields
+# --------------------------------------------------------------------------- #
+
+
+def test_providers_sections_map_to_the_flat_web_fields(project) -> None:
+    (project / "config.toml").write_text(
+        "[tools.web.providers.tavily]\n"
+        "search_depth = 'advanced'\n"
+        "topic = 'news'\n\n"
+        "[tools.web.providers.mcp]\n"
+        "config_file = 'custom.json'\n"
+        "[tools.web.providers.exa]\n"
+        "search_type = 'neural'\n",
+        encoding="utf-8",
+    )
+    config = load_config(project)
+
+    assert config.tools.web.tavily.search_depth == "advanced"
+    assert config.tools.web.tavily.topic == "news"
+    assert config.tools.web.mcp.config_file == "custom.json"
+    assert config.tools.web.exa.search_type == "neural"
+    # Fields the section did not mention keep their defaults.
+    assert config.tools.web.tavily.include_answer is True
+
+
+def test_a_nested_env_override_beats_the_toml_section(project, monkeypatch) -> None:
+    (project / "config.toml").write_text(
+        "[tools.web.providers.tavily]\nsearch_depth = 'basic'\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("LUMI__TOOLS__WEB__PROVIDERS__TAVILY__SEARCH_DEPTH", "advanced")
+    assert load_config(project).tools.web.tavily.search_depth == "advanced"
+
+
+def test_a_flat_env_override_beats_the_toml_section(project, monkeypatch) -> None:
+    (project / "config.toml").write_text(
+        "[tools.web.providers.tavily]\nsearch_depth = 'basic'\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("LUMI__TOOLS__WEB__TAVILY__SEARCH_DEPTH", "advanced")
+    assert load_config(project).tools.web.tavily.search_depth == "advanced"
+
+
+def test_an_unknown_provider_table_is_warned_about(project, caplog) -> None:
+    (project / "config.toml").write_text(
+        "[tools.web.providers.askjeeves]\napi_key_env = 'ASKJEEVES_KEY'\n",
+        encoding="utf-8",
+    )
+    with caplog.at_level(logging.WARNING, logger="lumi.config"):
+        config = load_config(project)
+
+    assert config.tools.web.tavily.search_depth == "basic"  # the tree still builds
+    assert any("askjeeves" in record.getMessage() for record in caplog.records)
 
 
 def test_optional_float_can_be_nulled(project, monkeypatch) -> None:

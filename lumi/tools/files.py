@@ -450,10 +450,17 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         if not path.is_dir():
             return ToolResult.failure(f"{self._display(path)} is a file, not a directory")
 
+        children = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        shown = 0
+        hidden = 0
         entries: list[str] = []
-        for child in sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+        for child in children:
             if child.name in {".git", "__pycache__", ".venv", "node_modules", ".pytest_cache"}:
                 continue
+            if shown >= MAX_LIST_ENTRIES:
+                hidden += 1
+                continue
+            shown += 1
             if child.is_dir():
                 count = sum(1 for _ in child.iterdir())
                 entries.append(f"{child.name}/  ({count} entries)")
@@ -463,14 +470,17 @@ it validates the path, caps the size, and shows a diff before it overwrites.
                 except OSError:
                     size = 0
                 entries.append(f"{child.name}  ({size} bytes)")
-            if len(entries) >= MAX_LIST_ENTRIES:
-                entries.append(f"… truncated at {MAX_LIST_ENTRIES} entries")
-                break
 
+        # The count describes the directory, not the rendered list: the
+        # truncation marker must not be counted as an entry, and a directory
+        # of 600 files must not read as "500 files".
+        text = f"--- {self._display(path)}/ ---\n" + "\n".join(entries or ["(empty)"])
+        if hidden:
+            text += f"\n… {hidden} more entries not shown"
         return ToolResult(
-            text=f"--- {self._display(path)}/ ---\n" + "\n".join(entries or ["(empty)"]),
-            data={"path": str(path), "count": len(entries)},
-            summary=f"listed {self._display(path)} ({len(entries)} entries)",
+            text=text,
+            data={"path": str(path), "count": shown, "truncated": hidden > 0},
+            summary=f"listed {self._display(path)} ({shown} entries)",
         )
 
     async def _search(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:

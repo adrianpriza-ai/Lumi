@@ -1,276 +1,126 @@
-# Lumi configuration.
-#
-# This file is committed on purpose: it holds no secrets, only behaviour.
-# Clone the repo, drop your tokens into .env, and it runs. Every key here can
-# also be overridden with an environment variable named LUMI__<SECTION>__<KEY>,
-# e.g. LUMI__LLM__MODEL=claude-sonnet-4-5  or  LUMI__TOOLS__SHELL__TIMEOUT_SECONDS=10
+# Lumi configuration. Committed on purpose: no secrets, only behaviour.
+# Override any key with LUMI__<SECTION>__<KEY>, e.g. LUMI__LLM__MODEL=claude-sonnet-4-5
 
 [bot]
-# Chat the bot greets you in. Optional, purely cosmetic.
+# Chat the bot greets you in. Optional.
 startup_chat_id = ""
-# Refuse to boot if TELEGRAM_OWNER_ID is missing. Keep this true: the shell
-# and file tools are only ever exposed to that user id.
+# Refuse to boot without TELEGRAM_OWNER_ID. Keep true: tools are owner-only.
 require_owner = true
-# How the bot behaves in group / supergroup chats. Private chats are
-# unaffected — the bot always replies 1:1.
-#   mention  (default) - reply only when the bot is mentioned (@Lumi_a_bot),
-#                        replied to, or sent a slash command targeting it
-#                        specifically (e.g. /start@Lumi_a_bot).
-#   always             - reply to every owner message regardless of chat type.
-#   off                - never reply in groups; private chats still work.
+# Group behaviour: mention (default) | always | off. Private chats unaffected.
 group_reply_mode = "mention"
-# Chat ids where the bot always replies, regardless of `group_reply_mode`.
-# Useful for a dedicated "Lumi lab" group where you want it to chat freely
-# without lifting the global rule. Telegram chat ids are negative for
-# supergroups; quotes keep them as strings.
+# Optional overrides (Telegram ids are negative for supergroups):
 #   always_reply_chats = ["-1001234567890"]
-# Group chat ids allowed to use the bot. Every member of a whitelisted group
-# may talk to the bot there — they do not need to be on `whitelisted_users` —
-# but they still have to mention the bot: the `group_reply_mode` rule applies
-# to whitelisted groups too. Careful: a whitelisted group hands the bot's
-# tools, shell included, to every member of that room.
-# Telegram chat ids are negative for supergroups; quotes keep them as strings.
 #   whitelisted_groups = ["-1001234567890"]
-# User ids allowed to use the bot alongside the owner. These users can
-# run all commands except whitelist management (owner-only).
 #   whitelisted_users = ["123456789", "987654321"]
-# SOCKS5 or HTTP proxy for the Bot API, if api.telegram.org is slow or blocked
-# from this network. Empty connects directly. Examples:
-#   proxy_url = "socks5://127.0.0.1:9050"
-#   proxy_url = "http://127.0.0.1:7890"
+# SOCKS5/HTTP proxy for the Bot API. Empty = direct connection.
 proxy_url = ""
-# TCP connect timeout in seconds for Bot API calls. Raise it on a slow or
-# lossy network: the stock 5s can abort startup before the bot is up.
+# Bot API connect timeout (s). Raise on slow networks.
 connect_timeout = 15.0
-# Extra startup attempts after a network failure while bootstrapping
-# (initialize, delete/set webhook). 0 means exactly one attempt. -1 retries
-# forever, so the bot waits out an outage instead of exiting when the count
-# runs dry — the same behaviour polling already has once the bot is up.
+# Extra startup attempts after network failure. 0 = once, -1 = retry forever.
 bootstrap_retries = -1
-# Largest file the bot will deliver to the chat as a document, in MB.
-# Telegram's own document ceiling is 50 MB. Anything larger is refused with a
-# reason the model can read out loud.
+# Max document size sent to chat (MB). Telegram's own limit is 50.
 max_upload_mb = 20
 
 [llm]
-# Any OpenAI-compatible endpoint: OpenAI, Ollama, LM Studio, vLLM, Groq,
-# OpenRouter, Together, ... Point base_url at it and set api_key_env.
+# Any OpenAI-compatible endpoint (OpenAI, Ollama, LM Studio, vLLM, Groq, ...).
 provider = "openai"
-# Leave `base_url` empty to take the endpoint from the environment. Resolution
-# order: this value, then OPENAI_BASE_URL / OPENAI_API_BASE from .env, then
-# OpenAI. So you can set the endpoint per machine in .env and still override it
-# per project here.
-#
-#   base_url = "https://api.openai.com/v1"
-#   base_url = "http://localhost:11434/v1"          # Ollama
-#   base_url = "http://localhost:1234/v1"           # LM Studio / vLLM
-#   base_url = "https://openrouter.ai/api/v1"
+# Empty = OPENAI_BASE_URL / OPENAI_API_BASE from .env, then OpenAI.
+#   base_url = "http://localhost:11434/v1"   # Ollama
 base_url = ""
-# Same deal for the model: this value, then OPENAI_MODEL, then the default.
-# Leave it empty to take the model from the environment (OPENAI_MODEL) or fall
-# back to the default; set a value to pin the model — a pin wins over
-# OPENAI_MODEL, even when it is the default id itself.
+# Empty = OPENAI_MODEL from .env or the default. Set to pin the model.
 model = ""
-# Optional second model for photo turns: when a message carries an image (or an
-# image is still in the replayed history), it is sent to this one instead of
-# `model`, so the default can stay text-only. Same endpoint and keys; empty
-# sends everything — photos included — to `model`. Same precedence too: this
-# value, then OPENAI_VISION_MODEL, then unset.
+# Model for image turns. Empty = use `model`.
 vision_model = ""
-# Which environment variable holds the key. Point this at your provider's own
-# name if it differs, e.g. "GROQ_API_KEY" or "OPENROUTER_API_KEY".
-# A comma-separated list is a rotation pool: "sk-...90, sk-...91".
+# Env var holding the key. Comma-separated values make a rotation pool.
 api_key_env = "OPENAI_API_KEY"
-# How to spend several keys, so one exhausted key cannot stop the bot.
-#   fallback     - use the first key, move on only when a call fails in a way
-#                  another key would survive (401/403/429/5xx, dropped
-#                  connection). A 400 fails at once. Right for backup keys.
-#   round_robin  - one call each, in turn. Right for keys on separate accounts.
-#   random       - pick at random; same balance as round_robin.
-# A key that fails is skipped for a minute, then tried again, so a rate limit
-# that clears itself recovers on its own.
+# fallback | round_robin | random
 key_strategy = "fallback"
-# Extra attempts after the first inference request for transient errors or an
-# empty final answer. 4 means at most five requests per key; 0 disables these
-# outer retries. The OpenAI SDK's hidden retry loop is disabled so this is the
-# one retry budget that applies to Ollama Cloud and other compatible endpoints.
+# Extra attempts on transient errors or empty answers.
 inference_retries = 4
-# Initial delay for the exponential retry backoff, in seconds: 0.5, 1, 2, 4.
+# Initial backoff delay (s), doubling each retry.
 inference_retry_delay = 0.5
-# null = let the provider pick its default (needed for some reasoning models).
-# Ignored while `reasoning = true`, which omits it entirely — see below.
+# Provider default when reasoning = true.
 temperature = 0.7
-# Ceiling on output tokens. 0 sends no ceiling at all, which is the default and
-# the right answer: a number here is a wall the model stops at, and a truncated
-# answer that stops mid-sentence is worse than a long one. Raise it if your
-# provider needs a specific limit, or leave it at 0 to let the model decide.
+# Output token ceiling. 0 = no limit.
 max_tokens = 0
-# How many tool-call round trips the agent may take for one message. A guard
-# against a runaway loop rather than a budget — a model that needs 20 round
-# trips is looping, and gets told so instead of burning tokens forever.
+# Max tool-call round trips per message.
 max_tool_iterations = 20
-# Prior turns replayed from data/history/<chat_id>.jsonl on a fresh
-# conversation. 0 means "as many as the context window holds", which is the
-# point of budgeting history in tokens rather than in turn counts: a fixed count
-# is forty messages on a quiet day and four on a busy one.
+# Prior turns replayed on a fresh conversation. 0 = as many as fit.
 history_turns = 0
-# Cap on each chat's MEMORY.md block injected into the system prompt. This is
-# the one limit that is not optional: the file goes into the part of the prompt
-# that nothing can condense away, so an unbounded one would grow into the window
-# and quietly push the conversation out of it. 0 means "no explicit cap" — the
-# file still gets an eighth of the context window (about 64k chars at 200k
-# tokens), which is room for hundreds of facts. Set a number to cap it harder;
-# the oldest facts are what get elided, and the prompt says so when it happens.
-# Memory is per chat (data/memory/<chat_id>/MEMORY.md); the cap is per file.
+# Cap on each chat's MEMORY.md block in the system prompt. 0 = context-derived cap.
 max_memory_chars = 0
 
-# --- Context window ---------------------------------------------------------
-# The conversation is measured against the model's window, in tokens, and the
-# oldest part is condensed into a record before anything is dropped. That is
-# what stops the bot forgetting what you said an hour ago and then answering
-# from imagination instead.
-#
-# Set context_window to your model's real limit, and context_headroom to that
-# model's maximum *output* tokens, so a full-length answer always fits. Both
-# numbers come from the provider: send a request with an absurd max_tokens and
-# it will tell you "maximum context length" and "maximum output tokens". If a
-# request ever overflows anyway, the error names the limit and the config line
-# to change. Everything else here has a sane default.
+# --- Context window ---
+# Set to your model's real limits.
 context_window = 200000
-# Held back from the window for the reply itself. Set it to the model's maximum
-# *output* tokens if you want a full-length answer to always fit — 65536 for
-# Nemotron 3 Super, for instance. The rest of the window is history.
+# Reserved for the reply. Set to the model's max output tokens.
 context_headroom = 16000
-# Messages at the tail that are never condensed, however full the window gets.
-# Losing the newest turns is how a model starts contradicting the message it
-# was replying to.
+# Newest turns that are never condensed.
 context_keep_recent = 12
-# Fill target: the conversation tries to stay under this fraction of the
-# usable budget (context_window minus context_headroom). Above it, older
-# *messages* are trimmed back (elided, then summarised if compaction is on,
-# then dropped) — oldest first, and only ever messages: the system prompt
-# (personality, instructions) and the long-term memory block are never
-# touched. This is a soft ceiling, not the hard limit: the request must still
-# fit the real budget, so a value below 1.0 just leaves slack so a late turn
-# never tips it over the provider's limit. 1.0 (default) disables the target
-# and trims only against the hard budget, as before. Try 0.7 for long chats.
+# Soft fill target as a fraction of the usable budget. 1.0 = hard budget only.
 context_target = 1.0
-# When the window fills, ask the model to write a record of the oldest part
-# before it is dropped, and keep that instead. Off means the old part is simply
-# dropped with a marker: cheaper, and the past is then gone.
+# Summarise the oldest messages before dropping them.
 compaction = true
-# Conversations held in memory at once. Each is bounded by context_window, so
-# this is the ceiling on what the process holds; an evicted chat replays itself
-# from its transcript, so nothing is lost but a re-read.
+# Chats kept in memory at once.
 max_conversations = 32
 
-# --- Reasoning models -------------------------------------------------------
-# Turn this on for a model that thinks before it answers (gpt-oss, DeepSeek
-# reasoner, Qwen3, Nemotron, o-series, gpt-5, and friends). It fixes the three
-# things that otherwise make such a model look broken:
-#
-#   - temperature is dropped. These models reject any value but their own
-#     default, and a 400 on every turn is the usual symptom.
-#   - the token limit moves to max_completion_tokens, because the thinking is
-#     billed as output and would otherwise eat the answer.
-#   - reasoning_tokens is reserved on top of max_tokens for the trace.
-#
-# Safe to leave on for a model that does not reason: the extra parameters go
-# unused. If the endpoint rejects one anyway, Lumi drops it and retries
-# automatically, so you do not have to work out which combination it wants.
-#
-# Off by default so a plain model's sampling is untouched. Turn it on when
-# llm.model is a model that thinks — and if a turn ever 400s mentioning
-# temperature or max_tokens, the error will point you straight back here.
+# --- Reasoning models ---
+# Enable for thinking models (gpt-oss, DeepSeek reasoner, Qwen3, o-series, ...).
 reasoning = false
-# How hard to think. One of: none, minimal, low, medium, high, xhigh, max.
-# Empty sends "medium" while reasoning = true — and that presence matters: on
-# endpoints like Ollama's, reasoning_effort is itself the thinking on/off
-# switch, so omitting it leaves the model's own (usually off) default in
-# charge. "none" actively tells a model to skip thinking.
+# none | minimal | low | medium | high | xhigh | max. Empty = "medium".
 reasoning_effort = ""
-# Token headroom for the thinking, on top of max_tokens. 0 — the default — adds
-# nothing, which is right when max_tokens is also 0: with no ceiling sent, the
-# provider's own output limit already covers the trace.
+# Extra token headroom for the thinking trace.
 reasoning_tokens = 0
-# Show the live step list in the chat while a turn runs — 🧠 Thinking, then
-# each tool as it happens (💻 Run Bash, 🌐 Web Search …). The thinking trace itself
-# is never shown; `/reasoning off` hides the step list for the running process.
-# In `lumi ask` the trace goes to stderr instead, so redirecting stdout still
-# gives you nothing but the answer.
+# Show live step list (thinking + tools) in chat.
 show_reasoning = true
 
 [tools]
-# Remove any tool from this list to disable it everywhere.
+# Remove a tool from this list to disable it everywhere.
 enabled = ["shell", "files", "read_file", "list_files", "grep", "memory", "web", "context7", "send"]
 
 [tools.shell]
 enabled = true
-# Working directory, relative to the project root. Use "." for the repo itself.
+# Working directory relative to the project root.
 cwd = "workspace"
 timeout_seconds = 60
-# Characters of a command's output handed to the model. 0 sends all of it: the
-# context window decides what fits, and it drops old output as the conversation
-# grows rather than mangling every command in real time.
+# Output chars sent to the model. 0 = all.
 max_output_chars = 0
-# Set false to hard-block anything that is not plainly safe (no prompts).
+# Hard-block anything not plainly safe (no prompts).
 ask_before_risky = true
-# "project" pins HOME to the project root so nothing writes into your real
-# home directory. "inherit" passes your real HOME through.
+# project = pin HOME to the project root | inherit = real HOME.
 home = "project"
-# Where a command is allowed to write, relative to the project root. Empty
-# (the default) means the whole project, which is what a coding bot needs in
-# order to edit the code it works on. Set to ["workspace"] to confine writes to
-# the scratch folder and make every other write ask first.
+# Writable paths relative to the project root. Empty = whole project.
 writable = []
 extra_deny = []
-# Regexes matched against the raw command; a hit means DENY.
+# Regexes matched against the raw command; a hit asks for confirmation.
 extra_confirm = []
 
 [tools.files]
 enabled = true
-# Only these directories are writable, relative to the project root.
+# Writable directories relative to the project root.
 writable = ["workspace"]
-# Characters of a file handed to the model on read. Generous by default,
-# because a read is usually done to look at the whole thing; 0 means no cap,
-# and the model's own `max_bytes` argument is there for the files that need one.
+# Chars handed to the model per read. 0 = no cap.
 max_read_chars = 200000
 max_write_chars = 200000
-# Let the model send files to the chat: `upload: true` on a write, or the
-# dedicated `upload` action for an existing file. Incoming documents from the
-# chat are stored under workspace/uploads/ regardless of this flag; set it to
-# false to disable the outgoing direction only.
+# Allow sending files to the chat.
 uploads = true
 
 [tools.memory]
 enabled = true
-# Let the model call remember() on its own. It can never delete memories;
-# erasing is a human action via /forget. Memory is scoped per chat: what is
-# remembered in one chat (or group) is invisible to every other.
+# Let the model call remember(). Deletion is human-only (/forget).
 auto_remember = true
 
 [tools.web]
 enabled = true
-# Providers are tried in this order; the first available one answers.
-# "mcp" reads .mcp.json from the project root, so you can drive any MCP
-# server (tavily, firecrawl, exa, or your own) with zero extra code.
+# Providers tried in order; the first available one answers.
 provider_order = ["firecrawl", "exa", "tavily", "mcp"]
-# Hits per search. Ten covers a hard question with room for the angles that do
-# not pan out, and every one of them is content the model can actually read.
-# 0 means "whatever the model asks for"; the model is told it may raise this.
+# Hits per search. 0 = whatever the model asks for.
 max_results = 10
-# Floor for an acceptable search: when the first provider comes back with
-# fewer hits than this, the next provider in the order tops the result up
-# (deduplicated by URL) instead of the sparse answer going back as-is.
-# Two is the deliberate minimum: it still guarantees a 1-hit answer never
-# ships, but no longer spends a whole second provider call just to grow a
-# 2-hit result to 3.
+# Top up from the next provider below this many hits.
 min_results = 2
-# Characters of body text per search or fetched page. 0 does not cut at all,
-# which is the default: a teaser snippet is what makes a model search again,
-# and again, paying for the same page every time.
+# Body chars per search/page. 0 = no cap.
 max_content_chars = 0
-# Seconds to wait on any single provider call.
+# Per-provider call timeout (s).
 timeout_seconds = 90
 
 [tools.web.providers.tavily]
@@ -281,14 +131,7 @@ topic = "general"           # general | news | finance
 include_answer = true
 include_raw_content = true
 base_url = "https://api.tavily.com"
-# Comma-separated values make a rotation pool, identical to the LLM section.
-# Tavily also accepts keyless use: leave TAVILY_API_KEY unset and the SDK
-# falls back to its free tier (lower rate limit; search and extract only).
-#   TAVILY_API_KEY=tvly-...90, tvly-...91
-# Strategies (only meaningful when there is more than one key):
-#   fallback     - first key, move on only on 401/403/429/5xx.
-#   round_robin  - one each in turn.
-#   random       - pick at random.
+# Unset key = free tier. fallback | round_robin | random.
 key_strategy = "fallback"
 
 [tools.web.providers.firecrawl]
@@ -296,51 +139,40 @@ enabled = true
 api_key_env = "FIRECRAWL_API_KEY"
 base_url = "https://api.firecrawl.dev"
 only_main_content = true
-# When search results carry no body text, scrape this many hits to fill them in.
+# Scrape this many hits when results lack body text.
 auto_scrape_top_n = 3
-# Same rotation rules as Tavily and the LLM client. Firecrawl has no keyless
-# tier, so unset means the provider is unavailable — not a fallback option.
+# fallback | round_robin | random. No keyless tier.
 key_strategy = "fallback"
 
 [tools.web.providers.exa]
 enabled = true
 api_key_env = "EXA_API_KEY"
 base_url = "https://api.exa.ai"
-# "auto" (default) lets Exa pick neural or keyword search per query;
-# "neural" and "keyword" force one. Optional category, e.g. "news", "github",
-# "paper", "pdf" — empty means no filter.
+# auto | neural | keyword
 search_type = "auto"
+# Optional category filter, e.g. news, github, paper.
 category = ""
-# Same rotation rules as Firecrawl and Tavily. Exa has no keyless tier, so
-# unset means the provider is unavailable — not a fallback option.
+# fallback | round_robin | random. No keyless tier.
 key_strategy = "fallback"
 
 [tools.web.providers.mcp]
 enabled = true
+# Project file merged with the user-level file. "" disables the latter.
 config_file = ".mcp.json"
+user_config_file = "~/.agents/mcp.json"
 timeout_seconds = 60
-# Tool name patterns matched against each server's advertised tool list.
-# First match wins; the list is just a preference order.
+# Tool name patterns; first match wins.
 search_tools = ["web_search_exa", "tavily_search", "firecrawl_search", "search"]
 fetch_tools = ["crawl_urls", "tavily_extract", "firecrawl_scrape", "scrape", "extract"]
 
 [tools.context7]
-# The `context7` tool fetches up-to-date library docs and code examples from
-# https://context7.com. It auto-enables the moment CONTEXT7_API_KEY is set;
-# leave the variable unset to keep it disabled and hidden from the model.
+# Auto-enables when CONTEXT7_API_KEY is set.
 enabled = true
-# Which env var holds the key. A comma-separated list is a rotation pool:
-# "ctx7sk-...91, ctx7sk-...92". Identical shape to OPENAI_API_KEY.
+# Comma-separated values make a rotation pool.
 api_key_env = "CONTEXT7_API_KEY"
-# Root of the Context7 API. The v2 prefix is part of the URL on purpose.
 base_url = "https://context7.com/api/v2"
-# Per-call HTTP timeout.
 timeout_seconds = 30
-# How to spend several keys.
-#   fallback     - first key, move on only on 401/403/429/5xx.
-#   round_robin  - one each in turn.
-#   random       - pick at random.
-# A key that fails is parked for a minute before it is retried.
+# fallback | round_robin | random
 key_strategy = "fallback"
 
 [logging]

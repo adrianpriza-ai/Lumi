@@ -43,6 +43,9 @@ def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
     monkeypatch.setenv("TELEGRAM_OWNER_ID", "42")
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    # The real ~/.agents/mcp.json must never leak into tests; the MCP tests
+    # that exercise the user-level file re-enable it against a throwaway HOME.
+    monkeypatch.setenv("LUMI__TOOLS__WEB__PROVIDERS__MCP__USER_CONFIG_FILE", "")
     for leaked in (
         "TAVILY_API_KEY", "FIRECRAWL_API_KEY", "EXA_API_KEY", "LUMI_MCP_URL",
         "OPENAI_MODEL", "OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_VISION_MODEL",

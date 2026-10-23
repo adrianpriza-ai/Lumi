@@ -29,14 +29,18 @@ write/edit/upload tool.
   window can include it — so the refusal names the line and points at
   `run_shell` for that one line.
 - `list_files` is `ls`: one directory, directories first with entry counts,
-  files with sizes. Venvs, `node_modules` and caches stay hidden.
+  files with sizes. Venvs, `node_modules` and caches stay hidden. A listing
+  longer than 500 entries is cut, and the body says how many were hidden —
+  the header's totals still describe the whole directory.
 - `grep` searches file contents. A multi-word query is an AND: every word must
   appear on the same line (case-insensitive by default), so `config token
   limit` returns lines containing all three. Results are
   `path:line: content`, scoppable with `glob` and `path`; binary files and
   files over 1 MB are skipped. A `glob` behaves the way a path glob does:
   `**` spans directories (`**/*.py` finds the root files too) while `*` and `?`
-  stop at a slash, and a bare `*.md` matches at any depth.
+  stop at a slash, and a bare `*.md` matches at any depth. A scan that hits
+  20,000 files stops and says so, the same way an over-long match list does —
+  a partial answer never pretends to be complete.
 
 Remove any of them from `tools.enabled` to take it away from the model.
 
@@ -175,7 +179,7 @@ provider_order = ["firecrawl", "exa", "tavily", "mcp"]
 - **firecrawl** — best for reading a specific page. Renders JavaScript, returns clean markdown. No keyless tier — a `FIRECRAWL_API_KEY` is required, but a comma-separated pool with the same three strategies (`tools.web.firecrawl.key_strategy`) keeps the bot up when one key is rate-limited.
 - **exa** — neural search built for agents: natural-language queries in, semantically ranked pages out, with highlights or full text per hit. Needs an `EXA_API_KEY` (no keyless tier); same rotation rules as the others (`tools.web.exa.key_strategy`). Optional `search_type` (`auto` / `neural` / `keyword`) and `category` (`news`, `github`, `paper`, `pdf`, ...) knobs in `[tools.web.providers.exa]`.
 - **tavily** — best for agentic search. LLM-ready snippets, optional bundled answer. **Works without an API key** — the SDK runs in its free tier (low rate limit; `search` and `extract` only) when `TAVILY_API_KEY` is unset. With one or more keys, a failed key is parked for a minute and the next one answers; `tools.web.tavily.key_strategy` picks `fallback` / `round_robin` / `random`.
-- **mcp** — reads `.mcp.json` from the project root, expands `${VAR}` from the environment, and speaks MCP over streamable HTTP or stdio. It discovers each server's tools and reads their input schemas, so it works with a server whose parameter is called `q` instead of `query`.
+- **mcp** — reads `.mcp.json` from the project root and `~/.agents/mcp.json` (for servers configured once for every project; the project file wins on a duplicate server name, and `tools.web.providers.mcp.user_config_file = ""` turns the user file off), expands `${VAR}` from the environment, and speaks MCP over streamable HTTP or stdio. It discovers each server's tools and reads their input schemas, so it works with a server whose parameter is called `q` instead of `query`.
 
 ```json
 {

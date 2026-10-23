@@ -39,7 +39,7 @@ expected, and it is why the two steps above are always both needed.
 
 **The safety layer is a file you can audit.** `lumi/tools/safety.py` is one screen of `(regex, tier, reason)` triples. `lumi shell "rm -rf /"` prints the verdict and the reason, so you can check the policy without provoking it.
 
-**Web access is pluggable four ways.** The Firecrawl SDK, the Exa SDK, the Tavily SDK, and a generic MCP client that reads `.mcp.json`. They normalise to the same interface, so adding a fifth is one file. The MCP path means a Tavily, Firecrawl, or Exa MCP server works with no code change at all — just add it to `.mcp.json`.
+**Web access is pluggable four ways.** The Firecrawl SDK, the Exa SDK, the Tavily SDK, and a generic MCP client that reads `.mcp.json` (plus `~/.agents/mcp.json`, for servers shared across every project). They normalise to the same interface, so adding a fifth is one file. The MCP path means a Tavily, Firecrawl, or Exa MCP server works with no code change at all — just add it to `.mcp.json`.
 
 ## Commands
 

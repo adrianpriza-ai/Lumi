@@ -1,10 +1,12 @@
 """Any MCP server as a web provider.
 
-This is what makes ``.mcp.json`` meaningful for Lumi. The file is read from the
-project root, ``${VAR}`` placeholders are expanded from the environment, and the
-server is spoken to over MCP proper — so a Tavily or Firecrawl MCP server
-dropped into that file works immediately, with no code change. A locally spawned
-server (``npx -y some-mcp-server``) works the same way.
+This is what makes ``.mcp.json`` meaningful for Lumi. Two files are read: the
+project's ``.mcp.json``, and the user-level ``~/.agents/mcp.json`` for servers
+configured once for every project. ``${VAR}`` placeholders are expanded from the
+environment, and the server is spoken to over MCP proper — so a Tavily or
+Firecrawl MCP server dropped into either file works immediately, with no code
+change. A locally spawned server (``npx -y some-mcp-server``) works the same
+way. When a server name appears in both files, the project file wins.
 
 Two transport kinds are supported:
 
@@ -54,7 +56,7 @@ def expand_env(value: str) -> str:
 
 @dataclass(slots=True)
 class ServerSpec:
-    """One entry from ``.mcp.json``."""
+    """One entry from an MCP config file (``.mcp.json`` or ``~/.agents/mcp.json``)."""
 
     name: str
     kind: str = "remote"  # "remote" | "local"
@@ -144,22 +146,71 @@ class MCPProvider(WebProvider):
 
     @property
     def config_path(self) -> Path:
+        """The project-level file (messages that name exactly one file use it)."""
         return resolve(self.config.config_file, base=self.root)
 
-    def servers(self) -> list[ServerSpec]:
-        path = self.config_path
+    @property
+    def config_paths(self) -> list[Path]:
+        """Every configured file that will be read, user-level first.
+
+        Deduplicated, so pointing ``user_config_file`` at ``config_file`` reads
+        it once. Relative paths resolve against the project root, ``~`` against
+        the home directory.
+        """
+        paths: list[Path] = []
+        for configured in (self.config.user_config_file, self.config.config_file):
+            if not configured:
+                continue
+            path = resolve(configured, base=self.root)
+            if path not in paths:
+                paths.append(path)
+        return paths
+
+    @property
+    def sources(self) -> list[str]:
+        """The configured file names as written, for human-facing messages."""
+        return list(
+            dict.fromkeys(
+                c for c in (self.config.user_config_file, self.config.config_file) if c
+            )
+        )
+
+    def _read_servers(self, path: Path) -> dict[str, ServerSpec]:
         if not path.is_file():
-            return []
+            return {}
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             log.warning("could not read %s: %s", path, exc)
-            return []
+            return {}
         block = raw.get("mcpServers") or raw.get("servers") or {}
         if not isinstance(block, dict):
             log.warning("%s has no usable mcpServers object", path)
+            return {}
+        return {
+            name: ServerSpec.from_json(name, cfg)
+            for name, cfg in block.items()
+            if isinstance(cfg, dict)
+        }
+
+    def servers(self) -> list[ServerSpec]:
+        """Servers from every configured file, merged.
+
+        The files are read in :attr:`config_paths` order, so the project file
+        (last) both overrides a duplicate name and leads the list, shadowing a
+        user-level entry everywhere the list is walked.
+        """
+        tables = [self._read_servers(path) for path in self.config_paths]
+        if not tables:
             return []
-        return [ServerSpec.from_json(name, cfg) for name, cfg in block.items() if isinstance(cfg, dict)]
+        merged: dict[str, ServerSpec] = {}
+        for table in tables:
+            merged.update(table)
+        order: dict[str, None] = {}
+        for table in reversed(tables):
+            for name in table:
+                order.setdefault(name, None)
+        return [merged[name] for name in order]
 
     def available(self) -> tuple[bool, str]:
         if not self.config.enabled:
@@ -168,12 +219,13 @@ class MCPProvider(WebProvider):
             import mcp  # noqa: F401
         except ImportError:
             return False, "the mcp package is not installed"
+        files = ", ".join(self.sources) or "the configured files"
         servers = self.servers()
         if not servers:
-            return False, f"no servers in {self.config_path}"
+            return False, f"no servers in {files}"
         missing = [f"{s.name} (needs {s.unresolved()})" for s in servers if s.unresolved()]
         if missing and len(missing) == len(servers):
-            return False, f"unset variables in {self.config_path}: {', '.join(missing)}"
+            return False, f"unset variables in {files}: {', '.join(missing)}"
         return True, ""
 
     # -- session plumbing -------------------------------------------------- #
@@ -343,7 +395,7 @@ class MCPProvider(WebProvider):
         )
         if chosen is None:
             result.error = (
-                f"no search tool found in {self.config_path} "
+                f"no search tool found in {', '.join(self.sources)} "
                 f"(looked for {', '.join(self.config.search_tools)} or any tool containing 'search')"
             )
             return result
@@ -380,7 +432,7 @@ class MCPProvider(WebProvider):
             self.config.fetch_tools, lambda name: any(k in name for k in ("scrape", "extract", "fetch"))
         )
         if chosen is None:
-            return Page(url=url, markdown=f"no fetch tool found in {self.config_path}")
+            return Page(url=url, markdown=f"no fetch tool found in {', '.join(self.sources)}")
 
         spec, tool = chosen
         key = tool.arg_for(("url", "urls", "link")) or "url"
@@ -410,7 +462,8 @@ class MCPProvider(WebProvider):
         if not ok:
             return f"- `{self.name}` _(unavailable: {reason})_"
         names = [s.name for s in self.servers() if not s.unresolved()]
-        return f"- `{self.name}` — {len(names)} server(s) from {self.config_path.name}: {', '.join(names)}"
+        sources = " + ".join(self.sources)
+        return f"- `{self.name}` — {len(names)} server(s) from {sources}: {', '.join(names)}"
 
 
 # --------------------------------------------------------------------------- #

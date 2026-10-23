@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from lumi.tools.base import NeedsApproval, Tool, ToolContext, ToolError, ToolResult
-from lumi.tools.explore import GrepTool, ListFilesTool, ReadFileTool
+from lumi.tools.explore import GREP_MAX_RESULTS, GrepTool, ListFilesTool, ReadFileTool
 from lumi.tools.files import FilesTool
 from lumi.tools.memory_tool import MemoryTool
 from lumi.tools.registry import ToolRegistry
@@ -282,6 +282,23 @@ async def test_list_hides_noise(files: FilesTool, config) -> None:
     (config.root / ".git").mkdir(exist_ok=True)
     result = await files.invoke({"action": "list", "path": "."}, ctx())
     assert ".git" not in result.text
+
+
+async def test_list_count_is_the_directory_not_the_rendered_list(
+    files: FilesTool, config, monkeypatch
+) -> None:
+    """The truncation marker is not an entry: a directory of 5 files listed
+    under a cap of 3 reports 3 shown, 2 hidden — never "4 entries"."""
+    monkeypatch.setattr("lumi.tools.files.MAX_LIST_ENTRIES", 3)
+    for i in range(5):
+        (config.shell_cwd / f"f{i}.txt").write_text("x", encoding="utf-8")
+
+    result = await files.invoke({"action": "list", "path": "workspace"}, ctx())
+
+    assert result.ok
+    assert result.data["count"] == 3
+    assert result.data["truncated"] is True
+    assert "2 more entries not shown" in result.text
 
 
 async def test_search_with_a_glob(files: FilesTool) -> None:
@@ -838,7 +855,7 @@ async def test_read_file_says_the_window_is_over_the_cap(config) -> None:
 
 async def test_read_file_reports_an_unreadable_file_instead_of_crashing(config) -> None:
     """A file that cannot be opened is a file that cannot be read — not a
-    crash, and not a claim that it is binary."""
+    crash, not a claim that it is binary, and with the OS's own reason kept."""
     if os.geteuid() == 0:  # root reads everything, so there is nothing to test
         pytest.skip("running as root: permissions are not enforced")
     locked = config.root / "locked.md"
@@ -852,6 +869,7 @@ async def test_read_file_reports_an_unreadable_file_instead_of_crashing(config) 
     assert not result.ok
     assert "could not read" in result.text
     assert "binary" not in result.text
+    assert "Permission denied" in result.text  # the OS's reason, not a shrug
 
 
 # --------------------------------------------------------------------------- #
@@ -896,6 +914,59 @@ async def test_list_files_missing_directory_fails_cleanly(config) -> None:
     result = await ListFilesTool(config).invoke({"path": "nowhere"}, ctx())
     assert not result.ok
     assert "no such directory" in result.text
+
+
+async def test_list_files_header_counts_the_whole_directory_when_truncated(
+    config, monkeypatch
+) -> None:
+    """The header totals describe the directory, not what survived the render
+    cap — a truncated listing used to report the cap itself as the count."""
+    monkeypatch.setattr("lumi.tools.explore.MAX_LIST_ENTRIES", 3)
+    for i in range(7):
+        _write(config.root, f"many/f{i}.txt", "x")
+
+    result = await ListFilesTool(config).invoke({"path": "many"}, ctx())
+
+    assert result.ok
+    assert "(0 dir(s), 7 file(s))" in result.text
+    assert "4 more entries not shown" in result.text
+    assert result.data["files"] == 7
+    assert result.data["truncated"] is True
+
+
+async def test_list_files_says_truncated_only_when_it_actually_is(config, monkeypatch) -> None:
+    """A directory with exactly the cap's worth of entries is fully listed and
+    must not claim something was cut."""
+    monkeypatch.setattr("lumi.tools.explore.MAX_LIST_ENTRIES", 3)
+    for i in range(3):
+        _write(config.root, f"exact/f{i}.txt", "x")
+
+    result = await ListFilesTool(config).invoke({"path": "exact"}, ctx())
+
+    assert result.ok
+    assert "not shown" not in result.text
+    assert result.data["truncated"] is False
+
+
+async def test_list_files_skips_symlinks_that_leave_the_project(
+    config, tmp_path: Path
+) -> None:
+    """The listing shows what is inside the project — a link out of it is not
+    ours to count, let alone to name the entry count of."""
+    outside = tmp_path.parent / f"{tmp_path.name}-outside_dir"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("x", encoding="utf-8")
+    link = config.root / "leakdir"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    result = await ListFilesTool(config).invoke({}, ctx())
+
+    assert result.ok
+    assert "leakdir" not in result.text
+    assert "secret.txt" not in result.text
 
 
 # --------------------------------------------------------------------------- #
@@ -959,6 +1030,55 @@ async def test_grep_max_results_truncates_with_a_note(config) -> None:
     assert result.data["truncated"] is True
     assert len(result.data["matches"]) == 5
     assert "narrow" in result.text
+
+
+async def test_grep_rejects_a_non_integer_max_results(config) -> None:
+    """Every other numeric parameter in this module raises ToolError; a bare
+    int() made this one report "grep crashed" instead."""
+    _write(config.root, "a.txt", "spam\n")
+    with pytest.raises(ToolError, match="max_results"):
+        await GrepTool(config).invoke({"query": "spam", "max_results": "lots"}, ctx())
+
+
+async def test_grep_clamps_max_results_to_the_ceiling(config) -> None:
+    _write(config.root, "many.txt", "".join(f"spam {i}\n" for i in range(GREP_MAX_RESULTS + 50)))
+    result = await GrepTool(config).invoke({"query": "spam", "max_results": 10_000}, ctx())
+    assert result.ok
+    assert len(result.data["matches"]) == GREP_MAX_RESULTS
+    assert result.data["truncated"] is True
+
+
+async def test_grep_reports_when_the_runaway_guard_stops_the_scan(
+    config, monkeypatch
+) -> None:
+    """A scan cut short by the file-count guard used to stop silently, so the
+    answer looked complete when it was not."""
+    monkeypatch.setattr("lumi.tools.explore.MAX_GREP_SCAN_FILES", 2)
+    for i in range(5):
+        _write(config.root, f"deep/f{i}.txt", "needle\n")
+
+    result = await GrepTool(config).invoke({"query": "needle"}, ctx())
+
+    assert result.ok
+    assert result.data["stopped_early"] is True
+    assert "stopped early" in result.text
+    assert "narrow" in result.text
+
+
+async def test_grep_says_so_when_an_empty_result_came_from_an_early_stop(
+    config, monkeypatch
+) -> None:
+    """"No matches" after a give-up is not "no matches" — the model has to be
+    able to tell the difference before it concludes anything."""
+    monkeypatch.setattr("lumi.tools.explore.MAX_GREP_SCAN_FILES", 2)
+    for i in range(5):
+        _write(config.root, f"deep/f{i}.txt", "nothing to see\n")
+
+    result = await GrepTool(config).invoke({"query": "needle"}, ctx())
+
+    assert result.ok
+    assert "no matches" in result.text
+    assert "stopped early" in result.text
 
 
 async def test_grep_glob_double_star_matches_the_project_root(config) -> None:

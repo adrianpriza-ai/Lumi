@@ -519,7 +519,13 @@ class ExaConfig:
 @dataclass(slots=True)
 class MCPConfig:
     enabled: bool = True
+    #: The project's own file. A relative path resolves against the project root.
     config_file: str = ".mcp.json"
+    #: A user-level file read *as well*, so servers can be configured once for
+    #: every project (``~`` expands to the home directory). Both files are
+    #: merged; the project file wins on a duplicate server name. Empty string
+    #: turns the user-level file off.
+    user_config_file: str = "~/.agents/mcp.json"
     timeout_seconds: int = 60
     search_tools: list[str] = field(
         default_factory=lambda: ["tavily_search", "firecrawl_search", "search"]
@@ -907,6 +913,45 @@ def _merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _hoist_web_providers(merged: dict[str, Any]) -> dict[str, Any]:
+    """Fold ``[tools.web.providers.<name>]`` into the flat ``tools.web.<name>``.
+
+    ``WebConfig`` holds each provider as ``tavily`` / ``firecrawl`` / ``exa`` /
+    ``mcp``, but config.toml nests them under ``providers`` — a table ``_build``
+    would drop as unknown, so ``[tools.web.providers.tavily] search_depth =
+    "advanced"`` used to be silently ignored.
+
+    Called twice in :func:`load_config`: once after the TOML is merged, once
+    after the env overrides. That way an env override wins over a TOML value
+    no matter which spelling each one uses, and within one layer the nested
+    table wins over a flat one of the same name.
+    """
+    tools = merged.get("tools")
+    web = tools.get("web") if isinstance(tools, dict) else None
+    providers = web.get("providers") if isinstance(web, dict) else None
+    if not isinstance(web, dict) or not isinstance(providers, dict):
+        return merged
+
+    hints = _hints(WebConfig)
+    known = {f.name for f in fields(WebConfig) if is_dataclass(hints.get(f.name))}
+
+    hoisted = {k: v for k, v in web.items() if k != "providers"}
+    for name, table in providers.items():
+        if name not in known:
+            log.warning(
+                "unknown web provider %r in tools.web.providers; ignoring. Known: %s",
+                name,
+                ", ".join(sorted(known)),
+            )
+            continue
+        if not isinstance(table, dict):
+            log.warning("tools.web.providers.%s: expected a table; ignoring", name)
+            continue
+        existing = hoisted.get(name)
+        hoisted[name] = _merge(existing, table) if isinstance(existing, dict) else table
+    return {**merged, "tools": {**tools, "web": hoisted}}
+
+
 def load_config(root: Path | None = None) -> Config:
     """Build a :class:`Config` from disk plus environment overrides."""
     root = (root or project_root()).resolve()
@@ -925,7 +970,12 @@ def load_config(root: Path | None = None) -> Config:
     else:
         log.debug("loaded config from %s", config_path)
 
+    # [tools.web.providers.*] is how config.toml spells the provider tables, so
+    # fold it up before the tree is built (and again after the env layer, which
+    # may spell the same tables the same way).
+    merged = _hoist_web_providers(merged)
     merged = _merge(merged, _env_overrides())
+    merged = _hoist_web_providers(merged)
 
     # Unknown top-level sections are ignored rather than fatal, so a config
     # written for a newer version still boots.

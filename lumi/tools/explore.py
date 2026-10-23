@@ -66,6 +66,12 @@ NOISE_DIRS = frozenset(
 GREP_DEFAULT_RESULTS = 50
 GREP_MAX_RESULTS = 200
 
+#: One grep call scans at most this many files; a bigger tree is a search the
+#: model needs to narrow, not a reason to hang. The stop is reported, never
+#: silent — a partial answer that looks complete is the same lie as a silent
+#: truncation.
+MAX_GREP_SCAN_FILES = 20_000
+
 #: A matching line is truncated to this many characters — the match is the
 #: point, and a minified bundle line is not something anyone wanted whole.
 GREP_LINE_CHARS = 300
@@ -98,16 +104,19 @@ def _display(root: Path, path: Path) -> str:
     return relative_to_root(path)
 
 
-def _is_binary_head(path: Path) -> bool | None:
+def _is_binary_head(path: Path, problems: list[str] | None = None) -> bool | None:
     """True when the first 8 KB contain a NUL byte — the cheap binary sniff.
 
     None when the file could not be opened at all: unreadable is not binary,
-    and the two deserve different answers.
+    and the two deserve different answers. When *problems* is given, the OS
+    error lands there so the caller can name the reason.
     """
     try:
         with path.open("rb") as handle:
             return b"\x00" in handle.read(8192)
-    except OSError:
+    except OSError as exc:
+        if problems is not None:
+            problems.append(str(exc))
         return None
 
 
@@ -184,9 +193,11 @@ never hangs, and the line numbers make `files.edit` calls unambiguous. Use the
                 "then keep raising offset until you have what you need."
             )
 
-        binary = _is_binary_head(path)
+        problems: list[str] = []
+        binary = _is_binary_head(path, problems)
         if binary is None:
-            return ToolResult.failure(f"could not read {display}.")
+            detail = f": {problems[0]}" if problems else ""
+            return ToolResult.failure(f"could not read {display}{detail}")
         if binary:
             return ToolResult.failure(
                 f"{display} looks like a binary file. For its contents, describe it or "
@@ -340,38 +351,54 @@ Version-control, venv, cache and node_modules directories are hidden.
                 f"{display} is a file, not a directory — use read_file to read it"
             )
 
-        entries: list[str] = []
-        files = 0
-        dirs = 0
         try:
             children = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
         except OSError as exc:
             return ToolResult.failure(f"could not list {display}: {exc}")
+        visible: list[Path] = []
         for child in children:
             if child.name in NOISE_DIRS:
                 continue
+            if child.is_symlink():
+                # A link out of the project would list somebody else's files.
+                try:
+                    if not is_within(child.resolve(), self.root):
+                        continue
+                except OSError:
+                    continue
+            visible.append(child)
+
+        # Count everything, render only the first MAX_LIST_ENTRIES: the header
+        # totals describe the directory, not what survived the cut.
+        dirs = sum(1 for child in visible if child.is_dir())
+        files = len(visible) - dirs
+
+        entries: list[str] = []
+        for child in visible:
+            if len(entries) >= MAX_LIST_ENTRIES:
+                break
             if child.is_dir():
-                dirs += 1
                 try:
                     count = sum(1 for _ in child.iterdir())
                 except OSError:
                     count = "?"
                 entries.append(f"{child.name}/  ({count} entries)")
             else:
-                files += 1
                 try:
                     size = child.stat().st_size
                 except OSError:
                     size = 0
                 entries.append(f"{child.name}  ({size:,} bytes)")
-            if len(entries) >= MAX_LIST_ENTRIES:
-                entries.append(f"… truncated at {MAX_LIST_ENTRIES} entries")
-                break
 
+        hidden = dirs + files - len(entries)
+        truncated = hidden > 0
         header = f"--- {display}/ ({dirs} dir(s), {files} file(s)) ---"
+        body = "\n".join(entries or ["(empty)"])
+        if truncated:
+            body += f"\n… {hidden} more entries not shown"
         return ToolResult(
-            text=f"{header}\n" + "\n".join(entries or ["(empty)"]),
-            data={"path": str(path), "dirs": dirs, "files": files},
+            text=f"{header}\n{body}",
+            data={"path": str(path), "dirs": dirs, "files": files, "truncated": truncated},
             summary=f"listed {display} ({dirs + files} entries)",
         )
 
@@ -445,8 +472,10 @@ to contain every word, so a distinctive multi-word phrase works as well."""
             raise ToolError("query is required for a search")
         case_sensitive = bool(arguments.get("case_sensitive"))
         needles = list(words) if case_sensitive else [w.casefold() for w in words]
-        max_results = int(arguments.get("max_results") or GREP_DEFAULT_RESULTS)
-        max_results = max(1, min(max_results, GREP_MAX_RESULTS))
+        max_results = _positive_int(
+            arguments.get("max_results"), default=GREP_DEFAULT_RESULTS, name="max_results"
+        ) or GREP_DEFAULT_RESULTS
+        max_results = min(max_results, GREP_MAX_RESULTS)
 
         start = _resolve_read(self.root, arguments.get("path") or ".")
         if not start.exists():
@@ -458,9 +487,11 @@ to contain every word, so a distinctive multi-word phrase works as well."""
         files_scanned = 0
         skipped_large = 0
         truncated = False
+        stopped_early = False
 
         for file in self._candidates(start, glob):
-            if skipped_large + files_scanned > 20_000:  # runaway tree guard
+            if files_scanned + skipped_large >= MAX_GREP_SCAN_FILES:  # runaway tree guard
+                stopped_early = True
                 break
             try:
                 too_big = file.stat().st_size > MAX_GREP_FILE_BYTES
@@ -505,9 +536,19 @@ to contain every word, so a distinctive multi-word phrase works as well."""
                 " Remember: every word must appear on the same line — try fewer words, "
                 "or a single distinctive word."
             )
+            if stopped_early:
+                hint += (
+                    " The scan also stopped early (runaway guard) — narrow with `path` "
+                    "or `glob` before treating this as a full search."
+                )
             return ToolResult(
                 text=f"no matches for {query!r} in {files_scanned} file(s).{hint}",
-                data={"query": query, "files_scanned": files_scanned, "matches": []},
+                data={
+                    "query": query,
+                    "files_scanned": files_scanned,
+                    "matches": [],
+                    "stopped_early": stopped_early,
+                },
                 summary=f"no matches for {query!r}",
             )
 
@@ -519,6 +560,11 @@ to contain every word, so a distinctive multi-word phrase works as well."""
                 f"\n\n(stopped at {max_results} matches — narrow with `glob`, `path`, "
                 "more words, or a higher max_results)"
             )
+        if stopped_early:
+            note += (
+                f"\n(stopped early after scanning {files_scanned + skipped_large} files "
+                "— narrow with `path` or `glob`)"
+            )
         if skipped_large:
             note += f"\n({skipped_large} file(s) over 1 MB were skipped)"
         return ToolResult(
@@ -529,6 +575,7 @@ to contain every word, so a distinctive multi-word phrase works as well."""
                 "files_matched": files_hit,
                 "matches": matches,
                 "truncated": truncated,
+                "stopped_early": stopped_early,
             },
             summary=f"{len(matches)} match(es) for {query!r} in {files_hit} file(s)",
         )

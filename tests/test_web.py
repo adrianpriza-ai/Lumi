@@ -429,6 +429,16 @@ def test_page_rendering() -> None:
 # --------------------------------------------------------------------------- #
 
 
+def test_sources_names_both_files(config) -> None:
+    assert config.tools.web.mcp.user_config_file == ""  # pinned by conftest
+    assert MCPProvider(config.tools.web.mcp, config.root).sources == [".mcp.json"]
+    config.tools.web.mcp.user_config_file = "~/.agents/mcp.json"
+    assert MCPProvider(config.tools.web.mcp, config.root).sources == [
+        "~/.agents/mcp.json",
+        ".mcp.json",
+    ]
+
+
 def test_expand_env(monkeypatch) -> None:
     monkeypatch.setenv("MY_KEY", "abc123")
     assert expand_env("https://x/${MY_KEY}/v2") == "https://x/abc123/v2"
@@ -517,6 +527,79 @@ def test_resolved_variables_clear_the_check(config: Path, monkeypatch) -> None:
     provider = MCPProvider(config.tools.web.mcp, config.root)
     assert provider.available()[0] is True
     assert provider.servers()[0].unresolved() is None
+
+
+# --------------------------------------------------------------------------- #
+# MCP: the user-level ~/.agents/mcp.json
+# --------------------------------------------------------------------------- #
+
+
+def _user_file(config, monkeypatch, tmp_path: Path, servers: dict) -> Path:
+    """Point the user-level setting at a throwaway HOME and write it there."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config.tools.web.mcp.user_config_file = "~/.agents/mcp.json"
+    agents = tmp_path / ".agents"
+    agents.mkdir(exist_ok=True)
+    path = agents / "mcp.json"
+    path.write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
+    return path
+
+
+def test_the_user_level_file_is_read_too(config, tmp_path, monkeypatch) -> None:
+    _user_file(config, monkeypatch, tmp_path, {"shared": {"url": "https://shared.test"}})
+    provider = MCPProvider(config.tools.web.mcp, config.root)
+
+    assert [s.name for s in provider.servers()] == ["shared"]
+    assert provider.available()[0] is True  # no .mcp.json in the project at all
+
+
+def test_the_project_file_wins_and_leads_over_the_user_file(config, tmp_path, monkeypatch) -> None:
+    _user_file(config, monkeypatch, tmp_path, {
+        "tavily": {"url": "https://user-file.test"},
+        "only-user": {"url": "https://only-user.test"},
+    })
+    (config.root / ".mcp.json").write_text(json.dumps({
+        "mcpServers": {
+            "tavily": {"url": "https://project-file.test"},
+            "only-project": {"url": "https://only-project.test"},
+        }
+    }), encoding="utf-8")
+
+    servers = MCPProvider(config.tools.web.mcp, config.root).servers()
+    by_name = {s.name: s for s in servers}
+
+    assert by_name["tavily"].url == "https://project-file.test"  # project wins
+    assert [s.name for s in servers] == ["tavily", "only-project", "only-user"]  # and leads
+
+
+def test_one_file_spelled_twice_is_read_once(config) -> None:
+    config.tools.web.mcp.user_config_file = ".mcp.json"
+    (config.root / ".mcp.json").write_text(json.dumps(
+        {"mcpServers": {"a": {"url": "https://a.test"}}}
+    ), encoding="utf-8")
+    assert [s.name for s in MCPProvider(config.tools.web.mcp, config.root).servers()] == ["a"]
+
+
+def test_an_unreadable_user_file_is_not_fatal(config, tmp_path, monkeypatch) -> None:
+    _user_file(config, monkeypatch, tmp_path, {})
+    (tmp_path / ".agents" / "mcp.json").write_text("{not json", encoding="utf-8")
+    provider = MCPProvider(config.tools.web.mcp, config.root)
+
+    assert provider.servers() == []
+    assert provider.available()[0] is False
+
+
+def test_an_empty_user_config_file_setting_turns_the_user_file_off(
+    config, tmp_path, monkeypatch
+) -> None:
+    # The conftest fixture pins the setting to ""; a file at the default
+    # ~/.agents/mcp.json path must then not be read.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / ".agents").mkdir()
+    (tmp_path / ".agents" / "mcp.json").write_text(json.dumps(
+        {"mcpServers": {"home": {"url": "https://home.test"}}}
+    ), encoding="utf-8")
+    assert MCPProvider(config.tools.web.mcp, config.root).servers() == []
 
 
 # --------------------------------------------------------------------------- #
