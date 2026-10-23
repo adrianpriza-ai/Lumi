@@ -312,9 +312,17 @@ def cmd_search(args: argparse.Namespace) -> int:
     arguments: dict[str, Any] = {"action": "search", "query": " ".join(args.query)}
     if args.limit:
         arguments["max_results"] = args.limit
-    result = asyncio.run(tool.invoke(arguments, ctx))
+    result = asyncio.run(_search_once(tool, arguments, ctx))
     print(result.text)
     return 0 if result.ok else 1
+
+
+async def _search_once(tool: Any, arguments: dict[str, Any], ctx: Any) -> Any:
+    """Run one CLI search and close transports before the event loop exits."""
+    try:
+        return await tool.invoke(arguments, ctx)
+    finally:
+        await tool.aclose()
 
 
 def cmd_memory(args: argparse.Namespace) -> int:

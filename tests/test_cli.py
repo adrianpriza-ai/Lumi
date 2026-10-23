@@ -266,6 +266,29 @@ def test_search_reports_when_no_provider_is_configured(config, monkeypatch, caps
     assert "unavailable" in capsys.readouterr().err
 
 
+def test_search_once_closes_web_transports(config) -> None:
+    import asyncio
+
+    from lumi import __main__ as cli
+    from lumi.tools.base import ToolResult
+
+    class FakeWebTool:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def invoke(self, arguments, ctx):
+            return ToolResult(text="ok")
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    tool = FakeWebTool()
+    result = asyncio.run(cli._search_once(tool, {"action": "search"}, None))
+
+    assert result.ok
+    assert tool.closed
+
+
 # --------------------------------------------------------------------------- #
 # chat reasoning & live steps
 # --------------------------------------------------------------------------- #

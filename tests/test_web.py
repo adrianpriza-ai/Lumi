@@ -807,6 +807,7 @@ class FakeSession:
         self.listed = 0
         self.called = 0
         self.call_arguments: list[dict] = []
+        self.read_timeouts: list[float | None] = []
 
     async def list_tools(self):
         self.listed += 1
@@ -820,6 +821,7 @@ class FakeSession:
     async def call_tool(self, name, arguments, read_timeout_seconds=None):
         self.called += 1
         self.call_arguments.append(arguments)
+        self.read_timeouts.append(read_timeout_seconds)
         return Result([Block(self._payload)])
 
 
@@ -852,6 +854,7 @@ async def test_mcp_search_maps_count_and_freshness_arguments(config) -> None:
 
     assert result.ok
     assert session.call_arguments == [{"query": "q", "count": 5, "freshness": "week"}]
+    assert session.read_timeouts == [60]
     await provider.aclose()
 
 
