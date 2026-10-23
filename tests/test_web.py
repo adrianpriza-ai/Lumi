@@ -27,6 +27,7 @@ from lumi.tools.web.providers.mcp_provider import (
     DiscoveredTool,
     MCPProvider,
     _flatten,
+    _mcp_freshness,
     _parse_search_payload,
     expand_env,
 )
@@ -632,6 +633,18 @@ def test_arg_for_ignores_known_knobs() -> None:
     assert tool.arg_for(("query", "q")) is None
 
 
+def test_freshness_maps_days_to_a_supported_bucket() -> None:
+    assert _mcp_freshness(1, {"enum": ["day", "week", "month", "year"]}) == "day"
+    assert _mcp_freshness(7, {"enum": ["day", "week", "month", "year"]}) == "week"
+    assert _mcp_freshness(30, {"enum": ["day", "week", "month", "year"]}) == "month"
+
+
+def test_freshness_can_use_an_iso_date_range() -> None:
+    value = _mcp_freshness(7, {"pattern": r"^YYYY-MM-DDtoYYYY-MM-DD$"})
+    assert value.endswith("to" + recent_cutoff(0))
+    assert value.startswith(recent_cutoff(7))
+
+
 # --------------------------------------------------------------------------- #
 # MCP: result flattening and normalisation
 # --------------------------------------------------------------------------- #
@@ -689,6 +702,36 @@ def test_parse_bare_list_payload() -> None:
     assert result.hits[0].snippet == "d"
 
 
+def test_parse_you_grouped_payload() -> None:
+    payload = json.dumps({
+        "results": {
+            "web": [
+                {
+                    "url": "https://one.test",
+                    "title": "One",
+                    "description": "first description",
+                    "page_age": "2 days ago",
+                    "contents": {"highlights": ["first", "highlight"]},
+                },
+                {
+                    "url": "https://two.test",
+                    "title": "Two",
+                    "description": "second description",
+                    "contents": {"highlights": ["second"]},
+                },
+            ]
+        }
+    })
+    result = SearchResult(query="q", provider="you")
+    _parse_search_payload(payload, result)
+
+    assert len(result.hits) == 2
+    assert result.hits[0].title == "One"
+    assert result.hits[0].snippet == "first description"
+    assert result.hits[0].content == "first\nhighlight"
+    assert result.hits[0].published == "2 days ago"
+
+
 def test_parse_plain_text_payload() -> None:
     result = SearchResult(query="q", provider="mcp")
     _parse_search_payload("just some prose", result)
@@ -728,7 +771,7 @@ async def test_fetch_reports_when_no_tool_matches(config) -> None:
     provider._list_tools = lambda spec: _raise(RuntimeError("unreachable"))  # type: ignore[assignment]
 
     page = await provider.fetch("https://x.test")
-    assert "no fetch tool found" in page.markdown
+    assert page.markdown.startswith("mcp fetch failed: no fetch tool found")
 
 
 async def _raise(exc: Exception):
@@ -758,22 +801,25 @@ async def test_web_tool_picks_the_mcp_provider_when_configured(config) -> None:
 class FakeSession:
     """Enough of a ClientSession for the provider's two call sites."""
 
-    def __init__(self, search_payload: str) -> None:
+    def __init__(self, search_payload: str, properties: dict | None = None) -> None:
         self._payload = search_payload
+        self._properties = properties or {"query": {"type": "string"}}
         self.listed = 0
         self.called = 0
+        self.call_arguments: list[dict] = []
 
     async def list_tools(self):
         self.listed += 1
         tool = type("T", (), {
             "name": "tavily_search",
             "description": "",
-            "inputSchema": {"properties": {"query": {"type": "string"}}},
+            "input_schema": {"properties": self._properties},
         })()
         return type("R", (), {"tools": [tool]})()
 
     async def call_tool(self, name, arguments, read_timeout_seconds=None):
         self.called += 1
+        self.call_arguments.append(arguments)
         return Result([Block(self._payload)])
 
 
@@ -783,6 +829,30 @@ def _mcp_project(config) -> str:
         "mcpServers": {"tavily": {"url": "https://mcp.tavily.test/mcp/"}}
     }), encoding="utf-8")
     return json.dumps({"results": [{"url": "https://one.test", "content": "x"}]})
+
+
+async def test_mcp_search_maps_count_and_freshness_arguments(config) -> None:
+    payload = _mcp_project(config)
+    provider = MCPProvider(config.tools.web.mcp, config.root)
+    session = FakeSession(
+        payload,
+        {
+            "query": {"type": "string"},
+            "count": {"type": "integer"},
+            "freshness": {"type": "string", "enum": ["day", "week", "month", "year"]},
+        },
+    )
+
+    async def fake_open(stack, spec):
+        return session
+
+    provider._open = fake_open  # type: ignore[method-assign]
+
+    result = await provider.search("q", 5, 7)
+
+    assert result.ok
+    assert session.call_arguments == [{"query": "q", "count": 5, "freshness": "week"}]
+    await provider.aclose()
 
 
 async def test_a_server_is_spawned_once_per_query_not_once_per_step(config) -> None:

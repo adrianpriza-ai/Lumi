@@ -335,7 +335,11 @@ class MCPProvider(WebProvider):
 
         tools = []
         for tool in getattr(response, "tools", []) or []:
-            schema = getattr(tool, "inputSchema", None) or {}
+            schema = (
+                getattr(tool, "input_schema", None)
+                or getattr(tool, "inputSchema", None)
+                or {}
+            )
             properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
             tools.append(
                 DiscoveredTool(
@@ -407,11 +411,15 @@ class MCPProvider(WebProvider):
             arguments["max_results"] = max_results
         elif "limit" in tool.properties:
             arguments["limit"] = max_results
+        elif "count" in tool.properties:
+            arguments["count"] = max_results
         # Tavily-shaped servers understand a coarse bucket; anything that takes
         # an ISO date gets the exact cutoff instead. Servers that accept
         # neither simply ignore both keys.
         if days and days > 0:
-            if "time_range" in tool.properties:
+            if "freshness" in tool.properties:
+                arguments["freshness"] = _mcp_freshness(days, tool.properties["freshness"])
+            elif "time_range" in tool.properties:
                 arguments["time_range"] = _mcp_time_range(days)
             elif "start_published_date" in tool.properties:
                 arguments["start_published_date"] = recent_cutoff(days)
@@ -432,7 +440,10 @@ class MCPProvider(WebProvider):
             self.config.fetch_tools, lambda name: any(k in name for k in ("scrape", "extract", "fetch"))
         )
         if chosen is None:
-            return Page(url=url, markdown=f"no fetch tool found in {', '.join(self.sources)}")
+            return Page(
+                url=url,
+                markdown=f"mcp fetch failed: no fetch tool found in {', '.join(self.sources)}",
+            )
 
         spec, tool = chosen
         key = tool.arg_for(("url", "urls", "link")) or "url"
@@ -479,6 +490,18 @@ def _mcp_time_range(days: int) -> str:
     return "year"
 
 
+def _mcp_freshness(days: int, schema: Any) -> str:
+    """Format *days* for MCP tools that expose You.com's ``freshness`` field."""
+    if isinstance(schema, dict):
+        pattern = str(schema.get("pattern") or "").lower()
+        description = str(schema.get("description") or "").lower()
+        if "yyyy-mm-ddtoyyyy-mm-dd" in description or "date range" in description:
+            return f"{recent_cutoff(days)}to{recent_cutoff(0)}"
+        if "yyyy-mm-dd" in pattern and "to" in pattern:
+            return f"{recent_cutoff(days)}to{recent_cutoff(0)}"
+    return _mcp_time_range(days)
+
+
 def _flatten(result: Any) -> str:
     """Turn a CallToolResult into plain text.
 
@@ -515,6 +538,17 @@ def _try_json(text: str) -> Any:
         return None
 
 
+def _highlights(item: dict[str, Any]) -> str:
+    """You.com's page text: a list under ``contents.highlights``."""
+    contents = item.get("contents")
+    if not isinstance(contents, dict):
+        return ""
+    highlights = contents.get("highlights")
+    if isinstance(highlights, list):
+        return "\n".join(str(h) for h in highlights if h)
+    return str(highlights or "")
+
+
 def _parse_search_payload(text: str, result: SearchResult) -> None:
     """Best-effort normalisation of whatever shape the server returned."""
     payload = _try_json(text)
@@ -524,7 +558,19 @@ def _parse_search_payload(text: str, result: SearchResult) -> None:
 
     if isinstance(payload, dict):
         result.answer = str(payload.get("answer") or payload.get("summary") or "")
-        for item in payload.get("results") or payload.get("data") or []:
+        items = payload.get("results") or payload.get("data") or []
+        # Grouped by source rather than a flat list — You.com answers with
+        # ``{"results": {"web": [...]}}`` — so flatten the groups first.
+        if isinstance(items, dict):
+            items = [
+                item
+                for group in items.values()
+                if isinstance(group, list)
+                for item in group
+            ]
+        elif not isinstance(items, list):
+            items = []
+        for item in items:
             if not isinstance(item, dict):
                 result.hits.append(SearchHit(title="", url="", content=str(item)))
                 continue
@@ -532,8 +578,14 @@ def _parse_search_payload(text: str, result: SearchResult) -> None:
             if not url:
                 continue
             # Tavily puts the snippet in "content" and the full page in
-            # "raw_content"; firecrawl puts markdown in "markdown". Accept all.
-            body = str(item.get("raw_content") or item.get("markdown") or item.get("content") or "")
+            # "raw_content"; firecrawl puts markdown in "markdown"; You.com
+            # nests highlights under "contents". Accept all.
+            body = str(
+                item.get("raw_content")
+                or item.get("markdown")
+                or item.get("content")
+                or _highlights(item)
+            )
             result.hits.append(
                 SearchHit(
                     title=str(item.get("title") or ""),
@@ -541,7 +593,12 @@ def _parse_search_payload(text: str, result: SearchResult) -> None:
                     snippet=str(item.get("content") or item.get("description") or item.get("snippet") or ""),
                     content=body,
                     score=item.get("score"),
-                    published=str(item.get("published_date") or item.get("publishedDate") or ""),
+                    published=str(
+                        item.get("published_date")
+                        or item.get("publishedDate")
+                        or item.get("page_age")
+                        or ""
+                    ),
                 )
             )
         if result.hits or result.answer:
