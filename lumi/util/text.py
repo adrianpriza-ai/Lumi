@@ -297,6 +297,96 @@ def markdown_bold_to_html(text: str) -> str:
     return "".join(parts)
 
 
+# --------------------------------------------------------------------------- #
+# Markdown tables
+# --------------------------------------------------------------------------- #
+
+#: A GFM table separator row: cells of dashes, optionally coloned, joined by
+#: pipes — ``--- | :---: | ---``. One dash per cell is accepted; real prose
+#: under a pipe-bearing line almost never looks like this.
+_TABLE_CELL_RE = re.compile(r":?-+:?")
+
+
+def _split_table_row(line: str) -> list[str]:
+    """The cells of one table line, or ``[]`` if the line holds no row.
+
+    Leading and trailing pipes are optional (GFM allows both shapes), an
+    escaped ``\\|`` is a literal pipe inside a cell rather than a separator,
+    and outer whitespace collapses away.
+    """
+    text = line.strip()
+    if text.startswith("|"):
+        text = text[1:]
+    if text.endswith("|") and not text.endswith("\\|"):
+        text = text[:-1]
+    cells = [cell.replace("\\|", "|").strip() for cell in re.split(r"(?<!\\)\|", text)]
+    return cells if any(cell for cell in cells) else []
+
+
+def _is_table_separator(line: str) -> bool:
+    cells = _split_table_row(line)
+    return bool(cells) and all(_TABLE_CELL_RE.fullmatch(cell) for cell in cells)
+
+
+def _render_table(rows: list[list[str]]) -> str:
+    """A padded, pipe-joined monospace block: the closest thing to a table
+    Telegram can show. Ragged rows are padded out, columns sized to their
+    widest cell."""
+    columns = max(len(row) for row in rows)
+    rows = [row + [""] * (columns - len(row)) for row in rows]
+    widths = [max(len(row[column]) for row in rows) for column in range(columns)]
+
+    def _fmt(row: list[str]) -> str:
+        return " | ".join(cell.ljust(widths[column]) for column, cell in enumerate(row))
+
+    body = "\n".join([_fmt(rows[0]), "-+-".join("-" * width for width in widths)])
+    body += "\n" + "\n".join(_fmt(row) for row in rows[1:])
+    return f"<pre>{escape_html(body)}</pre>"
+
+
+def _convert_tables(segment: str) -> str:
+    lines = segment.split("\n")
+    out: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        # A table starts where a pipe-bearing line is followed by a separator
+        # row; the pipe-bearing lines after it belong to the table.
+        if (
+            "|" in line
+            and _split_table_row(line)
+            and index + 1 < len(lines)
+            and _is_table_separator(lines[index + 1])
+        ):
+            rows = [_split_table_row(line)]
+            body = index + 2
+            while body < len(lines) and "|" in lines[body] and _split_table_row(lines[body]):
+                rows.append(_split_table_row(lines[body]))
+                body += 1
+            out.append(_render_table(rows))
+            index = body
+        else:
+            out.append(line)
+            index += 1
+    return "\n".join(out)
+
+
+def markdown_table_to_html(text: str) -> str:
+    """Convert Markdown tables in *text* to an aligned ``<pre>`` block.
+
+    Telegram's HTML mode has no table markup, and a smaller model coached out
+    of ``**bold**`` still reaches for a GFM pipe table — which under this chat
+    renders as raw ``|`` clutter in the middle of the message. The table is
+    re-laid-out into a monospace block with aligned columns instead, which is
+    both parseable and readable. Runs only outside ``<pre>``/``<code>``
+    segments, so a table inside a code block stays code.
+    """
+    parts = _CODE_SEGMENT_RE.split(text)
+    for index in range(0, len(parts), 2):
+        parts[index] = _convert_tables(parts[index])
+    return "".join(parts)
+
+
 def format_error(exc: BaseException) -> str:
     """One-line, human-readable error description."""
     name = type(exc).__name__

@@ -60,11 +60,11 @@ only touch the text it names), shows a diff, and leaves the rest of the file
 alone — prefer it over `write` whenever you are changing less than the whole
 file. The `old_string` must match exactly once unless `replace_all` is true.
 
-Set `upload: true` on a write to also send the finished file to the chat as a
-document — use it whenever the owner asked for "a file" they can download. The
-`upload` action sends a file that already exists (e.g. one a shell command
-produced) without modifying it. Delivery is handled for you: just say which
-file, and it arrives in the chat.
+Set `upload: true` on a write or an edit to also send the finished file to the
+chat as a document — use it whenever the owner asked for "a file" they can
+download. The `upload` action sends a file that already exists (e.g. one a
+shell command produced) without modifying it. Delivery is handled for you:
+just say which file, and it arrives in the chat.
 
 Prefer this over shell redirection for anything that involves file contents:
 it validates the path, caps the size, and shows a diff before it overwrites.
@@ -123,8 +123,8 @@ it validates the path, caps the size, and shows a diff before it overwrites.
             "upload": {
                 "type": "boolean",
                 "description": (
-                    "write only: also send the file to the chat as a document when "
-                    "the write succeeds."
+                    "write and edit: also send the file to the chat as a document "
+                    "when the action succeeds."
                 ),
             },
         },

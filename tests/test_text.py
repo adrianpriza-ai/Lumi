@@ -9,6 +9,7 @@ from lumi.util.text import (
     format_error,
     markdown_bold_to_html,
     markdown_code_to_html,
+    markdown_table_to_html,
     sanitize_html,
     split_message,
     truncate,
@@ -276,6 +277,61 @@ def test_globs_and_lone_asterisks_stay_literal() -> None:
 
 def test_an_unclosed_pair_stays_literal() -> None:
     assert markdown_bold_to_html("**open forever") == "**open forever"
+
+
+# --------------------------------------------------------------------------- #
+# Markdown tables
+# --------------------------------------------------------------------------- #
+
+
+def test_markdown_table_becomes_an_aligned_pre_block() -> None:
+    text = "Here you go:\n| Name | Age |\n|---|---|\n| Alice | 30 |\n| Bo | 7 |\ndone"
+    out = markdown_table_to_html(text)
+    assert out == (
+        "Here you go:\n<pre>Name  | Age\n"
+        "------+----\n"
+        "Alice | 30 \n"
+        "Bo    | 7  </pre>\ndone"
+    )
+
+
+def test_table_without_outer_pipes_is_converted() -> None:
+    out = markdown_table_to_html("x\nName | Age\n--- | ---\nAda | 36\ny")
+    assert out.startswith("x\n<pre>")
+    assert "36" in out
+
+
+def test_table_separators_with_colons_and_short_dashes() -> None:
+    out = markdown_table_to_html("| a | b |\n|:-:|-|")
+    assert "<pre>" in out
+
+
+def test_a_pipe_in_prose_is_not_a_table() -> None:
+    text = "run `a | b` through it, or a && b"
+    assert markdown_table_to_html(text) == text
+
+
+def test_table_inside_a_code_block_is_left_alone() -> None:
+    text = "```\n| a | b |\n|---|---|\n| 1 | 2 |\n```"
+    out = markdown_code_to_html(text)
+    assert markdown_table_to_html(out) == out  # already a <pre>; untouched
+
+
+def test_table_cells_are_escaped() -> None:
+    out = markdown_table_to_html("| x | y |\n|---|---|\n| a<b | c&d |")
+    assert "a&lt;b" in out
+    assert "c&amp;d" in out
+
+
+def test_full_reply_pipeline_handles_a_table() -> None:
+    """The order the bot composes: code, then bold, then tables — a smaller
+    model's Markdown table still lands as a clean block."""
+    text = "**Summary**\n| key | val |\n|-----|-----|\n| a< | 1 |"
+    out = markdown_table_to_html(markdown_bold_to_html(markdown_code_to_html(text)))
+    assert "<b>Summary</b>" in out
+    assert "<pre>" in out
+    assert "a&lt;" in out
+    assert "| key | val |" not in out
 
 
 # --------------------------------------------------------------------------- #

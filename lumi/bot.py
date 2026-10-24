@@ -18,7 +18,9 @@ import base64
 import contextlib
 import json
 import os
+import signal
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +51,7 @@ from .util.text import (
     format_error,
     markdown_bold_to_html,
     markdown_code_to_html,
+    markdown_table_to_html,
     sanitize_html,
     split_message,
     truncate,
@@ -640,7 +643,9 @@ async def reply(update: Update, text: str, *, strict: bool = False, **kwargs: An
         else:
             raise TelegramError("no target to deliver chunk to")
 
-    for chunk in split_message(markdown_bold_to_html(markdown_code_to_html(text))):
+    for chunk in split_message(
+        markdown_table_to_html(markdown_bold_to_html(markdown_code_to_html(text)))
+    ):
         try:
             await _send_chunk(chunk, formatted=True)
         except BadRequest:
@@ -1953,9 +1958,65 @@ def build_application(config: Config, agent: Agent | None = None, *, bot: Any = 
     return application
 
 
+def stop_signal_handler(
+    application: Application, force_exit: Callable[[], None]
+) -> Callable[[], None]:
+    """The callback installed for SIGINT/SIGTERM: stop cleanly, or die on demand.
+
+    PTB's own stop handling raises ``SystemExit`` inside the event loop. That
+    works exactly once: a second press lands mid-cleanup — inside
+    ``run_until_complete(updater.stop())`` — and aborts the graceful chain, so
+    ``post_shutdown`` never runs and the process leaves a traceback behind. It
+    also offers no escape from the wait itself: while a turn is in flight
+    (an LLM call retrying through its backoff, a slow search), the first
+    ctrl-c looks like the bot ignored it.
+
+    This handler replaces PTB's: the first signal stops the loop cleanly (the
+    graceful chain in :meth:`Application.run_polling` then drains whatever is
+    in flight), and a second one — the user has said "now" twice — exits the
+    process immediately. When the application is not running yet (a signal
+    during bootstrap), it raises :exc:`KeyboardInterrupt`, which PTB's
+    ``__run`` handles the same as its own ``SystemExit``.
+    """
+    stopping = False
+
+    def handler() -> None:
+        nonlocal stopping
+        if application.running:
+            if stopping:
+                log.warning("second stop signal — exiting immediately")
+                force_exit()
+                return
+            stopping = True
+            log.info("stop signal — finishing in-flight work; send it again to stop now")
+            application.stop_running()
+        else:
+            raise KeyboardInterrupt
+
+    return handler
+
+
+def _install_stop_handlers(application: Application) -> None:
+    """Wire :func:`stop_signal_handler` to SIGINT/SIGTERM on the running loop.
+
+    Best effort: an event loop without ``add_signal_handler`` (Windows'
+    ProactorEventLoop) keeps PTB's default handling — the KeyboardInterrupt
+    path still shuts down gracefully there, just without the force-exit
+    escape.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        handler = stop_signal_handler(application, lambda: os._exit(130))
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, handler)
+    except (NotImplementedError, RuntimeError):
+        log.debug("no signal handler support on this loop; using PTB's default stop handling")
+
+
 async def _post_init(application: Application) -> None:
     config: Config = application.bot_data["config"]
     agent: Agent = application.bot_data["agent"]
+    _install_stop_handlers(application)
     me = await application.bot.get_me()
     log.info("telegram: @%s (%s) ready", me.username, me.id)
     log.info("model: %s via %s", config.llm.model_of(), config.llm.base_url_of())
@@ -1993,6 +2054,13 @@ def run(config: Config) -> None:
     once has no residual budget to lose. ``-1`` means retry startup forever —
     matching the polling loop's own unlimited retries once the bot is up — so
     the process waits out an outage instead of exiting while the owner sleeps.
+
+    Stopping is PTB's graceful chain (drain the polling loop, stop handlers,
+    ``post_shutdown``), triggered by the first SIGINT/SIGTERM via the handler
+    :func:`_post_init` installs; a second signal exits immediately. No cleanup
+    is done here: ``run_polling`` owns the whole shutdown, and an extra
+    ``application.shutdown()`` on this side would only ever be a coroutine
+    nobody awaited.
     """
     application = build_application(config)
     retries = config.bot.bootstrap_retries
@@ -2002,22 +2070,15 @@ def run(config: Config) -> None:
         "unlimited" if retries < 0 else f"up to {retries + 1}",
         f" via {config.bot.proxy_url}" if config.bot.proxy_url else "",
     )
-    try:
-        application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-            close_loop=False,
-            # PTB's default is 0: one TCP connect failure to api.telegram.org
-            # aborts the whole startup. -1 keeps retrying startup forever,
-            # matching the polling loop's own unlimited retries once running.
-            bootstrap_retries=retries,
-        )
-    except KeyboardInterrupt:
-        log.info("interrupted, shutting down")
-    finally:
-        # Best effort on the way out: a failure here must not mask the exit reason.
-        with contextlib.suppress(Exception):
-            application.shutdown()
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+        close_loop=False,
+        # PTB's default is 0: one TCP connect failure to api.telegram.org
+        # aborts the whole startup. -1 keeps retrying startup forever,
+        # matching the polling loop's own unlimited retries once running.
+        bootstrap_retries=retries,
+    )
 
 
 __all__ = ["build_application", "build_handlers", "run", "reply", "deliver", "HELP_TEXT"]

@@ -30,6 +30,7 @@ from lumi.bot import (
     _write_toml,
     build_application,
     build_handlers,
+    stop_signal_handler,
 )
 from lumi.chatlog import CHATLOG
 from lumi.memory import History
@@ -2793,3 +2794,75 @@ def test_write_toml_puts_top_level_keys_before_any_table() -> None:
     assert text.index("z = 1") < text.index("[a]")
     assert text.index("y = 2") < text.index("[a.b]")
     assert tomllib.loads(text) == {"z": 1, "a": {"y": 2, "b": {"x": 3}}}
+
+
+# --------------------------------------------------------------------------- #
+# stop-signal handling
+# --------------------------------------------------------------------------- #
+
+
+class _StopApp:
+    """The slice of Application the stop handler touches."""
+
+    def __init__(self) -> None:
+        self.running = False
+        self.stopped = False
+
+    def stop_running(self) -> None:
+        self.stopped = True
+
+
+def test_first_stop_signal_stops_the_application_gracefully() -> None:
+    app = _StopApp()
+    app.running = True
+    exits: list[int] = []
+    handler = stop_signal_handler(app, lambda: exits.append(130))
+
+    handler()
+
+    assert app.stopped
+    assert exits == []
+
+
+def test_second_stop_signal_force_exits() -> None:
+    """A second press means 'now': no more waiting on an in-flight turn."""
+    app = _StopApp()
+    app.running = True
+    exits: list[int] = []
+    handler = stop_signal_handler(app, lambda: exits.append(130))
+
+    handler()
+    handler()
+
+    assert exits == [130]
+
+
+def test_stop_signal_during_bootstrap_interrupts_cleanly() -> None:
+    """Before the application is running (e.g. an endless bootstrap retry),
+    a signal must abort the wait the same way PTB's own handler did."""
+    app = _StopApp()
+    handler = stop_signal_handler(app, lambda: None)
+
+    with pytest.raises(KeyboardInterrupt):
+        handler()
+
+
+def test_install_stop_handlers_wires_a_real_signal() -> None:
+    """A real SIGINT on the running loop reaches the handler: the application
+    is asked to stop, and nothing exits the process."""
+    import asyncio
+    import os
+    import signal as signal_module
+
+    from lumi.bot import _install_stop_handlers
+
+    async def scenario() -> None:
+        app = _StopApp()
+        app.running = True
+        _install_stop_handlers(app)
+        await asyncio.sleep(0)
+        os.kill(os.getpid(), signal_module.SIGINT)
+        await asyncio.sleep(0.1)  # let the loop run the handler callback
+        assert app.stopped
+
+    asyncio.run(scenario())

@@ -72,7 +72,7 @@ If a call fails, the error names the endpoint, model, and key variable it used, 
 With no dedicated OCR provider, the model choice is:
 
 | Configured models | Text-only context | Photos / image files | Scanned PDF pages |
-|---|---|---|---|
+|-|-|-|-|
 | Default only | default | default | default |
 | Default + vision | default | vision | default |
 | Default + OCR | default | default | OCR |
