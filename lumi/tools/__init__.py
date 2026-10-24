@@ -20,6 +20,8 @@ from .context7 import Context7Tool
 from .explore import GrepTool, ListFilesTool, ReadFileTool
 from .files import FilesTool
 from .memory_tool import MemoryTool
+from .more_context import MoreContextTool
+from .ocr import OCRTool
 from .registry import ToolRegistry
 from .send import SendTool
 from .shell import ShellTool
@@ -46,8 +48,10 @@ def build_registry(config: Config, memory: MemoryStore) -> ToolRegistry:
         "list_files": lambda: ListFilesTool(config),
         "grep": lambda: GrepTool(config),
         "memory": lambda: MemoryTool(config, memory),
+        "more_context": lambda: MoreContextTool(config),
         "web": lambda: WebTool(config),
         "context7": lambda: Context7Tool(config),
+        "ocr": lambda: OCRTool(config),
         "send": lambda: SendTool(config),
     }
 
@@ -82,8 +86,10 @@ __all__ = [
     "ListFilesTool",
     "GrepTool",
     "MemoryTool",
+    "MoreContextTool",
     "WebTool",
     "Context7Tool",
+    "OCRTool",
     "SendTool",
     "build_registry",
 ]

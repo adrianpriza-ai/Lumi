@@ -8,6 +8,7 @@ adapter earns its place, add it to :data:`PROVIDERS` and nothing else changes.
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import cast
 
 from ..config import Config, LLMConfig
 from ..util.log import get_logger
@@ -38,14 +39,39 @@ PROVIDERS: dict[str, Callable[[LLMConfig], LLMClient]] = {
 
 
 def build_llm(config: Config) -> LLMClient:
-    """Instantiate the client named by ``llm.provider``."""
+    """Instantiate the client named by ``llm.provider``, plus its routes.
+
+    ``[llm.vision]`` builds a second client — its own provider, endpoint, key
+    pool and model — attached to answer every image-bearing request. That is
+    what makes "text model on provider A with key A, vision model on provider B
+    with key B" pure configuration: two lines in ``config.toml``, two env vars.
+    An unknown provider in either block raises here, at boot, rather than on
+    the first photo that arrives.
+    """
     key = config.llm.provider.strip().lower()
     factory = PROVIDERS.get(key)
     if factory is None:
         raise LLMError(
             f"unknown llm.provider {config.llm.provider!r}. Known: {', '.join(sorted(PROVIDERS))}"
         )
-    return factory(config.llm)
+    client = factory(config.llm)
+    route = config.llm.vision_route_of()
+    if route is not None:
+        vision_key = route.provider.strip().lower()
+        vision_factory = PROVIDERS.get(vision_key)
+        if vision_factory is None:
+            raise LLMError(
+                f"unknown llm.vision.provider {route.provider!r}. "
+                f"Known: {', '.join(sorted(PROVIDERS))}"
+            )
+        cast(OpenAICompatClient, client).vision = cast(OpenAICompatClient, vision_factory(route))
+        log.info(
+            "vision route ready: model=%s endpoint=%s key=%s",
+            route.vision_model_of(),
+            route.base_url_of(),
+            route.api_key_env,
+        )
+    return client
 
 
 __all__ = [

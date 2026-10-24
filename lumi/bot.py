@@ -38,6 +38,7 @@ from telegram.ext import (
 
 from .agent import Agent, PendingAction, TurnHooks, TurnResult
 from .artifacts import Artifact, ArtifactError, ArtifactStore
+from .chatlog import CHATLOG, entry_from
 from .config import Config, ConfigError, validate
 from .doctor import platform_line, run_checks
 from .memory import History, MemoryFile, MemoryStore
@@ -475,6 +476,102 @@ def _is_addressed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     return False
 
 
+#: How many messages a reply chain may quote into the prompt. Telegram puts
+#: no bound on the chain — a pinned message can be answered for weeks — and
+#: every link is another block in front of the model's question, so the walk
+#: stops here and says so rather than letting the prefix grow unbounded.
+REPLY_CHAIN_MAX = 5
+
+
+def _quote_body(quoted: Any) -> tuple[str, str]:
+    """``(sender, text)`` for one replied-to message.
+
+    A message with no text of its own — a photo, a sticker, a poll — still
+    gets named, because the reply points at it: dropping it would leave the
+    model holding a pointer to nothing.
+    """
+    sender = quoted.from_user
+    who = "someone" if sender is None else (sender.first_name or sender.username or "someone")
+    body = (quoted.text or quoted.caption or "").strip()
+    if not body:
+        kind = next((field for field in CONTENT_FIELDS if getattr(quoted, field, None)), "")
+        body = f"(a {kind} with no text)" if kind else "(an empty message)"
+    return who, body
+
+
+def _quoted_prefix(message: Any) -> str:
+    """The message *message* replies to, shaped as a prompt prefix.
+
+    A reply carries its meaning in the thing it quotes: ``@lumi try this`` is
+    unanswerable without the message above it. But Telegram delivers only the
+    new text, and nothing else fills the gap either — the quoted message was
+    addressed to a person (or is older than the turns this conversation kept),
+    so it never became a turn here and is not in the transcript. Unless it is
+    folded into the prompt at this point, the model is handed a word like
+    "this" with nothing for it to point at.
+
+    Replies chain in Telegram (a reply to a reply to a reply…), and one link
+    is rarely the whole story — "no it isn't" answers the message *above the
+    quote*. So the chain is walked too, up to :data:`REPLY_CHAIN_MAX` links,
+    rendered oldest first so the prompt reads in the order things were said.
+    A single link keeps the one-message format; deeper chains get numbered
+    blocks. Returns ``""`` for a message that is not a reply, so the ordinary
+    path is byte-for-byte what it was.
+    """
+    quoted = getattr(message, "reply_to_message", None)
+    if quoted is None:
+        return ""
+
+    # chain[0] is the direct quote, chain[-1] the oldest ancestor reachable.
+    # The seen-set is paranoia: Telegram has no cycles, but one would spin
+    # this loop to the cap and back if it ever did.
+    chain: list[Any] = []
+    seen: set[int] = set()
+    while quoted is not None and len(chain) < REPLY_CHAIN_MAX:
+        chain.append(quoted)
+        marker = getattr(quoted, "message_id", None)
+        if marker is not None:
+            if marker in seen:
+                break
+            seen.add(marker)
+        quoted = getattr(quoted, "reply_to_message", None)
+
+    if len(chain) == 1:
+        who, body = _quote_body(chain[0])
+        return f'[the message this replies to, from {who}:\n"""\n{body}\n"""\n]\n\n'
+
+    blocks: list[str] = []
+    for link in reversed(chain):
+        who, body = _quote_body(link)
+        blocks.append(f'(from {who}):\n"""\n{body}\n"""')
+    note = " — chain cut at the cap" if quoted is not None else ""
+    head = f"[reply chain: the {len(chain)} message(s) this replies to, oldest first{note}:"
+    return f"{head}\n" + "\n\n".join(blocks) + "\n]\n\n"
+
+
+def _record_room(update: Update) -> None:
+    """Keep a group message the bot is about to drop.
+
+    Called from the paths that stay silent — the mention rule and the
+    stranger gate — because those messages are exactly the ones the model
+    will never see any other way: not addressed to it, so never a turn of its
+    conversation. The log is what ``more_context`` reads back later.
+
+    Private chats are skipped on purpose: there every message becomes a turn,
+    so the log would only duplicate what the transcript already holds.
+    """
+    chat = update.effective_chat
+    message = update.effective_message
+    if message is None or not _is_group(chat):
+        return
+    sender = message.from_user
+    if sender is not None and sender.is_bot:
+        return  # never another bot's lines — and never our own
+    entry = entry_from(message)
+    if entry is not None:
+        CHATLOG.record(chat.id, entry)
+
+
 # --------------------------------------------------------------------------- #
 # Outbound helpers
 # --------------------------------------------------------------------------- #
@@ -676,6 +773,7 @@ STEP_LABELS = {
     "web.search": "🌐 Web Search",
     "web.fetch": "🌐 Web Fetch",
     "memory": "📌 Memory",
+    "more_context": "🕒 More Context",
     "context7": "📚 Context7",
     "send": "✉️ Send",
 }
@@ -1460,6 +1558,10 @@ def build_handlers(config: Config) -> list[Any]:
         if message is None or not message.text:
             return
         if not _should_reply(update, context, config):
+            # The bot stays silent; the room does not. Keep what it said so
+            # `more_context` can show the model a conversation it was never
+            # addressed in (see lumi.chatlog).
+            _record_room(update)
             return
         if not await authorised(update):
             return
@@ -1506,7 +1608,8 @@ def build_handlers(config: Config) -> list[Any]:
         caption = (message.caption or "").strip()
         prompt = (
             f"[The owner sent a file: {artifact.path} ({artifact.size} bytes, {artifact.mime}). "
-            "It is in the project; read it with the `files` tool before acting on it."
+            "It is in the project; read it with the `files` tool before acting on it. "
+            "For a PDF, the `ocr` tool extracts its text (scanned pages included)."
             f"]\n\n{caption or 'What is this file, and what should I do with it?'}"
         )
         await run_agent(update, context, prompt)
@@ -1523,6 +1626,9 @@ def build_handlers(config: Config) -> list[Any]:
             log.debug("ignoring a service message in chat %s", chat_of(update))
             return
         if not _should_reply(update, context, config):
+            # Same as on_text: a dropped message is the only kind worth
+            # logging — anything the bot answers is already in its history.
+            _record_room(update)
             return
         if not await authorised(update):
             return
@@ -1569,6 +1675,9 @@ def build_handlers(config: Config) -> list[Any]:
         there — the opposite of "only reply when mentioned".
         """
         if _is_group(update.effective_chat) and not _is_addressed(update, context):
+            # A stranger talking to the room, not to the bot. Silent, but not
+            # invisible: it goes to the log `more_context` reads.
+            _record_room(update)
             log.debug(
                 "ignoring an unaddressed group message from user %s",
                 update.effective_user and update.effective_user.id,
@@ -1609,6 +1718,10 @@ def build_handlers(config: Config) -> list[Any]:
         agent = agent_of(context)
         chat_id = chat_of(update)
         hooks = hooks_for(update, context)
+        # If this message is a reply, the message it quotes goes in front of
+        # the text — see _quoted_prefix: it is the only place that quote can
+        # still be recovered, and without it "try this" has no referent.
+        text = _quoted_prefix(update.effective_message) + text
         async with _Typing(context.bot, chat_id):
             try:
                 result = await agent.handle(

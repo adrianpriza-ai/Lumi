@@ -8,7 +8,7 @@ behaviour, and every tool it can reach is a file you can read before you trust
 it.
 
 ```bash
-git clone <this repo> lumi && cd lumi
+git clone https://github.com/adrianpriza-ai/Lumi && cd Lumi
 cp .env.example .env          # fill in TELEGRAM_BOT_TOKEN and TELEGRAM_OWNER_ID
 
 # plain venv — no extra tooling needed

@@ -16,10 +16,11 @@ from __future__ import annotations
 
 import os
 import tomllib
-from dataclasses import dataclass, field, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from pathlib import Path
 from types import UnionType
 from typing import Any, Union, get_args, get_origin, get_type_hints
+from urllib.parse import urlsplit
 
 from .memory import MemoryStore
 from .paths import project_root, resolve
@@ -93,6 +94,50 @@ class BotConfig:
     bootstrap_retries: int = -1
 
 
+@dataclass(slots=True)
+class ModelRouteConfig:
+    """A per-role provider override — ``[llm.vision]`` and ``[llm.ocr]``.
+
+    One model is rarely right for every request: a cheap text model answers
+    most turns, while images and scanned documents want a vision-capable one —
+    possibly on a different provider, with its own endpoint and its own API
+    key. A route states only what differs; every empty field inherits the
+    ``[llm]`` table.
+
+    .. code-block:: toml
+
+        [llm]
+        model = "gpt-4.1-mini"          # provider A, key A
+
+        [llm.vision]
+        provider = "openrouter"
+        model = "google/gemini-2.0-flash-001"
+        api_key_env = "OPENROUTER_API_KEY"   # provider B, key B
+
+        [llm.ocr]
+        model = "gpt-4o-mini"           # the `ocr` tool's model for PDFs
+    """
+
+    provider: str = ""
+    model: str = ""
+    base_url: str = ""
+    api_key_env: str = ""
+    key_strategy: str = ""
+
+    def is_set(self) -> bool:
+        """Whether the route says anything at all — an empty table is unset."""
+        return any(
+            value.strip()
+            for value in (
+                self.provider,
+                self.model,
+                self.base_url,
+                self.api_key_env,
+                self.key_strategy,
+            )
+        )
+
+
 OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
 OPENAI_DEFAULT_MODEL = "gpt-4.1-mini"
 
@@ -136,6 +181,17 @@ class LLMConfig:
     #: routes to this model once an image is anywhere in the replayed context,
     #: because a text-only default could not read the history back either.
     vision_model: str = ""
+    #: Model the ``ocr`` tool reads PDFs with (scanned pages included).
+    #: Empty means "use ``model``" — the same default that answers text.
+    #: Deliberately not the vision model: photos go to ``vision_model``,
+    #: documents go here, everything else goes to ``model``. Env spelling:
+    #: ``LUMI__LLM__OCR_MODEL``.
+    ocr_model: str = ""
+    #: Per-role provider overrides; see :class:`ModelRouteConfig`. ``[llm.vision]``
+    #: sends image-bearing turns to their own provider/endpoint/key; ``[llm.ocr]``
+    #: does the same for the ``ocr`` tool. Empty tables inherit ``[llm]``.
+    vision: ModelRouteConfig = field(default_factory=ModelRouteConfig)
+    ocr: ModelRouteConfig = field(default_factory=ModelRouteConfig)
     #: Empty means "ask the environment". See :meth:`base_url_of`.
     base_url: str = ""
     api_key_env: str = "OPENAI_API_KEY"
@@ -343,6 +399,56 @@ class LLMConfig:
                 return value
         return ""
 
+    def _with_route(self, route: ModelRouteConfig, base: LLMConfig, model: str) -> LLMConfig:
+        """*base* with the route's non-empty fields on top; *model* as the vision model."""
+        return replace(
+            base,
+            provider=route.provider.strip() or base.provider,
+            base_url=route.base_url.strip() or base.base_url,
+            api_key_env=route.api_key_env.strip() or base.api_key_env,
+            key_strategy=route.key_strategy.strip() or base.key_strategy,
+            vision_model=model,
+        )
+
+    def vision_route_of(self) -> LLMConfig | None:
+        """The endpoint image-bearing turns use when ``[llm.vision]`` is set.
+
+        None when the route is unset — everything then goes to the default
+        endpoint, exactly as before. A set route is a full :class:`LLMConfig`
+        merged over ``[llm]``, so the vision client is built by the same code
+        as the main one: same provider registry, same key-pool machinery.
+        """
+        if not self.vision.is_set():
+            return None
+        return self._with_route(self.vision, self, self.vision.model.strip() or self.vision_model)
+
+    def ocr_model_of(self) -> str:
+        """The model the ``ocr`` tool sends PDF pages to.
+
+        ``[llm.ocr].model`` wins, then the flat ``llm.ocr_model`` (env spelling
+        ``LUMI__LLM__OCR_MODEL``), then the default model — the one that also
+        answers text. Deliberately *not* the vision model: one setting per
+        input type — photos to ``vision_model``, PDFs to ``ocr_model``,
+        everything to ``model`` — so configuring a vision model never
+        silently changes what reads a document.
+        """
+        if self.ocr.model.strip():
+            return self.ocr.model.strip()
+        if self.ocr_model.strip():
+            return self.ocr_model.strip()
+        return self.model_of()
+
+    def ocr_route_of(self) -> LLMConfig:
+        """The endpoint the ``ocr`` tool uses: ``[llm.ocr]`` merged over
+        ``[llm]``. Never None — the tool degrades to the default endpoint
+        rather than disappearing.
+
+        It merges over the *default* route, not the vision one: a PDF goes to
+        the default endpoint and model unless ``[llm.ocr]`` says otherwise,
+        even when a vision model is configured for photos.
+        """
+        return self._with_route(self.ocr, self, self.ocr_model_of())
+
     def where_from(self) -> str:
         """Where the endpoint came from, for /status, /doctor and error messages."""
         if self.base_url.strip():
@@ -395,6 +501,96 @@ class FilesConfig:
 
     def writable_roots(self) -> list[Path]:
         return [resolve(p) for p in self.writable]
+
+
+OCR_DEFAULT_BASE_URL = "https://api.mistral.ai/v1"
+OCR_DEFAULT_MODEL = "mistral-ocr-latest"
+
+#: The OCR endpoint spellings accepted. Both speak the same wire format —
+#: Mistral's ``POST /ocr``: a ``document`` (URL or base64) in, per-page
+#: markdown out — which any compatible service can serve by pointing
+#: ``base_url`` at it. ``"mistral"`` is the hosted default; ``"custom"``
+#: means "my own host", and validate() insists on a ``base_url`` for it.
+OCR_PROVIDERS = ("mistral", "custom")
+
+
+@dataclass(slots=True)
+class OCRConfig:
+    """The ``ocr`` tool: PDFs and scanned images, two ways to read them.
+
+    With ``provider`` set (``"mistral"``, or ``"custom"`` for your own host),
+    the whole document goes to a dedicated OCR API — the Mistral OCR shape:
+    ``POST <base_url>/ocr`` with ``document`` (a public URL or base64) and a
+    model, per-page markdown back. No local rendering, no per-page model
+    tokens. ``custom`` is the same wire format pointed at any compatible
+    endpoint — it needs its own ``base_url``.
+
+    .. code-block:: toml
+
+        [tools.ocr]
+        provider = "mistral"        # or "custom" + base_url = "https://…/v1"
+        api_key_env = "MISTRAL_API_KEY"
+        # model = "mistral-ocr-latest"   # base_url = "https://api.mistral.ai/v1"
+
+    With ``provider`` empty (the default), the tool works locally: text
+    embedded in the PDF is extracted for free, and only pages that come back
+    empty (scans) are rendered and transcribed — by ``[llm.ocr]``'s model
+    when one is set, else the default model (``llm.model``), never the vision
+    model. Image files follow the photo rule instead: vision model if set,
+    else the default.
+    """
+
+    enabled: bool = True
+    #: Dedicated OCR endpoint to use, or empty for the local path (embedded
+    #: text + a model call only for scans). See :data:`OCR_PROVIDERS`.
+    provider: str = ""
+    #: Root of the OCR API. Only meaningful with ``provider`` set.
+    base_url: str = OCR_DEFAULT_BASE_URL
+    #: OCR model id. Only meaningful with ``provider`` set.
+    model: str = OCR_DEFAULT_MODEL
+    #: Env var holding the OCR API key. Only meaningful with ``provider`` set.
+    api_key_env: str = "MISTRAL_API_KEY"
+    timeout_seconds: float = 120.0
+    #: Ceiling on pages of one PDF processed per call in the local path.
+    #: Pages with embedded text are free; this bounds the ones that fall
+    #: through to the vision model, which are the ones that cost. 0 means
+    #: every page. Unused by the dedicated API — the server pages itself.
+    max_pages: int = 20
+    #: Render scale for pages that need scanning. pypdfium2 scales by 72 DPI
+    #: per 1.0, so 3.0 is ~216 DPI — crisp small print without quadrupling
+    #: the image tokens.
+    render_scale: float = 3.0
+
+    def api_key(self) -> str | None:
+        """The OCR API key, or None when the variable is unset or empty."""
+        keys = parse_env_var(self.api_key_env)
+        return keys[0] if keys else None
+
+    def provider_of(self) -> str:
+        """The configured provider, normalised; empty means the local path."""
+        return self.provider.strip().lower()
+
+    def endpoint_problem(self) -> str:
+        """Reject unusable OCR endpoints before a document can be uploaded."""
+        provider = self.provider_of()
+        if not provider:
+            return ""
+        if provider not in OCR_PROVIDERS:
+            return (
+                f"unknown tools.ocr.provider {self.provider!r}. "
+                f"Known: {', '.join(OCR_PROVIDERS)} (or empty for the local path)"
+            )
+        url = self.base_url.strip().rstrip("/")
+        if provider == "custom" and url in ("", OCR_DEFAULT_BASE_URL):
+            return 'tools.ocr.provider = "custom" needs tools.ocr.base_url pointed at your own OCR endpoint'
+        try:
+            parsed = urlsplit(url)
+            valid = parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+        except ValueError:
+            valid = False
+        if not valid:
+            return "tools.ocr.base_url must be an absolute http(s) URL"
+        return ""
 
 
 @dataclass(slots=True)
@@ -670,8 +866,10 @@ class ToolsConfig:
             "list_files",
             "grep",
             "memory",
+            "more_context",
             "web",
             "context7",
+            "ocr",
             "send",
         ]
     )
@@ -680,6 +878,7 @@ class ToolsConfig:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     web: WebConfig = field(default_factory=WebConfig)
     context7: Context7Config = field(default_factory=Context7Config)
+    ocr: OCRConfig = field(default_factory=OCRConfig)
 
     def is_enabled(self, name: str) -> bool:
         return name in self.enabled
@@ -1071,9 +1270,24 @@ def validate(config: Config) -> list[str]:
         ("tools.files.max_read_chars", config.tools.files.max_read_chars),
         ("tools.web.max_results", config.tools.web.max_results),
         ("tools.web.max_content_chars", config.tools.web.max_content_chars),
+        ("tools.ocr.max_pages", config.tools.ocr.max_pages),
     ):
         if value < 0:
             problems.append(f"{label} cannot be negative (0 means: no limit)")
+    if config.tools.ocr.render_scale <= 0:
+        problems.append("tools.ocr.render_scale must be a positive number (1.0 = 72 DPI)")
+    if config.tools.ocr.timeout_seconds <= 0:
+        problems.append("tools.ocr.timeout_seconds must be a positive number of seconds")
+    if problem := config.tools.ocr.endpoint_problem():
+        problems.append(problem)
+    # A route states what differs from [llm]; an unknown rotation strategy in
+    # one is a typo worth naming, same as in the main block.
+    for label, route in (("llm.vision", config.llm.vision), ("llm.ocr", config.llm.ocr)):
+        if route.key_strategy.strip() and route.key_strategy.strip().lower() not in KEY_STRATEGIES:
+            problems.append(
+                f"unknown {label}.key_strategy {route.key_strategy!r}. "
+                f"Known: {', '.join(KEY_STRATEGIES)}"
+            )
     if config.llm.context_window <= 0:
         problems.append("llm.context_window must be a positive number of tokens")
     if config.llm.context_headroom >= config.llm.context_window:
@@ -1122,8 +1336,10 @@ def validate(config: Config) -> list[str]:
             "list_files",
             "grep",
             "memory",
+            "more_context",
             "web",
             "context7",
+            "ocr",
             "send",
         }:
             problems.append(f"unknown tool {name!r} in tools.enabled")

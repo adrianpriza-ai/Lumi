@@ -95,8 +95,13 @@ def request_model(messages: list[dict[str, Any]], config: LLMConfig) -> str:
 class OpenAICompatClient(LLMClient):
     name = "openai-compatible"
 
-    def __init__(self, config: LLMConfig) -> None:
+    def __init__(self, config: LLMConfig, vision: OpenAICompatClient | None = None) -> None:
         self.config = config
+        #: A second provider for image-bearing requests, wired by
+        #: :func:`lumi.llm.build_llm` from ``[llm.vision]`` — its own
+        #: endpoint, key pool and model. None when the route is unset, in
+        #: which case this client answers every request itself.
+        self.vision = vision
         self._pool = KeyPool(config.api_keys(), config.strategy_of())
         self._clients: dict[str, Any] = {}
         #: (model id, carried an image) for the call in flight, for error text.
@@ -271,6 +276,12 @@ class OpenAICompatClient(LLMClient):
                 f"{self.config.api_key_env} is not set. Put it in .env, or point "
                 f"llm.base_url at a local server and set llm.api_key_env to a dummy value."
             )
+
+        if self.vision is not None and has_image_part(messages):
+            # [llm.vision] owns this request: separate provider, endpoint and
+            # key. The sub-client does its own retries and error explanation,
+            # naming its own endpoint — which is the point of the route.
+            return await self.vision.complete(messages, tools=tools)
 
         variants = self._variants(self._params(messages, tools))
         # Remember which model this call went out under so a failure can name

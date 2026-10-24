@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -189,8 +190,10 @@ def test_defaults_apply_with_no_config_file(project) -> None:
         "list_files",
         "grep",
         "memory",
+        "more_context",
         "web",
         "context7",
+        "ocr",
         "send",
     ]
 
@@ -676,3 +679,135 @@ def test_minus_one_bootstrap_retries_validate(config) -> None:
     """-1 means retry startup forever and is accepted."""
     config.bot.bootstrap_retries = -1
     assert not any("bootstrap_retries" in p for p in validate(config))
+
+
+# --------------------------------------------------------------------------- #
+# per-role provider routes ([llm.vision], [llm.ocr])
+# --------------------------------------------------------------------------- #
+
+
+def test_unset_routes_stay_unset(config) -> None:
+    assert config.llm.vision_route_of() is None
+    assert not config.llm.vision.is_set()
+    assert not config.llm.ocr.is_set()
+    # The ocr route degrades to the default endpoint rather than disappearing.
+    assert config.llm.ocr_route_of().model_of() == config.llm.model_of()
+
+
+def test_a_vision_route_merges_only_what_it_states(config, monkeypatch) -> None:
+    monkeypatch.setenv("OR_API_KEY", "sk-or")
+    config.llm.vision.provider = "openrouter"
+    config.llm.vision.model = "google/gemini-2.0-flash-001"
+    config.llm.vision.api_key_env = "OR_API_KEY"
+
+    route = config.llm.vision_route_of()
+    assert route is not None
+    assert route.provider == "openrouter"          # from the route
+    assert route.api_key() == "sk-or"              # its own key
+    assert route.vision_model_of() == "google/gemini-2.0-flash-001"
+    assert route.model_of() == config.llm.model_of()  # text model inherited
+    assert route.base_url_of() == config.llm.base_url_of()
+    assert route.strategy_of() == "fallback"
+
+
+def test_the_ocr_route_stays_on_the_default_even_with_a_vision_route(config) -> None:
+    """A vision route is for photos; a PDF stays on the default endpoint."""
+    config.llm.vision.provider = "openrouter"
+    config.llm.vision.model = "google/gemini-2.0-flash-001"
+    ocr = config.llm.ocr_route_of()
+    assert ocr.provider == config.llm.provider      # default endpoint, not vision's
+    assert ocr.base_url_of() == config.llm.base_url_of()
+    assert config.llm.ocr_model_of() == config.llm.model_of()
+
+    # [llm.ocr] overrides, exactly like any other route.
+    config.llm.ocr.model = "gpt-4o-mini"
+    assert config.llm.ocr_route_of().vision_model_of() == "gpt-4o-mini"
+    assert config.llm.ocr_model_of() == "gpt-4o-mini"
+
+
+def test_the_ocr_model_falls_back_to_the_default_not_the_vision_model(config) -> None:
+    config.llm.vision_model = "gpt-4o"
+    assert config.llm.ocr_model_of() == config.llm.model_of()
+
+
+def test_the_ocr_model_resolves_from_the_flat_field(config) -> None:
+    config.llm.ocr_model = "paddleocr-v4"
+    assert config.llm.ocr_model_of() == "paddleocr-v4"
+
+
+def test_the_ocr_route_model_beats_the_flat_field(config) -> None:
+    config.llm.ocr_model = "from-flat"
+    config.llm.ocr.model = "from-route"
+    assert config.llm.ocr_model_of() == "from-route"
+
+
+def test_the_ocr_model_can_come_from_the_environment(project, monkeypatch) -> None:
+    monkeypatch.setenv("LUMI__LLM__OCR_MODEL", "paddleocr-v4")
+    assert load_config(project).llm.ocr_model_of() == "paddleocr-v4"
+
+
+def test_routes_can_come_from_toml(project, monkeypatch) -> None:
+    monkeypatch.setenv("OR_API_KEY", "sk-or")
+    monkeypatch.setenv("MISTRAL_API_KEY", "mk-1")
+    (project / "config.toml").write_text(
+        "[llm]\n"
+        "model = 'gpt-4.1-mini'\n"
+        "[llm.vision]\n"
+        "provider = 'openrouter'\n"
+        "model = 'google/gemini-2.0-flash-001'\n"
+        "api_key_env = 'OR_API_KEY'\n"
+        "[llm.ocr]\n"
+        "model = 'gpt-4o-mini'\n"
+        "[tools.ocr]\n"
+        "provider = 'mistral'\n"
+        "api_key_env = 'MISTRAL_API_KEY'\n",
+        encoding="utf-8",
+    )
+    loaded = load_config(project)
+    route = loaded.llm.vision_route_of()
+    assert route is not None
+    assert route.provider == "openrouter"
+    assert route.api_key() == "sk-or"
+    assert loaded.llm.ocr_model_of() == "gpt-4o-mini"
+    assert loaded.tools.ocr.provider_of() == "mistral"
+    assert loaded.tools.ocr.api_key() == "mk-1"
+    assert not any("tools.ocr" in p for p in validate(loaded))
+
+
+def test_an_unknown_route_key_strategy_is_reported(config) -> None:
+    config.llm.vision.key_strategy = "telepathy"
+    assert any("llm.vision.key_strategy" in p for p in validate(config))
+
+
+def test_an_unknown_ocr_provider_is_reported(config) -> None:
+    config.tools.ocr.provider = "tesseract-cloud"
+    assert any("tools.ocr.provider" in p for p in validate(config))
+
+
+def test_a_custom_ocr_provider_requires_a_base_url(config) -> None:
+    config.tools.ocr.provider = "custom"
+    config.tools.ocr.base_url = ""
+    assert any("tools.ocr.base_url" in p for p in validate(config))
+
+    config.tools.ocr.base_url = "https://ocr.internal/v1"
+    assert not any("tools.ocr.base_url" in p for p in validate(config))
+
+
+@pytest.mark.parametrize("base_url", ["", "relative/path", "file:///tmp/ocr", "https://"])
+def test_a_dedicated_ocr_provider_requires_an_http_endpoint(config, base_url) -> None:
+    config.tools.ocr.provider = "mistral"
+    config.tools.ocr.base_url = base_url
+    assert any("tools.ocr.base_url" in p for p in validate(config))
+
+
+def test_the_ocr_tool_is_enabled_by_default(config) -> None:
+    assert "ocr" in config.tools.enabled
+    assert not any("unknown tool" in p for p in validate(config))
+
+
+def test_the_shipped_config_enables_ocr(project) -> None:
+    shipped = Path(__file__).resolve().parents[1] / "config.toml"
+    (project / "config.toml").write_text(shipped.read_text(encoding="utf-8"), encoding="utf-8")
+    loaded = load_config(project)
+    assert loaded.tools.is_enabled("ocr")
+    assert loaded.tools.ocr.enabled

@@ -30,6 +30,7 @@ from lumi.bot import (
     build_application,
     build_handlers,
 )
+from lumi.chatlog import CHATLOG
 from lumi.memory import History
 from lumi.personality import Personality
 from lumi.tools import build_registry
@@ -281,9 +282,24 @@ def texts(bot: FakeBot) -> str:
     return "\n".join(message["text"] for message in bot.sent if "text" in message)
 
 
+def prompts(agent: Agent) -> str:
+    """Every message the agent handed the model, flattened for assertions."""
+    return "\n".join(
+        str(message.get("content", "")) for call in agent.llm.calls for message in call
+    )
+
+
 def documents(bot: FakeBot) -> list[dict[str, Any]]:
     """Every document the bot tried to send (payload bytes recorded)."""
     return [message for message in bot.sent if "document" in message]
+
+
+@pytest.fixture(autouse=True)
+def empty_room():
+    """The room log is process-wide; every test starts with it empty."""
+    CHATLOG.clear()
+    yield
+    CHATLOG.clear()
 
 
 # --------------------------------------------------------------------------- #
@@ -908,6 +924,232 @@ async def test_group_chat_does_not_reply_to_a_reply_to_a_human(config) -> None:
         reply_to_message=reply_to_human,
     )
     assert bot.sent == []
+
+
+async def test_a_mentioned_reply_carries_the_quoted_message_to_the_model(config) -> None:
+    """``@bot`` under a reply to someone else: the quote must reach the model.
+
+    The mention opens the gate, but the message being replied to never became
+    a turn of this conversation — without folding it into the prompt the model
+    is handed "try this" with nothing to point at.
+    """
+    reply_to_human = {
+        "message_id": 99,
+        "date": int(time.time()),
+        "chat": {"id": GROUP_CHAT, "type": "supergroup", "title": "Lab"},
+        "from": {"id": 777, "is_bot": False, "first_name": "Other", "username": "other"},
+        "text": "the failing test is in tests/test_web.py",
+    }
+    mention_text = "@lumi_test_bot try to fix this"
+    bot, agent = await send(
+        config,
+        [make_reply("on it")],
+        mention_text,
+        chat_id=GROUP_CHAT,
+        chat_type="supergroup",
+        entities=[{"type": "mention", "offset": 0, "length": len("@lumi_test_bot")}],
+        reply_to_message=reply_to_human,
+    )
+    assert "on it" in texts(bot)
+    assert "the failing test is in tests/test_web.py" in prompts(agent)
+    assert "try to fix this" in prompts(agent)
+
+
+async def test_a_reply_quoting_a_media_message_says_what_it_quoted(config) -> None:
+    """A quote with no text (a photo) is named, not silently dropped."""
+    reply_to_photo = {
+        "message_id": 98,
+        "date": int(time.time()),
+        "chat": {"id": GROUP_CHAT, "type": "supergroup", "title": "Lab"},
+        "from": {"id": 777, "is_bot": False, "first_name": "Other", "username": "other"},
+        "photo": [{"file_id": "p1", "file_unique_id": "pu1", "width": 90, "height": 60}],
+    }
+    mention_text = "@lumi_test_bot what is in this"
+    _, agent = await send(
+        config,
+        [make_reply("no idea")],
+        mention_text,
+        chat_id=GROUP_CHAT,
+        chat_type="supergroup",
+        entities=[{"type": "mention", "offset": 0, "length": len("@lumi_test_bot")}],
+        reply_to_message=reply_to_photo,
+    )
+    assert "photo with no text" in prompts(agent)
+
+
+async def test_a_plain_message_gets_no_quote_prefix(config) -> None:
+    """Not a reply → the model sees the text exactly as it was sent."""
+    _, agent = await send(config, [make_reply("ok")], "just saying hi")
+    assert any(message.get("content") == "just saying hi" for message in agent.llm.calls[0])
+
+
+async def test_a_reply_chain_reaches_the_prompt_oldest_first(config) -> None:
+    """A reply to a reply carries every link, in the order they were said.
+
+    "no it isn't" answers the message *above* the quote, so one link is not
+    enough — the chain is walked and rendered oldest first.
+    """
+    oldest = {
+        "message_id": 96,
+        "date": int(time.time()),
+        "chat": {"id": GROUP_CHAT, "type": "supergroup", "title": "Lab"},
+        "from": {"id": 777, "is_bot": False, "first_name": "Other", "username": "other"},
+        "text": "the deploy token is expired",
+    }
+    middle = {
+        "message_id": 97,
+        "date": int(time.time()),
+        "chat": {"id": GROUP_CHAT, "type": "supergroup", "title": "Lab"},
+        "from": {"id": OWNER, "is_bot": False, "first_name": "Owner", "username": "owner"},
+        "text": "which token though",
+        "reply_to_message": oldest,
+    }
+    mention_text = "@lumi_test_bot fix it"
+    _, agent = await send(
+        config,
+        [make_reply("on it")],
+        mention_text,
+        chat_id=GROUP_CHAT,
+        chat_type="supergroup",
+        entities=[{"type": "mention", "offset": 0, "length": len("@lumi_test_bot")}],
+        reply_to_message=middle,
+    )
+    prompt = prompts(agent)
+    assert "reply chain" in prompt
+    assert prompt.index("the deploy token is expired") < prompt.index("which token though")
+    assert "fix it" in prompt
+
+
+async def test_the_reply_chain_stops_at_five_links(config) -> None:
+    """Telegram chains are unbounded; the prompt stops at five of them."""
+    chat = {"id": GROUP_CHAT, "type": "supergroup", "title": "Lab"}
+    node: dict[str, Any] | None = None
+    for i in range(7):
+        node = {
+            "message_id": 200 + i,
+            "date": int(time.time()),
+            "chat": chat,
+            "from": {"id": 777, "is_bot": False, "first_name": "Other", "username": "other"},
+            "text": f"chain link {i}",
+            **({"reply_to_message": node} if node is not None else {}),
+        }
+    mention_text = "@lumi_test_bot and this"
+    _, agent = await send(
+        config,
+        [make_reply("ok")],
+        mention_text,
+        chat_id=GROUP_CHAT,
+        chat_type="supergroup",
+        entities=[{"type": "mention", "offset": 0, "length": len("@lumi_test_bot")}],
+        reply_to_message=node,
+    )
+    prompt = prompts(agent)
+    assert "chain link 6" in prompt  # the direct quote
+    assert "chain link 2" in prompt  # the fifth link back
+    assert "chain link 1" not in prompt
+    assert "chain link 0" not in prompt
+    assert "chain cut at the cap" in prompt
+
+
+async def test_an_unaddressed_group_message_is_kept_for_the_model(config) -> None:
+    """The bot stays silent, but the room's line goes to the log.
+
+    This is what `more_context` exists for: a dropped message is one the model
+    will never see any other way.
+    """
+    bot, agent = await send(
+        config,
+        [make_reply("never sent")],
+        "the deploy is broken again",
+        chat_id=GROUP_CHAT,
+        chat_type="supergroup",
+    )
+    assert bot.sent == []
+    assert agent.llm.calls == []
+    assert [entry.text for entry in CHATLOG.entries(GROUP_CHAT)] == [
+        "the deploy is broken again"
+    ]
+
+
+async def test_a_group_document_is_not_logged(config) -> None:
+    """Files are skipped even with a caption: the log is conversation, not an
+    inbox the model can recall."""
+    application, bot, _ = build(config, [make_reply("never sent")])
+    await application.initialize()
+    try:
+        await application.process_update(
+            make_document_update(
+                bot,
+                caption="see attached",
+                chat_id=GROUP_CHAT,
+                chat_type="supergroup",
+            )
+        )
+    finally:
+        await application.shutdown()
+    assert bot.sent == []
+    assert CHATLOG.entries(GROUP_CHAT) == []
+
+
+async def test_a_group_photo_is_not_logged(config) -> None:
+    """A captioned photo is media, not room chatter."""
+    application, bot, _ = build(config, [make_reply("never sent")])
+    await application.initialize()
+    try:
+        await application.process_update(
+            _make_photo_update(
+                bot,
+                caption="look at this",
+                chat_id=GROUP_CHAT,
+                chat_type="supergroup",
+            )
+        )
+    finally:
+        await application.shutdown()
+    assert bot.sent == []
+    assert CHATLOG.entries(GROUP_CHAT) == []
+
+
+async def test_a_mentioned_group_message_is_not_logged(config) -> None:
+    """An addressed message is already in the conversation — logging it would
+    show the model the same line twice."""
+    mention_text = "@lumi_test_bot hello"
+    await send(
+        config,
+        [make_reply("hi")],
+        mention_text,
+        chat_id=GROUP_CHAT,
+        chat_type="supergroup",
+        entities=[{"type": "mention", "offset": 0, "length": len("@lumi_test_bot")}],
+    )
+    assert CHATLOG.entries(GROUP_CHAT) == []
+
+
+async def test_a_strangers_chatter_in_a_group_is_logged(config) -> None:
+    """Silent for the stranger, visible in the log: the not-whitelisted path
+    records too, so a room the bot refuses still reads as a room."""
+    bot, agent = await send(
+        config,
+        [make_reply("never sent")],
+        "anyone seen the release notes?",
+        chat_id=GROUP_CHAT,
+        chat_type="supergroup",
+        user_id=STRANGER,
+    )
+    assert bot.sent == []
+    assert agent.llm.calls == []
+    assert [entry.text for entry in CHATLOG.entries(GROUP_CHAT)] == [
+        "anyone seen the release notes?"
+    ]
+    assert CHATLOG.entries(GROUP_CHAT)[0].author  # a name the model can quote
+
+
+async def test_a_private_chat_is_not_logged(config) -> None:
+    """Every private message becomes a turn, so logging it would only
+    duplicate the transcript."""
+    bot, _ = await send(config, [make_reply("hi back")], "hello")
+    assert "hi back" in texts(bot)
+    assert CHATLOG.entries(CHAT) == []
 
 
 async def test_group_chat_does_not_reply_to_a_reply_to_another_bot(config) -> None:

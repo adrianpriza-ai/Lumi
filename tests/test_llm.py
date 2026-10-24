@@ -862,3 +862,74 @@ async def test_the_vision_hint_does_not_appear_without_an_image(config) -> None:
     with pytest.raises(LLMError) as caught:
         await client_with(config, completions).complete([{"role": "user", "content": "q"}])
     assert "vision_model" not in str(caught.value)
+
+
+# --------------------------------------------------------------------------- #
+# per-role routes: [llm.vision] gets its own client
+# --------------------------------------------------------------------------- #
+
+
+def test_build_llm_without_a_route_has_no_vision_client(config) -> None:
+    assert build_llm(config).vision is None
+
+
+def test_build_llm_attaches_the_vision_route(config, monkeypatch) -> None:
+    monkeypatch.setenv("OR_API_KEY", "sk-or")
+    config.llm.vision.provider = "openrouter"
+    config.llm.vision.model = "google/gemini-2.0-flash-001"
+    config.llm.vision.api_key_env = "OR_API_KEY"
+
+    client = build_llm(config)
+
+    assert isinstance(client, OpenAICompatClient)
+    assert client.vision is not None
+    assert client.vision.config.provider == "openrouter"
+    assert client.vision.config.api_key_env == "OR_API_KEY"
+    assert client.vision.config.vision_model_of() == "google/gemini-2.0-flash-001"
+    # The main client is untouched.
+    assert client.config.provider == "openai"
+
+
+def test_an_unknown_vision_provider_is_rejected_at_boot(config) -> None:
+    config.llm.vision.provider = "skynet"
+    with pytest.raises(LLMError, match="llm.vision.provider"):
+        build_llm(config)
+
+
+def test_the_vision_route_uses_its_own_provider_factory(config, monkeypatch) -> None:
+    from lumi.llm import PROVIDERS
+
+    class VisionClient(OpenAICompatClient):
+        pass
+
+    monkeypatch.setitem(PROVIDERS, "test-vision", VisionClient)
+    config.llm.vision.provider = "test-vision"
+    assert isinstance(build_llm(config).vision, VisionClient)
+
+
+async def test_image_turns_go_to_the_vision_client(config) -> None:
+    config.llm.vision.model = "vision-model"
+    main = client_with(config, StubCompletions(reply("from main")))
+    vision_completions = StubCompletions(reply("from vision"))
+    vision = OpenAICompatClient(config.llm.vision_route_of())
+    vision_used: list[str] = []
+    vision._client_for = lambda key: (vision_used.append(key) or StubClient(vision_completions))  # type: ignore[method-assign]
+    main.vision = vision
+
+    text_only = [{"role": "user", "content": "plain question"}]
+    assert (await main.complete(text_only)).text == "from main"
+    assert vision_used == []
+
+    with_image = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is this?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            ],
+        }
+    ]
+    assert (await main.complete(with_image)).text == "from vision"
+    assert vision_used != []
+    # The vision client sent its own model id.
+    assert vision_completions.requests[0]["model"] == "vision-model"

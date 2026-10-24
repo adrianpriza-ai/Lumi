@@ -31,6 +31,8 @@ base_url = ""
 model = ""
 # Model for image turns. Empty = use `model`.
 vision_model = ""
+# Model the ocr tool reads PDFs with. Empty = use `model` (never vision_model).
+ocr_model = ""
 # Env var holding the key. Comma-separated values make a rotation pool.
 api_key_env = "OPENAI_API_KEY"
 # fallback | round_robin | random
@@ -76,7 +78,7 @@ show_reasoning = true
 
 [tools]
 # Remove a tool from this list to disable it everywhere.
-enabled = ["shell", "files", "read_file", "list_files", "grep", "memory", "web", "context7", "send"]
+enabled = ["shell", "files", "read_file", "list_files", "grep", "memory", "more_context", "web", "context7", "ocr", "send"]
 
 [tools.shell]
 enabled = true

@@ -162,6 +162,7 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
         detail = "missing — the bot cannot answer anything"
     checks.append(Check(f"{config.llm.api_key_env}", OK if keys else FAIL, detail))
     vision = config.llm.vision_model_of()
+    route = config.llm.vision_route_of()
     checks.append(
         Check(
             "llm",
@@ -169,9 +170,35 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
             f"{config.llm.model_of()} via {config.llm.base_url_of()} "
             f"(from {config.llm.where_from()}), keys: {config.llm.strategy_of()}"
             + (f", vision: {vision}" if vision else "")
+            + (f" | vision via {route.base_url_of()} ({route.api_key_env})" if route else "")
             + _reasoning_note(config),
         )
     )
+    ocr_cfg = config.tools.ocr
+    if not config.tools.is_enabled("ocr") or not ocr_cfg.enabled:
+        checks.append(Check("ocr", WARN, "disabled in config"))
+    elif problem := ocr_cfg.endpoint_problem():
+        checks.append(Check("ocr", FAIL, problem))
+    elif ocr_cfg.provider_of():
+        ocr_key = ocr_cfg.api_key()
+        checks.append(
+            Check(
+                "ocr",
+                OK if ocr_key else WARN,
+                f"{ocr_cfg.model} via {ocr_cfg.base_url} ({ocr_cfg.api_key_env})"
+                if ocr_key
+                else f"{ocr_cfg.api_key_env} unset; the ocr tool is unavailable (no automatic fallback)",
+            )
+        )
+    elif config.tools.is_enabled("ocr"):
+        checks.append(
+            Check(
+                "ocr",
+                OK,
+                f"local path (embedded text + {config.llm.ocr_model_of()} for scans); "
+                'set [tools.ocr] provider = "mistral" for a dedicated OCR API',
+            )
+        )
 
     # -- shell ------------------------------------------------------------- #
     shell_ok = shutil.which("bash") or shutil.which("sh")

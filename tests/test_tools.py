@@ -7,10 +7,17 @@ from pathlib import Path
 
 import pytest
 
+from lumi.chatlog import ChatLog, LogEntry
 from lumi.tools.base import NeedsApproval, Tool, ToolContext, ToolError, ToolResult
 from lumi.tools.explore import GREP_MAX_RESULTS, GrepTool, ListFilesTool, ReadFileTool
 from lumi.tools.files import FilesTool
 from lumi.tools.memory_tool import MemoryTool
+from lumi.tools.more_context import (
+    MAX_MESSAGES,
+    MAX_OFFSET,
+    MAX_OUTPUT_TOKENS,
+    MoreContextTool,
+)
 from lumi.tools.registry import ToolRegistry
 from lumi.tools.send import SendTool
 from lumi.tools.shell import SECRET_PATTERN, ShellTool
@@ -1141,3 +1148,104 @@ async def test_grep_skips_symlinks_that_leave_the_project(config, tmp_path: Path
     assert result.data["matches"] == []
     assert "leak.txt" not in result.text
     assert "lives out here" not in result.text
+
+
+# --------------------------------------------------------------------------- #
+# more_context
+# --------------------------------------------------------------------------- #
+
+CHAT_ID = -1001
+
+
+def room(*texts: str) -> ChatLog:
+    """A log with one message per text, oldest first."""
+    log = ChatLog()
+    for i, text in enumerate(texts, start=1):
+        log.record(CHAT_ID, LogEntry(message_id=i, author="Other", text=text, clock="12:00"))
+    return log
+
+
+async def test_more_context_returns_the_newest_ten_oldest_first(config) -> None:
+    log = room(*(f"m{i}" for i in range(1, 13)))
+    result = await MoreContextTool(config, log=log).invoke({}, ctx(chat_id=CHAT_ID))
+    assert result.ok
+    assert result.data["count"] == MAX_MESSAGES
+    for text in (f"m{i}" for i in range(3, 13)):
+        assert text in result.text
+    assert "m2" not in result.text
+    assert result.text.index("m3") < result.text.index("m12")
+
+
+async def test_more_context_offset_skips_the_newest(config) -> None:
+    log = room("m1", "m2", "m3", "m4", "m5", "m6", "m7")
+    result = await MoreContextTool(config, log=log).invoke(
+        {"offset": 2}, ctx(chat_id=CHAT_ID)
+    )
+    assert result.ok
+    assert "m1" in result.text and "m5" in result.text
+    assert "m6" not in result.text and "m7" not in result.text
+
+
+async def test_more_context_refuses_an_offset_above_the_cap(config) -> None:
+    result = await MoreContextTool(config, log=room("m1")).invoke(
+        {"offset": MAX_OFFSET + 1}, ctx(chat_id=CHAT_ID)
+    )
+    assert not result.ok
+    assert f"0 and {MAX_OFFSET}" in result.text
+
+
+async def test_more_context_refuses_a_limit_above_the_cap(config) -> None:
+    result = await MoreContextTool(config, log=room("m1")).invoke(
+        {"limit": MAX_MESSAGES + 1}, ctx(chat_id=CHAT_ID)
+    )
+    assert not result.ok
+    assert f"1 and {MAX_MESSAGES}" in result.text
+
+
+async def test_more_context_refuses_a_non_numeric_argument(config) -> None:
+    """A garbled argument is refused, not silently read as zero."""
+    result = await MoreContextTool(config, log=room("m1")).invoke(
+        {"offset": "back"}, ctx(chat_id=CHAT_ID)
+    )
+    assert not result.ok
+    assert "offset" in result.text
+
+
+async def test_more_context_reports_an_offset_past_the_end(config) -> None:
+    result = await MoreContextTool(config, log=room("only")).invoke(
+        {"offset": 3}, ctx(chat_id=CHAT_ID)
+    )
+    assert not result.ok
+    assert "past the end" in result.text
+
+
+async def test_more_context_says_so_when_nothing_is_logged(config) -> None:
+    result = await MoreContextTool(config, log=ChatLog()).invoke({}, ctx(chat_id=CHAT_ID))
+    assert not result.ok
+    assert "no messages" in result.text.lower()
+
+
+async def test_more_context_refuses_a_result_over_the_token_cap(config) -> None:
+    """Over the cap is refused with the remedy, never truncated into a read
+    that looks complete — the same rule read_file follows."""
+    log = ChatLog()
+    for i in range(MAX_MESSAGES):
+        log.record(
+            CHAT_ID,
+            LogEntry(message_id=i + 1, author="Other", text="x" * 40_000, clock="12:00"),
+        )
+    result = await MoreContextTool(config, log=log).invoke({}, ctx(chat_id=CHAT_ID))
+    assert not result.ok
+    assert f"{MAX_OUTPUT_TOKENS:,}" in result.text
+    assert "limit" in result.text
+
+
+async def test_more_context_only_sees_its_own_chat(config) -> None:
+    log = ChatLog()
+    log.record(-1001, LogEntry(message_id=1, author="Other", text="group line", clock="12:00"))
+    log.record(42, LogEntry(message_id=2, author="Owner", text="private line", clock="12:00"))
+    tool = MoreContextTool(config, log=log)
+    group = await tool.invoke({}, ctx(chat_id=-1001))
+    private = await tool.invoke({}, ctx(chat_id=42))
+    assert "group line" in group.text and "private line" not in group.text
+    assert "private line" in private.text and "group line" not in private.text

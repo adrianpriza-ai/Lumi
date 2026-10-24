@@ -40,10 +40,13 @@ Images sent in Telegram are passed through the standard OpenAI multimodal conten
 
 Resolution order, most specific wins:
 
-1. `base_url` / `model` / `vision_model` / `api_key_env` / `key_strategy` in `config.toml`
-2. `LUMI__LLM__BASE_URL`, `LUMI__LLM__MODEL`, `LUMI__LLM__VISION_MODEL`, `LUMI__LLM__API_KEY_ENV`, `LUMI__LLM__KEY_STRATEGY`
-3. `OPENAI_BASE_URL` (or `OPENAI_API_BASE`), `OPENAI_MODEL`, `OPENAI_VISION_MODEL`, and the key named by `api_key_env`
-4. OpenAI and `gpt-4.1-mini`
+1. `LUMI__LLM__*` environment overrides
+2. `config.local.toml`, then `config.toml`
+3. For unset endpoint/model fields: `OPENAI_BASE_URL` (or `OPENAI_API_BASE` / `OPENAI_API_BASE_URL`), `OPENAI_MODEL`, and `OPENAI_VISION_MODEL`
+4. Built-in defaults (OpenAI and `gpt-4.1-mini` for the main route)
+
+`api_key_env` names the environment variable containing the credential; it is
+not the credential itself.
 
 The inference retry settings (`inference_retries`,
 `inference_retry_delay`) and reasoning settings (`reasoning`,
@@ -57,11 +60,55 @@ Always check what actually took effect:
 lumi config --key llm.base_url      # -> http://localhost:20128/v1
 lumi config --key llm.model         # -> nemotron-3-nano-reasoning
 lumi config --key llm.vision_model  # -> gpt-4o (empty means: use llm.model for photos)
+lumi config --key llm.ocr_model     # resolved PDF model, including the default fallback
 lumi config --key llm.key_strategy  # -> fallback
 lumi doctor | grep llm              # -> model via endpoint (from OPENAI_BASE_URL), keys: fallback
 ```
 
 If a call fails, the error names the endpoint, model, and key variable it used, so a key rejected by the wrong host is obvious immediately. Transient connection, timeout, 408/409/429, 5xx and empty-answer failures get the configured bounded retry budget with exponential backoff. Permanent request errors such as 400, 404 and 422 are reported immediately. `temperature = null` omits the parameter, which some reasoning models require.
+
+### Photo and PDF routing
+
+With no dedicated OCR provider, the model choice is:
+
+| Configured models | Text-only context | Photos / image files | Scanned PDF pages |
+|---|---|---|---|
+| Default only | default | default | default |
+| Default + vision | default | vision | default |
+| Default + OCR | default | default | OCR |
+| All three | default | vision | OCR |
+
+Use `LUMI__LLM__VISION_MODEL` for photos and `LUMI__LLM__OCR_MODEL` for scanned
+PDFs. PDF pages with embedded text are extracted locally without inference.
+The selected model for image files or rendered PDF pages must accept images;
+`ocr_model` is a chat-completions model, not a dedicated `/ocr` model ID.
+Chat turns remain on the vision route while any image is still in their context.
+
+For separate endpoints or credentials, use `[llm.vision]` and `[llm.ocr]`:
+
+```toml
+[llm.vision]
+provider = "openrouter"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+# model = "your-vision-model"
+
+[llm.ocr]
+# model = "your-document-chat-model"
+```
+
+Each route inherits unspecified fields from `[llm]`. A route's `model` takes
+precedence over its flat `vision_model` or `ocr_model` setting. The PDF route
+never inherits the vision endpoint, model, or key. A provider name alone does
+not select an endpoint: set `base_url` when changing hosts.
+
+`tools.ocr.provider = "mistral"` or `"custom"` selects a dedicated document
+API instead of local PDF extraction. That path uses `tools.ocr.model`,
+`tools.ocr.base_url`, and `tools.ocr.api_key_env`; it does not use `llm.ocr_model`.
+`custom` requires your own absolute HTTP(S) base URL. Missing OCR credentials
+make the tool unavailable, with no automatic switch to another provider.
+Local image files still use the photo route. Public document URLs require the
+dedicated API, and `max_pages` applies only to local PDF processing.
 
 ## No output ceiling
 

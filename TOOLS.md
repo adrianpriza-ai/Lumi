@@ -10,6 +10,8 @@
 | `list_files` | List one directory, like `ls` |
 | `grep` | Multi-word content search across the project |
 | `memory` | Remember and recall, scoped to the chat it is used in; forgetting is human-only by design |
+| `more_context` | Up to 10 messages of room chatter the bot never answered (`offset` ≤ 9, ~30k-token cap) |
+| `ocr` | Extract text from PDFs, scans, and document images |
 | `web` | Search and fetch, across three interchangeable providers |
 | `context7` | Up-to-date library docs from https://context7.com; auto-enables on `CONTEXT7_API_KEY` |
 | `send` | Send the owner a message *mid-turn*, so one reply can arrive in parts |
@@ -55,6 +57,54 @@ keeps going; the final answer still arrives when the turn ends.
 
 Like every other tool it is a file: `lumi/tools/send.py`. Remove `"send"` from
 `tools.enabled` to take it away from the model.
+
+## The room's own conversation (`more_context`)
+
+In a group the bot only sees messages addressed to it, so the model's history
+is a series of interruptions with the conversation between them missing. When
+the owner says "as they said above", there is nothing above — this tool is
+how the model asks for it.
+
+It reads a per-chat log of exactly the messages the bot *dropped*
+(`lumi/chatlog.py`): never the ones addressed to it, which are already in the
+conversation, and never a private chat, where every message already became a
+turn. Photos, files and other attachments stay out of the log, caption or not:
+the log is the room's conversation, not its inbox.
+
+- `offset` (0-9): skip this many of the newest messages before reading — use
+  it to walk further back.
+- `limit` (1-10, default 10): how many messages to return, oldest first.
+
+One call is capped at 10 messages and ~30k tokens; a result over the cap is
+**refused with the remedy** — "call again with a smaller `limit`" — never
+truncated, the same rule `read_file` follows: a cut-off answer reads like the
+whole truth to the model that asked.
+
+The log is in memory (10 messages per chat) and starts fresh on a restart;
+long-term memory is still `MEMORY.md`, and the transcript is still the bot's
+own conversation. Reading the room at all needs Telegram's group privacy
+setting disabled — see [TELEGRAM.md](TELEGRAM.md). Remove `"more_context"`
+from `tools.enabled` to take it away from the model.
+
+## OCR and document images (`ocr`)
+
+The `ocr` tool reads PDFs, scans, and document images from project paths. It
+keeps the input-type routing explicit:
+
+- without a dedicated provider, embedded PDF text is extracted locally without
+  a model call;
+- locally rendered PDF pages use `llm.ocr.model`, then `llm.ocr_model`, then
+  the default `llm.model` route, never the photo-only vision route;
+- image files use `llm.vision_model` or the `[llm.vision]` route, even when a
+  dedicated OCR API is configured;
+- a dedicated `tools.ocr` provider can process whole PDFs and public document
+  URLs through a Mistral-compatible `POST /ocr` endpoint.
+
+The committed configuration enables the tool. Remove `"ocr"` from
+`tools.enabled` or set `tools.ocr.enabled = false` to disable it. Set
+`tools.ocr.provider = "mistral"` for the
+dedicated API path. With no provider, local PDF extraction needs `pypdfium2`
+and only scanned pages use the configured model.
 
 ## Editing files
 

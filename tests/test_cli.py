@@ -131,6 +131,21 @@ def test_doctor_is_happy_with_a_complete_setup(config, capsys) -> None:
     assert "no blocking problems" in capsys.readouterr().out
 
 
+def test_doctor_does_not_promise_a_missing_ocr_key_fallback(config, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("LUMI__TOOLS__OCR__PROVIDER", "mistral")
+    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    assert main(["doctor"]) == 0
+    assert "unavailable (no automatic fallback)" in capsys.readouterr().out
+
+
+def test_doctor_reports_disabled_ocr(config, monkeypatch, capsys) -> None:
+    from lumi.doctor import WARN, Check
+
+    monkeypatch.setenv("LUMI__TOOLS__OCR__ENABLED", "false")
+    assert main(["doctor"]) == 0
+    assert Check("ocr", WARN, "disabled in config").render() in capsys.readouterr().out
+
+
 def test_doctor_reports_the_exa_key(config, capsys) -> None:
     """Exa sits in the default provider_order, so the doctor must name its key."""
     assert main(["doctor"]) == 0

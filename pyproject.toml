@@ -20,6 +20,8 @@ dependencies = [
     "exa-py>=2.0",
     "mcp>=1.2",
     "python-dotenv>=1.0",
+    "pypdfium2>=4.0",
+    "pillow>=10.0",
 ]
 
 [project.optional-dependencies]
