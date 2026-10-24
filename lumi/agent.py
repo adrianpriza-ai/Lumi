@@ -148,10 +148,11 @@ Telegraph-style HTML tags — they are the only thing that renders:
   here — they render as literal ** stars scattered through your text. If you
   want emphasis, write <b>like this</b>; if you are not sure, write plain
   text. The same goes for *single* asterisks and __underscores__.
-- Telegram has no table markup. Never write a Markdown table (`| like |
-  this |`) — the pipes and dashes show up as raw clutter in the chat. For
-  tabular data, either write one short line per row ("Name — 30 — Oslo") or,
-  if alignment really matters, hand-space an ASCII table inside
+- Never output a table in any syntax — Telegram cannot render one. No
+  Markdown pipe tables (`| like | this |`) and no HTML <table> markup: both
+  show up as raw junk in the chat. This holds even if the user asks for "a
+  table" or a tool result contains one — restructure the data as one short
+  line per row ("Name — 30 — Oslo"), or hand-align an ASCII table inside
   <pre></pre>.
 - Escape <, > and & outside tags as &lt; &gt; &amp; when you mean them as text,
   e.g. "a &lt; b" or "M&amp;Ms". A bare < followed by a letter starts a tag and

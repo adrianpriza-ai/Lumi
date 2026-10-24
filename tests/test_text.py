@@ -324,14 +324,47 @@ def test_table_cells_are_escaped() -> None:
 
 
 def test_full_reply_pipeline_handles_a_table() -> None:
-    """The order the bot composes: code, then bold, then tables — a smaller
-    model's Markdown table still lands as a clean block."""
+    """The order the bot composes: code, then tables, then bold — the table
+    renderer strips bold markers from cells, and the bold pass protects the
+    resulting <pre> block."""
     text = "**Summary**\n| key | val |\n|-----|-----|\n| a< | 1 |"
-    out = markdown_table_to_html(markdown_bold_to_html(markdown_code_to_html(text)))
+    out = markdown_bold_to_html(markdown_table_to_html(markdown_code_to_html(text)))
     assert "<b>Summary</b>" in out
     assert "<pre>" in out
     assert "a&lt;" in out
     assert "| key | val |" not in out
+
+
+def test_html_table_markup_is_converted() -> None:
+    """The shape a small model reaches for when told to 'write HTML':
+    Telegram has no <table> tags, so unconverted it would render as escaped
+    literal markup."""
+    text = "<p>compare:</p>\n<table><tr><th>Name</th><th>Age</th></tr>\n<tr><td>Ada</td><td>36</td></tr></table>"
+    out = markdown_table_to_html(text)
+    assert "<table" not in out
+    assert "<pre>Name | Age\n-----+----\nAda  | 36 </pre>" in out
+
+
+def test_html_table_cells_keep_text_not_tags() -> None:
+    text = "<table><tr><td><b>bold</b> &amp; more</td><td>x<br>y</td></tr></table>"
+    out = markdown_table_to_html(text)
+    assert "<b>" not in out
+    assert "bold &amp; more" in out
+    assert "x / y" in out
+
+
+def test_markdown_table_cells_strip_bold_markers() -> None:
+    """A model that bolds its header row must not end up with literal <b>
+    tags inside the monospace block."""
+    out = markdown_table_to_html("| **Name** | Age |\n|---|---|\n| Ada | 36 |")
+    assert "**" not in out
+    assert "<b>" not in out
+    assert "Name | Age" in out
+
+
+def test_html_table_inside_a_code_block_is_left_alone() -> None:
+    out = markdown_code_to_html("```\n<table><tr><td>a</td></tr></table>\n```")
+    assert markdown_table_to_html(out) == out
 
 
 # --------------------------------------------------------------------------- #

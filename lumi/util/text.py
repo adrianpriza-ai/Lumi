@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html as _html
 import re
 
 #: Telegram rejects Bot API messages longer than this.
@@ -306,6 +307,30 @@ def markdown_bold_to_html(text: str) -> str:
 #: under a pipe-bearing line almost never looks like this.
 _TABLE_CELL_RE = re.compile(r":?-+:?")
 
+#: HTML tables a model emits instead of Markdown — irresistible to a small
+#: model told to "write HTML", and fatal here: Telegram's HTML mode has no
+#: table tags, so the sanitizer would escape them into visible junk. Matched
+#: so they can be converted to the same monospace block as the Markdown kind.
+_HTML_TABLE_RE = re.compile(r"<table\b[\s\S]*?</table\s*>", re.IGNORECASE)
+_HTML_ROW_RE = re.compile(r"<tr\b[\s\S]*?</tr\s*>", re.IGNORECASE)
+_HTML_CELL_RE = re.compile(r"<t[hd]\b[^>]*>([\s\S]*?)</t[hd]\s*>", re.IGNORECASE)
+#: Only the formatting tags are stripped from cells — an angle-bracket pair
+#: that is not one of them ("<widget>", "a < b") is content and must survive
+#: as literal text.
+_TAG_RE = re.compile(
+    r"</?(?:b|strong|i|em|u|s|strike|del|ins|code|pre|blockquote|a|tg-spoiler)\b[^>]*>",
+    re.IGNORECASE,
+)
+_BR_RE = re.compile(r"<br\s*/?\s*>", re.IGNORECASE)
+
+
+def _strip_inline(text: str) -> str:
+    """Cell text for a monospace table: bold markers, inline tags and entities
+    have no meaning inside ``<pre>``, so keep the words only."""
+    text = _MD_BOLD_RE.sub(r"\1", text)
+    text = _BR_RE.sub(" / ", text)
+    return _html.unescape(_TAG_RE.sub("", text)).strip()
+
 
 def _split_table_row(line: str) -> list[str]:
     """The cells of one table line, or ``[]`` if the line holds no row.
@@ -332,6 +357,7 @@ def _render_table(rows: list[list[str]]) -> str:
     """A padded, pipe-joined monospace block: the closest thing to a table
     Telegram can show. Ragged rows are padded out, columns sized to their
     widest cell."""
+    rows = [[_strip_inline(cell) for cell in row] for row in rows]
     columns = max(len(row) for row in rows)
     rows = [row + [""] * (columns - len(row)) for row in rows]
     widths = [max(len(row[column]) for row in rows) for column in range(columns)]
@@ -371,19 +397,30 @@ def _convert_tables(segment: str) -> str:
     return "\n".join(out)
 
 
+def _html_table_repl(match: re.Match[str]) -> str:
+    rows: list[list[str]] = []
+    for row in _HTML_ROW_RE.findall(match.group(0)):
+        cells = [_strip_inline(cell) for cell in _HTML_CELL_RE.findall(row)]
+        if cells:
+            rows.append(cells)
+    return _render_table(rows) if rows else match.group(0)
+
+
 def markdown_table_to_html(text: str) -> str:
-    """Convert Markdown tables in *text* to an aligned ``<pre>`` block.
+    """Convert tables in *text* to an aligned ``<pre>`` block.
 
     Telegram's HTML mode has no table markup, and a smaller model coached out
-    of ``**bold**`` still reaches for a GFM pipe table — which under this chat
-    renders as raw ``|`` clutter in the middle of the message. The table is
-    re-laid-out into a monospace block with aligned columns instead, which is
-    both parseable and readable. Runs only outside ``<pre>``/``<code>``
-    segments, so a table inside a code block stays code.
+    of ``**bold**`` still reaches for a table — as a GFM pipe table, which
+    renders as raw ``|`` clutter, or as an HTML ``<table>``, which the
+    sanitizer would escape into visible tags. Both are re-laid-out into a
+    monospace block with aligned columns instead, which is both parseable and
+    readable. Runs only outside ``<pre>``/``<code>`` segments, so a table
+    inside a code block stays code.
     """
     parts = _CODE_SEGMENT_RE.split(text)
     for index in range(0, len(parts), 2):
-        parts[index] = _convert_tables(parts[index])
+        segment = _HTML_TABLE_RE.sub(_html_table_repl, parts[index])
+        parts[index] = _convert_tables(segment)
     return "".join(parts)
 
 

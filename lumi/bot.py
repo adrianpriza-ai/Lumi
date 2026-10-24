@@ -643,8 +643,12 @@ async def reply(update: Update, text: str, *, strict: bool = False, **kwargs: An
         else:
             raise TelegramError("no target to deliver chunk to")
 
+    # Order matters: code fences first (their <pre> is protected from every
+    # later pass), then tables — so bold markers inside cells are stripped by
+    # the table renderer instead of turning into literal <b> tags — and bold
+    # last, skipping every <pre>/<code> the first two passes created.
     for chunk in split_message(
-        markdown_table_to_html(markdown_bold_to_html(markdown_code_to_html(text)))
+        markdown_bold_to_html(markdown_table_to_html(markdown_code_to_html(text)))
     ):
         try:
             await _send_chunk(chunk, formatted=True)
