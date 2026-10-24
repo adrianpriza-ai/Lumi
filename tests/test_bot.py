@@ -18,7 +18,7 @@ from typing import Any
 
 import pytest
 from conftest import FakeLLM, make_reply, make_store
-from telegram import Bot, Chat, Message, Update, User
+from telegram import Bot, Chat, InaccessibleMessage, Message, TextQuote, Update, User
 from telegram.error import TelegramError
 
 from lumi.agent import Agent
@@ -26,6 +26,7 @@ from lumi.bot import (
     CB_NO,
     CB_OK,
     StepFeed,
+    _quoted_prefix,
     _write_toml,
     build_application,
     build_handlers,
@@ -975,6 +976,24 @@ async def test_a_reply_quoting_a_media_message_says_what_it_quoted(config) -> No
         reply_to_message=reply_to_photo,
     )
     assert "photo with no text" in prompts(agent)
+
+
+def test_an_inaccessible_reply_uses_telegram_quote_excerpt() -> None:
+    """A selected quote remains readable when Telegram hides the source message."""
+    source = InaccessibleMessage(Chat(id=CHAT, type="private"), message_id=98)
+    message = Message(
+        message_id=99,
+        date=datetime.now(UTC),
+        chat=Chat(id=CHAT, type="private"),
+        text="please handle this",
+        reply_to_message=source,
+        quote=TextQuote(text="the important line", position=0, is_manual=True),
+    )
+
+    prompt = _quoted_prefix(message)
+
+    assert "the important line" in prompt
+    assert "inaccessible" not in prompt
 
 
 async def test_a_plain_message_gets_no_quote_prefix(config) -> None:

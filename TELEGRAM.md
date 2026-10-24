@@ -52,8 +52,9 @@ an earlier human message
 Without that the model only ever saw "try to fix this" — the quoted message
 was addressed to a person, so it is not part of the bot's transcript, and
 "this" had nothing to point at. A quote with no text (a photo, a sticker) is
-named as what it was instead. Messages that are not replies reach the model
-unchanged.
+named as what it was instead. If Telegram cannot provide the original message,
+the selected quote excerpt is used when one is available. Messages that are not
+replies reach the model unchanged.
 
 Replies themselves chain — a reply to a reply to a reply — and one link is
 rarely the whole story ("no it isn't" answers the message *above* the quote).

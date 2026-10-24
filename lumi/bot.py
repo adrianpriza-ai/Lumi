@@ -483,19 +483,24 @@ def _is_addressed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 REPLY_CHAIN_MAX = 5
 
 
-def _quote_body(quoted: Any) -> tuple[str, str]:
+def _quote_body(quoted: Any, excerpt: str = "") -> tuple[str, str]:
     """``(sender, text)`` for one replied-to message.
 
     A message with no text of its own — a photo, a sticker, a poll — still
     gets named, because the reply points at it: dropping it would leave the
-    model holding a pointer to nothing.
+    model holding a pointer to nothing. Telegram can also provide only an
+    inaccessible reply target plus a selected quote excerpt, so *excerpt* is
+    used as the best available text in that case.
     """
-    sender = quoted.from_user
+    sender = getattr(quoted, "from_user", None)
     who = "someone" if sender is None else (sender.first_name or sender.username or "someone")
-    body = (quoted.text or quoted.caption or "").strip()
+    body = (getattr(quoted, "text", None) or getattr(quoted, "caption", None) or "").strip()
+    excerpt = excerpt.strip()
     if not body:
-        kind = next((field for field in CONTENT_FIELDS if getattr(quoted, field, None)), "")
-        body = f"(a {kind} with no text)" if kind else "(an empty message)"
+        body = excerpt
+        if not body:
+            kind = next((field for field in CONTENT_FIELDS if getattr(quoted, field, None)), "")
+            body = f"(a {kind} with no text)" if kind else "(an inaccessible or empty message)"
     return who, body
 
 
@@ -522,6 +527,12 @@ def _quoted_prefix(message: Any) -> str:
     if quoted is None:
         return ""
 
+    # Telegram may include the manually selected part of a reply separately
+    # from the replied-to message. It is especially important when the target
+    # is inaccessible, because that excerpt may be the only readable content.
+    reply_quote = getattr(message, "quote", None)
+    excerpt = (getattr(reply_quote, "text", None) or "").strip()
+
     # chain[0] is the direct quote, chain[-1] the oldest ancestor reachable.
     # The seen-set is paranoia: Telegram has no cycles, but one would spin
     # this loop to the cap and back if it ever did.
@@ -537,12 +548,12 @@ def _quoted_prefix(message: Any) -> str:
         quoted = getattr(quoted, "reply_to_message", None)
 
     if len(chain) == 1:
-        who, body = _quote_body(chain[0])
+        who, body = _quote_body(chain[0], excerpt)
         return f'[the message this replies to, from {who}:\n"""\n{body}\n"""\n]\n\n'
 
     blocks: list[str] = []
-    for link in reversed(chain):
-        who, body = _quote_body(link)
+    for index, link in enumerate(reversed(chain)):
+        who, body = _quote_body(link, excerpt if index == len(chain) - 1 else "")
         blocks.append(f'(from {who}):\n"""\n{body}\n"""')
     note = " — chain cut at the cap" if quoted is not None else ""
     head = f"[reply chain: the {len(chain)} message(s) this replies to, oldest first{note}:"
