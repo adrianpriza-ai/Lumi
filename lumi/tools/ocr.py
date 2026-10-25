@@ -19,7 +19,8 @@ from ..llm.ocr_api import CONTENT_TYPES, OCRDocumentClient
 from ..llm.openai_compat import OpenAICompatClient
 from ..paths import is_within, project_root, relative_to_root, resolve
 from ..util.log import get_logger
-from ..util.text import truncate
+from ..util.net import validate_fetch_url
+from ..util.text import fence_untrusted, truncate
 from .base import Tool, ToolContext, ToolError, ToolResult
 
 log = get_logger(__name__)
@@ -117,6 +118,10 @@ class OCRTool(Tool):
         if not raw:
             return ToolResult.failure("`path` is required — a project file path or an http(s) URL.")
         if raw.lower().startswith(("http://", "https://")):
+            if reason := validate_fetch_url(raw):
+                return ToolResult.failure(
+                    f"refusing to OCR {raw!r}: {reason} (only globally reachable http/https hosts)"
+                )
             return await self._url(raw)
         return await self._file(Path(raw), arguments)
 
@@ -238,7 +243,7 @@ class OCRTool(Tool):
                 if scanned
                 else ""
             )
-            text = truncate("\n\n".join(parts) + note, MAX_TEXT_CHARS)
+            text = fence_untrusted(truncate("\n\n".join(parts), MAX_TEXT_CHARS)) + note
             if total > limit:
                 text += (
                     f"\n\n[stopped at page {limit}; {total - limit} more page(s) "
@@ -256,7 +261,7 @@ class OCRTool(Tool):
         image_b64 = _read_b64(path)
         text = (await self._transcribe(image_b64, client=self._image_client(), mime=mime)).strip()
         return ToolResult(
-            text=text or "(no text found in the image)",
+            text=fence_untrusted(text or "(no text found in the image)"),
             summary=f"{relative_to_root(path)}: transcribed",
             data={"pages": 1, "scanned": 1},
         )
@@ -291,9 +296,11 @@ def _result(pages: list[tuple[int, str]], *, source: str) -> ToolResult:
     """Assemble ``(page_number, markdown)`` pairs into one tool result."""
     if not pages:
         return ToolResult.failure(f"the OCR API returned no pages for {source}.")
-    text = truncate(
-        "\n\n".join(f"[page {number}]\n{content}" for number, content in pages),
-        MAX_TEXT_CHARS,
+    text = fence_untrusted(
+        truncate(
+            "\n\n".join(f"[page {number}]\n{content}" for number, content in pages),
+            MAX_TEXT_CHARS,
+        )
     )
     return ToolResult(
         text=text,

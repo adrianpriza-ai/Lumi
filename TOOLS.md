@@ -123,7 +123,8 @@ The `files` tool is where edits happen, in three shapes:
 `edit` is the right default for a change to an existing file; `write` is for
 creating one or replacing all of it. Both are confined to `tools.files.writable`
 (default: `workspace/`) and both refuse the shell policy's protected paths —
-a `.git/hooks` file or an ssh key is off-limits through either tool.
+a `.git/hooks` file, an ssh key, or the bot's own `config.toml`,
+`data/whitelist.json` or `.mcp.json` is off-limits through either tool.
 
 ## File delivery (documents)
 
@@ -152,8 +153,10 @@ Three tiers, resolved in order, strictest wins:
 
 - **deny** — never runs, not even with approval. `rm -rf /`, `sudo`, piping a
   download into a shell, writing to `/dev/sda`, touching `.bashrc` or `.ssh`,
-  writing to a `.git/hooks` file, persistent `git config --global`, reverse
-  shells, `find / -delete`, power state changes, fork bombs.
+  writing to a `.git/hooks` file, rewriting the bot's own state
+  (`data/whitelist.json`, `.mcp.json`, `config.toml`), persistent
+  `git config --global`, reverse shells, `find / -delete`, power state
+  changes, fork bombs.
 - **confirm** — the owner gets a Confirm/Cancel button in the chat. Anything
   that destroys or overwrites state: deleting, clobbering a file that already
   exists (whether the clobber arrives as `mv`, `cp`, `tee`, or a `>` onto a
@@ -167,6 +170,15 @@ Three tiers, resolved in order, strictest wins:
   the owner to stop reading the prompt.
 
 On top of that: writes outside the project are blocked, `HOME` is pinned to the project, the child environment is scrubbed of anything matching `*KEY*|*TOKEN*|*SECRET*|*PASSWORD*` (so a command cannot exfiltrate your API keys), and every command runs in its own process group and is killed on timeout.
+
+Reads are bounded the same way. A read-only command may read inside the project
+and may read a system path — `cat /etc/passwd` is fine — but a read of
+anything else on the machine asks the owner first, the same way a write
+outside the project does. Files whose *contents* are credentials are refused
+outright, even to `cat`: `.env` and its variants, private keys, and
+anything inside `.ssh`, `.aws`, `.gnupg`, `.kube` or `.docker`. The
+environment scrub hides secrets from a command's *environment*; without a
+read-side guard, `cat .env` would hand the same values straight back.
 
 Output is not truncated. `tools.shell.max_output_chars` is `0` by default, so the model sees the whole thing; what gets dropped instead is *old* output, when the conversation outgrows the context window — at which point the model is told a command ran and that its output is no longer in front of it. Set the cap to a number if you would rather always see a short version.
 
@@ -215,7 +227,9 @@ cannot run unattended, but it can run if the owner says yes.
 
 If you need a hard boundary, run Lumi in a container or under a dedicated
 unprivileged user. Owner gating is by Telegram user id and is enforced twice: as
-a handler filter, and as an explicit check in every privileged handler.
+a handler filter, and as an explicit check in every privileged handler. What
+the guardrails assume about the machine they run on is written down in
+[DEPLOYMENT.md](docs/DEPLOYMENT.md).
 
 ## Web providers
 

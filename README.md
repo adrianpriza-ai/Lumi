@@ -54,7 +54,7 @@ expected, and it is why the two steps above are always both needed.
 | `lumi doctor` | Full environment check |
 | `lumi config [--key llm.model]` | Print the resolved configuration |
 
-In Telegram: `/start` (the help), `/memory`, `/remember`, `/forget`, `/personality`, `/reasoning`, `/context`, `/status`, `/doctor`, `/reload`, `/reset`, plus `/approve` and `/deny`. Owner only: `/own_help` (lists `/config`, `/env`, and the whitelist commands). Anything else is just a message to the agent.
+In Telegram: `/start` (the help), `/memory`, `/remember`, `/personality`, `/reasoning`, `/context`, `/status`, `/doctor`, plus `/approve` and `/deny`. Owner only: `/forget`, `/reload`, `/reset`, and `/own_help` (lists `/config`, `/env`, and the whitelist commands). Anything else is just a message to the agent.
 
 Send the bot a photo and it looks at it. The caption becomes your question; a
 photo with no caption gets a default "what's in this image?". Images go to `llm.vision_model` when one is set, so `llm.model` can stay text-only. Unset, everything goes to `llm.model`, which then has to be vision-capable. See [CONFIGURATION.md](CONFIGURATION.md#the-llm) for the multimodal note and [Configuration](CONFIGURATION.md) for how the model is resolved.
@@ -70,6 +70,7 @@ In group chats the bot only answers when **mentioned** (`@Lumi_a_bot ...`), **re
 | [CONFIGURATION.md](CONFIGURATION.md) | `config.toml` and precedence, picking an endpoint, reasoning models and thinking traces, key pools and rotation |
 | [TOOLS.md](TOOLS.md) | The tools, shell safety and its threat model, web providers (Firecrawl / Exa / Tavily / MCP), Context7, mid-turn messages, and how to add a tool |
 | [TELEGRAM.md](TELEGRAM.md) | Group chats and when the bot answers, and getting past `api.telegram.org` timeouts |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | What the safety controls assume about the machine: unprivileged user, protected state files, egress, systemd |
 
 Start with `lumi doctor`: it names whichever of these is misconfigured.
 ## Layout

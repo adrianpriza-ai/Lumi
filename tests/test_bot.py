@@ -232,8 +232,14 @@ def make_document_update(bot: Bot, *, caption: str | None = None, chat_id: int =
     return Update.de_json({"update_id": 5, "message": message}, bot)
 
 
-def make_callback(bot: Bot, data: str, *, chat_id: int = CHAT, user_id: int = OWNER) -> Update:
-    """An update for a tapped inline button."""
+def make_callback(bot: Bot, data: str, *, chat_id: int = CHAT, user_id: int = OWNER,
+                  chat_type: str = "private") -> Update:
+    """An update for a tapped inline button.
+
+    ``chat_type`` matters for authorisation: ``_is_allowed`` admits *any* member
+    of a whitelisted group, but only when the callback's chat really is a group
+    — a tap defaulting to "private" would silently never exercise that path.
+    """
     return Update.de_json(
         {
             "update_id": 1,
@@ -245,7 +251,7 @@ def make_callback(bot: Bot, data: str, *, chat_id: int = CHAT, user_id: int = OW
                 "message": {
                     "message_id": 7,
                     "date": int(time.time()),
-                    "chat": {"id": chat_id, "type": "private"},
+                    "chat": {"id": chat_id, "type": chat_type},
                     "text": "stub",
                 },
             },
@@ -387,13 +393,15 @@ async def test_start_greets_without_the_backend_details(config) -> None:
 async def test_start_lists_the_commands(config) -> None:
     bot, _ = await send(config, [], "/start")
     body = texts(bot)
-    for command in ("/memory", "/doctor", "/reset", "/status"):
+    for command in ("/memory", "/doctor", "/status"):
         assert command in body
     for gone in ("/run", "/search", "/fetch", "/ask", "/tools", "/help"):
         assert gone not in body
     # Owner commands live behind /own_help, not in the greeting.
     assert "/config" not in body
     assert "/whitelist" not in body
+    for owner_only in ("/forget", "/reload", "/reset"):
+        assert owner_only not in body
 
 
 async def test_start_advertises_the_approval_flow(config) -> None:
@@ -573,6 +581,152 @@ async def test_model_asks_for_approval_from_plain_text(config) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# approval authority (owner only)
+# --------------------------------------------------------------------------- #
+#
+# ``_is_allowed`` answers "may this person talk to the bot" — it lets in the
+# owner, whitelisted users and every member of a whitelisted group. Approval is
+# a separate, owner-reserved decision (lumi/agent.py, docs/policy/policy.md),
+# so every way of resolving a pending action re-checks ``_is_owner`` itself.
+
+RISKY_TURN = ("c1", "run_shell", {"command": "rm -rf workspace/tmp"})
+
+
+async def test_a_group_member_cannot_tap_run_it(config) -> None:
+    """A whitelisted room's member taps Confirm: nothing may run.
+
+    The regression this exists for: the button handler checked only
+    ``_is_allowed``, so in a whitelisted group any member could approve a
+    pending ``run_shell`` that the owner was asked to review.
+    """
+    config.bot.whitelisted_groups = [str(WHITELISTED_GROUP)]
+    config.bot.always_reply_chats = [str(WHITELISTED_GROUP)]
+    application, bot, agent = build(
+        config,
+        [make_reply("", [RISKY_TURN]), make_reply("should never narrate an approval")],
+    )
+    await application.initialize()
+    try:
+        await application.process_update(
+            make_update(
+                bot, "clean up the workspace",
+                chat_id=WHITELISTED_GROUP, chat_type="supergroup", user_id=STRANGER,
+            )
+        )
+        keyboard = next(m["reply_markup"] for m in bot.sent if m.get("reply_markup"))
+        approve = keyboard.inline_keyboard[0][0]
+        await application.process_update(
+            make_callback(
+                bot, approve.callback_data,
+                chat_id=WHITELISTED_GROUP, chat_type="supergroup", user_id=STRANGER,
+            )
+        )
+    finally:
+        await application.shutdown()
+
+    assert agent.conversation(WHITELISTED_GROUP).pending, "the tap must not resolve the action"
+    assert "should never narrate an approval" not in texts(bot)
+    # PTB forwards the toast text as a keyword, not a positional arg.
+    toast = " ".join(
+        str(t["args"][0]) if t["args"] else str(t.get("text", "")) for t in bot.toasts
+    )
+    assert "only the owner" in toast
+
+
+async def test_a_whitelisted_user_cannot_tap_run_it_in_their_own_chat(config) -> None:
+    """Same gate for a whitelisted user's private chat, not just groups."""
+    config.bot.whitelisted_users = [str(WHITELISTED_USER)]
+    application, bot, agent = build(
+        config,
+        [make_reply("", [RISKY_TURN]), make_reply("should never narrate an approval")],
+    )
+    await application.initialize()
+    try:
+        await application.process_update(
+            make_update(bot, "clean up the workspace", chat_id=WHITELISTED_USER,
+                        user_id=WHITELISTED_USER)
+        )
+        keyboard = next(m["reply_markup"] for m in bot.sent if m.get("reply_markup"))
+        approve = keyboard.inline_keyboard[0][0]
+        await application.process_update(
+            make_callback(bot, approve.callback_data,
+                          chat_id=WHITELISTED_USER, user_id=WHITELISTED_USER)
+        )
+    finally:
+        await application.shutdown()
+
+    assert agent.conversation(WHITELISTED_USER).pending
+    assert "should never narrate an approval" not in texts(bot)
+
+
+async def test_a_group_member_cannot_approve_or_deny_by_command(config) -> None:
+    """``/approve`` and ``/deny`` are owner-only, same as the button."""
+    config.bot.whitelisted_groups = [str(WHITELISTED_GROUP)]
+    config.bot.always_reply_chats = [str(WHITELISTED_GROUP)]
+    application, bot, agent = build(
+        config,
+        [make_reply("", [RISKY_TURN]), make_reply("should never narrate an approval")],
+    )
+    await application.initialize()
+    try:
+        await application.process_update(
+            make_update(
+                bot, "clean up the workspace",
+                chat_id=WHITELISTED_GROUP, chat_type="supergroup", user_id=STRANGER,
+            )
+        )
+        for command, message_id in (("/approve", 8), ("/deny", 9)):
+            await application.process_update(
+                make_update(
+                    bot, command, message_id=message_id,
+                    chat_id=WHITELISTED_GROUP, chat_type="supergroup", user_id=STRANGER,
+                )
+            )
+    finally:
+        await application.shutdown()
+
+    body = texts(bot).lower()
+    assert body.count("only the owner") == 2, body
+    assert agent.conversation(WHITELISTED_GROUP).pending
+    assert "should never narrate an approval" not in texts(bot)
+
+
+async def test_the_owner_still_approves_a_pending_action_in_the_group(config) -> None:
+    """Positive control: the gate must not be so wide it locks the owner out.
+
+    A member raises the action; the owner resolves it — approval stays a
+    review of someone else's request, which is the whole point of the gate.
+    """
+    config.bot.whitelisted_groups = [str(WHITELISTED_GROUP)]
+    config.bot.always_reply_chats = [str(WHITELISTED_GROUP)]
+    application, bot, agent = build(
+        config,
+        [make_reply("", [RISKY_TURN]), make_reply("it is gone")],
+    )
+    await application.initialize()
+    try:
+        await application.process_update(
+            make_update(
+                bot, "clean up the workspace",
+                chat_id=WHITELISTED_GROUP, chat_type="supergroup", user_id=STRANGER,
+            )
+        )
+        keyboard = next(m["reply_markup"] for m in bot.sent if m.get("reply_markup"))
+        approve = keyboard.inline_keyboard[0][0]
+        await application.process_update(
+            make_callback(
+                bot, approve.callback_data,
+                chat_id=WHITELISTED_GROUP, chat_type="supergroup", user_id=OWNER,
+            )
+        )
+    finally:
+        await application.shutdown()
+
+    assert "it is gone" in texts(bot)
+    assert not agent.conversation(WHITELISTED_GROUP).pending
+
+
+# --------------------------------------------------------------------------- #
 # memory commands
 # --------------------------------------------------------------------------- #
 
@@ -617,6 +771,48 @@ async def test_forget_rejects_a_non_number(config) -> None:
 async def test_forget_with_nothing_to_forget(config) -> None:
     bot, _ = await send(config, [], "/forget")
     assert "nothing to forget" in texts(bot).lower()
+
+
+async def test_forget_is_owner_only(config) -> None:
+    """A whitelisted user may use the bot, but erasing its memory is the
+    owner's call — /forget is the human side of the memory tool's asymmetry."""
+    config.bot.whitelisted_users = [str(WHITELISTED_USER)]
+    memory = make_store(config).get(CHAT)
+    memory.remember("first fact")
+
+    bot, _ = await send(config, [], "/forget", user_id=WHITELISTED_USER)
+    assert "only the owner" in texts(bot).lower()
+    assert memory.managed() == ["first fact"]  # nothing was erased
+
+
+async def test_reset_is_owner_only(config) -> None:
+    """Clearing a shared conversation destroys other people's transcript too,
+    so it is not a whitelisted user's button to press."""
+    config.bot.whitelisted_users = [str(WHITELISTED_USER)]
+    await send(config, [make_reply("one")], "hello", user_id=WHITELISTED_USER)
+
+    bot, _ = await send(config, [], "/reset", user_id=WHITELISTED_USER, message_id=2)
+    assert "only the owner" in texts(bot).lower()
+    assert History(config.history_dir).read(CHAT)  # the transcript survives
+
+
+async def test_reload_is_owner_only(config) -> None:
+    config.bot.whitelisted_users = [str(WHITELISTED_USER)]
+    bot, _ = await send(config, [], "/reload", user_id=WHITELISTED_USER)
+    assert "only the owner" in texts(bot).lower()
+
+
+async def test_a_whitelisted_user_can_still_remember(config) -> None:
+    """Saving a fact stays open to allowed users — and is stored as what it is,
+    a human-typed fact, not fenced as model-authored data."""
+    config.bot.whitelisted_users = [str(WHITELISTED_USER)]
+    bot, _ = await send(config, [], "/remember likes quiet rooms", user_id=WHITELISTED_USER)
+    assert "remembered" in texts(bot).lower()
+
+    memory = make_store(config).get(CHAT)
+    assert "likes quiet rooms" in memory.managed()
+    assert "lumi:model" not in memory.text
+    assert "lumi:model-notes" not in memory.for_prompt()
 
 
 # --------------------------------------------------------------------------- #
@@ -771,6 +967,54 @@ def test_owner_filter_is_applied_when_an_owner_is_set(config) -> None:
     assert {"start", "help", "own_help", "memory", "doctor"} <= names
     # The removed direct-invocation commands must not be registered either.
     assert not ({"run", "search", "fetch", "ask", "tools"} & names)
+
+
+def test_the_gate_filter_admits_allowed_principals_not_just_the_owner(config) -> None:
+    """The filter in front of every handler answers "may this person talk to
+    the bot?", not "is this person the owner?".
+
+    It used to be called ``OwnerFilter`` while returning ``_is_allowed``,
+    which read as a much narrower gate than it was — and is how the owner-only
+    checks in this module were easy to miss. The name now says what it does,
+    and the behaviour is asserted here so the two cannot drift apart again.
+    """
+    from telegram.ext import MessageHandler
+
+    config.bot.whitelisted_groups = [str(WHITELISTED_GROUP)]
+    handlers = build_handlers(config)
+    text_gate = next(
+        h for h in handlers
+        if isinstance(h, MessageHandler) and getattr(h.callback, "__name__", "") == "on_text"
+    )
+    bot = FakeBot()
+
+    # The owner passes.
+    assert text_gate.filters.check_update(make_update(bot, "hi", user_id=OWNER))
+    # A member of a whitelisted group passes, in that group.
+    assert text_gate.filters.check_update(
+        make_update(
+            bot, "hi", chat_id=WHITELISTED_GROUP, chat_type="supergroup", user_id=STRANGER
+        )
+    )
+    # The same stranger in a private chat does not.
+    assert not text_gate.filters.check_update(make_update(bot, "hi", user_id=STRANGER))
+
+    # And the filter is not named after a narrower gate than it implements.
+    # The filter class is local to build_handlers, so it is found by walking
+    # the composed filter tree rather than by importing it.
+    def filter_names(f) -> set[str]:
+        found = {type(f).__name__}
+        for part in getattr(f, "filters", ()) or ():
+            found |= filter_names(part)
+        return found
+
+    names = set()
+    for handler in handlers:
+        gate = getattr(handler, "filters", None)
+        if gate is not None:
+            names |= filter_names(gate)
+    assert "AllowedFilter" in names
+    assert "OwnerFilter" not in names
 
 
 def test_the_stranger_handler_is_registered_last(config) -> None:
@@ -2726,6 +2970,10 @@ async def test_own_help_lists_the_owner_introspection_commands(config) -> None:
     assert "/config" in body
     assert "/env" in body
     assert "masked" in body
+    # Memory- and conversation-changing commands are the owner's alone.
+    assert "/forget" in body
+    assert "/reload" in body
+    assert "/reset" in body
 
 
 async def test_own_help_accepts_the_hyphen_spelling(config) -> None:

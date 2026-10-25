@@ -1,9 +1,11 @@
 """The ``files`` tool: read, write and edit inside the project.
 
 Reads are allowed anywhere under the project root (so the bot can inspect its
-own source), plus a small set of read-only system paths. Writes are confined to
-the directories listed in ``tools.files.writable``, and overwriting an existing
-non-empty file needs approval.
+own source), plus a small set of read-only system paths — except for secret
+files (``.env``, keys, credentials), which are refused by name: the env scrub
+only protects the child process, so the read path has to refuse too. Writes
+are confined to the directories listed in ``tools.files.writable``, and
+overwriting an existing non-empty file needs approval.
 
 ``edit`` is the surgical path: an exact ``old_string``/``new_string`` swap that
 can only touch the text it names, so it runs without the approval prompt that a
@@ -13,7 +15,9 @@ Path handling is the security boundary here, so it is done with
 ``Path.resolve()`` plus an ``is_within`` check — no string prefix matching,
 which is trivially bypassed by ``../`` or a symlink. The shell's
 protected-path deny list applies here too (see :func:`protected_write`), so
-widening ``tools.files.writable`` cannot reopen what ``run_shell`` refuses.
+widening ``tools.files.writable`` cannot reopen what ``run_shell`` refuses,
+and the secret-file read guard (see :func:`read_guard`) applies to every
+read, list, stat and upload alike.
 """
 
 from __future__ import annotations
@@ -28,7 +32,7 @@ from ..paths import is_within, relative_to_root
 from ..util.log import get_logger
 from ..util.text import truncate
 from .base import NeedsApproval, Tool, ToolContext, ToolError, ToolResult
-from .safety import protected_write
+from .safety import protected_write, read_guard
 
 log = get_logger(__name__)
 
@@ -50,9 +54,10 @@ class FilesTool(Tool):
     description = """
 Read, write, edit, list, search and upload files inside this project.
 
-Paths are relative to the project root. Reads work anywhere in the project;
-writes only work inside the project's workspace directory, and overwriting an
-existing file needs the owner's approval.
+Paths are relative to the project root. Reads work anywhere in the project
+except secret files (.env, keys, credentials), which are refused; writes only
+work inside the project's workspace directory, and overwriting an existing
+file needs the owner's approval.
 
 `edit` is how you change an existing file: give the exact `old_string` you
 found and the `new_string` that replaces it. It needs no approval (it can
@@ -184,6 +189,13 @@ it validates the path, caps the size, and shows a diff before it overwrites.
             return resolved
 
         if is_within(resolved, self.root):
+            guard = read_guard(candidate) or read_guard(resolved)
+            if guard is not None:
+                raise ToolError(
+                    f"reading {resolved} is not allowed: {guard} holds credentials. "
+                    "run_shell refuses to print it too — ask the owner if a value "
+                    "from it is really needed."
+                )
             return resolved
         if requested in READABLE_SYSTEM_PATHS or str(resolved) in READABLE_SYSTEM_PATHS:
             return resolved

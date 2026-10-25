@@ -15,6 +15,7 @@ from lumi.llm.ocr_api import OCRDocumentClient
 from lumi.llm.openai_compat import OpenAICompatClient, request_model
 from lumi.tools.base import ToolContext, ToolError
 from lumi.tools.ocr import OCRTool, _sniffs_pdf
+from lumi.util.text import UNTRUSTED_BEGIN, UNTRUSTED_END
 
 #: The shape of a message whose context carries an image — what decides the
 #: per-request model id in :func:`request_model`.
@@ -128,6 +129,7 @@ async def test_a_text_pdf_never_touches_the_model(config, project: Path) -> None
     assert result.ok
     assert "Hello Lumi OCR" in result.text
     assert "second page text" in result.text
+    assert result.text.startswith(UNTRUSTED_BEGIN)  # transcribed text is data
     assert result.data["scanned"] == 0
 
 
@@ -184,7 +186,7 @@ async def test_an_image_is_transcribed(config, project: Path) -> None:
     tool._image_llm = stub
 
     result = await tool.invoke({"path": str(path)}, ctx())
-    assert result.text == "TOTAL 42.00"
+    assert result.text == f"{UNTRUSTED_BEGIN}\nTOTAL 42.00\n{UNTRUSTED_END}"
     url = stub.calls[0][0]["content"][1]["image_url"]["url"]
     assert url.startswith("data:image/png;base64,")
 
@@ -207,7 +209,8 @@ async def test_an_image_still_uses_the_vision_route_with_a_dedicated_ocr_provide
     result = await tool.invoke({"path": str(path)}, ctx())
 
     assert result.ok
-    assert result.text == "TOTAL 42.00"
+    assert "TOTAL 42.00" in result.text
+    assert result.text.startswith(UNTRUSTED_BEGIN)
 
 
 async def test_a_dedicated_ocr_provider_does_not_accept_plain_text_files(
@@ -335,6 +338,31 @@ async def test_a_url_goes_to_the_api_as_a_document_url(config, monkeypatch) -> N
     assert result.ok
     assert stub.calls[0]["document_url"] == "https://arxiv.org/pdf/2201.04234"
     assert "arxiv text" in result.text
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1/x.pdf",
+        "http://localhost/x.pdf",
+        "http://169.254.169.254/latest/meta-data",
+        "http://10.0.0.5/x.pdf",
+        "http://[::1]/x.pdf",
+    ],
+)
+async def test_a_private_host_url_is_refused_before_the_api(config, monkeypatch, url: str) -> None:
+    """SSRF-shaped OCR URLs never reach the OCR API."""
+    monkeypatch.setenv("MISTRAL_API_KEY", "mk-1")
+    config.tools.ocr.provider = "mistral"
+    tool = OCRTool(config)
+    stub = StubOCRServer([(1, "should not be called")])
+    tool._api = stub
+
+    result = await tool.invoke({"path": url}, ctx())
+
+    assert not result.ok
+    assert "refusing to OCR" in result.text
+    assert stub.calls == []
 
 
 async def test_a_url_without_a_provider_explains_the_fix(config) -> None:

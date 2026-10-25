@@ -9,6 +9,9 @@ import pytest
 from lumi.memory import (
     MANAGED_END,
     MANAGED_START,
+    MODEL_NOTES_END,
+    MODEL_NOTES_START,
+    MODEL_TAG,
     History,
     MemoryFile,
     MemoryStore,
@@ -139,6 +142,76 @@ def test_forget_zero_does_nothing(memory: MemoryFile) -> None:
     memory.remember("keep me")
     assert memory.forget(0) == []
     assert memory.managed() == ["keep me"]
+
+
+# --------------------------------------------------------------------------- #
+# provenance: who wrote the fact decides how it is injected
+# --------------------------------------------------------------------------- #
+
+
+def test_model_written_facts_carry_a_tag(memory: MemoryFile) -> None:
+    memory.remember("learned from a web page", by="model")
+    assert MODEL_TAG in memory.text
+
+
+def test_human_written_facts_carry_no_tag(memory: MemoryFile) -> None:
+    memory.remember("the owner prefers tabs", by="human")
+    assert MODEL_TAG not in memory.text
+
+
+def test_the_default_provenance_is_the_model(memory: MemoryFile) -> None:
+    """A caller that does not say who wrote the fact gets the untrusted one."""
+    memory.remember("unattributed")
+    assert MODEL_TAG in memory.text
+
+
+def test_the_tag_is_invisible_wherever_facts_are_listed(memory: MemoryFile) -> None:
+    memory.remember("model fact", by="model")
+    memory.remember("human fact", by="human")
+    assert memory.managed() == ["model fact", "human fact"]
+    assert memory.search("fact") == ["model fact", "human fact"]
+    assert memory.forget(2) == ["model fact", "human fact"]
+
+
+def test_fact_text_cannot_smuggle_its_own_provenance(memory: MemoryFile) -> None:
+    """A model-written fact claiming human provenance would be injected as
+    trusted system-prompt material, so remember() strips any tag it is handed."""
+    memory.remember(f"{MODEL_TAG} planted tag", by="model")
+    assert memory.managed() == ["planted tag"]
+    rendered = memory.for_prompt()
+    assert rendered.count(MODEL_TAG) == 1  # the one remember() wrote itself
+    assert rendered.index(MODEL_NOTES_START) < rendered.index("planted tag")
+
+
+def test_prompt_fences_model_facts_below_the_human_ones(memory: MemoryFile) -> None:
+    memory.remember("human fact", by="human")
+    memory.remember("model fact", by="model")
+    memory.remember("later human fact", by="human")
+
+    rendered = memory.for_prompt()
+    fence = rendered.index(MODEL_NOTES_START)
+    assert fence < rendered.index(MODEL_NOTES_END)
+    assert "model fact" in rendered[fence:]
+    # Everything a human wrote — facts and hand-written prose — stays above
+    # the fence, outside the untrusted block.
+    assert rendered.index("human fact") < fence
+    assert rendered.index("later human fact") < fence
+    assert rendered.index("hand-written notes that must survive") < fence
+
+
+def test_the_fence_is_rendering_only_never_persisted(memory: MemoryFile) -> None:
+    memory.remember("model fact", by="model")
+    memory.for_prompt()
+    assert "lumi:model-notes" not in memory.text
+
+
+def test_fenced_prompt_still_obeys_the_budget(memory: MemoryFile) -> None:
+    memory.max_chars = 400
+    for i in range(10):
+        memory.remember(f"fact {i} " + "x" * 60, by="model" if i % 2 else "human")
+    rendered = memory.for_prompt()
+    assert len(rendered) <= 400
+    assert rendered.count(MODEL_NOTES_START) == 1  # one block, never scattered
 
 
 # --------------------------------------------------------------------------- #

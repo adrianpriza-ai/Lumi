@@ -13,7 +13,7 @@ import abc
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from ....util.text import truncate
+from ....util.text import fence_untrusted, truncate
 
 #: Body-text floor for a hit when a search returns few results *and* a content
 #: cap is set: the budget is shared between the hits, but with five or fewer
@@ -84,17 +84,20 @@ class SearchResult:
         # invites answering from stale hits; this makes the age unmissable.
         today = datetime.now(UTC).strftime("%Y-%m-%d (%A)")
         window = f", last {self.recency_days} day(s) only" if self.recency_days else ""
-        lines = [f"Results for {self.query!r} (via {self.provider}, searched on {today}{window}):"]
+        header = f"Results for {self.query!r} (via {self.provider}, searched on {today}{window}):"
+        body: list[str] = []
         if self.answer:
-            lines += ["", "Summary:", self.answer]
-        lines.append("")
+            body += ["Summary:", self.answer, ""]
         per_hit = _share(max_chars, len(self.hits))
         for index, hit in enumerate(self.hits, start=1):
-            lines.append(hit.render(index, per_hit))
-            lines.append("")
+            body.append(hit.render(index, per_hit))
+            body.append("")
         if not self.hits:
-            lines.append("(no results)")
-        return "\n".join(lines)
+            body.append("(no results)")
+        # Everything below the header is provider content: titles, snippets and
+        # answers are written by whoever published the page, so they enter the
+        # prompt as data inside a fence rather than as free-standing text.
+        return f"{header}\n{fence_untrusted(chr(10).join(body).strip())}"
 
 
 @dataclass(slots=True)
@@ -105,7 +108,7 @@ class Page:
 
     def render(self, max_chars: int) -> str:
         head = f"--- {self.title or self.url} ---\n{self.url}\n"
-        return head + truncate(self.markdown.strip(), max_chars)
+        return head + fence_untrusted(truncate(self.markdown.strip(), max_chars))
 
 
 class WebProvider(abc.ABC):

@@ -1,6 +1,6 @@
 # Lumi Privacy Policy
 
-**Last updated: September 28, 2026**
+**Last updated: October 25, 2026**
 
 Lumi (`@Lumi_a_bot`) is an AI assistant that runs on Telegram. This policy explains what happens to the information you send it.
 
@@ -20,7 +20,7 @@ When you ask the bot to run a command, read or write a file, search the web, or 
 
 Four things happen to it: the reply is generated, the conversation stays continuous, the tasks you ask for get carried out, and notes you chose to save get recalled. Lumi does not build advertising profiles and does not sell personal information to anyone.
 
-Because the bot can act on your behalf, it also needs to know which instructions to trust. Only the account ID registered by the person running the instance may run programs, write files, or change stored notes. In a group chat the bot stays quiet unless you mention it, reply to it, or give it a command directly, so it does not answer every message in the room. Anyone else who tries gets a short refusal and nothing else. The one exception is a group the operator has explicitly allowed: every member of such a group may use the bot there, and they reach the same tools — so allow only rooms whose members you trust with that.
+Because the bot can act on your behalf, it also needs to know which instructions to trust. The account ID registered by the person running the instance is the owner, and the owner alone approves a pending action, manages the whitelist, erases saved notes, and clears or reloads a conversation. In a group chat the bot stays quiet unless you mention it, reply to it, or give it a command directly, so it does not answer every message in the room. Anyone else who tries gets a short refusal and nothing else. There are two exceptions, both set by the operator. A user the operator has explicitly allowlisted may use the bot in a private chat. And a group the operator has explicitly allowlisted opens the bot to every member of that room, who reach the same tools — so allow only rooms whose members you trust with that.
 
 ### Services that receive your information
 
@@ -49,7 +49,7 @@ The rotating logs can record technical details about the environment the bot run
 
 ### How your information is protected
 
-Commands that touch the system pass through a safety layer first. It blocks destructive operations: deleting a whole filesystem path, elevating privileges, or altering shell and SSH startup files. Commands stay inside one working directory, the home directory is pinned away from your real one, and environment variables that look like credentials are withheld from anything the bot runs.
+Commands that touch the system pass through a safety layer first. It blocks destructive operations: deleting a whole filesystem path, elevating privileges, or altering shell and SSH startup files. Commands stay inside one working directory, the home directory is pinned away from your real one, and environment variables that look like credentials are withheld from anything the bot runs. Files whose contents are credentials — the `.env` file, private keys, credential directories — are refused even to read-only commands, because reading one hands over exactly what the environment scrub hides. A command that reads a path outside the project asks the owner first.
 
 Credentials for outside services live in a private file on the machine running the bot. They are never written into the published source code or the sample configuration that ships with it.
 
@@ -57,7 +57,7 @@ A bot that can act on your computer has significant authority. The person runnin
 
 ### Your rights
 
-You can read and edit the notes the bot keeps, and ask to see the technical logs. Clearing a single conversation removes its transcript while leaving saved notes intact. You can remove saved notes individually or all at once, or have the bot do it for you. To remove all stored data—transcripts, notes, and working files—stop the bot and delete the files.
+You can read and edit the notes the bot keeps, and ask to see the technical logs. Clearing a single conversation removes its transcript while leaving saved notes intact. You can remove saved notes individually or all at once, or have the bot do it for you — erasing what the bot remembers is the owner's decision alone, and a note the bot writes for itself is never saved with a credential in it. To remove all stored data—transcripts, notes, and working files—stop the bot and delete the files.
 
 If you are in a group chat and have a question about data from your own use of the bot, contact the person who runs the instance. They are the ones who can act on it.
 

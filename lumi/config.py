@@ -73,7 +73,9 @@ class BotConfig:
     #: Strings to accommodate the negative supergroup ids Telegram hands out.
     whitelisted_groups: list[str] = field(default_factory=list)
     #: User ids allowed to use the bot alongside the owner. These users can
-    #: run all commands except whitelist management (owner-only).
+    #: use the agent and its tools like the owner can; what stays owner-only is
+    #: the approval decision, whitelist management, and the commands that
+    #: change what the bot remembers (\`/forget\`, \`/reset\`, \`/reload\`).
     whitelisted_users: list[str] = field(default_factory=list)
     #: SOCKS5 or HTTP proxy for the Bot API, e.g. "socks5://127.0.0.1:9050".
     #: Empty connects directly. Use this where api.telegram.org is slow or

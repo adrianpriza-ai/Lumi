@@ -29,6 +29,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import time
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -371,6 +372,78 @@ PROTECTED_SUBPATHS: frozenset[tuple[str, ...]] = frozenset(
         (".git", "config"),
         (".config", "gh"),
         (".vscode", "tasks.json"),
+        # The user-level MCP table names the command the web provider spawns.
+        # It is outside the project, so the write zone already asks; naming it
+        # here makes the answer a deny rather than a tap.
+        (".agents", "mcp.json"),
+    }
+)
+
+#: Project-relative files that grant access or change what the bot will run.
+#: They sit inside the shell's default write root (the whole project), so the
+#: zone check waves them through, and unlike ``.env`` they are not credentials:
+#: writing one is privilege escalation. ``data/whitelist.json`` awards the
+#: bot's tools to whoever it lists, ``.mcp.json`` names a local command the web
+#: provider will spawn, and ``config.toml`` decides the write roots and deny
+#: rules themselves.
+PROTECTED_PROJECT_PATHS: frozenset[tuple[str, ...]] = frozenset(
+    {
+        ("data", "whitelist.json"),
+        (".mcp.json",),
+        ("config.toml",),
+        ("config.local.toml",),
+    }
+)
+
+#: Files whose *contents* are credentials. The write guards above protect
+#: files because changing them changes what the machine does; this list
+#: protects files because *reading* one hands the model exactly what the
+#: child-env scrub in ``run_shell`` exists to hide — ``cat .env`` needs no
+#: write at all to defeat that control. Deliberately a different set from
+#: :data:`PROTECTED_BASENAMES`: a login file like ``.bashrc`` is dangerous to
+#: write and boring to read, while ``.env`` is the other way round.
+SECRET_FILE_BASENAMES: frozenset[str] = frozenset(
+    {
+        ".env",
+        ".mcp.json",
+        "config.local.toml",
+        "whitelist.json",
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+        ".git-credentials",
+        "id_rsa",
+        "id_ed25519",
+        "id_ecdsa",
+    }
+)
+
+#: Key material, named by extension because the issuer decided the basename.
+SECRET_FILE_SUFFIXES: tuple[str, ...] = (".pem", ".key", ".p12", ".pfx")
+
+#: System files that hold credentials under names that look ordinary. A
+#: read-only command may read a system path — ``cat /etc/passwd`` is fine —
+#: but these three are the password hashes and the sudo policy, and reading
+#: them hands the model something it should never see.
+SYSTEM_SECRET_PATHS: frozenset[str] = frozenset(
+    {
+        "/etc/shadow",
+        "/etc/gshadow",
+        "/etc/sudoers",
+    }
+)
+
+#: Directories whose *contents* are credentials whatever the file is called.
+#: ~/.aws/credentials and ~/.ssh/config hold live secrets under names that give
+#: nothing away, so the basename list above never sees them. Naming the
+#: directory catches every file inside it, at any depth.
+CREDENTIAL_DIRS: frozenset[str] = frozenset(
+    {
+        ".ssh",
+        ".gnupg",
+        ".aws",
+        ".kube",
+        ".docker",
     }
 )
 
@@ -506,6 +579,41 @@ INTERPRETERS: frozenset[str] = frozenset(
         "ksh",
     }
 )
+
+#: Interpreter flags whose following token is inline code or a module name, not
+#: a script path. Without this, ``python3 -c "print(1)"`` would look like an
+#: execution of a file called ``print(1)`` and ``python3 -m pytest`` like one
+#: called ``pytest``.
+INTERPRETER_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    "sh": frozenset({"-c", "-o"}),
+    "bash": frozenset({"-c", "-o"}),
+    "zsh": frozenset({"-c", "-o"}),
+    "ksh": frozenset({"-c"}),
+    "dash": frozenset({"-c"}),
+    "python": frozenset({"-c", "-m", "-W", "-X", "-Q"}),
+    "python2": frozenset({"-c", "-m", "-W", "-X"}),
+    "python3": frozenset({"-c", "-m", "-W", "-X"}),
+    "node": frozenset(
+        {"-e", "-p", "-r", "--eval", "--print", "--require", "--import", "--loader"}
+    ),
+    "deno": frozenset({"-e", "--eval"}),
+    "bun": frozenset({"-e", "--eval", "--require"}),
+    "perl": frozenset({"-e", "-E", "-M", "-m", "-I"}),
+    "ruby": frozenset({"-e", "-r", "-I"}),
+    "php": frozenset({"-r", "-f"}),
+    "lua": frozenset({"-e", "-l"}),
+}
+
+#: Programs that execute a code file named as their first operand. ``source``
+#: is ``bash builtin`` with the same effect as running the file.
+SCRIPT_RUNNERS: frozenset[str] = INTERPRETERS | frozenset({"source"})
+
+#: Wall-clock start of this process. A script created or changed after this
+#: moment was authored during this run; the shell asks the owner before running
+#: it. This is the write-then-run half of a prompt injection: fetched content
+#: talks the model into writing a program, and the program then executes with
+#: no approval of its own.
+SESSION_START = time.time()
 
 #: Programs that take a free-text message, where a path in the text is prose and
 #: not a target. ``git commit -m "drop the /etc fallback"`` writes to .git and
@@ -855,6 +963,116 @@ def _unwrap_program(tokens: list[str]) -> str:
     return program
 
 
+def _program_token(tokens: list[str]) -> str | None:
+    """The program word as typed, skipping leading ``VAR=value`` assignments."""
+    for token in tokens:
+        if token in _SEPARATORS:
+            return None
+        if "=" in token and not token.startswith(("-", "/", "./", "../")):
+            continue
+        return token
+    return None
+
+
+def _interpreter_index(tokens: list[str]) -> int | None:
+    """Index of the program that will actually run, looking through wrappers."""
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in _SEPARATORS:
+            return None
+        if "=" in token and not token.startswith(("-", "/", "./", "../")):
+            index += 1
+            continue
+        if Path(token).name in DELEGATING_COMMANDS:
+            index += 1
+            while index < len(tokens) and (
+                tokens[index].startswith("-")
+                or tokens[index].isdigit()
+                or (
+                    "=" in tokens[index]
+                    and not tokens[index].startswith(("/", "~", "./", "../"))
+                )
+            ):
+                index += 1
+            continue
+        return index
+    return None
+
+
+def script_paths(tokens: list[str], cwd: Path, home: Path | None) -> list[Path]:
+    """Files an interpreter (or ``source``) is asked to execute.
+
+    Only the first non-flag operand is a script: operands after it are
+    arguments the script reads, and flags such as ``-c``, ``-m`` and ``-e``
+    carry inline code or a module name instead of a path.
+    """
+    index = _interpreter_index(tokens)
+    if index is None:
+        return []
+    program = Path(tokens[index]).name
+    if program not in SCRIPT_RUNNERS:
+        return []
+    value_flags = INTERPRETER_VALUE_FLAGS.get(program, frozenset())
+    word_index = index + 1
+    while word_index < len(tokens):
+        word = tokens[word_index]
+        if word in _SEPARATORS:
+            break
+        if word.startswith("-"):
+            word_index += 2 if word in value_flags else 1
+            continue
+        return [_absolute(word, cwd, home)]
+    return []
+
+
+def _direct_script(tokens: list[str], cwd: Path, home: Path | None) -> Path | None:
+    """The program itself when the command executes a path (``./build.sh``)."""
+    raw = _program_token(tokens)
+    if raw is None:
+        return None
+    path = _path_like(raw)
+    return _absolute(path, cwd, home) if path is not None else None
+
+
+#: Programs whose bare operands name files they create or replace. Only these
+#: feed the same-command authoring check: an interpreter's operands are read,
+#: not written, and counting them would call every script self-authored.
+CREATING_COMMANDS: frozenset[str] = frozenset({"touch", "mkdir", "tee", "truncate", "shred"})
+
+
+def _command_write_targets(tokens: list[str], base: Path, home: Path | None) -> set[Path]:
+    """Paths this command line creates or writes before later segments run.
+
+    ``echo ... > x.py && python3 x.py`` has no pre-existing file for the
+    freshness check to see, so the redirect target itself counts as authored
+    by the same command.
+    """
+    written: set[Path] = set()
+    for word in _redirect_destinations(tokens):
+        if word:
+            written.add(_absolute(word, base, home))
+    for segment in _segments(tokens):
+        program = _unwrap_program(segment)
+        targets = operand_paths(segment, program, base, home)
+        if program in DESTINATION_LAST_COMMANDS:
+            targets = targets[-1:]
+        elif program in CREATING_COMMANDS:
+            pass
+        else:
+            continue
+        written.update(targets)
+    return written
+
+
+def _written_since(path: Path, session_start: float) -> bool:
+    """True when *path* exists and was created or changed after *session_start*."""
+    try:
+        return path.stat().st_mtime >= session_start
+    except OSError:
+        return False
+
+
 def _zone(path: Path, project_root: Path, home: Path | None) -> str:
     """Classify a path as ``system`` / ``home`` / ``outside`` / ``project``."""
     text = os.path.normpath(str(path))
@@ -950,11 +1168,87 @@ OVERWRITE_COMMANDS: frozenset[str] = frozenset(
 SINGLE_SOURCE_DEST_COMMANDS: frozenset[str] = frozenset({"cp", "mv", "ln", "install"})
 
 
+def _flag_values(tokens: list[str], flags: tuple[str, ...]) -> list[str]:
+    """The values given to *flags*, in ``-f value`` or ``--flag=value`` form."""
+    values: list[str] = []
+    for index, token in enumerate(tokens):
+        for flag in flags:
+            if token == flag and index + 1 < len(tokens):
+                values.append(tokens[index + 1])
+            elif flag.startswith("--") and token.startswith(flag + "="):
+                values.append(token.split("=", 1)[1])
+    return values
+
+
+def _readonly_write_targets(tokens: list[str], base: Path, home: Path | None) -> list[Path]:
+    """Files a *read-only* command still writes, under its output flags.
+
+    ``sort``, ``sed``, ``tree``, ``uniq`` and ``xxd`` are in
+    :data:`READ_ONLY_COMMANDS` because their common form prints to stdout; with
+    ``-o``, ``-i``, a second operand or ``-r`` one of their operands becomes the
+    output. Without this, ``sort -o ../config.toml ../config.toml`` was an
+    ``allow`` and the state-file guard never saw the write.
+    """
+    program = _unwrap_program(tokens)
+    operands = _operands(tokens)
+    # These operands are filenames by definition, including bare names that
+    # `_path_like` ignores (`sort -o out.txt ...`). Flag values that are numbers
+    # (`uniq -f 2`, `xxd -c 16`) are dropped so they are not mistaken for input.
+    words = [word for word in operands if not word.isdigit()]
+
+    def paths(items: list[str]) -> list[Path]:
+        return [_absolute(word, base, home) for word in items]
+
+    if program == "sed":
+        in_place = any(
+            token == "--in-place"
+            or token.startswith("--in-place=")
+            or (token.startswith("-i") and not token.startswith("--"))
+            for token in tokens
+        )
+        return paths(words) if in_place else []
+    if program == "sort":
+        return paths(_flag_values(tokens, ("-o", "--output")))
+    if program == "tree":
+        return paths(_flag_values(tokens, ("-o",)))
+    if program == "xxd":
+        # `xxd -r [input [output]]`: the last file operand is the write target.
+        return paths(words[-1:]) if "-r" in tokens and len(words) > 1 else []
+    if program == "uniq":
+        # `uniq [input [output]]`: with two files, the last one is the output.
+        return paths(words[-1:]) if len(words) > 1 else []
+    return []
+
+
+def _protected_project_path(path: Path, project_root: Path | None) -> str | None:
+    """The project-state file a write to *path* would land on, if any.
+
+    Matched after resolution and relative to *project_root*, so a symlink into
+    the file is caught the same way the literal name is, and a nested
+    ``config.toml`` in some other project is not.
+    """
+    if project_root is None:
+        return None
+    try:
+        resolved = path.resolve()
+        root = project_root.resolve()
+    except OSError:  # pragma: no cover - broken symlink loop
+        return None
+    if not (resolved == root or root in resolved.parents):
+        return None
+    relative = tuple(resolved.relative_to(root).parts)
+    for protected in PROTECTED_PROJECT_PATHS:
+        if relative == protected:
+            return "/".join(protected)
+    return None
+
+
 def protected_write(path: Path, project_root: Path | None = None) -> str | None:
     """What a write to *path* trips, if anything, under the protected-path rules.
 
-    Returns the protected basename (``.bashrc``, ``id_rsa``, …) or subpath
-    (``.git/hooks``, …) that makes the write a deny, else ``None``.
+    Returns the protected basename (``.bashrc``, ``id_rsa``, …), subpath
+    (``.git/hooks``, …) or project state file (``data/whitelist.json``) that
+    makes the write a deny, else ``None``.
 
     :class:`lumi.tools.files.FilesTool` calls this so both write paths agree
     on what is sacred: a hook file is off-limits through ``run_shell``, so it
@@ -968,8 +1262,103 @@ def protected_write(path: Path, project_root: Path | None = None) -> str | None:
     subpath = _has_protected_subpath(path)
     if subpath is not None:
         return subpath
+    project_path = _protected_project_path(path, project_root)
+    if project_path is not None:
+        return project_path
     if project_root is not None and not _is_within(path, project_root):
         return next((name for name in path.parts if name in PROTECTED_BASENAMES), None)
+    return None
+
+
+def _is_secret_name(name: str) -> bool:
+    """Whether *name* marks a file whose contents are credentials."""
+    if name in SECRET_FILE_BASENAMES:
+        return True
+    # .env.local, .env.production, .envrc — dotenv files under any spelling.
+    if name.startswith(".env"):
+        return True
+    return name.endswith(SECRET_FILE_SUFFIXES)
+
+
+def credential_dir(path: Path) -> tuple[str, Path] | None:
+    """The credential directory *path* lives in, if it lives in one.
+
+    ``~/.aws/credentials`` and ``~/.ssh/config`` hold live secrets under
+    names that give nothing away, so the basename list never sees them.
+    Naming the directory catches every file inside it, at any depth.
+
+    Returns the directory's name and the directory itself, so a caller can
+    ask whether the directory is there.
+    """
+    try:
+        resolved = path.resolve()
+    except OSError:  # pragma: no cover - broken symlink loop
+        resolved = path
+    for candidate in (path, resolved):
+        parts = candidate.parts
+        for index in range(len(parts) - 1, -1, -1):
+            if parts[index] in CREDENTIAL_DIRS:
+                return parts[index], Path(*parts[: index + 1])
+    return None
+
+
+def read_guard(path: Path) -> str | None:
+    """The credential *path* exposes, if a read of it would expose one.
+
+    Same rules as :func:`protected_read`, but existence-aware, because the two
+    kinds of guard differ in what "it is there" means. A secret *file* only
+    matters if it exists: ``grep -rn .env .`` names the file without reading
+    it, and refusing that would break a normal source-code lookup. A secret
+    *directory* matters as soon as the directory is there, because every file
+    inside it is a credential — and the file that was named may not be the one
+    that exists.
+    """
+    try:
+        resolved = path.resolve()
+    except OSError:  # pragma: no cover - broken symlink loop
+        resolved = path
+    for candidate in (path, resolved):
+        if os.path.normpath(str(candidate)) in SYSTEM_SECRET_PATHS:
+            return str(candidate)
+        if _is_secret_name(candidate.name) and _exists(candidate):
+            return candidate.name
+    # A credential directory: the guard is the directory being there, not the
+    # named file, because the file that exists inside it may be another one.
+    found = credential_dir(path)
+    if found is not None and _exists(found[1]):
+        return f"{found[0]}/"
+    return None
+
+
+def protected_read(path: Path) -> str | None:
+    """What a *read* of *path* trips, if anything, under the secret-file rules.
+
+    Returns the name that makes the read a deny (``.env``, ``id_rsa``, …) or
+    ``None``. The counterpart to :func:`protected_write`: that one stops a
+    secret file being changed, this one stops it being *shown* — the env scrub
+    strips ``OPENAI_API_KEY`` from the child process, but ``cat .env`` puts the
+    same value straight into the tool result, and only a read-side guard closes
+    that hole.
+
+    Checks the path as written as well as the resolved one, so a symlink with
+    an innocent name pointing at ``.env`` is caught the same way the write
+    guard catches one pointing at ``.bashrc``.
+    """
+    try:
+        resolved = path.resolve()
+    except OSError:  # pragma: no cover - broken symlink loop
+        resolved = path
+    for candidate in (path, resolved):
+        if os.path.normpath(str(candidate)) in SYSTEM_SECRET_PATHS:
+            return candidate.name
+        if _is_secret_name(candidate.name):
+            return candidate.name
+    # A file inside a credential directory is a credential whatever it is
+    # called: ~/.aws/credentials and ~/.ssh/config give nothing away in
+    # the filename, so the basename list above never sees them.
+    found = credential_dir(path)
+    if found is not None:
+        return f"{found[0]}/"
     return None
 
 
@@ -1000,6 +1389,21 @@ def _clobbered(program: str, tokens: list[str], destinations: list[Path]) -> lis
 # --------------------------------------------------------------------------- #
 
 
+def _expand_tilde(tokens: list[str], home: Path | None) -> list[str]:
+    """Rewrite a leading ``~`` in each token to the directory it means."""
+    if home is None:
+        return tokens
+    out: list[str] = []
+    for token in tokens:
+        if token == "~":
+            out.append(str(home))
+        elif token.startswith("~/") or token.startswith("~\\"):
+            out.append(str(home) + token[1:])
+        else:
+            out.append(token)
+    return out
+
+
 def explain(
     command: str,
     *,
@@ -1009,6 +1413,8 @@ def explain(
     write_root: Path | None = None,
     extra_deny: tuple[str, ...] | list[str] = (),
     extra_confirm: tuple[str, ...] | list[str] = (),
+    session_start: float | None = None,
+    tilde_home: Path | None = None,
 ) -> list[Verdict]:
     """Every rule that fires for *command*, in table order.
 
@@ -1018,6 +1424,16 @@ def explain(
     :param write_root: the directory writes are allowed to land in. Defaults to
         *project_root*, which is the old behaviour and the right one for a
         library test; the shell tool passes its workspace instead.
+
+    :param session_start: wall-clock start of this run. A script created or
+        changed at or after this moment is treated as authored during the
+        session, so executing it asks for approval. Defaults to
+        :data:`SESSION_START`.
+
+    :param tilde_home: what ``~`` means to the command. The shell pins
+        ``HOME`` to the project root, so ``cat ~/notes`` reads a project file,
+        not one in the owner's real home. Defaults to *home* (the real home
+        directory), which is right for a caller that does not pin it.
     """
     verdicts: list[Verdict] = []
     command = command.strip()
@@ -1054,6 +1470,11 @@ def explain(
             verdicts.append(Verdict(Tier.CONFIRM, reason, pattern.pattern[:48]))
 
     tokens = tokenize(command)
+    # Expand ``~`` the way the command will see it, before any path is
+    # resolved. The child process gets HOME pinned to the project root, so
+    # judging ``~/.aws/credentials`` against the owner's real home would
+    # refuse a read of a file the command cannot even open.
+    tokens = _expand_tilde(tokens, tilde_home if tilde_home is not None else home)
 
     # 3. Structural checks. These beat the regex tables because they see the
     #    actual token structure, so `ls -> f` and `cmd 2>&1` are not mistaken
@@ -1153,6 +1574,66 @@ def explain(
         if segment_program in READ_ONLY_UNLESS and READ_ONLY_UNLESS[segment_program] & set(segment):
             segment_mutating = True
         if not segment_mutating:
+            # Reading is where the env scrub leaks: `cat ../.env` names no
+            # write target, so the zoning below never runs for it, yet the
+            # output is exactly the secret the scrub exists to hide. Judge the
+            # operands of read-only segments against the secret rules before
+            # skipping. `read_guard` is existence-aware, so a search *for* the
+            # string `.env` (`grep -rn .env .`) stays a search, not a read.
+            for word in _operands(segment):
+                target = _absolute(word, base, home)
+                guard = read_guard(target)
+                if guard is not None:
+                    verdicts.append(
+                        Verdict(
+                            Tier.DENY,
+                            f"{guard} holds credentials, so its contents are "
+                            "not handed to commands",
+                            "zone:secret-read",
+                        )
+                    )
+                    continue
+                # The read side has the same confinement as the write side: a
+                # read-only command may read inside the project, and it may
+                # read a system path (that is how `cat /etc/passwd` works),
+                # but a read of anything else on the machine is the owner's
+                # business, not the model's. The files and explore tools
+                # already refuse such a path outright; asking here is the same
+                # boundary, with the shell's usual tap instead of an error.
+                if not _exists(target):
+                    continue
+                try:
+                    resolved_target = target.resolve()
+                except OSError:  # pragma: no cover - broken symlink loop
+                    resolved_target = target
+                if _is_within(resolved_target, project_root):
+                    continue
+                if _zone(target, project_root, home) == "system":
+                    continue
+                verdicts.append(
+                    Verdict(
+                        Tier.CONFIRM,
+                        f"reads a path outside the project ({target})",
+                        "zone:outside-read",
+                    )
+                )
+            # A command classified read-only can still name its output as an
+            # operand (`sed -i`, `sort -o`, `uniq in out`). Judge only those
+            # actual outputs, so the input file beside them stays a read.
+            for target in dict.fromkeys(_readonly_write_targets(segment, base, home)):
+                try:
+                    resolved = target.resolve()
+                except OSError:  # pragma: no cover - broken symlink loop
+                    resolved = target
+                guard = protected_write(resolved, project_root)
+                if guard is not None:
+                    verdicts.append(
+                        Verdict(
+                            Tier.DENY,
+                            f"{guard} is protected; this command would write it",
+                            "zone:protected-write",
+                        )
+                    )
             continue
         # Per segment, not per line: in `cd .. && rm -rf data` the line's first
         # program is `cd`, and reading the delete as non-recursive because of
@@ -1196,7 +1677,26 @@ def explain(
         # names no path token at all. Scoped to the interpreter's own segment so
         # a commit message quoting a path stays a commit message.
         if segment_program in INTERPRETERS:
-            targets += quoted_paths(" ".join(segment), base, home)
+            segment_text = " ".join(segment)
+            # The same spans are a *read* vector: `python3 -c "print(open('../.env').read())"`
+            # names the secret file inside its script string, where neither the
+            # write zoning nor the read-only operand skip ever looks.
+            for match in _QUOTED_SPAN.finditer(segment_text):
+                span = next(group for group in match.groups() if group is not None).strip()
+                if not span:
+                    continue
+                target = _absolute(span, base, home)
+                guard = read_guard(target)
+                if guard is not None:
+                    verdicts.append(
+                        Verdict(
+                            Tier.DENY,
+                            f"{guard} holds credentials, so its contents are "
+                            "not handed to commands",
+                            "zone:secret-read",
+                        )
+                    )
+            targets += quoted_paths(segment_text, base, home)
         # For cp/mv/ln the earlier operands are sources, so only the last path
         # is actually written to.
         if segment_program in DESTINATION_LAST_COMMANDS and targets:
@@ -1238,9 +1738,19 @@ def explain(
             protected_part = any(
                 name in PROTECTED_BASENAMES for name in (*path.parts, *resolved.parts)
             )
+            project_state = _protected_project_path(resolved, project_root)
             if zone == "system":
                 verdicts.append(
                     Verdict(Tier.DENY, f"would modify the system path {path}", "zone:system-write")
+                )
+            elif project_state:
+                verdicts.append(
+                    Verdict(
+                        Tier.DENY,
+                        f"{project_state} controls the bot's own access or configuration; "
+                        "ask the owner to change it by hand",
+                        "zone:protected-state",
+                    )
                 )
             elif protected_name or (zone != "project" and protected_part):
                 verdicts.append(
@@ -1305,6 +1815,30 @@ def explain(
                     )
                 )
 
+    # 7. Executing a script authored during this run is the write-then-run half
+    #    of a prompt injection: fetched content can talk the model into writing
+    #    a program, and without this the shell would run it with no tap of its
+    #    own. Scripts that predate this process remain free.
+    if session_start is None:
+        session_start = SESSION_START
+    authored_here = _command_write_targets(tokens, base, home)
+    for segment in _segments(tokens):
+        candidates = [
+            *script_paths(segment, base, home),
+            _direct_script(segment, base, home),
+        ]
+        for script in candidates:
+            if script is None:
+                continue
+            if script in authored_here or _written_since(script, session_start):
+                verdicts.append(
+                    Verdict(
+                        Tier.CONFIRM,
+                        f"runs {script.name}, which was created or changed during this session",
+                        "exec:recent-script",
+                    )
+                )
+
     return verdicts
 
 
@@ -1318,6 +1852,8 @@ def classify(
     write_root: Path | None = None,
     extra_deny: tuple[str, ...] | list[str] = (),
     extra_confirm: tuple[str, ...] | list[str] = (),
+    session_start: float | None = None,
+    tilde_home: Path | None = None,
 ) -> Verdict:
     """Fold every matching rule into one verdict; the strictest tier wins."""
     verdicts = explain(
@@ -1328,6 +1864,8 @@ def classify(
         write_root=write_root,
         extra_deny=extra_deny,
         extra_confirm=extra_confirm,
+        session_start=session_start,
+        tilde_home=tilde_home,
     )
     denies = [v for v in verdicts if v.tier is Tier.DENY]
     if denies:
@@ -1352,6 +1890,7 @@ def describe_policy() -> str:
         f"{len(DENY_RULES)} hard-deny rules, {len(CONFIRM_RULES)} confirm rules, "
         f"{len(SYSTEM_PREFIXES)} protected system prefixes, "
         f"{len(PROTECTED_SUBPATHS)} protected subpaths, "
+        f"{len(SECRET_FILE_BASENAMES)} secret files refused on read, "
         f"{len(PIPE_TARGETS)} pipe targets blocked"
     )
 
@@ -1364,6 +1903,9 @@ __all__ = [
     "tokenize",
     "describe_policy",
     "protected_write",
+    "protected_read",
+    "read_guard",
+    "SECRET_FILE_BASENAMES",
     "referenced_paths",
     "quoted_paths",
     "effective_cwd",

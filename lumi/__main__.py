@@ -332,7 +332,9 @@ def cmd_memory(args: argparse.Namespace) -> int:
     memory = store.get(scope)
 
     if args.add:
-        print(memory.remember(" ".join(args.add), source="cli"))
+        # by="human": this is the operator typing at their own terminal, so
+        # the fact is trusted memory rather than fenced model-authored data.
+        print(memory.remember(" ".join(args.add), source="cli", by="human"))
         return 0
     if args.forget:
         removed = memory.forget(args.forget)

@@ -33,6 +33,7 @@ from typing import Any
 
 from ....config import MCPConfig
 from ....paths import resolve
+from ....util.env import scrubbed_env
 from ....util.log import get_logger
 from .base import Page, SearchHit, SearchResult, WebProvider, recent_cutoff
 
@@ -105,6 +106,17 @@ class ServerSpec:
             headers={k: expand_env(v) for k, v in raw_headers.items()},
             raw=[raw_url, *command_parts, *args, *raw_env.values(), *raw_headers.values()],
         )
+
+
+def _stdio_env(spec: ServerSpec) -> dict[str, str]:
+    """The environment a local MCP server is spawned with.
+
+    A server is a program the owner configured, but it is also a program whose
+    output the model reads, so it gets the same allowlist scrub as
+    ``run_shell`` rather than the bot's whole environment. Variables the owner
+    names in the server's ``env`` block are explicit and still pass through.
+    """
+    return scrubbed_env(overrides=spec.env)
 
 
 @dataclass(slots=True)
@@ -239,7 +251,7 @@ class MCPProvider(WebProvider):
             if not spec.command:
                 raise RuntimeError(f"server {spec.name} has no command")
             params = StdioServerParameters(
-                command=spec.command, args=spec.args, env={**os.environ, **spec.env}
+                command=spec.command, args=spec.args, env=_stdio_env(spec)
             )
             streams = await stack.enter_async_context(stdio_client(params))
         else:

@@ -11,7 +11,11 @@ Three layers, in order:
 Environment scrubbing is the part people forget: the process would otherwise
 inherit ``OPENAI_API_KEY`` and ``TELEGRAM_BOT_TOKEN``, and any command the model
 runs could post them to the internet. Everything that looks like a secret is
-stripped before ``execve``.
+stripped before ``execve``. Scrubbing the environment is only half the
+control, though: the same values sit in ``.env`` in the project root, so the
+classifier also denies read-only commands that name a secret file (see
+:func:`lumi.tools.safety.protected_read`) — ``cat ../.env`` is refused the same
+way ``cat`` of any other credential file is.
 """
 
 from __future__ import annotations
@@ -19,53 +23,19 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-import re
 import signal
 from pathlib import Path
 from typing import Any
 
 from ..config import Config
 from ..paths import is_within
+from ..util.env import ENV_PASSTHROUGH, SECRET_PATTERN, scrubbed_env
 from ..util.log import get_logger
 from ..util.text import truncate
 from . import safety
 from .base import NeedsApproval, Tool, ToolContext, ToolError, ToolResult
 
 log = get_logger(__name__)
-
-#: Environment variables that pass through to the child process.
-ENV_PASSTHROUGH: frozenset[str] = frozenset(
-    {
-        "PATH",
-        "LANG",
-        "LC_ALL",
-        "LC_CTYPE",
-        "TZ",
-        "TERM",
-        "SHELL",
-        "USER",
-        "LOGNAME",
-        "SYSTEMROOT",
-        "COMSPEC",
-        "PATHEXT",
-        "TEMP",
-        "TMP",
-        "HOME",
-        "TMPDIR",
-        # Build tooling that legitimately needs to know where it is.
-        "VIRTUAL_ENV",
-        "CONDA_PREFIX",
-        "NODE_PATH",
-        "PYTHONPATH",
-        "GOPATH",
-        "GOROOT",
-    }
-)
-
-#: Anything matching this is stripped, whatever its name.
-SECRET_PATTERN = re.compile(
-    r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|SESSION|COOKIE)", re.IGNORECASE
-)
 
 #: Hard ceiling regardless of config, so a bad config cannot wedge the bot.
 MAX_TIMEOUT_SECONDS = 600
@@ -93,6 +63,8 @@ Rules:
   what gets dropped from the context later, not this one — so redirect to a
   file and read that back when you only need part of it.
 - The environment is scrubbed: API keys are not visible to the command.
+- Secret files (.env, private keys, credentials) are refused even to read-only
+  commands — their contents are the same secrets the scrub hides.
 """.strip()
 
     parameters = {
@@ -137,6 +109,18 @@ Rules:
             self.cwd.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             log.warning("could not create the shell working directory %s: %s", self.cwd, exc)
+        if self.shell_config.home == "inherit":
+            # The child process gets the owner's real HOME, so a stray command
+            # can reach every file the owner can read. The read and write zones
+            # still apply, but the blast radius is wider than the default
+            # "project" setting, and that deserves a word at startup rather
+            # than a line in a config file nobody reads.
+            log.warning(
+                "tools.shell.home = inherit: shell commands run with HOME=%s, so they "
+                "can read the owner's home directory. The default \"project\" keeps "
+                "them inside the project.",
+                Path.home(),
+            )
 
     # -- plumbing ---------------------------------------------------------- #
 
@@ -164,19 +148,23 @@ Rules:
         except (TypeError, ValueError):
             return min(configured, MAX_TIMEOUT_SECONDS)
 
+    @property
+    def effective_home(self) -> Path:
+        """The directory ``~`` and ``HOME`` mean to a command this tool runs.
+
+        ``tools.shell.home = "inherit"`` hands the child the owner's real
+        home directory, which widens what a stray command can reach; the
+        default pins it to the project root instead.
+        """
+        return Path.home() if self.shell_config.home == "inherit" else self.root
+
     def _build_env(self) -> dict[str, str]:
         """A minimal, secret-free environment for the child process."""
-        env = {key: value for key, value in os.environ.items() if key in ENV_PASSTHROUGH}
+        env = scrubbed_env(home=self.effective_home)
         stripped = [k for k in os.environ if k not in ENV_PASSTHROUGH and SECRET_PATTERN.search(k)]
         if stripped:
             log.debug("scrubbed %d secret-looking variables from the child env", len(stripped))
 
-        if self.shell_config.home == "inherit":
-            env.setdefault("HOME", str(Path.home()))
-        else:
-            # Pinning HOME to the project keeps every stray dotfile the command
-            # writes inside the repo, which is the whole portability story.
-            env["HOME"] = str(self.root)
         env.setdefault("TERM", "dumb")
         env["LUMI_PROJECT_ROOT"] = str(self.root)
         env["LUMI_SHELL_CWD"] = str(self.cwd)
@@ -188,6 +176,9 @@ Rules:
             cwd=cwd,
             project_root=self.root,
             home=Path.home(),
+            # ``~`` means what the child process will see, not the owner's
+            # real home: the environment pins HOME to the project root.
+            tilde_home=self.effective_home,
             # Writes are confined to the workspace, not merely to the project:
             # the rest of the repo is Lumi's own source and the owner's config.
             write_root=self.workspace,

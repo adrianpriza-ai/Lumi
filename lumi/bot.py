@@ -97,17 +97,15 @@ steps.
 <b>slash commands</b>
 <code>/memory</code> — show what i remember in this chat
 <code>/remember &lt;fact&gt;</code> — save a fact
-<code>/forget [n]</code> — drop the last n saved facts
 <code>/personality</code> — show the personality file
 <code>/reasoning</code> — reasoning setup, or <code>on</code>/<code>off</code> to show or hide the live step list
 <code>/context</code> — what i'm holding in my context window right now
 <code>/status</code> — model, tools and provider health
 <code>/doctor</code> — diagnose the whole setup
-<code>/reload</code> — re-read personality, memory and config
-<code>/reset</code> — forget this conversation (keeps long-term memory)
 
 dangerous commands ask for confirmation first. i can't delete that, on purpose.
-owner commands live in <code>/own_help</code>.
+dropping saved facts, clearing this conversation and reloading are owner-only —
+they live in <code>/own_help</code> with the rest of the owner commands.
 """
 
 #: The owner-only commands, listed by ``/own_help`` and nowhere else. Kept
@@ -117,6 +115,9 @@ OWNER_HELP_TEXT = """\
 <b>owner commands</b>
 <code>/config</code> — the resolved configuration this process runs on
 <code>/env</code> — which credentials are set, values masked
+<code>/forget [n]</code> — drop the newest n saved facts (erasing memory is a human decision, and yours)
+<code>/reload</code> — re-read personality, memory and config
+<code>/reset</code> — forget this conversation (keeps long-term memory)
 <code>/whitelist</code> — show whitelisted users and groups
 <code>/whitelist_add_user &lt;id&gt;</code> — add a user to the whitelist
 <code>/whitelist_remove_user &lt;id&gt;</code> — remove a user from the whitelist
@@ -127,6 +128,12 @@ OWNER_HELP_TEXT = """\
 NOT_AUTHORISED = "this bot is private. your id is not whitelisted."
 NOT_OWNER = "only the owner can manage the whitelist."
 NOT_OWNER_SENSITIVE = "only the owner can see that."
+NOT_OWNER_APPROVAL = "only the owner can approve or deny a pending action."
+#: /forget, /reset and /reload. These change what the bot remembers — a chat's
+#: saved facts, its transcript, its loaded state — and the policy is that only
+#: the owner does that, matching docs/policy/policy.md ("only the account ID
+#: registered by the person running the instance may … change stored notes").
+NOT_OWNER_ACTION = "only the owner can change what this bot remembers there."
 
 
 def _mask(value: str | None) -> str:
@@ -1055,8 +1062,20 @@ def _write_toml(f: Any, data: dict[str, Any], prefix: str = "") -> None:
 
 
 def build_handlers(config: Config) -> list[Any]:
-    class OwnerFilter(filters.UpdateFilter):
+    class AllowedFilter(filters.UpdateFilter):
         """Filter that checks the live config for authorisation.
+
+        This admits *allowed* principals, not the owner: the owner, users on
+        ``bot.whitelisted_users``, and every member of a whitelisted group (see
+        :func:`_is_allowed`). The name says so on purpose. An earlier version
+        called this ``OwnerFilter`` while returning ``_is_allowed``, which read
+        as a much narrower gate than it was — and it is how the owner-only
+        checks in this module were easy to miss.
+
+        Owner-only handlers do *not* rely on this filter: it lets whitelisted
+        principals through. They re-check :func:`_is_owner` inline, so the
+        filter answers "may this person talk to the bot?" and the handler
+        answers "may this person do *that*?".
 
         Must subclass :class:`telegram.ext.filters.UpdateFilter`, not
         ``BaseFilter``: ``BaseFilter.check_update`` only tests that the update
@@ -1074,7 +1093,7 @@ def build_handlers(config: Config) -> list[Any]:
             user = update.effective_user
             return user is not None and _is_allowed(user, self.cfg, update.effective_chat)
 
-    owner_filter = OwnerFilter(config)
+    allowed_filter = AllowedFilter(config)
 
     async def authorised(update: Update) -> bool:
         user = update.effective_user
@@ -1230,10 +1249,17 @@ def build_handlers(config: Config) -> list[Any]:
         if not fact:
             await reply(update, "usage: `/remember <fact>`")
             return
-        await reply(update, memory_of(update, context).remember(fact, source="chat"))
+        # by="human": this fact was typed by a person, so it is injected as
+        # ordinary memory rather than fenced as model-authored data. The model
+        # writing memories through its own tool takes the other path.
+        await reply(update, memory_of(update, context).remember(fact, source="chat", by="human"))
 
     async def forget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await authorised(update):
+            return
+        user = update.effective_user
+        if user is None or not _is_owner(user, config):
+            await reply(update, NOT_OWNER_ACTION)
             return
         count = 1
         if context.args:
@@ -1400,11 +1426,19 @@ def build_handlers(config: Config) -> list[Any]:
     async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await authorised(update):
             return
+        user = update.effective_user
+        if user is None or not _is_owner(user, config):
+            await reply(update, NOT_OWNER_ACTION)
+            return
         notes = agent_of(context).reload()
         await reply(update, "reloaded:\n" + "\n".join(f"- {note}" for note in notes))
 
     async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await authorised(update):
+            return
+        user = update.effective_user
+        if user is None or not _is_owner(user, config):
+            await reply(update, NOT_OWNER_ACTION)
             return
         agent = agent_of(context)
         agent.reset(chat_of(update))
@@ -1419,10 +1453,18 @@ def build_handlers(config: Config) -> list[Any]:
     async def approve(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await authorised(update):
             return
+        user = update.effective_user
+        if user is None or not _is_owner(user, config):
+            await reply(update, NOT_OWNER_APPROVAL)
+            return
         await _resolve(update, context, approved=True)
 
     async def deny(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await authorised(update):
+            return
+        user = update.effective_user
+        if user is None or not _is_owner(user, config):
+            await reply(update, NOT_OWNER_APPROVAL)
             return
         await _resolve(update, context, approved=False)
 
@@ -1542,6 +1584,13 @@ def build_handlers(config: Config) -> list[Any]:
         user = update.effective_user
         if user is None or not _is_allowed(user, config, update.effective_chat):
             await _toast(query, "not authorised", show_alert=True)
+            return
+        # ``_is_allowed`` decides who may *talk* to the bot (whitelisted users
+        # and every member of a whitelisted group included). Approval is a
+        # separate, owner-reserved decision, so it re-checks ``_is_owner`` —
+        # otherwise the confirm tap gives no separation of duty at all.
+        if not _is_owner(user, config):
+            await _toast(query, NOT_OWNER_APPROVAL, show_alert=True)
             return
         data = query.data or ""
         approved = data.startswith(CB_OK)
@@ -1831,20 +1880,22 @@ def build_handlers(config: Config) -> list[Any]:
     _load_whitelist(config)
 
     return [
-        # Owner-gated commands, all before the catch-all text handler.
-        # Every command is wrapped in ``gated`` so the group/mention rule
-        # applies uniformly: in a group, only addressed commands run.
-        CommandHandler("start", gated(start), filters=owner_filter),
+        # Commands, all before the catch-all text handler. Every command is
+        # wrapped in ``gated`` so the group/mention rule applies uniformly: in a
+        # group, only addressed commands run. ``allowed_filter`` admits
+        # whitelisted principals as well as the owner, so each handler decides
+        # for itself whether the caller needs to be the owner.
+        CommandHandler("start", gated(start), filters=allowed_filter),
         # /help used to be the command list; it now points at /start.
-        CommandHandler("help", gated(help_command), filters=owner_filter),
-        CommandHandler("memory", gated(memory_command), filters=owner_filter),
-        CommandHandler("remember", gated(remember_command), filters=owner_filter),
-        CommandHandler("forget", gated(forget_command), filters=owner_filter),
-        CommandHandler("personality", gated(personality_command), filters=owner_filter),
-        CommandHandler("reasoning", gated(reasoning_command), filters=owner_filter),
-        CommandHandler("context", gated(context_command), filters=owner_filter),
-        CommandHandler("status", gated(status_command), filters=owner_filter),
-        CommandHandler("doctor", gated(doctor_command), filters=owner_filter),
+        CommandHandler("help", gated(help_command), filters=allowed_filter),
+        CommandHandler("memory", gated(memory_command), filters=allowed_filter),
+        CommandHandler("remember", gated(remember_command), filters=allowed_filter),
+        CommandHandler("forget", gated(forget_command), filters=allowed_filter),
+        CommandHandler("personality", gated(personality_command), filters=allowed_filter),
+        CommandHandler("reasoning", gated(reasoning_command), filters=allowed_filter),
+        CommandHandler("context", gated(context_command), filters=allowed_filter),
+        CommandHandler("status", gated(status_command), filters=allowed_filter),
+        CommandHandler("doctor", gated(doctor_command), filters=allowed_filter),
         # Owner only, checked inside each handler on top of the filter: these
         # expose the backend (endpoint, layout, credential inventory).
         # Owner-only help: the backend commands, for the owner alone.
@@ -1852,23 +1903,25 @@ def build_handlers(config: Config) -> list[Any]:
         # Telegram commands allow letters, digits and underscores only
         # (clients autocomplete ``/own_help``), and PTB's CommandHandler
         # rejects a hyphen outright with a ValueError at build time.
-        CommandHandler("own_help", gated(own_help_command), filters=owner_filter),
+        CommandHandler("own_help", gated(own_help_command), filters=allowed_filter),
         MessageHandler(
             callback=gated(own_help_command),
-            filters=filters.Regex(r"^/own-help(?:\s|$|@)") & owner_filter,
+            filters=filters.Regex(r"^/own-help(?:\s|$|@)") & allowed_filter,
         ),
-        CommandHandler("config", gated(config_command), filters=owner_filter),
-        CommandHandler("env", gated(env_command), filters=owner_filter),
-        CommandHandler("reload", gated(reload_command), filters=owner_filter),
-        CommandHandler("reset", gated(reset_command), filters=owner_filter),
-        CommandHandler(["approve", "yes", "y"], gated(approve), filters=owner_filter),
-        CommandHandler(["deny", "no", "n"], gated(deny), filters=owner_filter),
+        CommandHandler("config", gated(config_command), filters=allowed_filter),
+        CommandHandler("env", gated(env_command), filters=allowed_filter),
+        CommandHandler("reload", gated(reload_command), filters=allowed_filter),
+        CommandHandler("reset", gated(reset_command), filters=allowed_filter),
+        # Approvals — owner only (checked inside each handler), unlike the
+        # whitelisted-principal commands: the tap decides, not the room.
+        CommandHandler(["approve", "yes", "y"], gated(approve), filters=allowed_filter),
+        CommandHandler(["deny", "no", "n"], gated(deny), filters=allowed_filter),
         # Whitelist management — owner only (checked inside each handler).
-        CommandHandler("whitelist", gated(whitelist_command), filters=owner_filter),
-        CommandHandler("whitelist_add_user", gated(whitelist_add_user), filters=owner_filter),
-        CommandHandler("whitelist_remove_user", gated(whitelist_remove_user), filters=owner_filter),
-        CommandHandler("whitelist_add_group", gated(whitelist_add_group), filters=owner_filter),
-        CommandHandler("whitelist_remove_group", gated(whitelist_remove_group), filters=owner_filter),
+        CommandHandler("whitelist", gated(whitelist_command), filters=allowed_filter),
+        CommandHandler("whitelist_add_user", gated(whitelist_add_user), filters=allowed_filter),
+        CommandHandler("whitelist_remove_user", gated(whitelist_remove_user), filters=allowed_filter),
+        CommandHandler("whitelist_add_group", gated(whitelist_add_group), filters=allowed_filter),
+        CommandHandler("whitelist_remove_group", gated(whitelist_remove_group), filters=allowed_filter),
         # Inline buttons: the approval Confirm/Cancel pair. Taps are never
         # messages in a group, so the mention rule does not apply, and
         # ``button`` checks the sender itself.
@@ -1881,17 +1934,17 @@ def build_handlers(config: Config) -> list[Any]:
         # Keyword arguments on purpose: MessageHandler's parameter order changed
         # between python-telegram-bot v20 and v22, and the keyword form is stable.
         MessageHandler(
-            callback=on_text, filters=filters.TEXT & ~filters.COMMAND & owner_filter
+            callback=on_text, filters=filters.TEXT & ~filters.COMMAND & allowed_filter
         ),
         MessageHandler(
-            callback=on_non_text, filters=~filters.TEXT & ~filters.COMMAND & owner_filter
+            callback=on_non_text, filters=~filters.TEXT & ~filters.COMMAND & allowed_filter
         ),
         # An unrecognised command from the owner still deserves an answer.
         MessageHandler(
-            callback=on_unknown_command, filters=filters.COMMAND & owner_filter
+            callback=on_unknown_command, filters=filters.COMMAND & allowed_filter
         ),
         # Everyone else. Last, so an owner's message is never caught here.
-        MessageHandler(callback=on_stranger, filters=~owner_filter),
+        MessageHandler(callback=on_stranger, filters=~allowed_filter),
     ]
 
 
