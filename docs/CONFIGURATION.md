@@ -1,6 +1,6 @@
 # Configuration
 
-[← Back to README](README.md) · [TOOLS.md](TOOLS.md) · [TELEGRAM.md](TELEGRAM.md)
+[← Back to README](../README.md) · [TOOLS.md](TOOLS.md) · [TELEGRAM.md](TELEGRAM.md) · [DEPLOYMENT.md](DEPLOYMENT.md)
 
 `config.toml` is committed and holds no secrets. `.env` holds the secrets and is gitignored. Every config value can also be set as an environment variable:
 

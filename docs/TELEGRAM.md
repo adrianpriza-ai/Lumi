@@ -1,6 +1,6 @@
 # Telegram
 
-[← Back to README](README.md) · [CONFIGURATION.md](CONFIGURATION.md) · [TOOLS.md](TOOLS.md)
+[← Back to README](../README.md) · [CONFIGURATION.md](CONFIGURATION.md) · [TOOLS.md](TOOLS.md) · [DEPLOYMENT.md](DEPLOYMENT.md)
 
 Two things about the Telegram side trip people up: when the bot is allowed to answer in a group, and getting a TCP connection to `api.telegram.org` at all. Both are configuration; nothing here needs a code change.
 

@@ -1,5 +1,7 @@
 # Deployment
 
+[← Back to README](../README.md) · [TOOLS.md](TOOLS.md) · [TELEGRAM.md](TELEGRAM.md) · [CONFIGURATION.md](CONFIGURATION.md)
+
 Lumi is a Telegram bot that runs commands, reads files and fetches pages on
 behalf of the person who set it up. The application-layer controls — the shell
 safety engine, the owner gate on approvals, the environment scrub, the

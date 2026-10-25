@@ -1,6 +1,6 @@
 # Tools
 
-[← Back to README](README.md) · [CONFIGURATION.md](CONFIGURATION.md) · [TELEGRAM.md](TELEGRAM.md)
+[← Back to README](../README.md) · [CONFIGURATION.md](CONFIGURATION.md) · [TELEGRAM.md](TELEGRAM.md) · [DEPLOYMENT.md](DEPLOYMENT.md)
 
 | Tool | Capability |
 |-|-|

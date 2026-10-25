@@ -67,10 +67,10 @@ In group chats the bot only answers when **mentioned** (`@Lumi_a_bot ...`), **re
 
 | Document | Covers |
 |-|-|
-| [CONFIGURATION.md](CONFIGURATION.md) | `config.toml` and precedence, picking an endpoint, reasoning models and thinking traces, key pools and rotation |
-| [TOOLS.md](TOOLS.md) | The tools, shell safety and its threat model, web providers (Firecrawl / Exa / Tavily / MCP), Context7, mid-turn messages, and how to add a tool |
-| [TELEGRAM.md](TELEGRAM.md) | Group chats and when the bot answers, and getting past `api.telegram.org` timeouts |
-| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | What the safety controls assume about the machine: unprivileged user, protected state files, egress, systemd |
+| [CONFIGURATION.md](docs/CONFIGURATION.md) | `config.toml` and precedence, picking an endpoint, reasoning models and thinking traces, key pools and rotation |
+| [TOOLS.md](docs/TOOLS.md) | The tools, shell safety and its threat model, web providers (Firecrawl / Exa / Tavily / MCP), Context7, mid-turn messages, and how to add a tool |
+| [TELEGRAM.md](docs/TELEGRAM.md) | Group chats and when the bot answers, and getting past `api.telegram.org` timeouts |
+| [DEPLOYMENT.md](docs/DEPLOYMENT.md) | What the safety controls assume about the machine: unprivileged user, protected state files, egress, systemd |
 
 Start with `lumi doctor`: it names whichever of these is misconfigured.
 ## Layout
