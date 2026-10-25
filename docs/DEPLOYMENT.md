@@ -6,7 +6,7 @@ Lumi is a Telegram bot that runs commands, reads files and fetches pages on
 behalf of the person who set it up. The application-layer controls — the shell
 safety engine, the owner gate on approvals, the environment scrub, the
 secret-file read guard — live in the code and are described in
-[TOOLS.md](../TOOLS.md#shell-safety).
+[TOOLS.md](TOOLS.md#shell-safety).
 
 They are guardrails, not a sandbox. Everything below the application layer is
 the operator's job, and nothing in the repository does it for you. This page

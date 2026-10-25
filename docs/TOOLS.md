@@ -229,7 +229,7 @@ If you need a hard boundary, run Lumi in a container or under a dedicated
 unprivileged user. Owner gating is by Telegram user id and is enforced twice: as
 a handler filter, and as an explicit check in every privileged handler. What
 the guardrails assume about the machine they run on is written down in
-[DEPLOYMENT.md](docs/DEPLOYMENT.md).
+[DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Web providers
 
