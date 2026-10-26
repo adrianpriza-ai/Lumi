@@ -1,8 +1,12 @@
-<div align=center>
+<div align="center">
 
 # Lumi
 
-[![CI](https://github.com/adrianpriza-ai/Lumi/actions/workflows/ci.yml/badge.svg?branch=main&label=CI)](https://github.com/adrianpriza-ai/Lumi/actions/workflows/ci.yml)[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg?logo=python&logoColor=white)](https://www.python.org/downloads/)
+[![CI](https://github.com/adrianpriza-ai/Lumi/actions/workflows/ci.yml/badge.svg?branch=main&label=CI)](https://github.com/adrianpriza-ai/Lumi/actions/workflows/ci.yml)
+
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11+-306998?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/downloads/)
+
+[![MIT](https://img.shields.io/badge/License-MIT-green?style=for-the-badge&logo=opensource&logoColor=white)](LICENSE)
 
 </div>
 
