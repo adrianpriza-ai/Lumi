@@ -1,4 +1,9 @@
+<div align=center>
+
 # Lumi
+
+[![CI](https://github.com/adrianpriza-ai/Lumi/actions/workflows/ci.yml/badge.svg?branch=main&label=CI)](https://github.com/adrianpriza-ai/Lumi/actions/workflows/ci.yml)
+</div>
 
 A Telegram AI agent that is a folder, not an install.
 

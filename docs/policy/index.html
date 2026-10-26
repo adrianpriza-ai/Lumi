@@ -6,7 +6,7 @@
   <title>Lumi Privacy Policy</title>
   <meta name="description" content="Lumi privacy policy.">
 
-  <script src="https://cdn.jsdelivr.net/npm/markdown@0.5.0/lib/markdown.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/markdown-it@14.1.0/dist/markdown-it.min.js"></script>
 
   <style>
     :root {
@@ -40,6 +40,31 @@
       overflow-x: auto;
     }
 
+    /* render some intentional HTML from the policy markdown */
+    .center {
+      text-align: center;
+    }
+
+    /* tables are not part of the CommonMark subset the old parser shipped, so
+       make sure they render when the policy uses them */
+    main table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 1em 0;
+    }
+
+    main th,
+    main td {
+      border: 1px solid CanvasText;
+      padding: 0.4em 0.6em;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    main th {
+      background: Canvas;
+    }
+
     #error {
       color: #b00020;
     }
@@ -59,7 +84,8 @@
         return response.text();
       })
       .then(markdownText => {
-        document.getElementById('content').innerHTML = markdown.toHTML(markdownText);
+        const md = window.markdownit().disable('code', {use: false}).disable('pre', {use: false});
+        document.getElementById('content').innerHTML = md.render(markdownText);
       })
       .catch(error => {
         document.getElementById('content').innerHTML =
