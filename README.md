@@ -2,7 +2,8 @@
 
 # Lumi
 
-[![CI](https://github.com/adrianpriza-ai/Lumi/actions/workflows/ci.yml/badge.svg?branch=main&label=CI)](https://github.com/adrianpriza-ai/Lumi/actions/workflows/ci.yml)
+[![CI](https://github.com/adrianpriza-ai/Lumi/actions/workflows/ci.yml/badge.svg?branch=main&label=CI)](https://github.com/adrianpriza-ai/Lumi/actions/workflows/ci.yml)[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg?logo=python&logoColor=white)](https://www.python.org/downloads/)
+
 </div>
 
 A Telegram AI agent that is a folder, not an install.
