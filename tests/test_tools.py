@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 
 import pytest
+from conftest import backdate
 
 from lumi.chatlog import ChatLog, LogEntry
 from lumi.tools.base import NeedsApproval, Tool, ToolContext, ToolError, ToolResult
@@ -271,7 +272,8 @@ async def test_read_missing_file_fails_cleanly(files: FilesTool) -> None:
 
 async def test_write_into_the_workspace(files: FilesTool, config) -> None:
     result = await files.invoke(
-        {"action": "write", "path": "workspace/notes.md", "content": "hello"}, ctx()
+        {"action": "write", "path": "workspace/notes.md", "content": "hello"},
+        ctx(confirmed=True),
     )
     assert result.ok
     assert (config.shell_cwd / "notes.md").read_text(encoding="utf-8") == "hello"
@@ -322,6 +324,7 @@ async def test_overwriting_a_non_empty_file_needs_approval(files: FilesTool, con
 async def test_overwrite_flag_skips_approval(files: FilesTool, config) -> None:
     target = config.shell_cwd / "exists.md"
     target.write_text("original", encoding="utf-8")
+    backdate(target)  # a file from before this session: only the overwrite rule applies
     result = await files.invoke(
         {"action": "write", "path": "workspace/exists.md", "content": "replaced", "overwrite": True},
         ctx(),
@@ -341,9 +344,80 @@ async def test_approved_overwrite_runs(files: FilesTool, config) -> None:
     assert target.read_text(encoding="utf-8") == "replaced"
 
 
+async def test_a_file_authored_this_session_asks_once_then_writes_freely(
+    files: FilesTool, config
+) -> None:
+    """A file this session created is gated on the owner — once, not per call.
+
+    This is the write half of write-then-run (audit finding 3b): the file did
+    not exist when the process started, so its contents may come from fetched
+    content and the owner sees the first write. The approval sticks to the
+    path, so the gate does not turn every follow-up fix into a tap.
+    """
+    args = {"action": "write", "path": "workspace/fresh.md", "content": "x"}
+    with pytest.raises(NeedsApproval) as caught:
+        await files.invoke(args, ctx())
+    assert "during this session" in caught.value.reason
+    assert not (config.shell_cwd / "fresh.md").exists()  # nothing was written
+
+    await files.invoke(args, ctx(confirmed=True))
+    # Once approved, the path is cleared: overwrite=true works without a second tap.
+    result = await files.invoke({**args, "content": "y", "overwrite": True}, ctx())
+    assert result.ok
+    assert (config.shell_cwd / "fresh.md").read_text(encoding="utf-8") == "y"
+
+
+async def test_edit_of_a_session_authored_file_asks_once(files: FilesTool, config) -> None:
+    """edit keeps its no-approval default, except on a file this session made."""
+    target = config.shell_cwd / "session.md"
+    target.write_text("old\n", encoding="utf-8")  # mtime is after SESSION_START
+
+    args = {
+        "action": "edit",
+        "path": "workspace/session.md",
+        "old_string": "old",
+        "new_string": "new",
+    }
+    with pytest.raises(NeedsApproval):
+        await files.invoke(args, ctx())
+    assert target.read_text(encoding="utf-8") == "old\n"  # refused, not applied
+
+    await files.invoke(args, ctx(confirmed=True))
+    assert target.read_text(encoding="utf-8") == "new\n"
+
+    # The approval is remembered per path, so the next edit needs no tap.
+    result = await files.invoke(
+        {
+            "action": "edit",
+            "path": "workspace/session.md",
+            "old_string": "new",
+            "new_string": "newer",
+        },
+        ctx(),
+    )
+    assert result.ok
+    assert target.read_text(encoding="utf-8") == "newer\n"
+
+
+async def test_append_to_a_session_authored_file_asks_once(files: FilesTool, config) -> None:
+    """append cannot slip past the gate by being additive."""
+    target = config.shell_cwd / "session-log.md"
+    target.write_text("one\n", encoding="utf-8")
+
+    args = {"action": "append", "path": "workspace/session-log.md", "content": "two\n"}
+    with pytest.raises(NeedsApproval):
+        await files.invoke(args, ctx())
+    assert target.read_text(encoding="utf-8") == "one\n"
+
+    result = await files.invoke(args, ctx(confirmed=True))
+    assert result.ok
+    assert target.read_text(encoding="utf-8") == "one\ntwo\n"
+
+
 async def test_write_creates_parent_directories(files: FilesTool, config) -> None:
     result = await files.invoke(
-        {"action": "write", "path": "workspace/deep/nested/file.md", "content": "x"}, ctx()
+        {"action": "write", "path": "workspace/deep/nested/file.md", "content": "x"},
+        ctx(confirmed=True),
     )
     assert result.ok
     assert (config.shell_cwd / "deep" / "nested" / "file.md").is_file()
@@ -352,12 +426,13 @@ async def test_write_creates_parent_directories(files: FilesTool, config) -> Non
 async def test_append(files: FilesTool, config) -> None:
     target = config.shell_cwd / "log.md"
     target.write_text("one\n", encoding="utf-8")
+    backdate(target)
     await files.invoke({"action": "append", "path": "workspace/log.md", "content": "two\n"}, ctx())
     assert target.read_text(encoding="utf-8") == "one\ntwo\n"
 
 
 async def test_append_needs_no_approval_even_when_the_file_exists(files: FilesTool) -> None:
-    await files.invoke({"action": "write", "path": "workspace/a.md", "content": "x"}, ctx())
+    await files.invoke({"action": "write", "path": "workspace/a.md", "content": "x"}, ctx(confirmed=True))
     result = await files.invoke({"action": "append", "path": "workspace/a.md", "content": "y"}, ctx())
     assert result.ok
 
@@ -493,6 +568,7 @@ async def test_write_size_limit(files: FilesTool, config) -> None:
 async def test_edit_replaces_exact_text(files: FilesTool, config) -> None:
     target = config.shell_cwd / "note.md"
     target.write_text("hello world\n", encoding="utf-8")
+    backdate(target)
 
     result = await files.invoke(
         {
@@ -515,10 +591,12 @@ async def test_edit_needs_no_approval_even_on_an_existing_file(
     """An anchored edit cannot clobber what it does not name, so no tap.
 
     The whole-file `write` to the same non-empty file must still ask — the
-    difference between the two actions is the whole point of edit.
+    difference between the two actions is the whole point of edit. Both files
+    here predate the session, so neither triggers the session-freshness gate.
     """
     target = config.shell_cwd / "exists.md"
     target.write_text("original content", encoding="utf-8")
+    backdate(target)
 
     with pytest.raises(NeedsApproval):
         await files.invoke(
@@ -542,6 +620,7 @@ async def test_edit_leaves_the_rest_of_the_file_untouched(files: FilesTool, conf
     target = config.shell_cwd / "code.py"
     original = "def add(a, b):\n    return a + b\n\n# keep me\n"
     target.write_text(original, encoding="utf-8")
+    backdate(target)
 
     result = await files.invoke(
         {
@@ -577,6 +656,7 @@ async def test_edit_refuses_an_ambiguous_match_and_changes_nothing(
 async def test_edit_replace_all_touches_every_occurrence(files: FilesTool, config) -> None:
     target = config.shell_cwd / "dup.md"
     target.write_text("x = 1\nx = 2\n", encoding="utf-8")
+    backdate(target)
 
     result = await files.invoke(
         {

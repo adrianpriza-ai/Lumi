@@ -6,6 +6,7 @@ MEMORY.md, workspace, or history.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -14,6 +15,20 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from lumi.config import load_config  # noqa: E402
+from lumi.tools.safety import SESSION_START  # noqa: E402
+
+
+def backdate(path: Path, seconds: float = 60.0) -> Path:
+    """Age *path* so it looks older than this process.
+
+    The files tool asks the owner before it writes, appends to or edits a file
+    that appeared or changed during the session. Tests whose subject is
+    something else put their fixture files back in the past instead of paying
+    that gate.
+    """
+    stamp = SESSION_START - seconds
+    os.utime(path, (stamp, stamp))
+    return path
 
 
 @pytest.fixture

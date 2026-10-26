@@ -8,7 +8,7 @@ turn. The Telegram delivery layer is covered in ``test_bot.py``.
 from __future__ import annotations
 
 import pytest
-from conftest import FakeLLM, make_reply
+from conftest import FakeLLM, backdate, make_reply
 
 from lumi.artifacts import DEFAULT_MAX_BYTES, ArtifactError, ArtifactStore
 from lumi.tools.base import ToolContext
@@ -215,7 +215,7 @@ def files(config) -> FilesTool:
 async def test_write_with_upload_attaches_an_artifact(files: FilesTool, config) -> None:
     result = await files.invoke(
         {"action": "write", "path": "workspace/out.md", "content": "# hi", "upload": True},
-        ctx(source="cli"),
+        ctx(source="cli", confirmed=True),
     )
     assert result.ok
     assert len(result.artifacts) == 1
@@ -228,7 +228,8 @@ async def test_write_with_upload_attaches_an_artifact(files: FilesTool, config) 
 
 async def test_write_without_upload_attaches_nothing(files: FilesTool) -> None:
     result = await files.invoke(
-        {"action": "write", "path": "workspace/quiet.md", "content": "x"}, ctx(source="cli")
+        {"action": "write", "path": "workspace/quiet.md", "content": "x"},
+        ctx(source="cli", confirmed=True),
     )
     assert result.ok
     assert result.artifacts == []
@@ -271,7 +272,8 @@ async def test_uploads_disabled_refuses_the_upload_action(files: FilesTool, conf
 async def test_uploads_disabled_ignores_the_write_flag(files: FilesTool, config) -> None:
     config.tools.files.uploads = False
     result = await files.invoke(
-        {"action": "write", "path": "workspace/y.md", "content": "y", "upload": True}, ctx()
+        {"action": "write", "path": "workspace/y.md", "content": "y", "upload": True},
+        ctx(confirmed=True),
     )
     # The write itself still succeeds; only delivery is off.
     assert result.ok
@@ -316,6 +318,12 @@ async def test_the_agent_collects_artifacts_into_the_turn(config) -> None:
     from lumi.memory import History
     from lumi.personality import Personality
     from lumi.tools import build_registry
+
+    # An empty file from before this run: the write replaces it without tripping
+    # the session-freshness gate, which this test is not about.
+    made = config.shell_cwd / "agent-made.md"
+    made.write_text("", encoding="utf-8")
+    backdate(made)
 
     memory = config.build_memory_store()
     agent = Agent(

@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
-from conftest import FakeLLM, make_reply, make_store
+from conftest import FakeLLM, backdate, make_reply, make_store
 from telegram import Bot, Chat, InaccessibleMessage, Message, TextQuote, Update, User
 from telegram.error import TelegramError
 
@@ -2229,6 +2229,11 @@ async def test_photo_in_group_without_mention_is_silent(config) -> None:
 
 async def test_a_model_written_file_is_delivered_as_a_document(config) -> None:
     """The full out path: the model writes with upload:true, the chat gets a file."""
+    # Pre-existing and empty, so the session-freshness gate (finding 3b) is not
+    # what this test is exercising — it would stop the turn for an owner tap.
+    report = config.shell_cwd / "report.md"
+    report.write_text("", encoding="utf-8")
+    backdate(report)
     application, bot, agent = build(
         config,
         [

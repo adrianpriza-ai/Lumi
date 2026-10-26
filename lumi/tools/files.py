@@ -9,7 +9,13 @@ overwriting an existing non-empty file needs approval.
 
 ``edit`` is the surgical path: an exact ``old_string``/``new_string`` swap that
 can only touch the text it names, so it runs without the approval prompt that a
-whole-file overwrite asks for.
+whole-file overwrite asks for — with one exception. A file that appeared or
+changed *during this session* may have been authored from fetched or injected
+content, so the first write, append or edit to such a file asks the owner once
+(:data:`lumi.tools.safety.SESSION_START` and the ``_approved`` set are what make
+"once" mean once). Files that predate the process are ordinary project
+material and keep the rules above. This is the write half of the
+write-then-run chain; the shell asks the run half.
 
 Path handling is the security boundary here, so it is done with
 ``Path.resolve()`` plus an ``is_within`` check — no string prefix matching,
@@ -32,7 +38,7 @@ from ..paths import is_within, relative_to_root
 from ..util.log import get_logger
 from ..util.text import truncate
 from .base import NeedsApproval, Tool, ToolContext, ToolError, ToolResult
-from .safety import protected_write, read_guard
+from .safety import SESSION_START, protected_write, read_guard
 
 log = get_logger(__name__)
 
@@ -64,6 +70,12 @@ found and the `new_string` that replaces it. It needs no approval (it can
 only touch the text it names), shows a diff, and leaves the rest of the file
 alone — prefer it over `write` whenever you are changing less than the whole
 file. The `old_string` must match exactly once unless `replace_all` is true.
+
+One exception: a file that was created or changed *during this session* gets
+one owner approval on its first write, append or edit, then goes on normally.
+That is the write half of the write-then-run chain — a file this session
+authored may come from fetched content, so its authorship is shown to the
+owner once before it changes.
 
 Set `upload: true` on a write or an edit to also send the finished file to the
 chat as a document — use it whenever the owner asked for "a file" they can
@@ -113,7 +125,8 @@ it validates the path, caps the size, and shows a diff before it overwrites.
                 "type": "boolean",
                 "description": (
                     "Set true to overwrite a non-empty file without asking the owner. "
-                    "Leave it out to get an approval prompt instead."
+                    "Leave it out to get an approval prompt instead. Files authored "
+                    "during this session ask the owner once regardless."
                 ),
             },
             "pattern": {
@@ -145,6 +158,10 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         # Lazily created: the store needs the bot's upload cap, which lives in
         # the bot config section.
         self._store: ArtifactStore | None = None
+        #: Files the owner has already let this session touch (or that predate
+        #: the session). One tap per file, not one tap per call — a gate the
+        #: model has to clear on every keystroke would be tapped blind.
+        self._approved: set[str] = set()
 
     @property
     def store(self) -> ArtifactStore:
@@ -203,6 +220,36 @@ it validates the path, caps the size, and shows a diff before it overwrites.
 
     def _display(self, path: Path) -> str:
         return relative_to_root(path)
+
+    def _session_authored(self, path: Path) -> bool:
+        """Whether *path* was not readable as a pre-existing file at session start.
+
+        True for a file that does not exist yet and for one whose mtime is at
+        or after :data:`SESSION_START` — in both cases the content the next
+        write would replace or extend was produced during this run, which is
+        the provenance finding 3 cares about. False once the owner has approved
+        this path, so a file costs one confirmation per session.
+        """
+        if str(path) in self._approved:
+            return False
+        try:
+            return path.stat().st_mtime >= SESSION_START
+        except OSError:
+            return True
+
+    def _require_owner(self, path: Path, ctx: ToolContext, arguments: dict[str, Any], preview: str) -> None:
+        """Raise :class:`NeedsApproval` unless *path* is already cleared."""
+        if ctx.confirmed or not self._session_authored(path):
+            return
+        raise NeedsApproval(
+            tool=self.name,
+            arguments=dict(arguments),
+            reason=(
+                f"{self._display(path)} was created or changed during this session, "
+                "so the owner approves the first write to it"
+            ),
+            preview=preview,
+        )
 
     # -- actions ----------------------------------------------------------- #
 
@@ -269,6 +316,8 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         previous = path.read_text(encoding="utf-8", errors="replace") if existed else ""
         overwrite = bool(arguments.get("overwrite"))
 
+        self._require_owner(path, ctx, arguments, _short_diff(previous, content))
+
         if existed and previous.strip() and not overwrite and not ctx.confirmed:
             raise NeedsApproval(
                 tool=self.name,
@@ -283,6 +332,7 @@ it validates the path, caps the size, and shows a diff before it overwrites.
             return ToolResult.failure(f"could not write {self._display(path)}: {exc}")
 
         verb = "overwrote" if existed else "created"
+        self._approved.add(str(path))
         log.info("%s %s (%d bytes)", verb, self._display(path), len(content))
         diff = _short_diff(previous, content) if existed else ""
 
@@ -349,6 +399,7 @@ it validates the path, caps the size, and shows a diff before it overwrites.
             return ToolResult.failure("nothing to append")
 
         created = not path.exists()
+        self._require_owner(path, ctx, arguments, truncate(content, 400))
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as handle:
@@ -357,6 +408,7 @@ it validates the path, caps the size, and shows a diff before it overwrites.
             return ToolResult.failure(f"could not append to {self._display(path)}: {exc}")
 
         verb = "created" if created else "appended to"
+        self._approved.add(str(path))
         return ToolResult(
             text=f"{verb} {self._display(path)} (+{len(content)} bytes)",
             data={"path": str(path), "appended": len(content), "created": created},
@@ -374,6 +426,10 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         a tap on every small fix would teach the owner to tap without
         reading. Everything else still applies: writable roots, the
         protected-path guard, a diff of what changed.
+
+        The one exception is a file this session authored: its first edit
+        goes through :meth:`_require_owner`, because ``old_string`` matching
+        is no reassurance when the whole file arrived from fetched content.
         """
         path = self._resolve(arguments.get("path"), for_write=True)
         old = arguments.get("old_string")
@@ -430,11 +486,13 @@ it validates the path, caps the size, and shows a diff before it overwrites.
 
         updated = previous.replace(old, new) if replace_all else previous.replace(old, new, 1)
         made = count if replace_all else 1
+        self._require_owner(path, ctx, arguments, _short_diff(previous, updated))
         try:
             self._atomic_write(path, updated)
         except OSError as exc:
             return ToolResult.failure(f"could not edit {self._display(path)}: {exc}")
 
+        self._approved.add(str(path))
         log.info("edited %s (%d replacement(s))", self._display(path), made)
         result = ToolResult(
             text=f"edited {self._display(path)} ({made} replacement(s))\n"

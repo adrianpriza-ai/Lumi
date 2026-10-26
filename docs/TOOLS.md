@@ -120,6 +120,15 @@ The `files` tool is where edits happen, in three shapes:
   refused rather than guessed at (add context to make it unique, or set
   `replace_all`). It shows the same diff `write` does, and refuses binary files.
 
+One gate applies to all three: a file that was created or changed **during the
+current session** gets one owner approval on its first `write`, `append` or
+`edit`, and is then treated normally for the rest of the session. Files that
+predate the process are ordinary project material and follow the bullets above.
+This is the write half of the write-then-run chain — fetched content can talk
+the model into authoring a file, so the owner sees what is being written once
+before it changes; the shell asks separately before *running* such a file
+(`exec:recent-script`).
+
 `edit` is the right default for a change to an existing file; `write` is for
 creating one or replacing all of it. Both are confined to `tools.files.writable`
 (default: `workspace/`) and both refuse the shell policy's protected paths —
