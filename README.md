@@ -2,11 +2,8 @@
 
 # Lumi
 
-[![CI](https://github.com/adrianpriza-ai/Lumi/actions/workflows/ci.yml/badge.svg?branch=main&label=CI)](https://github.com/adrianpriza-ai/Lumi/actions/workflows/ci.yml)
-
-[![Python 3.11+](https://img.shields.io/badge/Python-3.11+-306998?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/downloads/)
-
-[![MIT](https://img.shields.io/badge/License-MIT-green?style=for-the-badge&logo=opensource&logoColor=white)](LICENSE)
+[![CI](https://github.com/adrianpriza-ai/Lumi/actions/workflows/ci.yml/badge.svg?branch=main&label=CI)](https://github.com/adrianpriza-ai/Lumi/actions/workflows/ci.yml)![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB.svg?logo=python&logoColor=fff&labelColor=3A454F)
+![License](https://img.shields.io/badge/MIT-EF4C32.svg?logo=mit&logoColor=fff&label=MIT&color=EF4C32&labelColor=3A454F)
 
 </div>
 
