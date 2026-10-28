@@ -667,6 +667,38 @@ def test_wrappers_do_not_hide_the_real_program() -> None:
     assert verdict("timeout 5 rm -rf /").blocked
 
 
+def test_double_wrapping_does_not_bypass_the_zone_checks() -> None:
+    # One peel landed on `env`, itself read-only, so the segment skipped every
+    # write-zone, protected-file and protected-state check. The unwrap has to
+    # run to a fixpoint: only `<delegating> env <real command>` was dangerous,
+    # and only when `env` was not the outermost wrapper.
+    def check(command: str) -> safety.Verdict:
+        # Run from the project root, the way the audit harness did: that is
+        # where config.toml and data/whitelist.json are the real state files.
+        return safety.classify(
+            command, cwd=ROOT, project_root=ROOT, home=HOME, write_root=ROOT
+        )
+
+    denied = [
+        "timeout 5 env cp notes.md /etc/lumi-audit-probe",
+        "xargs env cp notes.md /etc/lumi-audit-probe",
+        "nohup env mv notes.md /etc/lumi-audit-probe",
+        "stdbuf -o0 env cp notes.md /etc/lumi-audit-probe",
+        "timeout 5 env cp notes.md config.toml",
+        "xargs env cp notes.md data/whitelist.json",
+        "echo hi | xargs env sh",
+        "timeout 5 env sed -i s/a/b/ ~/.bashrc",
+        "env timeout 5 rm -rf ~/stuff",
+    ]
+    for command in denied:
+        result = check(command)
+        assert result.blocked, f"{command!r} -> {result}"
+    # Wrapping a read must not turn it into a write: the peeled program is
+    # still what runs, so `cat /etc/passwd` stays a read through any wrapper.
+    assert check("timeout 5 env cat /etc/passwd").tier is safety.Tier.ALLOW
+    assert check("env grep -rn TODO .").tier is safety.Tier.ALLOW
+
+
 # --------------------------------------------------------------------------- #
 # read-only programs with teeth
 # --------------------------------------------------------------------------- #

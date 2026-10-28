@@ -165,6 +165,9 @@ data/
 workspace/
 # Working notes from a review pass — useful locally, not part of the project.
 handoff.md
+handoff_*.md
+# Local tool state (perch).
+.perch/
 # config.toml IS tracked (no secrets). config.local.toml, if you use it, is not.
 config.local.toml
 # Remote MCP servers embed API keys in their URLs. This file is tracked with

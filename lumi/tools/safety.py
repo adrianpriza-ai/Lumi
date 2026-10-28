@@ -943,24 +943,43 @@ def effective_cwd(tokens: list[str], cwd: Path, home: Path | None) -> Path | Non
     return base
 
 
+def _unwrap_chain(tokens: list[str]) -> list[str]:
+    """Every program name *tokens* can run, outermost wrapper first.
+
+    The first element is the program as written, each following element is the
+    next wrapper peeled off, and the last is what actually runs. ``timeout 5
+    env cp a b`` reads ``["timeout", "env", "cp"]``. Peeling has to be a
+    fixpoint, not one step: a single peel leaves ``env`` - which is on
+    :data:`READ_ONLY_COMMANDS` - as the judged program, and the read-only
+    branch then skips every write-zone, protected-file and protected-state
+    check for the command hiding behind it.
+    """
+    chain: list[str] = []
+    rest = list(tokens)
+    while rest:
+        program = _program_name(rest)
+        if not program:
+            break  # leading separator or nothing at all
+        chain.append(program)
+        if program not in DELEGATING_COMMANDS:
+            break
+        index = _interpreter_index(rest)
+        if index is None or index >= len(rest):
+            break  # wrapper with nothing to hand its arguments to
+        rest = rest[index:]
+    return chain
+
+
 def _unwrap_program(tokens: list[str]) -> str:
     """The program that will actually run, looking through thin wrappers.
 
     ``env cp a /etc/passwd`` is a write to a system path wearing a read-only
     program's name. ``env`` is on the read-only list because ``env`` on its own
-    really does only print the environment, so the wrapper has to be peeled off
-    before the zone check means anything.
+    really does only print the environment, so the wrappers have to be peeled
+    off - all of them - before the zone check means anything.
     """
-    program = _program_name(tokens)
-    if program not in DELEGATING_COMMANDS:
-        return program
-    for word in tokens[1:]:
-        if word.startswith("-") or word.isdigit():
-            continue
-        if "=" in word and not word.startswith(("/", "~", "./", "../")):
-            continue  # `env FOO=bar rm x`
-        return Path(word).name
-    return program
+    chain = _unwrap_chain(tokens)
+    return chain[-1] if chain else _program_name(tokens)
 
 
 def _program_token(tokens: list[str]) -> str | None:

@@ -1855,8 +1855,14 @@ def build_handlers(config: Config) -> list[Any]:
             "whitelisted_users": cfg.bot.whitelisted_users,
             "whitelisted_groups": cfg.bot.whitelisted_groups,
         }
-        with path.open("w") as f:
+        # Atomic write: a crash mid-write must not truncate the whitelist,
+        # or a revocation would silently revert at the next load.
+        tmp = path.with_suffix(".json.tmp")
+        with tmp.open("w") as f:
             json.dump(payload, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
 
     def _load_whitelist(cfg: Config) -> None:
         """Load the whitelist from data/whitelist.json into the config.
@@ -1870,8 +1876,15 @@ def build_handlers(config: Config) -> list[Any]:
         try:
             with path.open("r") as f:
                 data = json.load(f)
-            cfg.bot.whitelisted_users = data.get("whitelisted_users", [])
-            cfg.bot.whitelisted_groups = data.get("whitelisted_groups", [])
+            # Only accept a list of scalars: ``str(user.id) in <str>`` would
+            # otherwise be a substring test, so a crafted file could admit
+            # unintended ids.
+            for key in ("whitelisted_users", "whitelisted_groups"):
+                value = data.get(key, [])
+                if not isinstance(value, list):
+                    log.warning("whitelist key %s is not a list; ignoring", key)
+                    continue
+                setattr(cfg.bot, key, [str(item) for item in value])
         except Exception:
             log.warning("could not read whitelist file %s", path, exc_info=True)
 

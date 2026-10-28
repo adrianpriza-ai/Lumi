@@ -1,6 +1,6 @@
 [project]
 name = "lumi"
-version = "0.3.1"
+version = "0.3.2"
 description = "A portable, fully modular Telegram AI agent with markdown-configurable personality, file-based memory, guarded shell access, and MCP-aware web search."
 readme = "README.md"
 requires-python = ">=3.11"
