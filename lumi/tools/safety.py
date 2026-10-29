@@ -604,6 +604,35 @@ INTERPRETER_VALUE_FLAGS: dict[str, frozenset[str]] = {
     "lua": frozenset({"-e", "-l"}),
 }
 
+#: Interpreter flags whose value is *code the interpreter will run*, as opposed
+#: to :data:`INTERPRETER_VALUE_FLAGS`, which also carries flags whose value is a
+#: module name or an option. After ``shlex`` strips the command's quotes, the
+#: script is an opaque blob that ``_path_like`` will happily read as one
+#: nonsense path, so it has to be tokenised and zoned on its own.
+INLINE_CODE_FLAGS: dict[str, frozenset[str]] = {
+    "sh": frozenset({"-c"}),
+    "bash": frozenset({"-c"}),
+    "zsh": frozenset({"-c"}),
+    "ksh": frozenset({"-c"}),
+    "dash": frozenset({"-c"}),
+    "python": frozenset({"-c"}),
+    "python2": frozenset({"-c"}),
+    "python3": frozenset({"-c"}),
+    "node": frozenset({"-e", "-p", "--eval", "--print"}),
+    "deno": frozenset({"-e", "--eval"}),
+    "bun": frozenset({"-e", "--eval"}),
+    "perl": frozenset({"-e", "-E"}),
+    "ruby": frozenset({"-e"}),
+    "php": frozenset({"-r"}),
+    "lua": frozenset({"-e"}),
+}
+
+#: How many layers of inline script to walk into. ``bash -c 'bash -c ...'``
+#: nests, but each layer's script is a substring of the last, so recursion
+#: terminates on its own; the cap only bounds the damage from a pathological
+#: input or a future parser change.
+_MAX_INLINE_DEPTH = 4
+
 #: Programs that execute a code file named as their first operand. ``source``
 #: is ``bash builtin`` with the same effect as running the file.
 SCRIPT_RUNNERS: frozenset[str] = INTERPRETERS | frozenset({"source"})
@@ -1016,6 +1045,70 @@ def _interpreter_index(tokens: list[str]) -> int | None:
                 index += 1
             continue
         return index
+    return None
+
+
+def _script_tokens(text: str) -> list[str]:
+    """Tokens of an inline script, with quoted spans flattened first.
+
+    ``shlex`` keeps a quoted span whole, so ``os.system('rm -rf /etc/X')``
+    arrives from :func:`tokenize` with the span as one token and the zoning
+    would see the same opaque blob the ``-c`` argument was. Peeling the quotes
+    first turns the span back into the words it holds - conservative for
+    zoning, which wants to see every path-shaped word, and harmless for prose,
+    which zones to nothing either way.
+    """
+    flattened = text
+    for _ in range(8):
+        stripped = _QUOTED_SPAN.sub(
+            lambda match: next(group for group in match.groups() if group is not None) or "",
+            flattened,
+        )
+        if stripped == flattened:
+            break
+        flattened = stripped
+    return tokenize(flattened)
+
+
+def _inline_script_value(tokens: list[str]) -> tuple[int, str] | None:
+    """Index and text of an interpreter's inline-code argument, if there is one.
+
+    ``bash -c 'rm -rf /etc/X'`` reaches this function with the quotes already
+    stripped by :func:`tokenize`, so the whole script sits in one token that the
+    path zoning would otherwise judge as a single nonsense project path. The
+    caller re-tokenises this value and zones the commands inside it.
+
+    Combined short flags are read the way the shell reads them: ``bash -lc
+    'code'`` ends its flag cluster with the ``-c`` that takes the script.
+    """
+    index = _interpreter_index(tokens)
+    if index is None:
+        return None
+    program = Path(tokens[index]).name
+    code_flags = INLINE_CODE_FLAGS.get(program)
+    if not code_flags:
+        return None
+    flag_chars = {flag[1] for flag in code_flags if len(flag) == 2}
+    for position in range(index + 1, len(tokens)):
+        token = tokens[position]
+        if token in _SEPARATORS:
+            return None
+        if token in code_flags:
+            if position + 1 < len(tokens) and tokens[position + 1] not in _SEPARATORS:
+                return position + 1, tokens[position + 1]
+            return None
+        for flag in code_flags:
+            if flag.startswith("--") and token.startswith(flag + "="):
+                return position, token.split("=", 1)[1]
+        if (
+            len(token) > 2
+            and token.startswith("-")
+            and not token.startswith("--")
+            and token[-1] in flag_chars
+        ):
+            if position + 1 < len(tokens) and tokens[position + 1] not in _SEPARATORS:
+                return position + 1, tokens[position + 1]
+            return None
     return None
 
 
@@ -1520,6 +1613,40 @@ def explain(
         )
         base = cwd
 
+    # 4b. Walk the segments, and walk into an interpreter's inline script: the
+    #     commands inside `bash -c '...'` are executed exactly as written, so
+    #     they get the same zoning as commands on the line itself. The script's
+    #     own token is flagged on its segment so the zoning below judges code as
+    #     code instead of as one nonsense path.
+    tilde_home_for_tokens = tilde_home if tilde_home is not None else home
+
+    def inline_segments(
+        line: list[str], depth: int
+    ) -> list[tuple[list[str], int | None]]:
+        out: list[tuple[list[str], int | None]] = []
+        for segment in _segments(line):
+            inline = _inline_script_value(segment) if depth < _MAX_INLINE_DEPTH else None
+            if inline is None:
+                out.append((segment, None))
+                continue
+            out.append((segment, inline[0]))
+            inner = _expand_tilde(_script_tokens(inline[1]), tilde_home_for_tokens)
+            # A pipe into an interpreter inside the script is the same deny as
+            # one on the line itself; the structural check above never sees it
+            # because to it the whole script is one token.
+            for index, token in enumerate(inner):
+                if token != "|" or index + 1 >= len(inner):
+                    continue
+                target = _unwrap_program(inner[index + 1 :])
+                if target in PIPE_TARGETS:
+                    verdicts.append(
+                        Verdict(Tier.DENY, f"piping into {target}", "pipe-to-interpreter")
+                    )
+            out.extend(inline_segments(inner, depth + 1))
+        return out
+
+    zoned_segments = inline_segments(tokens, 0)
+
     # 5. Redirections write files too, and this is where "creates" and
     #    "clobbers" part ways: `> new.txt` inside the workspace just runs,
     #    `> existing.txt` asks, and anything aimed out of the workspace asks
@@ -1580,7 +1707,7 @@ def explain(
     # 6. Path zoning, one segment at a time. Judging the whole line as a single
     #    command is what lets `cd ..` look like a write target and what makes
     #    `cp a b` ambiguous about which operand is the destination.
-    for segment in _segments(tokens):
+    for segment, inline_script in zoned_segments:
         segment_program = _unwrap_program(segment)
         if segment_program in _CD_COMMANDS:
             continue  # already accounted for in effective_cwd
@@ -1682,11 +1809,20 @@ def explain(
                     )
                     break
 
-        targets = referenced_paths(segment, base, home)
+        # The inline script's token is code, not a path: left in, `bash -c
+        # 'cp NOTES.md /etc/X'` is judged as a write to a nonsense project
+        # path named after the whole script. The commands inside it were
+        # zoned above; here it is dropped so only real operands remain. The
+        # variable check keeps the full segment, because a `$` in inline
+        # code means exactly the same unknowable target as one on the line.
+        zone_tokens = segment
+        if inline_script is not None:
+            zone_tokens = [*segment[:inline_script], *segment[inline_script + 1 :]]
+        targets = referenced_paths(zone_tokens, base, home)
         # Bare operands: `rm -rf data` names its target with no separator in it,
         # so the path-shapedness test above cannot see it. Gated on the program,
         # because `kill 1234` takes a pid and not a path.
-        targets += operand_paths(segment, segment_program, base, home)
+        targets += operand_paths(zone_tokens, segment_program, base, home)
         # A commit message is prose. `git commit -m 'stop touching /etc'` names
         # a path the same way `rm /etc/passwd` does, and reading it as a write
         # target makes those messages impossible to commit.
@@ -1841,7 +1977,7 @@ def explain(
     if session_start is None:
         session_start = SESSION_START
     authored_here = _command_write_targets(tokens, base, home)
-    for segment in _segments(tokens):
+    for segment, _ in zoned_segments:
         candidates = [
             *script_paths(segment, base, home),
             _direct_script(segment, base, home),
@@ -1858,7 +1994,17 @@ def explain(
                     )
                 )
 
-    return verdicts
+    # The same write can be found twice now - once as a quoted span, once by
+    # zoning the re-tokenised inline script - and one finding deserves one
+    # verdict. Order-preserving so tests and /doctor see stable output.
+    deduped: list[Verdict] = []
+    seen: set[tuple[Tier, str, str]] = set()
+    for item in verdicts:
+        key = (item.tier, item.reason, item.rule)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(item)
+    return deduped
 
 
 def classify(
