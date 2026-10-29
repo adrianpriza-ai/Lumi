@@ -34,7 +34,7 @@ from typing import Any
 from ..config import Context7Config
 from ..llm.keypool import KeyPool, is_retryable, mask
 from ..util.log import get_logger
-from ..util.text import truncate
+from ..util.text import fence_untrusted, truncate
 from .base import Tool, ToolContext, ToolError, ToolResult
 
 log = get_logger(__name__)
@@ -506,13 +506,16 @@ def _render_snippets(
     head = f"context7 docs for {library_id}"
     if query:
         head += f" / {query!r}"
-    body = [head + ":"]
+    # Snippets are third-party doc text, so they go into the prompt inside the
+    # same fence every other external-content path uses (finding H); only our
+    # own one-line header stays unfenced.
+    lines: list[str] = []
     for index, snippet in enumerate(snippets, start=1):
         title = snippet.title or (f"snippet {index}" if snippet.kind == "info" else f"code {index}")
-        body.append("")
-        body.append(f"[{index}] {title}  ({snippet.kind})")
-        body.append(truncate(snippet.body.strip(), max_chars, marker="\n… [truncated]"))
-    return "\n".join(body)
+        lines.append("")
+        lines.append(f"[{index}] {title}  ({snippet.kind})")
+        lines.append(truncate(snippet.body.strip(), max_chars, marker="\n… [truncated]"))
+    return head + ":\n" + fence_untrusted("\n".join(lines).strip())
 
 
 __all__ = [

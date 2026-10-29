@@ -521,6 +521,26 @@ def test_firecrawl_top_up_does_not_rotate(monkeypatch) -> None:
     assert c1.scrape_calls + c2.scrape_calls == 1
 
 
+def test_firecrawl_top_up_skips_urls_the_tool_would_refuse(monkeypatch) -> None:
+    """A search index can name a URL web.fetch would refuse; the provider must
+    not scrape it behind the tool's back."""
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-91")
+    provider = FirecrawlProvider(FirecrawlConfig())
+
+    search_reply = {"web": [{"url": "http://169.254.169.254/latest/meta-data", "title": "meta"}], "news": []}
+    scrape_reply = {"metadata": {"title": "meta"}, "markdown": "instance secret"}
+    fake = FakeFirecrawlClient(search_reply=search_reply, scrape_reply=scrape_reply)
+    provider._clients = {"fc-91": fake}
+
+    import asyncio
+
+    result = asyncio.run(provider.search("x", 5))
+
+    assert result.ok
+    assert fake.scrape_calls == 0
+    assert result.hits[0].content == ""
+
+
 # --------------------------------------------------------------------------- #
 # Recency: every provider must turn a day window into its API's filter shape.
 # --------------------------------------------------------------------------- #

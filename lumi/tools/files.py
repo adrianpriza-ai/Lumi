@@ -55,6 +55,33 @@ READABLE_SYSTEM_PATHS: tuple[str, ...] = (
 MAX_LIST_ENTRIES = 500
 
 
+def foreign_uploads(path: Path, root: Path, chat_id: int | str | None) -> str | None:
+    """The *other* chat whose upload directory *path* sits in, if any.
+
+    Incoming documents are stored per chat (``workspace/uploads/<chat_id>/``),
+    but every read inside the project used to be allowed from any chat, so
+    chat B could list and pull chat A's files back to itself with no approval
+    anywhere. Read-side calls only: the component is compared as a string with
+    the requesting ``chat_id``, and ``None`` (the local CLI, which has no chat)
+    is not restricted.
+    """
+    if chat_id is None:
+        return None
+    try:
+        relative = path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return None
+    parts = relative.parts
+    if (
+        len(parts) >= 3
+        and parts[0] == "workspace"
+        and parts[1] == "uploads"
+        and parts[2] != str(chat_id)
+    ):
+        return parts[2]
+    return None
+
+
 class FilesTool(Tool):
     name = "files"
     description = """
@@ -179,7 +206,13 @@ it validates the path, caps the size, and shows a diff before it overwrites.
 
     # -- path resolution --------------------------------------------------- #
 
-    def _resolve(self, raw: str | None, *, for_write: bool) -> Path:
+    def _resolve(
+        self,
+        raw: str | None,
+        *,
+        for_write: bool,
+        chat_id: int | str | None = None,
+    ) -> Path:
         if not raw or not str(raw).strip():
             raise ToolError("path is required")
         candidate = Path(str(raw).strip()).expanduser()
@@ -206,6 +239,11 @@ it validates the path, caps the size, and shows a diff before it overwrites.
             return resolved
 
         if is_within(resolved, self.root):
+            if (foreign := foreign_uploads(resolved, self.root, chat_id)) is not None:
+                raise ToolError(
+                    f"reading {resolved} is not allowed: workspace/uploads/{foreign} "
+                    "belongs to another chat. Each chat only sees its own uploads."
+                )
             guard = read_guard(candidate) or read_guard(resolved)
             if guard is not None:
                 raise ToolError(
@@ -273,7 +311,7 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         return await handler(arguments, ctx)
 
     async def _read(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        path = self._resolve(arguments.get("path"), for_write=False)
+        path = self._resolve(arguments.get("path"), for_write=False, chat_id=ctx.chat_id)
         if not path.exists():
             return ToolResult.failure(f"no such file: {self._display(path)}")
         if path.is_dir():
@@ -379,7 +417,7 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         raw = arguments.get("path")
         if not raw or not str(raw).strip():
             raise ToolError("path is required for an upload")
-        path = self._resolve(raw, for_write=False)
+        path = self._resolve(arguments.get("path"), for_write=False, chat_id=ctx.chat_id)
         if not path.is_file():
             return ToolResult.failure(f"no such file: {self._display(path)}")
 
@@ -514,7 +552,7 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         tmp.replace(path)
 
     async def _list(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        path = self._resolve(arguments.get("path") or ".", for_write=False)
+        path = self._resolve(arguments.get("path") or ".", for_write=False, chat_id=ctx.chat_id)
         if not path.exists():
             return ToolResult.failure(f"no such directory: {self._display(path)}")
         if not path.is_dir():
@@ -557,7 +595,7 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         pattern = str(arguments.get("pattern") or "").strip()
         if not pattern:
             raise ToolError("pattern is required for a search")
-        start = self._resolve(arguments.get("path") or ".", for_write=False)
+        start = self._resolve(arguments.get("path") or ".", for_write=False, chat_id=ctx.chat_id)
         if not start.is_dir():
             start = start.parent
 
@@ -578,7 +616,7 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         )
 
     async def _stat(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        path = self._resolve(arguments.get("path"), for_write=False)
+        path = self._resolve(arguments.get("path"), for_write=False, chat_id=ctx.chat_id)
         if not path.exists():
             return ToolResult.failure(f"no such path: {self._display(path)}")
         try:

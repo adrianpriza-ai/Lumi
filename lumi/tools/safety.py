@@ -376,6 +376,13 @@ PROTECTED_SUBPATHS: frozenset[tuple[str, ...]] = frozenset(
         # It is outside the project, so the write zone already asks; naming it
         # here makes the answer a deny rather than a tap.
         (".agents", "mcp.json"),
+        # Per-chat bot state, not workspace material. Writing one plants
+        # persistent instructions in a *different* chat's system prompt
+        # (memory is rendered untagged unless the provenance tag is there)
+        # or forges the history replay, and reading one hands over another
+        # chat's curated memory. Finding A.
+        ("data", "memory"),
+        ("data", "history"),
     }
 )
 
@@ -557,6 +564,32 @@ DELEGATING_COMMANDS: frozenset[str] = frozenset(
     {"xargs", "parallel", "env", "timeout", "nohup", "stdbuf"}
 )
 
+#: Flags of a delegating command that swallow the *next* token as their value.
+#: The skip loop in :func:`_interpreter_index` eats flags and digits, so
+#: ``env -u FOO bash -c '...'`` stopped at ``FOO``, unwrapped to program
+#: ``FOO``, and the script behind it was never re-tokenised while env ran it.
+#: A value that looks like a name has to be skipped together with its flag.
+_DELEGATOR_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    "env": frozenset({"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}),
+    "timeout": frozenset({"-k", "--kill-after", "-s", "--signal"}),
+    "stdbuf": frozenset({"-i", "-o", "-e", "--input", "--output", "--error"}),
+    "xargs": frozenset(
+        {
+            "-I",
+            "-d",
+            "-E",
+            "-L",
+            "-s",
+            "-n",
+            "-P",
+            "-a",
+            "--max-args",
+            "--max-procs",
+            "--arg-file",
+        }
+    ),
+}
+
 #: Programs that take a script as an argument, where a path inside a quoted
 #: string is something the program will actually open. ``python3 -c "open(
 #: '/etc/passwd','w')"`` names no path token at all, so without this the write
@@ -627,6 +660,41 @@ INLINE_CODE_FLAGS: dict[str, frozenset[str]] = {
     "lua": frozenset({"-e"}),
 }
 
+#: Interpreter *subcommands* whose following operand is inline code rather
+#: than a file path. ``deno eval "..."`` runs its argument as code, and no
+#: flag table will ever name it - ``deno -e`` is the flag spelling, already
+#: covered above.
+SUBCOMMAND_CODE: dict[str, frozenset[str]] = {
+    "deno": frozenset({"eval"}),
+}
+
+#: Subcommand flags that swallow the next token, and plain subcommand flags,
+#: for :data:`SUBCOMMAND_CODE`. ``deno eval --ext ts "code"`` must skip both
+#: ``--ext`` and ``ts`` before reaching the code; an *unknown* flag-shaped
+#: word is taken as the code itself rather than skipped, because guessing
+#: would zone the flag and miss the payload behind it.
+SUBCOMMAND_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    "deno": frozenset({"--ext", "--config", "--import-map", "--lock"}),
+}
+SUBCOMMAND_FLAGS: dict[str, frozenset[str]] = {
+    "deno": frozenset(
+        {
+            "-q",
+            "--quiet",
+            "--no-check",
+            "--check",
+            "--no-config",
+            "--no-emit",
+            "--no-remote",
+            "--cached-only",
+            "--no-lock",
+            "--no-npm",
+            "--vendor",
+            "--reload",
+        }
+    ),
+}
+
 #: How many layers of inline script to walk into. ``bash -c 'bash -c ...'``
 #: nests, but each layer's script is a substring of the last, so recursion
 #: terminates on its own; the cap only bounds the damage from a pathological
@@ -636,6 +704,28 @@ _MAX_INLINE_DEPTH = 4
 #: Programs that execute a code file named as their first operand. ``source``
 #: is ``bash builtin`` with the same effect as running the file.
 SCRIPT_RUNNERS: frozenset[str] = INTERPRETERS | frozenset({"source"})
+
+#: Shells whose ``-c`` script is shell code. It is re-tokenised and zoned
+#: segment by segment, so a variable inside it is judged exactly like the same
+#: word on the bare line: ``bash -c 'cp a $DEST'`` asks (as ``cp a $DEST``
+#: does) while ``bash -c 'echo $HOME'`` is free (as ``echo $HOME`` is).
+SHELL_INTERPRETERS: frozenset[str] = frozenset({"sh", "bash", "zsh", "ksh", "dash"})
+
+#: awk-family programs whose first non-flag operand is *program text*, not a
+#: path. ``awk 'BEGIN{print "x" > "/etc/X"}'`` writes files, runs commands
+#: (``system()``, ``print ... | "cmd"``) and reads anything, yet ``awk`` sits
+#: on :data:`READ_ONLY_COMMANDS` - a plain ``awk '{print $1}' f`` really is a
+#: read - and it appears in no interpreter table, so its program text never
+#: reached the zone check at all.
+INLINE_PROGRAM_COMMANDS: frozenset[str] = frozenset({"awk", "gawk", "mawk", "nawk"})
+
+#: awk flags whose value is a separate word (``-v var=val``, ``-F sep``), so
+#: the word after them is not the program text.
+_AWK_VALUE_FLAGS: frozenset[str] = frozenset({"-v", "-F", "-i"})
+
+#: awk flags that read the program from a file instead of the command line:
+#: there is no inline text to zone, and the following operand is data.
+_AWK_FILE_FLAGS: frozenset[str] = frozenset({"-f", "--file"})
 
 #: Wall-clock start of this process. A script created or changed after this
 #: moment was authored during this run; the shell asks the owner before running
@@ -1033,16 +1123,19 @@ def _interpreter_index(tokens: list[str]) -> int | None:
             index += 1
             continue
         if Path(token).name in DELEGATING_COMMANDS:
+            value_flags = _DELEGATOR_VALUE_FLAGS.get(Path(token).name, frozenset())
             index += 1
-            while index < len(tokens) and (
-                tokens[index].startswith("-")
-                or tokens[index].isdigit()
-                or (
-                    "=" in tokens[index]
-                    and not tokens[index].startswith(("/", "~", "./", "../"))
-                )
-            ):
-                index += 1
+            while index < len(tokens):
+                word = tokens[index]
+                if word in value_flags:
+                    index += 2  # the flag and the value it swallows
+                    continue
+                if word.startswith("-") or word.isdigit() or (
+                    "=" in word and not word.startswith(("/", "~", "./", "../"))
+                ):
+                    index += 1
+                    continue
+                break
             continue
         return index
     return None
@@ -1070,6 +1163,23 @@ def _script_tokens(text: str) -> list[str]:
     return tokenize(flattened)
 
 
+def _script_starts_with_variable(text: str) -> bool:
+    """Whether an inline script's program word is a variable expansion.
+
+    ``bash -c "$X"`` and ``bash -c 'FOO=1 $CMD'`` run whatever the variable
+    holds, so the whole script stays an unknowable target. ``bash -c 'echo
+    $HOME'`` starts with a real command and is judged by the commands inside
+    the script (which is how the bare ``echo $HOME`` is judged).
+    """
+    for token in _script_tokens(text):
+        if token in _SEPARATORS:
+            break
+        if "=" in token and not token.startswith(("-", "/", "./", "../")):
+            continue  # leading VAR=value assignment, not the program
+        return "$" in token or "`" in token
+    return False
+
+
 def _inline_script_value(tokens: list[str]) -> tuple[int, str] | None:
     """Index and text of an interpreter's inline-code argument, if there is one.
 
@@ -1078,20 +1188,42 @@ def _inline_script_value(tokens: list[str]) -> tuple[int, str] | None:
     path zoning would otherwise judge as a single nonsense project path. The
     caller re-tokenises this value and zones the commands inside it.
 
-    Combined short flags are read the way the shell reads them: ``bash -lc
-    'code'`` ends its flag cluster with the ``-c`` that takes the script.
+    Combined short flags are read the way bash reads them: ``bash -cx
+    'code'`` runs the code even though ``c`` does not end the cluster (``x``
+    becomes -x, and the next word is still the script), so any position of a
+    flag char inside a short cluster counts.
     """
     index = _interpreter_index(tokens)
     if index is None:
         return None
     program = Path(tokens[index]).name
     code_flags = INLINE_CODE_FLAGS.get(program)
-    if not code_flags:
+    code_subcommands = SUBCOMMAND_CODE.get(program, frozenset())
+    if not code_flags and not code_subcommands:
         return None
+    code_flags = code_flags or frozenset()
     flag_chars = {flag[1] for flag in code_flags if len(flag) == 2}
     for position in range(index + 1, len(tokens)):
         token = tokens[position]
         if token in _SEPARATORS:
+            return None
+        if token in code_subcommands:
+            # `deno eval "code"`: the code is the first word after the
+            # subcommand that is neither one of its flags nor a flag's value.
+            sub_value_flags = SUBCOMMAND_VALUE_FLAGS.get(program, frozenset())
+            sub_flags = SUBCOMMAND_FLAGS.get(program, frozenset())
+            inner_position = position + 1
+            while inner_position < len(tokens):
+                word = tokens[inner_position]
+                if word in _SEPARATORS:
+                    return None
+                if word in sub_value_flags:
+                    inner_position += 2
+                    continue
+                if word in sub_flags:
+                    inner_position += 1
+                    continue
+                return inner_position, word
             return None
         if token in code_flags:
             if position + 1 < len(tokens) and tokens[position + 1] not in _SEPARATORS:
@@ -1104,11 +1236,107 @@ def _inline_script_value(tokens: list[str]) -> tuple[int, str] | None:
             len(token) > 2
             and token.startswith("-")
             and not token.startswith("--")
-            and token[-1] in flag_chars
+            and set(token[1:]) & flag_chars
         ):
             if position + 1 < len(tokens) and tokens[position + 1] not in _SEPARATORS:
                 return position + 1, tokens[position + 1]
             return None
+    return None
+
+
+def _wrapper_script_value(tokens: list[str]) -> tuple[int, str] | None:
+    """Index and text of an ``env -S`` split string, wherever env sits.
+
+    ``env -S "cp a /etc/X"`` splits its argument on whitespace and runs the
+    result as a command line, so the string is code - the same payload as a
+    ``-c`` value. Judged as one token it was a nonsense path, and the write
+    it carries never reached the zone check. ``env`` is itself a wrapper, so
+    the search walks the same chain :func:`_interpreter_index` walks:
+    ``timeout 5 env -S "..."`` has to find it too, or the payload behind the
+    outer wrapper is judged as nothing at all.
+    """
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in _SEPARATORS:
+            return None
+        if "=" in token and not token.startswith(("-", "/", "./", "../")):
+            index += 1
+            continue
+        name = Path(token).name
+        if name == "env":
+            position = index + 1
+            while position < len(tokens):
+                word = tokens[position]
+                if word in _SEPARATORS:
+                    return None
+                if word in {"-S", "--split-string"}:
+                    if position + 1 < len(tokens) and tokens[position + 1] not in _SEPARATORS:
+                        return position + 1, tokens[position + 1]
+                    return None
+                if word.startswith("--split-string="):
+                    return position, word.split("=", 1)[1]
+                if "=" in word and not word.startswith(("-", "/", "./", "../")):
+                    position += 1  # VAR=value passed through to the command
+                    continue
+                if word in _DELEGATOR_VALUE_FLAGS.get("env", frozenset()):
+                    position += 2
+                    continue
+                if word.startswith("-") and len(word) > 1:
+                    position += 1
+                    continue
+                break  # env's program: keep walking the chain from there
+            if position >= len(tokens):
+                return None  # env with only flags: nothing left to run
+            index = position
+            continue
+        if name in DELEGATING_COMMANDS:
+            index += 1
+            value_flags = _DELEGATOR_VALUE_FLAGS.get(name, frozenset())
+            while index < len(tokens):
+                word = tokens[index]
+                if word in value_flags:
+                    index += 2
+                    continue
+                if word.startswith("-") or word.isdigit() or (
+                    "=" in word and not word.startswith(("/", "~", "./", "../"))
+                ):
+                    index += 1
+                    continue
+                break
+            continue
+        return None  # a plain program with no env before it
+    return None
+
+
+def _inline_program_value(tokens: list[str]) -> tuple[int, str] | None:
+    """Index and text of an awk-family program operand, if there is one.
+
+    ``awk 'BEGIN{...}'`` has no flag marking its code - the program is a bare
+    operand - so :func:`_inline_script_value` never sees it and the read-only
+    name lets the whole segment skip write zoning. The caller re-tokenises
+    this value exactly like a ``-c`` script, so the commands inside the awk
+    program get the same zoning as commands on the line itself.
+    """
+    index = _interpreter_index(tokens)
+    if index is None:
+        return None
+    if Path(tokens[index]).name not in INLINE_PROGRAM_COMMANDS:
+        return None
+    position = index + 1
+    while position < len(tokens):
+        token = tokens[position]
+        if token in _SEPARATORS:
+            return None
+        if token in _AWK_FILE_FLAGS:
+            return None  # program comes from a file; the rest are data files
+        if token in _AWK_VALUE_FLAGS:
+            position += 2
+            continue
+        if token.startswith("-") and len(token) > 1:
+            position += 1
+            continue
+        return position, token
     return None
 
 
@@ -1434,6 +1662,13 @@ def read_guard(path: Path) -> str | None:
             return str(candidate)
         if _is_secret_name(candidate.name) and _exists(candidate):
             return candidate.name
+        # Per-chat state (finding A): readable state files are as much another
+        # chat's data as a credential is, so the read side refuses them too,
+        # not only the write side.
+        if _has_protected_subpath(candidate) in {"data/memory", "data/history"} and _exists(
+            candidate
+        ):
+            return _has_protected_subpath(candidate)
     # A credential directory: the guard is the directory being there, not the
     # named file, because the file that exists inside it may be another one.
     found = credential_dir(path)
@@ -1621,15 +1856,32 @@ def explain(
     tilde_home_for_tokens = tilde_home if tilde_home is not None else home
 
     def inline_segments(
-        line: list[str], depth: int
-    ) -> list[tuple[list[str], int | None]]:
-        out: list[tuple[list[str], int | None]] = []
+        line: list[str], depth: int, line_base: Path
+    ) -> list[tuple[list[str], int | None, Path]]:
+        out: list[tuple[list[str], int | None, Path]] = []
         for segment in _segments(line):
-            inline = _inline_script_value(segment) if depth < _MAX_INLINE_DEPTH else None
+            inline = _inline_script_value(segment)
             if inline is None:
-                out.append((segment, None))
+                inline = _wrapper_script_value(segment)
+            if inline is None:
+                inline = _inline_program_value(segment)
+            if inline is None:
+                out.append((segment, None, line_base))
                 continue
-            out.append((segment, inline[0]))
+            out.append((segment, inline[0], line_base))
+            if depth >= _MAX_INLINE_DEPTH:
+                # Deeper than the policy follows: real bash runs every layer
+                # we stop at, so the blob must not be judged as one workspace
+                # path. Ask, the same way an unfollowable `cd` asks.
+                verdicts.append(
+                    Verdict(
+                        Tier.CONFIRM,
+                        "the script nests deeper than the policy follows, so "
+                        "what it does cannot be determined",
+                        "target:variable",
+                    )
+                )
+                continue
             inner = _expand_tilde(_script_tokens(inline[1]), tilde_home_for_tokens)
             # A pipe into an interpreter inside the script is the same deny as
             # one on the line itself; the structural check above never sees it
@@ -1642,10 +1894,24 @@ def explain(
                     verdicts.append(
                         Verdict(Tier.DENY, f"piping into {target}", "pipe-to-interpreter")
                     )
-            out.extend(inline_segments(inner, depth + 1))
+            # A `cd` inside the script moves the *script's* shell, not the
+            # outer one: `bash -c 'cd /etc && rm -rf X'` deletes in /etc
+            # exactly like the bare line, so the inner line gets its own base.
+            inner_base = effective_cwd(inner, line_base, home)
+            if inner_base is None:
+                verdicts.append(
+                    Verdict(
+                        Tier.CONFIRM,
+                        "changes directory in a way that cannot be followed, so "
+                        "the target is unknown",
+                        "cwd:unfollowable",
+                    )
+                )
+                inner_base = line_base
+            out.extend(inline_segments(inner, depth + 1, inner_base))
         return out
 
-    zoned_segments = inline_segments(tokens, 0)
+    zoned_segments = inline_segments(tokens, 0, base)
 
     # 5. Redirections write files too, and this is where "creates" and
     #    "clobbers" part ways: `> new.txt` inside the workspace just runs,
@@ -1707,7 +1973,7 @@ def explain(
     # 6. Path zoning, one segment at a time. Judging the whole line as a single
     #    command is what lets `cd ..` look like a write target and what makes
     #    `cp a b` ambiguous about which operand is the destination.
-    for segment, inline_script in zoned_segments:
+    for segment, inline_script, segment_base in zoned_segments:
         segment_program = _unwrap_program(segment)
         if segment_program in _CD_COMMANDS:
             continue  # already accounted for in effective_cwd
@@ -1727,14 +1993,14 @@ def explain(
             # skipping. `read_guard` is existence-aware, so a search *for* the
             # string `.env` (`grep -rn .env .`) stays a search, not a read.
             for word in _operands(segment):
-                target = _absolute(word, base, home)
+                target = _absolute(word, segment_base, home)
                 guard = read_guard(target)
                 if guard is not None:
                     verdicts.append(
                         Verdict(
                             Tier.DENY,
-                            f"{guard} holds credentials, so its contents are "
-                            "not handed to commands",
+                            f"{guard} holds credentials or is protected "
+                            "state, so its contents are not handed to commands",
                             "zone:secret-read",
                         )
                     )
@@ -1796,8 +2062,37 @@ def explain(
         # unfollowable `cd`. Read-only segments never reach this, so
         # `grep -r $PATTERN .` still runs free.
         segment_redirects = any(token in _REDIRECTS for token in segment)
-        if segment_program in PATH_OPERAND_COMMANDS or segment_redirects:
+        script_token = segment[inline_script] if inline_script is not None else None
+        # An interpreter's operand is code the interpreter will run, so
+        # `bash $X` runs whatever the expansion yields - the same unknowable
+        # target as `mv a $DEST`, one level further from the policy. The
+        # inline script itself is left out of this operand scan in two cases
+        # where it is zoned on its own: the awk family, whose program text is
+        # a positional operand (`$1` in `awk '{print $1}'` is field syntax),
+        # and a shell's `-c` script, which is re-tokenised as shell code, so
+        # `bash -c 'echo $HOME'` stays free like `echo $HOME` while
+        # `bash -c 'cp a $DEST'` asks like `cp a $DEST`. A script whose
+        # program is itself a variable (`bash -c "$X"`) keeps the outer scan;
+        # a non-shell interpreter keeps it too - `python3 -c "open('$OUT',
+        # 'w')"` does not re-tokenise into anything the operand checks see.
+        shell_script_is_zoned = (
+            script_token is not None
+            and segment_program in SHELL_INTERPRETERS
+            and not _script_starts_with_variable(script_token)
+        )
+        if (
+            segment_program in PATH_OPERAND_COMMANDS
+            or segment_program in SCRIPT_RUNNERS
+            or segment_redirects
+            or inline_script is not None
+        ):
             for word in [*_operands(segment), *_redirect_destinations(segment)]:
+                if (
+                    script_token is not None
+                    and word == script_token
+                    and (segment_program in INLINE_PROGRAM_COMMANDS or shell_script_is_zoned)
+                ):
+                    continue
                 if "$" in word or "`" in word:
                     verdicts.append(
                         Verdict(
@@ -1808,26 +2103,40 @@ def explain(
                         )
                     )
                     break
+        # Command substitution inside an inline script runs a file this
+        # policy never tokenised: `bash -c "$(cat fresh.sh)"` executes a
+        # session-authored script while the exec:recent-script gate sees only
+        # the opaque `-c` blob, and where it writes cannot be followed.
+        if script_token is not None and ("$(" in script_token or "`" in script_token):
+            verdicts.append(
+                Verdict(
+                    Tier.CONFIRM,
+                    "the inline script runs a command substitution, so what it "
+                    "does cannot be determined",
+                    "target:variable",
+                )
+            )
 
         # The inline script's token is code, not a path: left in, `bash -c
         # 'cp NOTES.md /etc/X'` is judged as a write to a nonsense project
         # path named after the whole script. The commands inside it were
         # zoned above; here it is dropped so only real operands remain. The
-        # variable check keeps the full segment, because a `$` in inline
-        # code means exactly the same unknowable target as one on the line.
+        # variable check keeps the full segment except where the script is
+        # zoned on its own (a shell's script, the awk program), because there
+        # the inner segments already decided the same way as the bare line.
         zone_tokens = segment
         if inline_script is not None:
             zone_tokens = [*segment[:inline_script], *segment[inline_script + 1 :]]
-        targets = referenced_paths(zone_tokens, base, home)
+        targets = referenced_paths(zone_tokens, segment_base, home)
         # Bare operands: `rm -rf data` names its target with no separator in it,
         # so the path-shapedness test above cannot see it. Gated on the program,
         # because `kill 1234` takes a pid and not a path.
-        targets += operand_paths(zone_tokens, segment_program, base, home)
+        targets += operand_paths(zone_tokens, segment_program, segment_base, home)
         # A commit message is prose. `git commit -m 'stop touching /etc'` names
         # a path the same way `rm /etc/passwd` does, and reading it as a write
         # target makes those messages impossible to commit.
         if segment_program in MESSAGE_COMMANDS:
-            targets = [p for p in targets if p not in _message_paths(segment, base, home)]
+            targets = [p for p in targets if p not in _message_paths(segment, segment_base, home)]
         # Quoted spans, for interpreters: `python3 -c "open('/etc/x','w')"`
         # names no path token at all. Scoped to the interpreter's own segment so
         # a commit message quoting a path stays a commit message.
@@ -1840,14 +2149,14 @@ def explain(
                 span = next(group for group in match.groups() if group is not None).strip()
                 if not span:
                     continue
-                target = _absolute(span, base, home)
+                target = _absolute(span, segment_base, home)
                 guard = read_guard(target)
                 if guard is not None:
                     verdicts.append(
                         Verdict(
                             Tier.DENY,
-                            f"{guard} holds credentials, so its contents are "
-                            "not handed to commands",
+                            f"{guard} holds credentials or is protected "
+                            "state, so its contents are not handed to commands",
                             "zone:secret-read",
                         )
                     )
@@ -1920,7 +2229,8 @@ def explain(
                 verdicts.append(
                     Verdict(
                         Tier.DENY,
-                        f"{protected_subpath} inside the project runs code on someone else's command",
+                        f"{protected_subpath} inside the project is protected "
+                        "state (it decides what runs, or what the bot remembers)",
                         "zone:protected-subpath",
                     )
                 )
@@ -1977,10 +2287,10 @@ def explain(
     if session_start is None:
         session_start = SESSION_START
     authored_here = _command_write_targets(tokens, base, home)
-    for segment, _ in zoned_segments:
+    for segment, _, segment_base in zoned_segments:
         candidates = [
-            *script_paths(segment, base, home),
-            _direct_script(segment, base, home),
+            *script_paths(segment, segment_base, home),
+            _direct_script(segment, segment_base, home),
         ]
         for script in candidates:
             if script is None:

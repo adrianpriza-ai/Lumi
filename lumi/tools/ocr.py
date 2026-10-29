@@ -8,6 +8,7 @@ Local image files always use the photo route (vision when set, else default).
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 from pathlib import Path
@@ -22,6 +23,8 @@ from ..util.log import get_logger
 from ..util.net import validate_fetch_url
 from ..util.text import fence_untrusted, truncate
 from .base import Tool, ToolContext, ToolError, ToolResult
+from .files import foreign_uploads
+from .safety import read_guard
 
 log = get_logger(__name__)
 
@@ -118,12 +121,12 @@ class OCRTool(Tool):
         if not raw:
             return ToolResult.failure("`path` is required — a project file path or an http(s) URL.")
         if raw.lower().startswith(("http://", "https://")):
-            if reason := validate_fetch_url(raw):
+            if reason := await asyncio.to_thread(validate_fetch_url, raw):
                 return ToolResult.failure(
                     f"refusing to OCR {raw!r}: {reason} (only globally reachable http/https hosts)"
                 )
             return await self._url(raw)
-        return await self._file(Path(raw), arguments)
+        return await self._file(Path(raw), arguments, ctx)
 
     async def _url(self, url: str) -> ToolResult:
         """OCR a public document URL — only the dedicated API can do this."""
@@ -140,10 +143,21 @@ class OCRTool(Tool):
             raise ToolError(str(exc)) from exc
         return _result(pages, source=url)
 
-    async def _file(self, path: Path, arguments: dict[str, Any]) -> ToolResult:
+    async def _file(self, path: Path, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         if not is_within(path := resolve(path), project_root()):
             return ToolResult.failure(
                 f"{relative_to_root(path)} is outside the project; I only read files inside it."
+            )
+        # Same read boundary as the files tool: another chat's uploads are not
+        # this chat's, and a credential file is not OCR material — its
+        # transcription would leave for a third-party API with no tap.
+        if (foreign := foreign_uploads(path, project_root(), ctx.chat_id)) is not None:
+            return ToolResult.failure(
+                f"workspace/uploads/{foreign} belongs to another chat; I only read this chat's uploads."
+            )
+        if (guard := read_guard(path)) is not None:
+            return ToolResult.failure(
+                f"{guard} holds credentials, so it is not sent for OCR."
             )
         if not path.is_file():
             return ToolResult.failure(f"no such file: {relative_to_root(path)}")

@@ -69,3 +69,26 @@ def test_non_global_literal_ips_are_refused(host: str) -> None:
 )
 def test_private_hostnames_are_refused(host: str) -> None:
     assert validate_fetch_url(f"https://{host}/x") is not None
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # UTS46 maps the ideographic full stop to '.', so a fetcher sees
+        # 127.0.0.1 while urlsplit's hostname is not an ASCII literal. A
+        # resolver without IDN support (musl) never resolved it at all.
+        "http://127\u30020\u30020\u30021/",
+        # WHATWG parsers read the authority up to the backslash as userinfo,
+        # so the fetcher connects to 127.0.0.1 while urlsplit reports
+        # example.com — a parser differential, refused rather than guessed at.
+        "http://127.0.0.1\\@example.com/",
+    ],
+)
+def test_parser_differential_hosts_are_refused(url: str) -> None:
+    assert validate_fetch_url(url) is not None
+
+
+def test_an_idn_host_is_checked_as_the_punycode_the_fetcher_resolves() -> None:
+    # 'münchen.example' encodes to an ASCII label before the host checks run;
+    # the example TLD is not resolvable here either, which is not a refusal.
+    assert validate_fetch_url("https://münchen.example/") is None

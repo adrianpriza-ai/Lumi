@@ -20,6 +20,7 @@ from typing import Any
 from ....config import FirecrawlConfig
 from ....llm.keypool import KeyPool, mask
 from ....util.log import get_logger
+from ....util.net import validate_fetch_url
 from .base import Page, SearchHit, SearchResult, WebProvider, recent_cutoff
 
 log = get_logger(__name__)
@@ -202,6 +203,10 @@ class FirecrawlProvider(WebProvider):
     async def _top_up(self, result: SearchResult) -> None:
         """Fill in missing bodies for the top hits with a real scrape."""
         thin = [hit for hit in result.hits if not hit.content.strip()][: self.config.auto_scrape_top_n]
+        # Search results are someone else's index: a hit whose URL the tool
+        # itself would refuse to fetch is not scraped behind its back either
+        # (finding K).
+        thin = [hit for hit in thin if validate_fetch_url(hit.url) is None]
         if not thin:
             return
         log.debug("scraping %d firecrawl hit(s) for body text", len(thin))

@@ -107,8 +107,18 @@ class Page:
     markdown: str = ""
 
     def render(self, max_chars: int) -> str:
-        head = f"--- {self.title or self.url} ---\n{self.url}\n"
-        return head + fence_untrusted(truncate(self.markdown.strip(), max_chars))
+        # Title and URL are attacker-influenced (ogTitle, a page's <title>,
+        # whatever the fetcher followed to), so they are rendered *inside* the
+        # fence with the body — instruction text in a page title must not sit
+        # in tool-protocol framing — and truncated so a title cannot pad the
+        # prompt (finding I).
+        title = truncate((self.title or "").strip(), 200, marker="…")
+        head = f"url: {self.url}\n"
+        if title:
+            head += f"title: {title}\n"
+        if not self.markdown.strip():
+            return fence_untrusted(head.strip())
+        return fence_untrusted(head + truncate(self.markdown.strip(), max_chars))
 
 
 class WebProvider(abc.ABC):

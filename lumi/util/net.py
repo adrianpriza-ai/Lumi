@@ -101,6 +101,21 @@ def validate_fetch_url(url: str) -> str | None:
     host = parts.hostname
     if not host:
         return "missing hostname"
+    # Internationalised hosts are checked as the punycode the fetcher will
+    # actually resolve. Mapping here (uts46-style) would turn '127。0。0。1'
+    # into the loopback literal it is, and a resolver without IDN support
+    # (musl has none) would otherwise get a host the checks never saw — so
+    # anything still non-ASCII is refused rather than guessed at. Backslashes
+    # are refused for the same reason: a WHATWG fetcher reads
+    # 'http://127.0.0.1\\@example.com/' as host 127.0.0.1 while urlsplit
+    # reports example.com, and a parser differential here is a bypass.
+    if "\\" in parts.netloc or "\\" in host:
+        return "backslash in the authority"
+    if not host.isascii():
+        try:
+            host = host.encode("idna").decode("ascii")
+        except UnicodeError:
+            return f"non-ASCII hostname {host!r} (send international domains as punycode)"
     return _host_reason(host)
 
 

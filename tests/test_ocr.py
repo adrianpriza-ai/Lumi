@@ -300,6 +300,27 @@ async def test_a_missing_file_says_so(config, project: Path) -> None:
     assert "no such file" in result.text
 
 
+async def test_another_chats_uploads_are_out_of_reach(config, project: Path) -> None:
+    path = project / "workspace" / "uploads" / "42" / "paper.pdf"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(make_pdf("hello"))
+    result = await OCRTool(config).invoke(
+        {"path": str(path)}, ToolContext(source="cli", chat_id=43)
+    )
+    assert not result.ok
+    assert "another chat" in result.text
+
+
+async def test_a_credential_file_is_not_sent_for_ocr(config, project: Path) -> None:
+    """A PDF is still a document, but one whose name marks it as credentials
+    is not handed to a third-party OCR API with no tap."""
+    path = project / "workspace" / ".env.pdf"
+    path.write_bytes(make_pdf("hello"))
+    result = await OCRTool(config).invoke({"path": str(path)}, ctx())
+    assert not result.ok
+    assert "credentials" in result.text
+
+
 # --------------------------------------------------------------------------- #
 # the dedicated OCR API ([tools.ocr] provider = "mistral")
 # --------------------------------------------------------------------------- #

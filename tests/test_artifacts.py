@@ -11,7 +11,7 @@ import pytest
 from conftest import FakeLLM, backdate, make_reply
 
 from lumi.artifacts import DEFAULT_MAX_BYTES, ArtifactError, ArtifactStore
-from lumi.tools.base import ToolContext
+from lumi.tools.base import ToolContext, ToolError
 from lumi.tools.files import FilesTool
 
 
@@ -243,6 +243,29 @@ async def test_upload_action_sends_an_existing_file(files: FilesTool, config) ->
     assert result.artifacts[0].path == "workspace/made-by-shell.csv"
     # The upload action never modifies the file.
     assert (config.shell_cwd / "made-by-shell.csv").read_text(encoding="utf-8") == "a,b\n1,2\n"
+
+
+async def test_another_chats_uploads_are_out_of_reach(files: FilesTool, config) -> None:
+    """Incoming documents are stored per chat; every read inside the project
+    used to be allowed from any chat, so chat B could list and upload chat A's
+    files back to itself with no approval."""
+    foreign = config.root / "workspace" / "uploads" / "42" / "notes.txt"
+    foreign.parent.mkdir(parents=True)
+    foreign.write_text("chat 42 only", encoding="utf-8")
+    path = "workspace/uploads/42/notes.txt"
+
+    for arguments in (
+        {"action": "read", "path": path},
+        {"action": "list", "path": "workspace/uploads/42"},
+        {"action": "upload", "path": path},
+    ):
+        with pytest.raises(ToolError, match="another chat"):
+            await files.invoke(arguments, ctx(chat_id=43))
+
+    # The owning chat reads its own uploads, and the local CLI, which has no
+    # chat, is not restricted.
+    assert (await files.invoke({"action": "read", "path": path}, ctx(chat_id=42))).ok
+    assert (await files.invoke({"action": "read", "path": path}, ctx())).ok
 
 
 async def test_upload_of_a_missing_file_fails_cleanly(files: FilesTool) -> None:

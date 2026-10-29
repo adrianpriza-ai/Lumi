@@ -554,6 +554,75 @@ def test_inline_script_inside_the_workspace_is_fine() -> None:
     assert verdict("bash -c 'ls -la'").tier is safety.Tier.ALLOW
 
 
+def test_awk_program_and_variable_indirection_are_zoned() -> None:
+    # The 13.2 candidates: awk's program text is code hiding behind a
+    # read-only name, an interpreter's `$` operand runs whatever the
+    # expansion yields, and a `-c` value with command substitution executes
+    # a file the zoning never tokenised.
+    assert verdict("""awk 'BEGIN{print "pwned" > "/etc/X"}'""").blocked
+    assert verdict("""awk 'BEGIN{system("rm -rf /etc/X")}'""").blocked
+    assert verdict("X='cp NOTES.md /etc/X'; bash $X").needs_approval
+    assert verdict("""bash -c "$(cat fresh.sh)" """).needs_approval
+    assert verdict("""bash -c "`cat fresh.sh`" """).needs_approval
+    # Benign awk stays free: `$1` there is field syntax, not an indirection.
+    assert verdict("awk '{print $1}' data.csv").tier is safety.Tier.ALLOW
+    assert verdict("awk '{print $1}' /etc/passwd").tier is safety.Tier.ALLOW
+
+
+def test_a_variable_inside_a_zoned_shell_script_is_judged_by_its_command() -> None:
+    # The 13.2 variable check is for an interpreter's *program* operand
+    # (`bash $X`); inside a shell `-c` script the same word is zoned exactly
+    # like the bare line, so an ordinary argument stays free and a path
+    # operand or redirect still asks.
+    assert verdict("bash -c 'echo $HOME'").tier is safety.Tier.ALLOW
+    assert verdict("sh -c 'echo $HOME'").tier is safety.Tier.ALLOW
+    assert verdict("env bash -c 'echo $HOME'").tier is safety.Tier.ALLOW
+    assert verdict("bash -c 'echo $HOME > log.txt'").needs_approval
+    assert verdict("bash -c 'cp NOTES.md $DEST'").needs_approval
+    # What the script *is* stays unknowable when the variable is its program.
+    assert verdict('bash -c "$CMD"').needs_approval
+    assert verdict("bash -c 'FOO=1 $CMD'").needs_approval
+    assert verdict('bash -c "$(cat fresh.sh)"').needs_approval
+    # A non-shell interpreter does not re-tokenise into commands the operand
+    # checks see, so its script keeps the conservative outer check.
+    assert verdict("python3 -c \"open('$OUT','w')\"").needs_approval
+
+
+def test_the_six_downgrade_shapes_match_their_baselines() -> None:
+    # 13.7: each of these used to land a tier below its bare form, because
+    # the code behind it was never tokenised as code.
+    assert verdict("bash -cx 'rm -rf /etc/X'").blocked  # flag cluster, c not last
+    assert verdict("bash -cl 'rm -rf /etc/X'").blocked
+    assert verdict("env -u FOO bash -c 'rm -rf /etc/X'").blocked  # value flag
+    assert verdict('env -S "rm -rf /etc/X"').blocked  # split string is a command line
+    assert verdict('deno eval "rm -rf /etc/X"').blocked  # subcommand, not a flag
+    assert verdict("bash -c 'cd /etc && rm -rf X'").blocked  # inner cd moves the base
+    # Five layers exceed _MAX_INLINE_DEPTH: the policy asks rather than
+    # judging the opaque blob as one nonsense workspace path.
+    deep = "rm -rf /etc/X"
+    for _ in range(5):
+        deep = "bash -c '" + deep.replace("'", "'\\''") + "'"
+    assert verdict(deep).tier is not safety.Tier.ALLOW
+    # The benign side of every shape stays free.
+    assert verdict("bash -c 'cd /app && make'").tier is safety.Tier.ALLOW
+    assert verdict("env -u FOO cat /etc/passwd").tier is safety.Tier.ALLOW
+    assert verdict("env -i bash -c 'echo hi'").tier is safety.Tier.ALLOW
+
+
+def test_env_split_behind_a_wrapper_and_deno_flag_tokens_are_zoned() -> None:
+    # The two residual edges of the 13.7 pass: env -S behind an outer wrapper
+    # and flag tokens between `deno eval` and its code.
+    assert verdict('timeout 5 env -S "rm -rf /etc/X"').blocked
+    assert verdict("nohup env -S 'cp NOTES.md /etc/X'").blocked
+    assert verdict('env FOO=1 -S "rm -rf /etc/X"').blocked
+    assert verdict('deno eval --ext ts "rm -rf /etc/X"').blocked  # value flag
+    assert verdict('deno eval --quiet "rm -rf /etc/X"').blocked  # bool flag
+    assert verdict('deno --quiet eval "rm -rf /etc/X"').blocked  # flag before
+    # Benign forms stay free.
+    assert verdict("env -S 'echo hi'").tier is safety.Tier.ALLOW
+    assert verdict("deno run file.ts").tier is safety.Tier.ALLOW
+
+
 # --------------------------------------------------------------------------- #
 # executing a script authored during this session
 # --------------------------------------------------------------------------- #
@@ -1088,3 +1157,29 @@ def test_tilde_is_expanded_against_the_home_the_child_sees(tmp_path: Path) -> No
         tilde_home=root,
     )
     assert result.tier is safety.Tier.ALLOW, result
+
+
+# --------------------------------------------------------------------------- #
+# per-chat bot state under data/ (finding A)
+# --------------------------------------------------------------------------- #
+
+
+def test_per_chat_memory_and_history_are_not_shell_material(tmp_path: Path) -> None:
+    """One chat's memory is rendered as another chat's system prompt, and a
+    forged history row replays as fact — so the shell may neither read one
+    chat's state from another nor write it at all."""
+    root, home = _project(tmp_path)
+    memory = root / "data" / "memory" / "-1002" / "MEMORY.md"
+    memory.parent.mkdir(parents=True)
+    memory.write_text("# Memory\n", encoding="utf-8")
+    history = root / "data" / "history"
+    history.mkdir(parents=True)
+    (history / "-1003.jsonl").write_text("{}\n", encoding="utf-8")
+
+    assert _verdict("cat ../data/memory/-1002/MEMORY.md", root, home).blocked
+    assert _verdict("ls ../data/memory", root, home).blocked
+    assert _verdict("cat ../data/history/-1003.jsonl", root, home).blocked
+    assert _verdict("echo injected >> ../data/memory/-1002/MEMORY.md", root, home).blocked
+    assert _verdict("rm -rf ../data/history", root, home).blocked
+    # The project's own MEMORY.md is the owner's file and stays readable.
+    assert _verdict("cat MEMORY.md", root, home).tier is safety.Tier.ALLOW
