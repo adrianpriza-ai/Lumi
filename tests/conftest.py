@@ -55,6 +55,14 @@ def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         encoding="utf-8",
     )
     monkeypatch.setenv("LUMI_HOME", str(tmp_path))
+    # A throwaway HOME: the real one holds ~/.agents/mcp.json and the
+    # user-level skill directory (~/.agents/skills), and neither may leak into
+    # a test — a stray user skill would show up in the system prompt and change
+    # what the context tests are measuring. Tests that exercise those files
+    # re-point HOME at their own directory.
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
     monkeypatch.setenv("TELEGRAM_OWNER_ID", "42")
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")

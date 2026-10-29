@@ -803,6 +803,7 @@ STEP_LABELS = {
     "more_context": "🕒 More Context",
     "context7": "📚 Context7",
     "send": "✉️ Send",
+    "skills": "🧩 Skills",
 }
 
 

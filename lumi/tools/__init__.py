@@ -25,6 +25,7 @@ from .ocr import OCRTool
 from .registry import ToolRegistry
 from .send import SendTool
 from .shell import ShellTool
+from .skills import SkillsTool
 from .web import WebTool
 
 log = get_logger(__name__)
@@ -53,6 +54,7 @@ def build_registry(config: Config, memory: MemoryStore) -> ToolRegistry:
         "context7": lambda: Context7Tool(config),
         "ocr": lambda: OCRTool(config),
         "send": lambda: SendTool(config),
+        "skills": lambda: SkillsTool(config),
     }
 
     for name, factory in candidates.items():
@@ -91,5 +93,6 @@ __all__ = [
     "Context7Tool",
     "OCRTool",
     "SendTool",
+    "SkillsTool",
     "build_registry",
 ]

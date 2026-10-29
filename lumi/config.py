@@ -488,7 +488,10 @@ class ShellConfig:
 @dataclass(slots=True)
 class FilesConfig:
     enabled: bool = True
-    writable: list[str] = field(default_factory=lambda: ["workspace"])
+    #: ``data/skills`` is here so the owner's skills can be written and edited
+    #: with this tool: a directory of instruction files the model maintains,
+    #: not project state — that is what safety's protected-path guard is for.
+    writable: list[str] = field(default_factory=lambda: ["workspace", "data/skills"])
     #: Characters of a file handed to the model on read. Generous by default
     #: because a read is usually done to look at the whole thing; 0 means no
     #: cap, and the model's own ``max_bytes`` argument is there for the files
@@ -873,6 +876,7 @@ class ToolsConfig:
             "context7",
             "ocr",
             "send",
+            "skills",
         ]
     )
     shell: ShellConfig = field(default_factory=ShellConfig)
@@ -1343,6 +1347,7 @@ def validate(config: Config) -> list[str]:
             "context7",
             "ocr",
             "send",
+            "skills",
         }:
             problems.append(f"unknown tool {name!r} in tools.enabled")
 

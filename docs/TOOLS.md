@@ -15,6 +15,7 @@
 | `web` | Search and fetch, across three interchangeable providers |
 | `context7` | Up-to-date library docs from https://context7.com; auto-enables on `CONTEXT7_API_KEY` |
 | `send` | Send the owner a message *mid-turn*, so one reply can arrive in parts |
+| `skills` | List and read the owner's skills (`data/skills/`, `~/.agents/skills/`), no approval to read |
 
 ## Reading and searching (`read_file`, `list_files`, `grep`)
 
@@ -131,7 +132,7 @@ before it changes; the shell asks separately before *running* such a file
 
 `edit` is the right default for a change to an existing file; `write` is for
 creating one or replacing all of it. Both are confined to `tools.files.writable`
-(default: `workspace/`) and both refuse the shell policy's protected paths —
+(default: `workspace/` and `data/skills/`) and both refuse the shell policy's protected paths —
 a `.git/hooks` file, an ssh key, or the bot's own `config.toml`,
 `data/whitelist.json` or `.mcp.json` is off-limits through either tool.
 
@@ -155,6 +156,47 @@ archives — no `.exe`), be non-empty, live under the project, and fit under
 A blocked delivery degrades to a note in the chat, never a failed turn. Turn
 the whole feature off with `tools.files.uploads = false` — the `files` tool
 keeps working for reads and writes.
+
+## Skills (`skills`)
+
+A **skill** is a directory with a `SKILL.md` in it — a name, a one-line
+description and the instructions for a job the owner does more than once. The
+tool reads them from two roots, in this order:
+
+- `data/skills/<name>/SKILL.md` — this project's skills, committed next to the
+  code they describe and maintained with the `files` tool;
+- `~/.agents/skills/<name>/SKILL.md` — the standard user-level directory, so a
+  skill installed once is available in every project.
+
+A project skill shadows a user skill of the same name, and `list` says so.
+
+The **catalog — every skill's name and one-line description — is part of the
+system prompt**, so the model sees what exists on every turn and loads the one
+that matches the task in front of it before starting. The bodies stay on disk:
+a 30-skill install costs a line per skill in the prompt, not a skill's worth of
+context, and the block stops growing at 60 entries (the rest is one `list`
+away). With no skills, or with the tool off, there is no section at all.
+
+Two actions, both **read-only, so neither ever asks for approval** — the same
+contract `read_file` has:
+
+- `list` — every skill found, with its description and which root it came
+  from. An empty listing says where to put the first one.
+- `read` — load a skill's `SKILL.md` into the conversation, by `name`. Pass
+  `file` to read any other file inside that skill's directory (a script or a
+  reference the skill points at); the file must stay inside the skill, and the
+  secret-file guard still applies, so a `.env` parked in a skill directory is
+  refused like any other.
+
+Creating or changing a skill is the `files` tool's job: `data/skills` is one of
+its writable roots, so `files` with `action: "write"` and
+`path: "data/skills/<name>/SKILL.md"` is how a skill is born. The shell's
+policy covers it too — `data/skills` is not on the protected list (`data/memory`,
+`data/history` and `data/whitelist.json` are), so nothing about it prompts.
+
+Skill contents are instructions the *owner* kept, and they are read like any
+other project file: they add to the rules the model was given, never replace
+them. Remove `"skills"` from `tools.enabled` to take the tool away.
 
 ## Shell safety
 

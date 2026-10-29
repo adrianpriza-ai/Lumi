@@ -179,6 +179,64 @@ async def test_system_prompt_mentions_context7_when_the_key_is_set(config, monke
     assert any(s["function"]["name"] == "context7" for s in agent.registry.specs())
 
 
+async def test_system_prompt_lists_skills_by_their_description(config) -> None:
+    """Relevance is decided from the description, so the catalog has to be in
+    front of the model every turn — while the body stays on disk until one
+    actually matches, which is what keeps the block cheap."""
+    skill = config.data_dir / "skills" / "deploy"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\ndescription: Ship a release to production.\n---\n1. run the tests\n",
+        encoding="utf-8",
+    )
+
+    agent = make_agent(config, [make_reply("ok")])
+    await agent.handle(CHAT, "hi")
+
+    system = agent.llm.calls[0][0]["content"]
+    assert "## Skills" in system
+    assert "`deploy` — Ship a release to production." in system
+    assert '`skills` tool (`action: "read"`, `name: ...`)' in system
+    assert "1. run the tests" not in system  # metadata only, body still on disk
+
+
+async def test_system_prompt_has_no_skills_section_when_there_are_none(config) -> None:
+    agent = make_agent(config, [make_reply("ok")])
+    assert "## Skills" not in agent.system_prompt()
+
+
+async def test_system_prompt_omits_the_catalog_when_the_skills_tool_is_off(config) -> None:
+    """A disabled tool is invisible in the prompt, exactly like one whose API
+    key is unset: never advertise a capability the model cannot call."""
+    skill = config.data_dir / "skills" / "deploy"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("no front matter here\n", encoding="utf-8")
+    config.tools.enabled = [name for name in config.tools.enabled if name != "skills"]
+
+    prompt = make_agent(config, []).system_prompt()
+
+    assert "## Skills" not in prompt
+    assert "deploy" not in prompt
+
+
+async def test_the_skill_catalog_is_bounded(config, monkeypatch) -> None:
+    """The block is paid for on every turn of every conversation, so it stops
+    growing at the cap and points at `list` for the rest instead of being
+    silently cut off."""
+    monkeypatch.setattr("lumi.tools.skills.MAX_PROMPT_SKILLS", 3)
+    root = config.data_dir / "skills"
+    for i in range(5):
+        skill = root / f"skill-{i}"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(f"body {i}\n", encoding="utf-8")
+
+    catalog = make_agent(config, []).skills_prompt()
+
+    assert catalog.count("- `skill-") == 3
+    assert "and 2 more" in catalog
+    assert '`action: "list"`' in catalog
+
+
 async def test_history_is_replayed(config) -> None:
     history = History(config.history_dir)
     history.append(CHAT, "user", "earlier question")

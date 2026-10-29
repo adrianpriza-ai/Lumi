@@ -22,6 +22,7 @@ from lumi.tools.more_context import (
 from lumi.tools.registry import ToolRegistry
 from lumi.tools.send import SendTool
 from lumi.tools.shell import SECRET_PATTERN, ShellTool
+from lumi.tools.skills import SkillsTool
 from lumi.util import env as env_module
 from lumi.util.env import scrubbed_env
 
@@ -1530,3 +1531,206 @@ async def test_more_context_only_sees_its_own_chat(config) -> None:
     private = await tool.invoke({}, ctx(chat_id=42))
     assert "group line" in group.text and "private line" not in group.text
     assert "private line" in private.text and "group line" not in private.text
+
+
+# --------------------------------------------------------------------------- #
+# skills
+# --------------------------------------------------------------------------- #
+
+
+def _skill(root: Path, name: str, body: str) -> Path:
+    directory = root / name
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "SKILL.md").write_text(body, encoding="utf-8")
+    return directory
+
+
+@pytest.fixture
+def skills(config, monkeypatch) -> SkillsTool:
+    """Both roots inside the throwaway project: the real ~/.agents/skills must
+    never leak into a test, the same way conftest pins the MCP user config."""
+    monkeypatch.setenv("HOME", str(config.root / "fake-home"))
+    (config.root / "fake-home" / ".agents" / "skills").mkdir(parents=True)
+    return SkillsTool(config)
+
+
+async def test_skills_list_shows_both_roots(skills: SkillsTool, config) -> None:
+    _skill(
+        config.data_dir / "skills",
+        "code-review",
+        "---\nname: code-review\ndescription: Reviews diffs.\n---\n# Code review\nDo the thing.\n",
+    )
+    _skill(config.root / "fake-home" / ".agents" / "skills", "deploy", "# Deploy\nShip it.\n")
+
+    result = await skills.invoke({"action": "list"}, ctx())
+
+    assert result.ok
+    assert "code-review — Reviews diffs." in result.text
+    assert "[project: data/skills/code-review/SKILL.md]" in result.text
+    # No front matter: the first body line stands in as the description.
+    assert "deploy — Deploy" in result.text
+    assert "[user: fake-home/.agents/skills/deploy/SKILL.md]" in result.text
+    assert [skill["name"] for skill in result.data["skills"]] == ["code-review", "deploy"]
+
+
+async def test_skills_list_says_so_when_there_are_none(skills: SkillsTool) -> None:
+    result = await skills.invoke({"action": "list"}, ctx())
+    assert result.ok
+    assert "No skills found" in result.text
+    assert "data/skills" in result.text  # and where to put one
+
+
+async def test_a_directory_without_skill_md_is_not_a_skill(skills: SkillsTool, config) -> None:
+    (config.data_dir / "skills" / "half-finished").mkdir(parents=True)
+    result = await skills.invoke({"action": "list"}, ctx())
+    assert "half-finished" not in result.text
+
+
+async def test_skills_reads_need_no_approval(skills: SkillsTool, config) -> None:
+    """list and read are read-only, so the owner is never prompted — the same
+    contract read_file has. ``ctx()`` is unconfirmed on purpose: a raise here
+    would be a prompt in the chat for looking at a file."""
+    _skill(config.data_dir / "skills", "deploy", "Ship it.\n")
+    for arguments in ({"action": "list"}, {"action": "read", "name": "deploy"}):
+        result = await skills.invoke(arguments, ctx())
+        assert result.ok, arguments
+
+
+async def test_skills_read_loads_the_instructions(skills: SkillsTool, config) -> None:
+    _skill(
+        config.data_dir / "skills",
+        "release",
+        "---\ndescription: Cut a release.\n---\n1. bump the version\n",
+    )
+    result = await skills.invoke({"action": "read", "name": "release"}, ctx())
+    assert result.ok
+    assert "1. bump the version" in result.text
+    assert result.data["path"].endswith("SKILL.md")
+    assert "read skill release" in result.summary
+
+
+async def test_skills_read_falls_back_to_the_user_root(skills: SkillsTool, config) -> None:
+    _skill(config.root / "fake-home" / ".agents" / "skills", "deploy", "Ship it.\n")
+    result = await skills.invoke({"action": "read", "name": "deploy"}, ctx())
+    assert result.ok
+    assert "Ship it." in result.text
+    assert str(config.root / "fake-home") in result.data["path"]
+
+
+async def test_a_project_skill_shadows_the_user_one(skills: SkillsTool, config) -> None:
+    _skill(config.data_dir / "skills", "shared", "from the project\n")
+    _skill(config.root / "fake-home" / ".agents" / "skills", "shared", "from the user\n")
+
+    read = await skills.invoke({"action": "read", "name": "shared"}, ctx())
+    assert "from the project" in read.text
+    assert "from the user" not in read.text
+
+    listing = await skills.invoke({"action": "list"}, ctx())
+    assert len(listing.data["skills"]) == 1  # one entry, not two competing ones
+    assert "shadows" in listing.text
+
+
+async def test_skills_read_of_an_unknown_name_lists_what_exists(skills: SkillsTool, config) -> None:
+    _skill(config.data_dir / "skills", "real", "body\n")
+    with pytest.raises(ToolError, match="Available: real"):
+        await skills.invoke({"action": "read", "name": "ghost"}, ctx())
+
+
+async def test_skills_read_refuses_a_name_that_is_not_a_directory_name(
+    skills: SkillsTool,
+) -> None:
+    for bad in ("", "..", "../secrets", "a/b", "/etc", "has space"):
+        with pytest.raises(ToolError):
+            await skills.invoke({"action": "read", "name": bad}, ctx())
+
+
+async def test_skills_read_refuses_a_file_outside_the_skill(skills: SkillsTool, config) -> None:
+    _skill(config.data_dir / "skills", "scoped", "body\n")
+    for bad in ("../../.env", "/etc/passwd", "../other/SKILL.md"):
+        with pytest.raises(ToolError, match="must be a path inside"):
+            await skills.invoke({"action": "read", "name": "scoped", "file": bad}, ctx())
+
+
+async def test_skills_read_follows_no_symlink_out_of_the_skill(skills: SkillsTool, config) -> None:
+    skill = _skill(config.data_dir / "skills", "linked", "body\n")
+    outside = config.root / "outside.md"
+    outside.write_text("leaked\n", encoding="utf-8")
+    try:
+        (skill / "escape.md").symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+
+    with pytest.raises(ToolError, match="outside the linked/ skill directory"):
+        await skills.invoke({"action": "read", "name": "linked", "file": "escape.md"}, ctx())
+
+
+async def test_skills_read_a_supporting_file(skills: SkillsTool, config) -> None:
+    skill = _skill(config.data_dir / "skills", "ref", "body\n")
+    (skill / "notes.md").write_text("extra detail\n", encoding="utf-8")
+    result = await skills.invoke({"action": "read", "name": "ref", "file": "notes.md"}, ctx())
+    assert result.ok
+    assert "extra detail" in result.text
+
+
+async def test_skills_read_missing_file_fails_cleanly(skills: SkillsTool, config) -> None:
+    _skill(config.data_dir / "skills", "ref", "body\n")
+    result = await skills.invoke({"action": "read", "name": "ref", "file": "nope.md"}, ctx())
+    assert not result.ok
+    assert "no such file" in result.text
+
+
+async def test_skills_unknown_action(skills: SkillsTool) -> None:
+    with pytest.raises(ToolError, match="unknown action"):
+        await skills.invoke({"action": "install"}, ctx())
+
+
+async def test_data_skills_is_writable_with_the_files_tool(files: FilesTool, config) -> None:
+    """data/skills is a writable root: the model creates and maintains skills
+    there, the same way it maintains any other project file."""
+    result = await files.invoke(
+        {"action": "write", "path": "data/skills/demo/SKILL.md", "content": "# Demo\n"},
+        ctx(confirmed=True),
+    )
+    assert result.ok
+    target = config.data_dir / "skills" / "demo" / "SKILL.md"
+    assert target.read_text(encoding="utf-8") == "# Demo\n"
+
+
+async def test_data_skills_is_readable(files: FilesTool, config) -> None:
+    path = config.data_dir / "skills" / "demo" / "SKILL.md"
+    path.parent.mkdir(parents=True)
+    path.write_text("# Demo\n", encoding="utf-8")
+    backdate(path)
+
+    result = await files.invoke({"action": "read", "path": "data/skills/demo/SKILL.md"}, ctx())
+    assert result.ok
+    assert "# Demo" in result.text
+
+
+async def test_editing_a_skill_needs_no_approval(files: FilesTool, config) -> None:
+    """An anchored edit in data/skills behaves exactly like one in the
+    workspace: no tap, because it can only touch the text it names."""
+    path = config.data_dir / "skills" / "demo" / "SKILL.md"
+    path.parent.mkdir(parents=True)
+    path.write_text("# Demo\nDo the demo.\n", encoding="utf-8")
+    backdate(path)
+
+    result = await files.invoke(
+        {
+            "action": "edit",
+            "path": "data/skills/demo/SKILL.md",
+            "old_string": "Do the demo.",
+            "new_string": "Do it well.",
+        },
+        ctx(),
+    )
+    assert result.ok
+    assert "Do it well." in path.read_text(encoding="utf-8")
+
+
+async def test_the_shell_creates_a_skill_without_asking(shell: ShellTool) -> None:
+    """safety protects data/memory, data/history and data/whitelist.json —
+    data/skills is ordinary project material, so creating one runs."""
+    result = await shell.invoke({"command": "mkdir -p ../data/skills/demo"}, ctx(source="cli"))
+    assert result.ok
+    assert "Refused" not in result.text

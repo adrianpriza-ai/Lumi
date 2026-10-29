@@ -39,6 +39,7 @@ from .memory import History, MemoryFile, MemoryStore
 from .paths import relative_to_root
 from .personality import Personality
 from .tools import NeedsApproval, ToolContext, ToolRegistry, build_registry
+from .tools.skills import SkillsTool
 from .util.log import get_logger
 
 log = get_logger(__name__)
@@ -144,6 +145,19 @@ When you use a tool:
 - Only the tools listed above are available right now. If a capability is
   missing here it is because an API key is unset or the tool was disabled in
   config — say so plainly rather than trying to call it.
+"""
+
+SKILLS_PREAMBLE = """\
+## Skills
+
+Reusable instructions the owner keeps for jobs they do more than once. What
+is listed below is only the catalog — a skill's body stays on disk until it
+is relevant. When the task in front of you matches one, load it with the
+`skills` tool (`action: "read"`, `name: ...`) before you start the work, then
+follow it: a skill's instructions add to yours, never replace them. Reading
+one never needs approval.
+
+{catalog}
 """
 
 FORMAT_PREAMBLE = """\
@@ -354,6 +368,22 @@ class Agent:
         """
         return self.memory.get(self.config.memory_scope_of(chat_id))
 
+    def skills_prompt(self) -> str:
+        """The skill catalog for the system prompt, or ``""`` when there is none.
+
+        Only the registered tool knows where skills live and what their
+        front-matter descriptions say, so the block is assembled from it
+        rather than scanned here. A project with no skills — or with the tool
+        disabled — gets no section at all instead of an empty heading.
+        """
+        tool = self.registry.get("skills")
+        if not isinstance(tool, SkillsTool):
+            return ""
+        lines = tool.prompt_catalog()
+        if not lines:
+            return ""
+        return SKILLS_PREAMBLE.format(catalog="\n".join(lines))
+
     def system_prompt(self, chat_id: int | str | None = None) -> str:
         now = datetime.now(UTC)
         limit = self.memory_limit()
@@ -370,6 +400,7 @@ class Agent:
                 date=now.strftime("%d %B %Y"),
             ),
             TOOL_PREAMBLE.format(tools=self.registry.describe(available_only=True) or "_none_"),
+            self.skills_prompt(),
             FORMAT_PREAMBLE,
             "## Long-term memory\n\n"
             + (

@@ -78,7 +78,7 @@ show_reasoning = true
 
 [tools]
 # Remove a tool from this list to disable it everywhere.
-enabled = ["shell", "files", "read_file", "list_files", "grep", "memory", "more_context", "web", "context7", "ocr", "send"]
+enabled = ["shell", "files", "read_file", "list_files", "grep", "memory", "more_context", "web", "context7", "ocr", "send", "skills"]
 
 [tools.shell]
 enabled = true
@@ -100,7 +100,8 @@ extra_confirm = []
 [tools.files]
 enabled = true
 # Writable directories relative to the project root.
-writable = ["workspace"]
+# data/skills holds the skills the `skills` tool lists and reads.
+writable = ["workspace", "data/skills"]
 # Chars handed to the model per read. 0 = no cap.
 max_read_chars = 200000
 max_write_chars = 200000

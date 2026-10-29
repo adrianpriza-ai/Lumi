@@ -195,6 +195,7 @@ def test_defaults_apply_with_no_config_file(project) -> None:
         "context7",
         "ocr",
         "send",
+        "skills",
     ]
 
 
