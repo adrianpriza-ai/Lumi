@@ -26,7 +26,7 @@ from typing import Any
 from ..config import Config
 from ..paths import is_within, relative_to_root
 from .base import Tool, ToolContext, ToolError, ToolResult
-from .files import MAX_LIST_ENTRIES, READABLE_SYSTEM_PATHS
+from .files import MAX_LIST_ENTRIES, READABLE_SYSTEM_PATHS, foreign_uploads
 from .safety import read_guard
 
 #: Rough chars-per-token for the read cap. Same order of magnitude as the
@@ -83,13 +83,16 @@ GREP_LINE_CHARS = 300
 OVERSIZE_PREVIEW_CHARS = 400
 
 
-def _resolve_read(root: Path, raw: Any) -> Path:
+def _resolve_read(root: Path, raw: Any, chat_id: int | str | None = None) -> Path:
     """Resolve a read-only path: anywhere under *root*, plus whitelisted system files.
 
     Same boundary as the ``files`` tool's read branch — resolved path plus an
     ``is_within`` check, never a string prefix match — and the same
     secret-file refusal (see :func:`lumi.tools.safety.read_guard`):
     ``read_file`` of ``.env`` must fail exactly like ``files: read`` of it.
+    Uploads belong to the chat that received them, so a path inside another
+    chat's ``workspace/uploads/<chat_id>/`` is refused exactly like the
+    ``files`` tool refuses it (see :func:`lumi.tools.files.foreign_uploads`).
     """
     if not raw or not str(raw).strip():
         raise ToolError("path is required")
@@ -97,6 +100,11 @@ def _resolve_read(root: Path, raw: Any) -> Path:
     requested = str(candidate)
     resolved = candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
     if is_within(resolved, root):
+        if (foreign := foreign_uploads(resolved, root, chat_id)) is not None:
+            raise ToolError(
+                f"reading {resolved} is not allowed: workspace/uploads/{foreign} "
+                "belongs to another chat. Each chat only sees its own uploads."
+            )
         guard = read_guard(candidate) or read_guard(resolved)
         if guard is not None:
             raise ToolError(
@@ -177,7 +185,7 @@ never hangs, and the line numbers make `files.edit` calls unambiguous. Use the
         self.root = config.root
 
     async def invoke(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        path = _resolve_read(self.root, arguments.get("path"))
+        path = _resolve_read(self.root, arguments.get("path"), ctx.chat_id)
         display = _display(self.root, path)
         if not path.exists():
             return ToolResult.failure(f"no such file: {display}")
@@ -352,7 +360,7 @@ Version-control, venv, cache and node_modules directories are hidden.
 
     async def invoke(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         raw = arguments.get("path") or "."
-        path = _resolve_read(self.root, raw)
+        path = _resolve_read(self.root, raw, ctx.chat_id)
         display = _display(self.root, path)
         if not path.exists():
             return ToolResult.failure(f"no such directory: {display}")
@@ -487,7 +495,7 @@ to contain every word, so a distinctive multi-word phrase works as well."""
         ) or GREP_DEFAULT_RESULTS
         max_results = min(max_results, GREP_MAX_RESULTS)
 
-        start = _resolve_read(self.root, arguments.get("path") or ".")
+        start = _resolve_read(self.root, arguments.get("path") or ".", ctx.chat_id)
         if not start.exists():
             return ToolResult.failure(f"no such path: {_display(self.root, start)}")
         glob = str(arguments.get("glob") or "").strip()
@@ -499,7 +507,7 @@ to contain every word, so a distinctive multi-word phrase works as well."""
         truncated = False
         stopped_early = False
 
-        for file in self._candidates(start, glob):
+        for file in self._candidates(start, glob, ctx.chat_id):
             if files_scanned + skipped_large >= MAX_GREP_SCAN_FILES:  # runaway tree guard
                 stopped_early = True
                 break
@@ -590,17 +598,20 @@ to contain every word, so a distinctive multi-word phrase works as well."""
             summary=f"{len(matches)} match(es) for {query!r} in {files_hit} file(s)",
         )
 
-    def _candidates(self, start: Path, glob: str = ""):
+    def _candidates(self, start: Path, glob: str = "", chat_id: int | str | None = None):
         """Every file to scan, deterministically ordered, noise pruned.
 
         Secret files are skipped outright: a grep that matched a line of
         ``.env`` would print the credential into the tool result, which is the
-        read leak the secret-file guard exists to stop.
+        read leak the secret-file guard exists to stop. Another chat's uploads
+        are skipped for the same reason — a grep from the parent directory
+        would otherwise print them into this chat's result.
         """
         if start.is_file():
             if (
                 not start.is_symlink()
                 and is_within(start.resolve(), self.root)
+                and foreign_uploads(start, self.root, chat_id) is None
                 and read_guard(start) is None
             ):
                 yield start
@@ -616,6 +627,8 @@ to contain every word, so a distinctive multi-word phrase works as well."""
                 if file.is_symlink():
                     continue
                 if read_guard(file) is not None:
+                    continue
+                if foreign_uploads(file, self.root, chat_id) is not None:
                     continue
                 try:
                     if not is_within(file.resolve(), self.root):

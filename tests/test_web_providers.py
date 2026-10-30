@@ -832,3 +832,27 @@ def test_mcp_fetch_propagates_the_result_url() -> None:
 
     assert page.url == "http://169.254.169.254/latest"
     assert page.markdown == "secret"
+
+
+def test_mcp_fetch_fails_closed_without_a_result_url() -> None:
+    """Content without a landing URL cannot pass the tool-layer SSRF re-check."""
+    provider = MCPProvider.__new__(MCPProvider)
+    provider.name = "mcp"
+    provider.config = MCPConfig()
+
+    async def fake_pick(*_args, **_kwargs):
+        return object(), DiscoveredTool(name="fetch", description="", properties={})
+
+    async def fake_call(*_args, **_kwargs):
+        return "page fetched after an undisclosed redirect"
+
+    provider._pick = fake_pick  # type: ignore[method-assign]
+    provider._call = fake_call  # type: ignore[method-assign]
+
+    import asyncio
+
+    page = asyncio.run(provider.fetch("https://example.com"))
+
+    assert page.url == "https://example.com"
+    assert page.markdown.startswith("mcp fetch failed:")
+    assert "without a final URL" in page.markdown

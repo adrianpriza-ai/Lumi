@@ -1084,6 +1084,90 @@ def _operands(tokens: list[str]) -> list[str]:
     return words
 
 
+#: The letters a short flag is made of. Stripping a run of them off a glued
+#: value is how getopt reads ``-Tuploads/x``: one flag char, then the value.
+_FLAG_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def _flag_borne_words(tokens: list[str]) -> list[str]:
+    """The words a flag token *carries*, for the read guard and nothing else.
+
+    A path can sit inside the flag itself: ``grep -fuploads/42/notes.md p .``
+    reads the file named straight after the flag char and ``dd
+    if=uploads/42/notes.md of=x`` names it as ``if=``. :func:`_operands` drops
+    every dash-word to get at the operands, and :func:`_path_like` lifts a value
+    out of ``flag=path`` only when that value starts at the root - so a
+    *relative* path glued to a flag reached neither the read-only pass nor the
+    sources of a mutating command, and the read guard (the only layer that
+    knows about another chat's uploads, a credential or protected per-chat
+    state) never saw it (R5/R6). A spaced ``-f uploads/42/notes.md`` was always
+    refused; this is that same command with no space in it.
+
+    Only :func:`_read_deny` is fed from here, which is what keeps this loose:
+    a word that is really a flag (``-rn`` -> ``rn``, ``--color=auto`` ->
+    ``auto``) resolves to a path that is not there and costs one existence
+    check, while a word that names a credential or another chat's file stops
+    the command. Write zoning deliberately does not use this - inventing a
+    write target out of a flag would ask about files nobody named.
+    """
+    words: list[str] = []
+
+    def offer(value: str) -> None:
+        value = value.strip()
+        if not value:
+            return
+        candidates = [value]
+        # `-f.env`, `-Tuploads/x`, `-qvTuploads/x`: the name only reads as a
+        # path once the flag char(s) in front of it are gone. Only worth
+        # peeling when the word already looks like a path, so a plain `-rn`
+        # does not turn into a walk over two junk names.
+        if "/" in value or "." in value:
+            letters = len(value) - len(value.lstrip(_FLAG_CHARS))
+            candidates += [value[index:] for index in range(1, letters + 1)]
+        for candidate in candidates:
+            if candidate and candidate not in words:
+                words.append(candidate)
+
+    for token in tokens:
+        if token in _SEPARATORS:
+            continue
+        if token.startswith("-"):
+            head, equals, value = token.lstrip("-").partition("=")
+            offer(value if equals else head)
+        elif "=" in token:
+            offer(token.partition("=")[2])
+    return words
+
+
+def _recursive_upload_scan(
+    tokens: list[str], program: str, base: Path, project_root: Path, chat_id: int | str | None
+) -> bool:
+    """Whether a chat command can recursively discover other chats' uploads."""
+    if chat_id is None or program not in {"grep", "rg"}:
+        return False
+    if not any(
+        token == "--recursive"
+        or (token.startswith("-") and not token.startswith("--") and "r" in token)
+        for token in tokens
+    ):
+        return False
+    operands = _operands(tokens)
+    if len(operands) < 2:
+        return False
+    uploads = (project_root / "workspace" / "uploads").resolve()
+    for raw in operands[1:]:
+        candidate = _absolute(raw, base, None)
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if not resolved.is_dir():
+            continue
+        if resolved == uploads or resolved in uploads.parents or uploads in resolved.parents:
+            return True
+    return False
+
+
 def _segments(tokens: list[str]) -> list[list[str]]:
     """Split a token list on shell operators so each command is judged alone."""
     out: list[list[str]] = []
@@ -1891,6 +1975,52 @@ def read_guard(path: Path) -> str | None:
     return None
 
 
+def _foreign_upload(path: Path, project_root: Path, chat_id: int | str | None) -> str | None:
+    """The *other* chat whose upload directory *path* sits in, if any.
+
+    ``workspace/uploads/<chat_id>/`` is per chat on every other surface — the
+    files, explore and ocr tools all refuse another chat's directory — so the
+    shell must refuse it too, or ``cat workspace/uploads/42/f.pdf`` reads back
+    what the files tool just turned away (R5). ``None`` (the local CLI, which
+    has no chat) is not restricted.
+    """
+    if chat_id is None:
+        return None
+    uploads = project_root / "workspace" / "uploads"
+    try:
+        relative = path.resolve().relative_to(uploads.resolve())
+    except (OSError, ValueError):
+        return None
+    if relative.parts and relative.parts[0] != str(chat_id):
+        return relative.parts[0]
+    return None
+
+
+def _read_deny(target: Path, project_root: Path, chat_id: int | str | None) -> Verdict | None:
+    """The verdict that stops a *read* of *target*, if it trips one.
+
+    Both read guards in one place, so the read-only pass, an interpreter's
+    quoted span and the sources of a mutating command all refuse exactly the
+    same paths: another chat's uploads, a credential, or protected per-chat
+    state.
+    """
+    if (foreign := _foreign_upload(target, project_root, chat_id)) is not None:
+        return Verdict(
+            Tier.DENY,
+            f"workspace/uploads/{foreign} belongs to another chat, so its "
+            "contents are not handed to commands",
+            "zone:foreign-upload-read",
+        )
+    if (guard := read_guard(target)) is not None:
+        return Verdict(
+            Tier.DENY,
+            f"{guard} holds credentials or is protected "
+            "state, so its contents are not handed to commands",
+            "zone:secret-read",
+        )
+    return None
+
+
 def protected_read(path: Path) -> str | None:
     """What a *read* of *path* trips, if anything, under the secret-file rules.
 
@@ -1976,6 +2106,7 @@ def explain(
     extra_confirm: tuple[str, ...] | list[str] = (),
     session_start: float | None = None,
     tilde_home: Path | None = None,
+    chat_id: int | str | None = None,
 ) -> list[Verdict]:
     """Every rule that fires for *command*, in table order.
 
@@ -1995,6 +2126,10 @@ def explain(
         ``HOME`` to the project root, so ``cat ~/notes`` reads a project file,
         not one in the owner's real home. Defaults to *home* (the real home
         directory), which is right for a caller that does not pin it.
+
+    :param chat_id: the chat the command runs for, if any. Another chat's
+        ``workspace/uploads/<id>/`` is refused on read, the way the files and
+        explore tools refuse it. ``None`` (the local CLI) is not restricted.
     """
     verdicts: list[Verdict] = []
     command = command.strip()
@@ -2206,18 +2341,22 @@ def explain(
             # operands of read-only segments against the secret rules before
             # skipping. `read_guard` is existence-aware, so a search *for* the
             # string `.env` (`grep -rn .env .`) stays a search, not a read.
+            if _recursive_upload_scan(
+                segment, segment_program, segment_base, project_root, chat_id
+            ):
+                verdicts.append(
+                    Verdict(
+                        Tier.CONFIRM,
+                        "recursive search may read another chat's uploads; "
+                        "approve the directory walk to continue",
+                        "zone:recursive-upload-read",
+                    )
+                )
             for word in _operands(segment):
                 target = _absolute(word, segment_base, home)
-                guard = read_guard(target)
-                if guard is not None:
-                    verdicts.append(
-                        Verdict(
-                            Tier.DENY,
-                            f"{guard} holds credentials or is protected "
-                            "state, so its contents are not handed to commands",
-                            "zone:secret-read",
-                        )
-                    )
+                denied = _read_deny(target, project_root, chat_id)
+                if denied is not None:
+                    verdicts.append(denied)
                     continue
                 # The read side has the same confinement as the write side: a
                 # read-only command may read inside the project, and it may
@@ -2243,6 +2382,16 @@ def explain(
                         "zone:outside-read",
                     )
                 )
+            # A value glued to a flag is read exactly like an operand, and
+            # `_operands` never sees it - `grep -fuploads/42/notes.md p .`
+            # prints another chat's file, `grep -f../.env p .` reads the
+            # credentials, with no word on this line that looks like a path.
+            # Judged only against the read rules, so a flag word that resolves
+            # to nothing costs one existence check.
+            for word in _flag_borne_words(segment):
+                denied = _read_deny(_absolute(word, segment_base, home), project_root, chat_id)
+                if denied is not None:
+                    verdicts.append(denied)
             # A command classified read-only can still name its output as an
             # operand (`sed -i`, `sort -o`, `uniq in out`). Judge only those
             # actual outputs, so the input file beside them stays a read.
@@ -2364,17 +2513,34 @@ def explain(
                 if not span:
                     continue
                 target = _absolute(span, segment_base, home)
-                guard = read_guard(target)
-                if guard is not None:
-                    verdicts.append(
-                        Verdict(
-                            Tier.DENY,
-                            f"{guard} holds credentials or is protected "
-                            "state, so its contents are not handed to commands",
-                            "zone:secret-read",
-                        )
-                    )
+                denied = _read_deny(target, project_root, chat_id)
+                if denied is not None:
+                    verdicts.append(denied)
             targets += quoted_paths(segment_text, base, home)
+        # What the segment *reads*, noted before the destination truncation
+        # below throws the sources away: a mutating command still reads its
+        # operands, and the read-only pass never runs for it, so `cp
+        # data/history/-1001.jsonl workspace/leak.jsonl` — a write that stays
+        # inside the workspace — used to read another chat's state with no
+        # guard anywhere (R6). All but the last operand for a
+        # destination-last program; otherwise every operand that is not the
+        # target of a `>`, which is written rather than read.
+        if segment_program in DESTINATION_LAST_COMMANDS:
+            source_paths = list(targets[:-1])
+        else:
+            written = {
+                _absolute(word, segment_base, home) for word in _redirect_destinations(zone_tokens)
+            }
+            source_paths = [path for path in targets if path not in written]
+        # A flag's own value is read too, and it is the one source the two
+        # lists above cannot see: `dd if=uploads/42/notes.md of=leak.bin` reads
+        # through `if=`, where `_path_like` only follows a value that starts at
+        # the root - `if=../data/history/x` was judged and `if=uploads/x` was
+        # not (R5/R6).
+        source_paths += [
+            _absolute(word, segment_base, home) for word in _flag_borne_words(zone_tokens)
+        ]
+
         # For cp/mv/ln the earlier operands are sources, so only the last path
         # is actually written to.
         if segment_program in DESTINATION_LAST_COMMANDS and targets:
@@ -2494,6 +2660,14 @@ def explain(
                     )
                 )
 
+        # Judged after the write zoning, so a path that is both stays described
+        # as the write it also is; a read-only source of a mutating command
+        # has no write verdict of its own, which is the whole gap this closes.
+        for source in dict.fromkeys(source_paths):
+            denied = _read_deny(source, project_root, chat_id)
+            if denied is not None:
+                verdicts.append(denied)
+
     # 7. Executing a script authored during this run is the write-then-run half
     #    of a prompt injection: fetched content can talk the model into writing
     #    a program, and without this the shell would run it with no tap of its
@@ -2543,6 +2717,7 @@ def classify(
     extra_confirm: tuple[str, ...] | list[str] = (),
     session_start: float | None = None,
     tilde_home: Path | None = None,
+    chat_id: int | str | None = None,
 ) -> Verdict:
     """Fold every matching rule into one verdict; the strictest tier wins."""
     verdicts = explain(
@@ -2555,6 +2730,7 @@ def classify(
         extra_confirm=extra_confirm,
         session_start=session_start,
         tilde_home=tilde_home,
+        chat_id=chat_id,
     )
     denies = [v for v in verdicts if v.tier is Tier.DENY]
     if denies:

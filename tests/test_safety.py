@@ -32,13 +32,16 @@ def _project(tmp_path: Path) -> tuple[Path, Path]:
     return root, home
 
 
-def _verdict(command: str, root: Path, home: Path) -> safety.Verdict:
+def _verdict(
+    command: str, root: Path, home: Path, *, chat_id: int | str | None = None
+) -> safety.Verdict:
     return safety.classify(
         command,
         cwd=root / "workspace",
         project_root=root,
         home=home,
         write_root=root / "workspace",
+        chat_id=chat_id,
     )
 
 
@@ -1309,3 +1312,103 @@ def test_per_chat_memory_and_history_are_not_shell_material(tmp_path: Path) -> N
     assert _verdict("rm -rf ../data/history", root, home).blocked
     # The project's own MEMORY.md is the owner's file and stays readable.
     assert _verdict("cat MEMORY.md", root, home).tier is safety.Tier.ALLOW
+
+
+# --------------------------------------------------------------------------- #
+# another chat's uploads, and what a mutating command reads (R5 / R6)
+# --------------------------------------------------------------------------- #
+
+
+def _uploads_project(tmp_path: Path) -> tuple[Path, Path]:
+    """A project with two chats' upload directories on disk."""
+    root, home = _project(tmp_path)
+    for chat in ("42", "43"):
+        folder = root / "workspace" / "uploads" / chat
+        folder.mkdir(parents=True)
+        (folder / "notes.md").write_text(f"chat {chat} only", encoding="utf-8")
+    return root, home
+
+
+def test_another_chats_uploads_are_not_shell_material(tmp_path: Path) -> None:
+    """R5: read_guard knows secrets and data/ but used to know nothing about
+    ``workspace/uploads``, so ``cat uploads/42/notes.md`` from chat 43 read
+    back exactly what the files tool refuses to hand over."""
+    root, home = _uploads_project(tmp_path)
+    path = "uploads/42/notes.md"
+
+    assert _verdict(f"cat {path}", root, home, chat_id=43).blocked
+    assert _verdict(f"grep -rn chat {path}", root, home, chat_id=43).blocked
+    assert _verdict(f"cat {path} > out.md", root, home, chat_id=43).blocked
+    assert _verdict(f"cp {path} copy.md", root, home, chat_id=43).blocked
+    assert _verdict(f"bash -c 'cat {path}'", root, home, chat_id=43).blocked
+
+    # The owning chat reads its own uploads, and the local CLI, which has no
+    # chat, is not restricted.
+    assert _verdict(f"cat {path}", root, home, chat_id=42).tier is safety.Tier.ALLOW
+    assert _verdict(f"cat {path}", root, home).tier is safety.Tier.ALLOW
+
+
+def test_a_mutating_command_reads_its_sources_under_the_same_rules(
+    tmp_path: Path,
+) -> None:
+    """R6: the read-only pass never runs for a mutating segment, so ``cp
+    data/history/-1001.jsonl workspace/leak.jsonl`` — a write that stays
+    inside the workspace — used to copy another chat's state into a file the
+    model can then read freely."""
+    root, home = _project(tmp_path)
+    history = root / "data" / "history"
+    history.mkdir(parents=True)
+    (history / "-1001.jsonl").write_text("{}\n", encoding="utf-8")
+    memory = root / "data" / "memory" / "-1002" / "MEMORY.md"
+    memory.parent.mkdir(parents=True)
+    memory.write_text("# Memory\n", encoding="utf-8")
+    (root / "workspace" / "NOTES.md").write_text("mine\n", encoding="utf-8")
+
+    assert _verdict("cp ../data/history/-1001.jsonl workspace/leak.jsonl", root, home).blocked
+    assert _verdict("cp ../data/memory/-1002/MEMORY.md workspace/leak.md", root, home).blocked
+    assert _verdict("cat ../data/history/-1001.jsonl > workspace/leak.jsonl", root, home).blocked
+    # An ordinary copy of a workspace file still runs: the write zone has
+    # nothing to say about it, and the read side has nothing to say either.
+    assert _verdict("cp NOTES.md workspace/out.md", root, home).tier is safety.Tier.ALLOW
+
+
+def test_a_path_carried_inside_a_flag_is_read_guarded_too(tmp_path: Path) -> None:
+    """R5/R6, residual: ``_operands`` drops every dash-word, so a path glued to
+    a flag was never judged — ``grep -fuploads/42/notes.md chat .`` prints
+    another chat's file and ``dd if=uploads/42/notes.md of=leak.bin`` reads it
+    through ``if=``, while the spaced form of each was always refused.
+    ``_path_like`` only lifts a value out of ``flag=path`` when that value
+    starts at the root, which is why ``if=../data/history/x`` had been judged
+    and ``if=uploads/x`` had not."""
+    root, home = _uploads_project(tmp_path)
+    history = root / "data" / "history"
+    history.mkdir(parents=True)
+    (history / "-1001.jsonl").write_text("{}\n", encoding="utf-8")
+    (root / ".env").write_text("TELEGRAM_BOT_TOKEN=test-token\n", encoding="utf-8")
+
+    for command in (
+        "grep -fuploads/42/notes.md chat .",
+        "xargs -auploads/42/notes.md echo",
+        "tar -Tuploads/42/list.txt -cf out.tgz",
+        "dd if=uploads/42/notes.md of=leak.bin",
+        "bash -c 'grep -fuploads/42/notes.md chat .'",
+        "grep -f../data/history/-1001.jsonl chat .",
+        "grep -f../.env chat .",
+    ):
+        assert _verdict(command, root, home, chat_id=43).blocked, command
+
+    # The owning chat reads its own uploads and the CLI, which has no chat, is
+    # not restricted — the same two exemptions the spaced forms get.
+    own = "grep -fuploads/42/notes.md chat ."
+    assert _verdict(own, root, home, chat_id=42).tier is safety.Tier.ALLOW
+    assert _verdict(own, root, home).tier is safety.Tier.ALLOW
+    # A flag word that is not a path still costs nothing: the read guard is
+    # the only thing judging these, and it only speaks about paths that exist
+    # where they are claimed to.
+    assert _verdict("grep -rn chat .", root, home, chat_id=43).tier is safety.Tier.CONFIRM
+    assert _verdict("grep -rn chat uploads", root, home, chat_id=43).tier is safety.Tier.CONFIRM
+    assert _verdict("grep -rn chat uploads/42", root, home, chat_id=43).tier is safety.Tier.DENY
+    assert _verdict("grep -rn chat uploads/42/notes.md", root, home, chat_id=43).tier is safety.Tier.DENY
+    assert _verdict("grep -rn chat .", root, home, chat_id=42).tier is safety.Tier.CONFIRM
+    assert _verdict("grep -rn chat .", root, home).tier is safety.Tier.ALLOW
+    assert _verdict("sort -oleak.txt NOTES.md", root, home, chat_id=43).tier is safety.Tier.ALLOW

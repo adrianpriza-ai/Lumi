@@ -471,11 +471,17 @@ class MCPProvider(WebProvider):
             for item in payload.get("results") or []:
                 item = item if isinstance(item, dict) else {}
                 if item.get("raw_content") or item.get("markdown") or item.get("content"):
+                    reported_url = final_url(item.get("url"), requested="")
+                    if not reported_url:
+                        return Page(
+                            url=url,
+                            markdown="mcp fetch failed: server returned content without a final URL",
+                        )
                     return Page(
                         # A tavily-shaped server reports the page it landed on
                         # after its own redirects; that URL is what the tool
                         # layer re-checks against the private-host rules.
-                        url=final_url(item.get("url"), requested=url),
+                        url=reported_url,
                         title=str(item.get("title") or ""),
                         markdown=str(
                             item.get("raw_content") or item.get("markdown") or item.get("content")
@@ -484,11 +490,20 @@ class MCPProvider(WebProvider):
             # Some servers answer with the page at the top level. The text
             # below is whatever the server flattened; the URL is upgraded only
             # when the payload names one.
+            reported_url = final_url(payload.get("url"), payload.get("sourceURL"), requested="")
+            if not reported_url:
+                return Page(
+                    url=url,
+                    markdown="mcp fetch failed: server returned content without a final URL",
+                )
             return Page(
-                url=final_url(payload.get("url"), payload.get("sourceURL"), requested=url),
+                url=reported_url,
                 markdown=text,
             )
-        return Page(url=url, markdown=text)
+        return Page(
+            url=url,
+            markdown="mcp fetch failed: server returned content without a final URL",
+        )
 
     def summary_line(self) -> str:
         ok, reason = self.available()

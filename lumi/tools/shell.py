@@ -170,7 +170,7 @@ Rules:
         env["LUMI_SHELL_CWD"] = str(self.cwd)
         return env
 
-    def classify(self, command: str, cwd: Path) -> safety.Verdict:
+    def classify(self, command: str, cwd: Path, chat_id: int | str | None = None) -> safety.Verdict:
         return safety.classify(
             command,
             cwd=cwd,
@@ -185,6 +185,8 @@ Rules:
             ask_before_risky=self.shell_config.ask_before_risky,
             extra_deny=self.shell_config.extra_deny,
             extra_confirm=self.shell_config.extra_confirm,
+            # Who is asking decides whose uploads the command may read.
+            chat_id=chat_id,
         )
 
     # -- execution --------------------------------------------------------- #
@@ -196,7 +198,7 @@ Rules:
 
         cwd = self._resolve_cwd(arguments.get("cwd"))
         timeout = self._timeout(arguments.get("timeout_seconds"))
-        verdict = self.classify(command, cwd)
+        verdict = self.classify(command, cwd, ctx.chat_id)
 
         log.info(
             "shell verdict=%s cwd=%s cmd=%s", verdict.tier.value, cwd, truncate(command, 200, "…")

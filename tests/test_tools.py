@@ -174,6 +174,35 @@ async def test_shell_refuses_to_cat_dotenv(shell: ShellTool, config) -> None:
     assert "test-token" not in result.text
 
 
+async def test_shell_refuses_another_chats_uploads(shell: ShellTool, config) -> None:
+    """R5 end to end: the shell must hand classify the chat that is asking,
+    or ``cat uploads/42/notes.md`` reads back what the files tool refuses."""
+    foreign = config.root / "workspace" / "uploads" / "42" / "notes.md"
+    foreign.parent.mkdir(parents=True)
+    foreign.write_text("chat 42 only", encoding="utf-8")
+    command = "cat uploads/42/notes.md"
+
+    refused = await shell.invoke({"command": command}, ctx(chat_id=43))
+    assert not refused.ok
+    assert "Refused" in refused.text
+    assert "chat 42 only" not in refused.text
+
+    # The owning chat runs it, and the local CLI, which has no chat, is not
+    # restricted.
+    assert (await shell.invoke({"command": command}, ctx(chat_id=42))).ok
+    assert (await shell.invoke({"command": command}, ctx(source="cli"))).ok
+
+    # The same file named *inside* a flag is refused too: `_operands` drops
+    # every dash-word, so ``xargs -a…`` used to reach the shell with no read
+    # guard having seen the path that follows it.
+    glued = await shell.invoke(
+        {"command": "xargs -auploads/42/notes.md echo"}, ctx(chat_id=43)
+    )
+    assert not glued.ok
+    assert "Refused" in glued.text
+    assert "chat 42 only" not in glued.text
+
+
 async def test_empty_command_is_an_error(shell: ShellTool) -> None:
     with pytest.raises(ToolError):
         await shell.invoke({"command": "   "}, ctx(source="cli"))
@@ -1430,6 +1459,44 @@ async def test_grep_never_matches_inside_secret_files(config) -> None:
     assert result.data["matches"] == []
     assert "no matches" in result.text  # the query echo is not a file match
     assert ".env" not in result.text  # and the secret file was never scanned
+
+
+async def test_explore_tools_reach_no_other_chats_uploads(config) -> None:
+    """Incoming documents are stored per chat; ``files`` refuses another
+    chat's uploads, and the explore tools must refuse them identically —
+    otherwise read_file / list_files / grep hand chat B everything the files
+    tool just turned away, with no approval anywhere."""
+    foreign = config.root / "workspace" / "uploads" / "42" / "notes.md"
+    foreign.parent.mkdir(parents=True)
+    foreign.write_text("CHAT-42-SECRET", encoding="utf-8")
+    mine = config.root / "workspace" / "uploads" / "43" / "notes.md"
+    mine.parent.mkdir(parents=True)
+    mine.write_text("chat 43 only", encoding="utf-8")
+    path = "workspace/uploads/42/notes.md"
+
+    with pytest.raises(ToolError, match="another chat"):
+        await ReadFileTool(config).invoke({"path": path}, ctx(chat_id=43))
+    with pytest.raises(ToolError, match="another chat"):
+        await ListFilesTool(config).invoke({"path": "workspace/uploads/42"}, ctx(chat_id=43))
+
+    # grep from the parent directory must not walk into the foreign tree.
+    grepped = await GrepTool(config).invoke(
+        {"query": "CHAT-42-SECRET", "path": "workspace/uploads"}, ctx(chat_id=43)
+    )
+    assert grepped.ok
+    assert grepped.data["matches"] == []
+    assert "notes.md" not in grepped.text
+
+    # The owning chat reads its own uploads, and the local CLI, which has no
+    # chat, is not restricted.
+    ok = await ReadFileTool(config).invoke({"path": path}, ctx(chat_id=42))
+    assert "CHAT-42-SECRET" in ok.text
+    ok = await ReadFileTool(config).invoke({"path": path}, ctx())
+    assert "CHAT-42-SECRET" in ok.text
+    own = await GrepTool(config).invoke(
+        {"query": "CHAT-42-SECRET", "path": "workspace/uploads"}, ctx(chat_id=42)
+    )
+    assert own.data["matches"]
 
 
 # --------------------------------------------------------------------------- #

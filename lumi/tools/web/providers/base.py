@@ -12,6 +12,7 @@ from __future__ import annotations
 import abc
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from ....util.text import fence_untrusted, truncate
 
