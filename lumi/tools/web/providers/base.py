@@ -144,6 +144,23 @@ class WebProvider(abc.ABC):
         return f"- `{self.name}`{mark}"
 
 
+def final_url(*candidates: Any, requested: str) -> str:
+    """The first http(s) URL among *candidates*, else the URL we asked for.
+
+    Providers follow redirects wherever they lead, long after the tool layer
+    has validated the requested URL. The address they actually landed on
+    reaches that layer through :attr:`Page.url`, which is what the redirect
+    re-check judges — so a provider that knows the final URL must say so here,
+    and a value that is not an URL (a relay id, an empty string) must not
+    pass as one: anything else falls back to the requested URL.
+    """
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if text.startswith(("http://", "https://")):
+            return text
+    return requested
+
+
 def recent_cutoff(days: int) -> str:
     """ISO date *days* back from now, for provider recency filters.
 
@@ -160,6 +177,7 @@ __all__ = [
     "SearchResult",
     "Page",
     "WebProvider",
+    "final_url",
     "recent_cutoff",
     "PER_HIT_CONTENT_CHARS",
     "PER_HIT_FLOOR_MAX_HITS",

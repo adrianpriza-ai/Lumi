@@ -26,7 +26,7 @@ from typing import Any
 from ....config import ExaConfig
 from ....llm.keypool import KeyPool, mask
 from ....util.log import get_logger
-from .base import Page, SearchHit, SearchResult, WebProvider, recent_cutoff
+from .base import Page, SearchHit, SearchResult, WebProvider, final_url, recent_cutoff
 
 log = get_logger(__name__)
 
@@ -181,18 +181,27 @@ class ExaProvider(WebProvider):
     def _page_from(self, raw: Any, url: str) -> Page:
         """Turn a ``get_contents`` response into a :class:`Page`."""
         data = _as_dict(raw)
-        results = data.get("results") or []
-        for item in results:
-            item = _as_dict(item)
+        items = [_as_dict(item) for item in data.get("results") or []]
+        for item in items:
             if str(item.get("url") or "").rstrip("/") == url.rstrip("/"):
-                return Page(
-                    url=url,
-                    title=str(item.get("title") or ""),
-                    markdown=str(item.get("text") or ""),
-                )
+                return self._page_of(item, url)
+        # A redirect means the page came back under the address it landed on,
+        # not the one we asked for. One result for one requested URL is
+        # unambiguous either way, and its own URL is what the tool layer
+        # re-checks (finding E).
+        if len(items) == 1:
+            return self._page_of(items[0], url)
         # Either an empty response or the URL came back under a normalised
         # address; both read to the caller as "nothing here".
         return Page(url=url, markdown="(no content returned)")
+
+    @staticmethod
+    def _page_of(item: dict[str, Any], url: str) -> Page:
+        return Page(
+            url=final_url(item.get("url"), requested=url),
+            title=str(item.get("title") or ""),
+            markdown=str(item.get("text") or ""),
+        )
 
 
 __all__ = ["ExaProvider"]

@@ -21,7 +21,7 @@ from ....config import FirecrawlConfig
 from ....llm.keypool import KeyPool, mask
 from ....util.log import get_logger
 from ....util.net import validate_fetch_url
-from .base import Page, SearchHit, SearchResult, WebProvider, recent_cutoff
+from .base import Page, SearchHit, SearchResult, WebProvider, final_url, recent_cutoff
 
 log = get_logger(__name__)
 
@@ -148,7 +148,14 @@ class FirecrawlProvider(WebProvider):
             data = _as_dict(doc)
             metadata = _as_dict(data.get("metadata"))
             return Page(
-                url=url,
+                # Firecrawl followed the redirects wherever they went; its
+                # metadata names the page it actually landed on, which is what
+                # the tool layer re-checks against the private-host rules
+                # (finding E).
+                url=final_url(
+                    metadata.get("url"), metadata.get("sourceURL"), metadata.get("pageUrl"),
+                    requested=url,
+                ),
                 title=str(metadata.get("title") or metadata.get("ogTitle") or ""),
                 markdown=str(data.get("markdown") or "(no content)"),
             )

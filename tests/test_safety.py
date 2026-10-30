@@ -623,6 +623,67 @@ def test_env_split_behind_a_wrapper_and_deno_flag_tokens_are_zoned() -> None:
     assert verdict("deno run file.ts").tier is safety.Tier.ALLOW
 
 
+def test_glued_flag_values_do_not_hide_the_inline_payload() -> None:
+    # R1: `bash -c'cp ...'` glues the flag to its value, and the tokeniser
+    # hands over ONE token where the spaced form has two. The cluster branch
+    # read the next token, which does not exist, so no detector fired and the
+    # whole payload - the cp, the write, the `$(cat)` - was invisible. The
+    # remainder after the code-flag char is the value; it is judged like the
+    # spaced form.
+    assert verdict("bash -c'cp NOTES.md /etc/X'").blocked
+    assert verdict("sh -c'cp NOTES.md /etc/X'").blocked
+    assert verdict("node -e'cp NOTES.md /etc/X'").blocked
+    assert verdict('python3 -c\'open("/etc/X","w")\'').blocked
+    assert verdict("bash -cx'cp NOTES.md /etc/X'").blocked  # glued mid-cluster
+    assert verdict("env -S'cp NOTES.md /etc/X'").blocked
+    assert verdict("timeout 5 env -S'cp NOTES.md /etc/X'").blocked  # behind a wrapper
+    assert verdict("node --eval'cp NOTES.md /etc/X'").blocked  # long flag, no `=`
+    assert verdict("env --split-string'cp NOTES.md /etc/X'").blocked
+    # The glued `$(cat)` used to slip past the command-substitution gate the
+    # spaced form hits; both ask now.
+    assert verdict('bash -c"$(cat fresh.sh)"').tier is not safety.Tier.ALLOW
+    assert verdict('bash -c "$(cat fresh.sh)"').tier is not safety.Tier.ALLOW
+    # A cluster whose tail is bare letters is option chars, not a glued
+    # value: the code is the next word, as in the 13.7 shapes.
+    assert verdict("bash -cx 'rm -rf /etc/X'").blocked
+    assert verdict("bash -cl 'cp NOTES.md /etc/X'").blocked
+    # Benign glued one-liners stay free.
+    assert verdict("python3 -c'print(1)'").tier is safety.Tier.ALLOW
+    assert verdict("bash -c'echo hi'").tier is safety.Tier.ALLOW
+    assert verdict("env -S'echo hi'").tier is safety.Tier.ALLOW
+    assert verdict("node -e'console.log(1)'").tier is safety.Tier.ALLOW
+
+
+def test_a_glued_payload_into_another_chats_state_is_denied(tmp_path: Path) -> None:
+    # The composition the glue made cheap: the glued form of `cat` slipped
+    # past the per-chat read deny that the bare form hits.
+    root, home = _project(tmp_path)
+    memory = root / "data" / "memory" / "-1002" / "MEMORY.md"
+    memory.parent.mkdir(parents=True)
+    memory.write_text("# Memory\n", encoding="utf-8")
+
+    assert _verdict("bash -c'cat ../data/memory/-1002/MEMORY.md'", root, home).blocked
+    assert _verdict("env -S'cat ../data/memory/-1002/MEMORY.md'", root, home).blocked
+    assert _verdict("cat ../data/memory/-1002/MEMORY.md", root, home).blocked
+    # R2's wrappers reach the same state: flock's -c value and parallel's
+    # -S-hosted command are inline code, and the thin wrappers peel off.
+    assert _verdict("flock /tmp/lk -c 'cat ../data/memory/-1002/MEMORY.md'", root, home).blocked
+    assert _verdict("parallel -S host bash -c 'cat ../data/memory/-1002/MEMORY.md'", root, home).blocked
+    assert _verdict("nice bash -c 'cat ../data/memory/-1002/MEMORY.md'", root, home).blocked
+
+
+def test_a_glued_output_flag_value_hits_the_state_guard(tmp_path: Path) -> None:
+    # The same glue on the output side: `sort -odata/whitelist.json` names its
+    # target inside the flag token, where the read-only branch never looked.
+    root, home = _project(tmp_path)
+    (root / "data").mkdir()
+    (root / "data" / "whitelist.json").write_text("[]\n", encoding="utf-8")
+
+    assert _verdict("sort -o../data/whitelist.json NOTES.md", root, home).blocked
+    assert _verdict("sort -o ../data/whitelist.json NOTES.md", root, home).blocked
+    assert _verdict("sort -o out.txt NOTES.md", root, home).tier is safety.Tier.ALLOW
+
+
 # --------------------------------------------------------------------------- #
 # executing a script authored during this session
 # --------------------------------------------------------------------------- #
@@ -766,6 +827,71 @@ def test_wrappers_do_not_hide_the_real_program() -> None:
     # off is what keeps `env cp a /etc/x` from being judged as a read.
     assert verdict("env cp notes.md /etc/lumi-test").blocked
     assert verdict("timeout 5 rm -rf /").blocked
+
+
+def test_thin_wrappers_do_not_stop_the_peel() -> None:
+    # R2: nice, ionice, setsid, taskset and flock run the named program
+    # unchanged, so leaving them out of the delegating set landed the verdict
+    # on the wrapper itself with the script behind it never tokenised.
+    # `command` and `builtin` are worse: they sit on the read-only list, so
+    # even the mutating branch was skipped for what they ran.
+    for wrapper in ("nice", "ionice -c 2", "ionice -c2", "setsid", "taskset -c 0,1",
+                    "taskset --cpu-list 0-3", "time", "strace -f", "chrt -f 10",
+                    "numactl -C 0-3", "command", "builtin"):
+        assert verdict(f"{wrapper} cp NOTES.md /etc/X").blocked, wrapper
+    assert verdict("nice -n 10 bash -c 'cp NOTES.md /etc/X'").blocked
+    assert verdict("nice -n10 bash -c 'cp NOTES.md /etc/X'").blocked
+    assert verdict("nice -n -5 bash -c 'cp NOTES.md /etc/X'").blocked
+    assert verdict("nice bash -c 'cp NOTES.md /etc/X'").blocked
+    assert verdict("nice bash -c \"$(cat fresh.sh)\"").tier is not safety.Tier.ALLOW
+    assert verdict("command bash -c 'cp NOTES.md /etc/X'").blocked
+    # Benign wrapped reads stay reads.
+    assert verdict("nice ls").tier is safety.Tier.ALLOW
+    assert verdict("time ls -la").tier is safety.Tier.ALLOW
+    assert verdict("command -v git").tier is safety.Tier.ALLOW
+    assert verdict("builtin echo hi").tier is safety.Tier.ALLOW
+    assert verdict("nice python3 -c 'print(1)'").tier is safety.Tier.ALLOW
+    # Same class, found while re-verifying: exec replaces the shell with the
+    # named program, setarch and a hexadecimal taskset mask sit positionally
+    # before it, and parallel -S swallows a host name the way env -u does.
+    assert verdict("exec bash -c 'cp NOTES.md /etc/X'").blocked
+    assert verdict("setarch -R bash -c 'cp NOTES.md /etc/X'").blocked
+    assert verdict("setarch x86_64 bash -c 'cp NOTES.md /etc/X'").blocked
+    assert verdict("taskset 0x1 bash -c 'cp NOTES.md /etc/X'").blocked
+    assert verdict("parallel -S host bash -c 'cp NOTES.md /etc/X'").blocked
+
+
+def test_trailing_punctuation_does_not_blind_the_inner_zoning() -> None:
+    # shlex hands a run of punctuation over as one token (`);`). Inside the
+    # re-tokenised inline script that run became a nonsense operand, and for a
+    # destination-last command it displaced the real destination from the
+    # zoning: `python3 -c 'os.system("cp NOTES.md /etc/X");'` - spaced or
+    # glued - judged as a write to a junk path and ran free.
+    assert verdict("python3 -c \"os.system('cp NOTES.md /etc/X');\"").blocked
+    assert verdict("php -r 'system(\"cp NOTES.md /etc/X\");'").blocked
+    assert verdict("php -r'system(\"cp NOTES.md /etc/X\");'").blocked
+    assert verdict("node -e 'require(\"child_process\").exec(\"cp NOTES.md /etc/X\");'").blocked
+    # The operators that are legitimately multi-character stay whole.
+    assert verdict("echo hi >> NOTES.md").tier is safety.Tier.ALLOW
+    assert verdict("grep -rn TODO . && ls").tier is safety.Tier.ALLOW
+    assert verdict("cat NOTES.md 2>&1").tier is safety.Tier.ALLOW
+
+
+def test_flock_and_watch_arguments_are_code() -> None:
+    # flock's -c value goes to sh -c, and watch joins its remaining arguments
+    # into one sh -c string it runs on repeat. The lock file (and watch's
+    # interval flag) sit before the code, and the code may be glued to the
+    # flag the way the R1 shapes glue it.
+    assert verdict("flock /tmp/lumi-test-lock -c 'cp NOTES.md /etc/X'").blocked
+    assert verdict("flock -c 'echo pwned > /etc/X'").blocked
+    assert verdict("flock -w 5 /tmp/lumi-test-lock -c 'cp NOTES.md /etc/X'").blocked
+    assert verdict("flock -w5 /tmp/lumi-test-lock -c'cp NOTES.md /etc/X'").blocked
+    assert verdict("watch -n 5 'cp NOTES.md /etc/X'").blocked
+    assert verdict("watch 'rm -rf /etc/X'").blocked
+    # A command run directly under flock (no shell) is judged as itself.
+    assert verdict("flock /tmp/lumi-test-lock true").tier is safety.Tier.ALLOW
+    assert verdict("watch date").tier is safety.Tier.ALLOW
+    assert verdict("watch -n 5 ls -la").tier is safety.Tier.ALLOW
 
 
 def test_double_wrapping_does_not_bypass_the_zone_checks() -> None:

@@ -22,7 +22,7 @@ from typing import Any
 from ....config import TavilyConfig
 from ....llm.keypool import KeyPool, mask
 from ....util.log import get_logger
-from .base import Page, SearchHit, SearchResult, WebProvider
+from .base import Page, SearchHit, SearchResult, WebProvider, final_url
 
 log = get_logger(__name__)
 
@@ -185,14 +185,29 @@ class TavilyProvider(WebProvider):
             return Page(url=url, markdown=f"extract failed: {type(exc).__name__}: {exc}")
 
         data = raw if isinstance(raw, dict) else getattr(raw, "__dict__", {}) or {}
-        for item in data.get("results") or []:
-            item = item if isinstance(item, dict) else getattr(item, "__dict__", {})
+        items = [
+            item if isinstance(item, dict) else getattr(item, "__dict__", {}) or {}
+            for item in data.get("results") or []
+        ]
+        for item in items:
             if str(item.get("url") or "").rstrip("/") == url.rstrip("/"):
-                return Page(url=url, markdown=str(item.get("raw_content") or ""))
+                return self._page_of(item, url)
+        # A redirect means the page came back under the address it landed on;
+        # one result for one requested URL is unambiguous either way, and its
+        # own URL is what the tool layer re-checks (finding E).
+        if len(items) == 1:
+            return self._page_of(items[0], url)
         failed = data.get("failed_results") or []
         if failed:
             return Page(url=url, markdown=f"extraction failed: {failed}")
         return Page(url=url, markdown="(no content returned)")
+
+    @staticmethod
+    def _page_of(item: dict[str, Any], url: str) -> Page:
+        return Page(
+            url=final_url(item.get("url"), requested=url),
+            markdown=str(item.get("raw_content") or ""),
+        )
 
 
 def _time_range(days: int | None) -> str | None:

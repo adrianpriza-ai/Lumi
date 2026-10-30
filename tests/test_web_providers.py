@@ -19,9 +19,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from lumi.config import ExaConfig, FirecrawlConfig, TavilyConfig
+from lumi.config import ExaConfig, FirecrawlConfig, MCPConfig, TavilyConfig
 from lumi.tools.web.providers.exa_provider import ExaProvider
 from lumi.tools.web.providers.firecrawl_provider import FirecrawlProvider
+from lumi.tools.web.providers.mcp_provider import DiscoveredTool, MCPProvider
 from lumi.tools.web.providers.tavily_provider import TavilyProvider
 
 # --------------------------------------------------------------------------- #
@@ -454,6 +455,9 @@ def test_exa_fetch_rotates(monkeypatch) -> None:
 
 
 def test_exa_fetch_matches_the_url_not_just_the_first_result(monkeypatch) -> None:
+    # A single result for one requested URL is the page itself, however its
+    # address changed on the way (the redirect propagation above); several
+    # results naming none of the requested URLs read as "nothing here".
     monkeypatch.setenv("EXA_API_KEY", "exa-91")
     provider = ExaProvider(ExaConfig())
     reply = {"results": [{"url": "https://other", "text": "wrong page"}]}
@@ -462,7 +466,8 @@ def test_exa_fetch_matches_the_url_not_just_the_first_result(monkeypatch) -> Non
     import asyncio
 
     page = asyncio.run(provider.fetch("https://wanted"))
-    assert "no content" in page.markdown
+    assert page.markdown == "wrong page"
+    assert page.url == "https://other"
 
 
 def test_exa_strategy_unknown_falls_back(monkeypatch) -> None:
@@ -689,3 +694,141 @@ def test_exa_parses_published_date(monkeypatch) -> None:
 
     result = asyncio.run(provider.search("hi", 5))
     assert result.hits[0].published == "2026-04-02"
+
+# --------------------------------------------------------------------------- #
+# Redirect URL propagation (finding E / R3)
+# --------------------------------------------------------------------------- #
+# The web tool re-checks the URL a fetch ended on against the private-host
+# rules, but only when the provider hands over that URL: every provider used
+# to stamp Page.url with the *requested* address, which made the re-check dead
+# code. These tests pin the propagation itself, per provider.
+
+
+def test_firecrawl_fetch_propagates_the_final_url(monkeypatch) -> None:
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-91")
+    provider = FirecrawlProvider(FirecrawlConfig())
+    reply = {
+        "metadata": {"url": "http://169.254.169.254/latest/meta-data", "title": "T"},
+        "markdown": "# secret",
+    }
+    provider._clients = {"fc-91": FakeFirecrawlClient(scrape_reply=reply)}
+
+    import asyncio
+
+    page = asyncio.run(provider.fetch("https://example.com"))
+
+    assert page.url == "http://169.254.169.254/latest/meta-data"
+
+
+def test_firecrawl_fetch_keeps_the_requested_url_without_one_in_metadata(monkeypatch) -> None:
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-91")
+    provider = FirecrawlProvider(FirecrawlConfig())
+    provider._clients = {
+        "fc-91": FakeFirecrawlClient(
+            scrape_reply={"metadata": {"title": "T"}, "markdown": "# body"}
+        )
+    }
+
+    import asyncio
+
+    page = asyncio.run(provider.fetch("https://example.com"))
+
+    assert page.url == "https://example.com"
+
+
+def test_exa_fetch_propagates_the_final_url(monkeypatch) -> None:
+    """Exa answers under the address its fetch landed on; one result for one
+    requested URL is unambiguous even when the addresses differ."""
+    monkeypatch.setenv("EXA_API_KEY", "exa-91")
+    provider = ExaProvider(ExaConfig())
+    reply = {"results": [{"url": "http://169.254.169.254/latest", "title": "T", "text": "secret"}]}
+    provider._clients = {"exa-91": FakeExaClient(contents_reply=reply)}
+
+    import asyncio
+
+    page = asyncio.run(provider.fetch("https://example.com"))
+
+    assert page.url == "http://169.254.169.254/latest"
+    assert page.markdown == "secret"
+
+
+def test_exa_fetch_still_matches_the_requested_url_when_given(monkeypatch) -> None:
+    monkeypatch.setenv("EXA_API_KEY", "exa-91")
+    provider = ExaProvider(ExaConfig())
+    reply = {
+        "results": [
+            {"url": "https://example.com", "text": "body"},
+            {"url": "https://other.test", "text": "noise"},
+        ]
+    }
+    provider._clients = {"exa-91": FakeExaClient(contents_reply=reply)}
+
+    import asyncio
+
+    page = asyncio.run(provider.fetch("https://example.com/"))
+
+    assert page.markdown == "body"
+
+
+def test_exa_fetch_stays_empty_for_an_unmatched_multi_result_reply(monkeypatch) -> None:
+    monkeypatch.setenv("EXA_API_KEY", "exa-91")
+    provider = ExaProvider(ExaConfig())
+    reply = {
+        "results": [
+            {"url": "https://a.test", "text": "one"},
+            {"url": "https://b.test", "text": "two"},
+        ]
+    }
+    provider._clients = {"exa-91": FakeExaClient(contents_reply=reply)}
+
+    import asyncio
+
+    page = asyncio.run(provider.fetch("https://example.com"))
+
+    assert page.url == "https://example.com"
+    assert page.markdown == "(no content returned)"
+
+
+def test_tavily_extract_propagates_the_final_url(monkeypatch) -> None:
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-91")
+    provider = TavilyProvider(TavilyConfig())
+    provider._auth_clients = {
+        "tvly-91": FakeTavilyClient(
+            extract_reply={"results": [{"url": "http://169.254.169.254/latest", "raw_content": "s"}]}
+        )
+    }
+
+    import asyncio
+
+    page = asyncio.run(provider.fetch("https://example.com"))
+
+    assert page.url == "http://169.254.169.254/latest"
+    assert page.markdown == "s"
+
+
+def test_mcp_fetch_propagates_the_result_url() -> None:
+    """The MCP fetch path is the one that reaches the bot's own network, so
+    a tavily-shaped server's answer URL must reach the tool layer."""
+    provider = MCPProvider.__new__(MCPProvider)
+    provider.name = "mcp"
+    provider.config = MCPConfig()
+
+    async def fake_pick(*_args, **_kwargs):
+        return object(), DiscoveredTool(name="fetch", description="", properties={})
+
+    async def fake_call(*_args, **_kwargs):
+        import json
+
+        return json.dumps(
+            {"results": [{"url": "http://169.254.169.254/latest", "raw_content": "secret"}]}
+        )
+
+    provider._pick = fake_pick  # type: ignore[method-assign]
+    provider._call = fake_call  # type: ignore[method-assign]
+
+    import asyncio
+
+    page = asyncio.run(provider.fetch("https://example.com"))
+
+    assert page.url == "http://169.254.169.254/latest"
+    assert page.markdown == "secret"

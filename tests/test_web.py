@@ -23,6 +23,7 @@ from lumi.tools.web.providers.base import (
     WebProvider,
     recent_cutoff,
 )
+from lumi.tools.web.providers.firecrawl_provider import FirecrawlProvider
 from lumi.tools.web.providers.mcp_provider import (
     DiscoveredTool,
     MCPProvider,
@@ -33,6 +34,7 @@ from lumi.tools.web.providers.mcp_provider import (
     _stdio_env,
     expand_env,
 )
+from lumi.tools.web.providers.tavily_provider import TavilyProvider
 from lumi.tools.web.tool import MAX_RESULTS
 from lumi.util.text import UNTRUSTED_BEGIN, UNTRUSTED_END, fence_untrusted
 
@@ -408,6 +410,65 @@ async def test_a_redirect_between_public_urls_is_fine(config) -> None:
 
     assert result.ok
     assert "public body" in result.text
+
+
+# The two tests above pin the tool's re-check with a stub that already carries
+# the final URL. These pin the other half of finding E: a *real* provider
+# propagating the URL its fetcher landed on from the raw SDK reply.
+
+
+class _FakeTavilySDK:
+    def __init__(self, reply: dict) -> None:
+        self._reply = reply
+
+    async def extract(self, *_args, **_kwargs):
+        return self._reply
+
+
+class _FakeFirecrawlSDK:
+    def __init__(self, reply: dict) -> None:
+        self._reply = reply
+
+    async def scrape(self, *_args, **_kwargs):
+        return self._reply
+
+
+async def test_a_redirect_through_a_real_provider_is_caught(config, monkeypatch) -> None:
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-91")
+    provider = TavilyProvider(config.tools.web.tavily)
+    provider._auth_clients = {
+        "tvly-91": _FakeTavilySDK(
+            {
+                "results": [
+                    {"url": "http://169.254.169.254/latest/meta-data", "raw_content": "secret"}
+                ]
+            }
+        )
+    }
+    tool = make_tool(config, provider)
+
+    result = await tool.invoke({"action": "fetch", "url": "https://x.test"}, None)
+
+    assert not result.ok
+    assert "secret" not in result.text
+    assert "redirected to" in result.text
+
+
+async def test_a_public_redirect_through_a_real_provider_renders(config, monkeypatch) -> None:
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-91")
+    provider = FirecrawlProvider(config.tools.web.firecrawl)
+    provider._clients = {
+        "fc-91": _FakeFirecrawlSDK(
+            {"metadata": {"url": "https://example.com/final"}, "markdown": "public body"}
+        )
+    }
+    tool = make_tool(config, provider)
+
+    result = await tool.invoke({"action": "fetch", "url": "https://x.test"}, None)
+
+    assert result.ok
+    assert "public body" in result.text
+    assert "https://example.com/final" in result.text
 
 
 async def test_fetch_attempt_lines_are_fenced(config) -> None:

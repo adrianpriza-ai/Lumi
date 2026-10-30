@@ -559,9 +559,34 @@ READ_ONLY_UNLESS: dict[str, frozenset[str]] = {
 
 #: Programs that hand their arguments to something else, so the arguments are
 #: not really arguments. ``find -exec rm`` and ``xargs rm`` are two spellings of
-#: the same delete, and a rule written for one misses the other.
+#: the same delete, and a rule written for one misses the other. ``nice`` and
+#: its scheduling siblings run the named program unchanged, so leaving them out
+#: let ``nice bash -c '...'`` land on ``nice`` as the judged program with the
+#: script behind it never tokenised; ``command`` and ``builtin`` do the same
+#: from inside the read-only list.
 DELEGATING_COMMANDS: frozenset[str] = frozenset(
-    {"xargs", "parallel", "env", "timeout", "nohup", "stdbuf"}
+    {
+        "xargs",
+        "parallel",
+        "env",
+        "timeout",
+        "nohup",
+        "stdbuf",
+        "nice",
+        "ionice",
+        "setsid",
+        "taskset",
+        "flock",
+        "command",
+        "builtin",
+        "time",
+        "strace",
+        "chrt",
+        "numactl",
+        "watch",
+        "exec",
+        "setarch",
+    }
 )
 
 #: Flags of a delegating command that swallow the *next* token as their value.
@@ -573,6 +598,32 @@ _DELEGATOR_VALUE_FLAGS: dict[str, frozenset[str]] = {
     "env": frozenset({"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}),
     "timeout": frozenset({"-k", "--kill-after", "-s", "--signal"}),
     "stdbuf": frozenset({"-i", "-o", "-e", "--input", "--output", "--error"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "ionice": frozenset({"-c", "-n", "--class", "--nice"}),
+    "taskset": frozenset({"-c", "--cpu-list"}),
+    "flock": frozenset({"-w", "--wait", "-E", "--conflict-exit-code", "-T", "--timeout"}),
+    "strace": frozenset({"-e", "-o", "-p", "-s"}),
+    "chrt": frozenset({"-R", "--rr-interval", "-N", "--nid"}),
+    "numactl": frozenset(
+        {"-C", "-M", "-N", "-P", "--cpunodebind", "--membind", "--interleave", "--physcpubind"}
+    ),
+    "watch": frozenset({"-n", "--interval"}),
+    "parallel": frozenset(
+        {
+            "-S",
+            "--sshlogin",
+            "--arg-file",
+            "--arg-sep",
+            "--colsep",
+            "-I",
+            "--replace-str",
+            "-N",
+            "-P",
+            "--jobs",
+            "--joblog",
+            "--results",
+        }
+    ),
     "xargs": frozenset(
         {
             "-I",
@@ -816,6 +867,19 @@ _SEPARATORS = {";", "&&", "||", "|", "&", "(", ")", "{", "}", "\n"}
 # --------------------------------------------------------------------------- #
 
 
+#: Multi-character operators the split below must not take apart: shlex hands
+#: them over as one token and the separator and redirect tables match them as
+#: units.
+_MULTI_CHAR_OPERATORS: frozenset[str] = frozenset({">>", "&&", "||"})
+
+#: The punctuation characters shlex groups runs of. A run like ``);`` is not in
+#: :data:`_SEPARATORS`, so it travelled into segment operands as one nonsense
+#: word - and for a destination-last command it displaced the real destination
+#: from the zoning (``python3 -c 'os.system("cp a /etc/X");'`` wrote /etc/X
+#: while the policy saw a write to a junk path named ``);``).
+_PUNCT_CHARS: frozenset[str] = frozenset("()<>|&;")
+
+
 def tokenize(command: str) -> list[str]:
     """Split a command line into words and shell operators, as one flat list.
 
@@ -827,9 +891,20 @@ def tokenize(command: str) -> list[str]:
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
         lexer.whitespace_split = True
-        return list(lexer)
+        tokens = list(lexer)
     except ValueError:
         return command.split()
+    out: list[str] = []
+    for token in tokens:
+        if (
+            len(token) > 1
+            and token not in _MULTI_CHAR_OPERATORS
+            and all(char in _PUNCT_CHARS for char in token)
+        ):
+            out.extend(token)
+        else:
+            out.append(token)
+    return out
 
 
 def _is_within(candidate: Path, root: Path) -> bool:
@@ -1123,13 +1198,32 @@ def _interpreter_index(tokens: list[str]) -> int | None:
             index += 1
             continue
         if Path(token).name in DELEGATING_COMMANDS:
-            value_flags = _DELEGATOR_VALUE_FLAGS.get(Path(token).name, frozenset())
+            name = Path(token).name
+            value_flags = _DELEGATOR_VALUE_FLAGS.get(name, frozenset())
             index += 1
+            # Some wrappers name a positional operand *before* the command:
+            # flock's lock file always, taskset's CPU mask and setarch's
+            # architecture when they are not given as flags. A mask or arch
+            # name carries a digit (`0x1`, `x86_64`), which is what tells it
+            # apart from the program that follows.
+            positional = name == "flock"
+            digit_positional = name in {"taskset", "setarch"}
             while index < len(tokens):
                 word = tokens[index]
+                if word in _SEPARATORS:
+                    return None
                 if word in value_flags:
                     index += 2  # the flag and the value it swallows
                     continue
+                if not word.startswith("-"):
+                    if positional:
+                        positional = False
+                        index += 1
+                        continue
+                    if digit_positional and any(char.isdigit() for char in word):
+                        digit_positional = False
+                        index += 1
+                        continue
                 if word.startswith("-") or word.isdigit() or (
                     "=" in word and not word.startswith(("/", "~", "./", "../"))
                 ):
@@ -1203,6 +1297,11 @@ def _inline_script_value(tokens: list[str]) -> tuple[int, str] | None:
         return None
     code_flags = code_flags or frozenset()
     flag_chars = {flag[1] for flag in code_flags if len(flag) == 2}
+    other_value_chars = {
+        flag[1]
+        for flag in INTERPRETER_VALUE_FLAGS.get(program, frozenset())
+        if len(flag) == 2
+    } - flag_chars
     for position in range(index + 1, len(tokens)):
         token = tokens[position]
         if token in _SEPARATORS:
@@ -1232,28 +1331,54 @@ def _inline_script_value(tokens: list[str]) -> tuple[int, str] | None:
         for flag in code_flags:
             if flag.startswith("--") and token.startswith(flag + "="):
                 return position, token.split("=", 1)[1]
-        if (
-            len(token) > 2
-            and token.startswith("-")
-            and not token.startswith("--")
-            and set(token[1:]) & flag_chars
-        ):
-            if position + 1 < len(tokens) and tokens[position + 1] not in _SEPARATORS:
-                return position + 1, tokens[position + 1]
-            return None
+            # Quotes glued to a long flag without ``=``: `node --eval'cp a
+            # /etc/X'` reaches here as one token. Judging the tail covers the
+            # runtimes that accept the glue and costs the ones that error out
+            # on it a stricter verdict than they earn.
+            if flag.startswith("--") and token.startswith(flag) and len(token) > len(flag):
+                return position, token[len(flag) :]
+        if len(token) > 2 and token.startswith("-") and not token.startswith("--"):
+            # A short cluster, read the way getopt reads it, left to right: the
+            # first value-taking flag char ends the cluster (the rest of the
+            # word is its value), and the first code-flag char marks where the
+            # value starts. Glued onto the flag - `bash -c'cp NOTES.md
+            # /etc/X'`, `python3 -c'open("/etc/X","w")'` - the whole script
+            # hides in this one token, which both the flag match above and the
+            # path zoning below judge as a single nonsense path. The remainder
+            # after the flag char *is* the value: getopt runtimes (env, python,
+            # node) run it exactly so, and a shell that rejects the glued word
+            # as an unknown option gets a stricter verdict than it earns.
+            # A remainder of bare letters and digits stays ambiguous - `bash
+            # -cx` is a cluster whose code is the next word - so the value is
+            # looked up in the next token, as for the spaced form.
+            glued: str | None = None
+            for char_index, char in enumerate(token[1:], start=1):
+                if char in flag_chars:
+                    glued = token[char_index + 1 :]
+                    break
+                if char in other_value_chars:
+                    break  # the rest of the cluster is that flag's value
+            if glued is not None:
+                if glued and not glued.isalnum():
+                    return position, glued
+                if position + 1 < len(tokens) and tokens[position + 1] not in _SEPARATORS:
+                    return position + 1, tokens[position + 1]
+                return None
     return None
 
 
 def _wrapper_script_value(tokens: list[str]) -> tuple[int, str] | None:
-    """Index and text of an ``env -S`` split string, wherever env sits.
+    """Index and text of a wrapper argument that is really a shell script.
 
     ``env -S "cp a /etc/X"`` splits its argument on whitespace and runs the
-    result as a command line, so the string is code - the same payload as a
-    ``-c`` value. Judged as one token it was a nonsense path, and the write
-    it carries never reached the zone check. ``env`` is itself a wrapper, so
-    the search walks the same chain :func:`_interpreter_index` walks:
-    ``timeout 5 env -S "..."`` has to find it too, or the payload behind the
-    outer wrapper is judged as nothing at all.
+    result as a command line, ``flock -c "cmd"`` hands it to ``sh -c``, and
+    ``watch`` joins its remaining arguments into one string and runs that the
+    same way, on repeat. In all three the string is code - the same payload as
+    a ``-c`` value. Judged as one token it was a nonsense path, and the write
+    it carries never reached the zone check. These are wrappers, so the search
+    walks the same chain :func:`_interpreter_index` walks: ``timeout 5 env -S
+    "..."`` has to find it too, or the payload behind the outer wrapper is
+    judged as nothing at all.
     """
     index = 0
     while index < len(tokens):
@@ -1276,6 +1401,11 @@ def _wrapper_script_value(tokens: list[str]) -> tuple[int, str] | None:
                     return None
                 if word.startswith("--split-string="):
                     return position, word.split("=", 1)[1]
+                if word.startswith("--split-string") and len(word) > len("--split-string"):
+                    # Glued without ``=``: `env --split-string'cp a /etc/X'`
+                    # reaches here as one token, and the tail is the split
+                    # string either way it is run.
+                    return position, word[len("--split-string") :]
                 if "=" in word and not word.startswith(("-", "/", "./", "../")):
                     position += 1  # VAR=value passed through to the command
                     continue
@@ -1283,6 +1413,24 @@ def _wrapper_script_value(tokens: list[str]) -> tuple[int, str] | None:
                     position += 2
                     continue
                 if word.startswith("-") and len(word) > 1:
+                    # A short cluster, read the way env's getopt reads it, left
+                    # to right: the first ``S`` starts the split string glued to
+                    # the flag (`env -S'cp a /etc/X'` hides the payload in this
+                    # one token), and the first value-taking flag char ends the
+                    # cluster with its value in the rest of the word.
+                    for char_index, char in enumerate(word[1:], start=1):
+                        if char == "S":
+                            glued = word[char_index + 1 :]
+                            if glued:
+                                return position, glued
+                            if (
+                                position + 1 < len(tokens)
+                                and tokens[position + 1] not in _SEPARATORS
+                            ):
+                                return position + 1, tokens[position + 1]
+                            return None
+                        if char in {"u", "C"}:
+                            break  # the rest of the cluster is that flag's value
                     position += 1
                     continue
                 break  # env's program: keep walking the chain from there
@@ -1290,6 +1438,70 @@ def _wrapper_script_value(tokens: list[str]) -> tuple[int, str] | None:
                 return None  # env with only flags: nothing left to run
             index = position
             continue
+        if name == "flock":
+            position = index + 1
+            while position < len(tokens):
+                word = tokens[position]
+                if word in _SEPARATORS:
+                    return None
+                if word in {"-c", "--command"}:
+                    if position + 1 < len(tokens) and tokens[position + 1] not in _SEPARATORS:
+                        return position + 1, tokens[position + 1]
+                    return None
+                if word.startswith("--command="):
+                    return position, word.split("=", 1)[1]
+                if word.startswith("--command") and len(word) > len("--command"):
+                    return position, word[len("--command") :]
+                if word in _DELEGATOR_VALUE_FLAGS.get("flock", frozenset()):
+                    position += 2
+                    continue
+                if word.startswith("-") and len(word) > 1 and not word.startswith("--"):
+                    # A short cluster, read the way getopt reads it: the first
+                    # ``c`` starts the shell command glued to the flag
+                    # (`flock -c'cp a /etc/X'`), and the first value-taking
+                    # flag char ends the cluster with its value in the word.
+                    for char_index, char in enumerate(word[1:], start=1):
+                        if char == "c":
+                            glued = word[char_index + 1 :]
+                            if glued:
+                                return position, glued
+                            if (
+                                position + 1 < len(tokens)
+                                and tokens[position + 1] not in _SEPARATORS
+                            ):
+                                return position + 1, tokens[position + 1]
+                            return None
+                        if char in {"E", "w", "T"}:
+                            break  # the rest of the cluster is that flag's value
+                    position += 1
+                    continue
+                if word.startswith("-"):
+                    position += 1  # a long flag
+                    continue
+                position += 1  # the lock file sits before -c, not after it
+                continue
+            return None
+        if name == "watch":
+            position = index + 1
+            while position < len(tokens):
+                word = tokens[position]
+                if word in _SEPARATORS:
+                    return None
+                if word in _DELEGATOR_VALUE_FLAGS.get("watch", frozenset()):
+                    position += 2
+                    continue
+                if word.startswith("-") and len(word) > 1:
+                    position += 1
+                    continue
+                break
+            if position >= len(tokens):
+                return None
+            # watch joins every remaining argument into one string and hands
+            # it to sh -c, on repeat - so the whole tail is the code.
+            end = position
+            while end < len(tokens) and tokens[end] not in _SEPARATORS:
+                end += 1
+            return position, " ".join(tokens[position:end])
         if name in DELEGATING_COMMANDS:
             index += 1
             value_flags = _DELEGATOR_VALUE_FLAGS.get(name, frozenset())
@@ -1509,7 +1721,7 @@ SINGLE_SOURCE_DEST_COMMANDS: frozenset[str] = frozenset({"cp", "mv", "ln", "inst
 
 
 def _flag_values(tokens: list[str], flags: tuple[str, ...]) -> list[str]:
-    """The values given to *flags*, in ``-f value`` or ``--flag=value`` form."""
+    """The values given to *flags*, in ``-f value``, ``-fvalue`` or ``--flag=value`` form."""
     values: list[str] = []
     for index, token in enumerate(tokens):
         for flag in flags:
@@ -1517,6 +1729,8 @@ def _flag_values(tokens: list[str], flags: tuple[str, ...]) -> list[str]:
                 values.append(tokens[index + 1])
             elif flag.startswith("--") and token.startswith(flag + "="):
                 values.append(token.split("=", 1)[1])
+            elif len(flag) == 2 and token.startswith(flag) and len(token) > 2:
+                values.append(token[2:])
     return values
 
 

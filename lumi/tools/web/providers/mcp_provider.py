@@ -35,7 +35,7 @@ from ....config import MCPConfig
 from ....paths import resolve
 from ....util.env import scrubbed_env
 from ....util.log import get_logger
-from .base import Page, SearchHit, SearchResult, WebProvider, recent_cutoff
+from .base import Page, SearchHit, SearchResult, WebProvider, final_url, recent_cutoff
 
 log = get_logger(__name__)
 
@@ -472,12 +472,22 @@ class MCPProvider(WebProvider):
                 item = item if isinstance(item, dict) else {}
                 if item.get("raw_content") or item.get("markdown") or item.get("content"):
                     return Page(
-                        url=url,
+                        # A tavily-shaped server reports the page it landed on
+                        # after its own redirects; that URL is what the tool
+                        # layer re-checks against the private-host rules.
+                        url=final_url(item.get("url"), requested=url),
                         title=str(item.get("title") or ""),
                         markdown=str(
                             item.get("raw_content") or item.get("markdown") or item.get("content")
                         ),
                     )
+            # Some servers answer with the page at the top level. The text
+            # below is whatever the server flattened; the URL is upgraded only
+            # when the payload names one.
+            return Page(
+                url=final_url(payload.get("url"), payload.get("sourceURL"), requested=url),
+                markdown=text,
+            )
         return Page(url=url, markdown=text)
 
     def summary_line(self) -> str:
