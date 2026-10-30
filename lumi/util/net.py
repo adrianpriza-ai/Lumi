@@ -71,7 +71,7 @@ def _host_reason(host: str) -> str | None:
     # rejection here as a warning-grade guard rather than proof.
     try:
         addrs = socket.getaddrinfo(lowered, None)
-    except OSError:
+    except (OSError, UnicodeError):
         return None  # unresolvable here does not mean malformed
     within = [a[4][0] for a in addrs]
     for text in within:

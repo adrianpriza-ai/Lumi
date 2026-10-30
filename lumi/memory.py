@@ -65,7 +65,19 @@ MODEL_NOTES_END = "<!-- lumi:model-notes: END -->"
 #: these out of a fact so the fact cannot forge the fences that decide how it
 #: is rendered (a fact ending with MODEL_NOTES_END would put the attacker's
 #: text after the closing marker, i.e. back into trusted system-prompt space).
-_MARKER_RE = re.compile(r"<!--\s*lumi:.*?-->", re.DOTALL)
+_MARKER_RE = re.compile(r"<!--\s*lumi:.*?-->", re.DOTALL | re.IGNORECASE)
+#: The *structural* markers of the model-notes fence — the provenance tag is
+#: left alone, because the render path strips these from lines it still has to
+#: classify by tag, and the managed-region markers are left alone too: they
+#: are the file's own structure and render through on purpose. ``remember()``
+#: strips markers at write time, but a hand edit or a fact written before that
+#: strip existed can already carry one into the file: rendered verbatim, an
+#: embedded MODEL_NOTES_END closes the fence early and everything after it —
+#: the rest of the facts, plus whatever the marker smuggled — reads as
+#: ordinary system-prompt material again. Stripped again on read, the only
+#: markers in the rendered block are the ones ``_collect_model_notes`` writes
+#: itself (R18).
+_FENCE_RE = re.compile(r"<!--\s*lumi:model-notes:.*?-->", re.DOTALL | re.IGNORECASE)
 #: What the fence pair costs in characters, reserved from the prompt budget
 #: before the facts are moved so the move can never overspend it.
 _MODEL_FENCE_ROOM = len(MODEL_NOTES_START) + len(MODEL_NOTES_END) + 4
@@ -173,11 +185,13 @@ class MemoryFile:
 
     @staticmethod
     def _fact_of(line: str) -> str:
-        """The fact itself: date prefix and provenance tag stripped."""
+        """The fact itself: date prefix and every lumi marker stripped."""
         match = _BULLET_RE.match(line)
         if match is None:
             return ""
-        return _MODEL_TAG_RE.sub("", _DATE_PREFIX_RE.sub("", match.group(1))).strip()
+        # ``_MARKER_RE`` subsumes the model tag; markers that reached the file
+        # another way (hand edit, pre-strip write) are stripped here too (R18).
+        return _MARKER_RE.sub("", _DATE_PREFIX_RE.sub("", match.group(1))).strip()
 
     def managed(self) -> list[str]:
         """Managed memories, newest last, with date prefix and tag stripped."""
@@ -324,6 +338,10 @@ class MemoryFile:
         an HTML comment to distinguish it is the exact sink this exists to
         close.
         """
+        # Strip forged fence markers before classifying: a forged END inside
+        # a tagged fact would close this very fence early, and one in prose
+        # would sit above it pretending to have opened a block (R18).
+        body = "\n".join(_FENCE_RE.sub("", line) for line in body.split("\n"))
         lines = body.split("\n")
         tagged = {
             i

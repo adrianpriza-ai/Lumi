@@ -489,8 +489,10 @@ class ShellConfig:
 class FilesConfig:
     enabled: bool = True
     #: ``data/skills`` is here so the owner's skills can be written and edited
-    #: with this tool: a directory of instruction files the model maintains,
-    #: not project state — that is what safety's protected-path guard is for.
+    #: with this tool: a directory of instruction files the model maintains.
+    #: It stays writable, but the first write to a skill file in a session
+    #: always asks the owner (and the shell asks on each write there), because
+    #: skill text is read into every chat's system prompt (lumi/tools/skills.py).
     writable: list[str] = field(default_factory=lambda: ["workspace", "data/skills"])
     #: Characters of a file handed to the model on read. Generous by default
     #: because a read is usually done to look at the whole thing; 0 means no

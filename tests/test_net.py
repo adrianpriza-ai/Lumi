@@ -92,3 +92,10 @@ def test_an_idn_host_is_checked_as_the_punycode_the_fetcher_resolves() -> None:
     # 'münchen.example' encodes to an ASCII label before the host checks run;
     # the example TLD is not resolvable here either, which is not a refusal.
     assert validate_fetch_url("https://münchen.example/") is None
+
+
+def test_long_hostname_label_does_not_crash_resolver() -> None:
+    # A label exceeding 63 ASCII characters causes socket.getaddrinfo to raise
+    # UnicodeEncodeError via idna encoding; this should be caught cleanly rather
+    # than raising an unhandled exception (R21).
+    assert validate_fetch_url("https://" + "a" * 64 + ".example.com/") is None

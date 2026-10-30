@@ -471,6 +471,68 @@ async def test_a_public_redirect_through_a_real_provider_renders(config, monkeyp
     assert "https://example.com/final" in result.text
 
 
+async def test_a_mcp_redirect_to_a_private_host_is_not_rendered(config) -> None:
+    """The MCP fetch path is the one that reaches the local network, so the
+    URL the server reports after its own redirects is re-checked like a cloud
+    provider's (finding E / R3)."""
+    (config.root / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"a": {"url": "https://a.test"}}}), encoding="utf-8"
+    )
+    provider = MCPProvider(config.tools.web.mcp, config.root)
+    spec = ServerSpec(name="a", url="https://a.test")
+    discovered = DiscoveredTool(
+        name="fetch_url", description="", properties={"url": {"type": "string"}}
+    )
+    payload = json.dumps(
+        {"url": "http://169.254.169.254/latest/meta-data", "markdown": "instance secret"}
+    )
+
+    async def _picked(*_args, **_kwargs):
+        return spec, discovered
+
+    async def _called(*_args, **_kwargs):
+        return payload
+
+    provider._pick = _picked  # type: ignore[method-assign]
+    provider._call = _called  # type: ignore[method-assign]
+    tool = make_tool(config, provider)
+
+    result = await tool.invoke({"action": "fetch", "url": "https://x.test"}, None)
+
+    assert not result.ok
+    assert "instance secret" not in result.text
+    assert "redirected to" in result.text
+
+
+async def test_mcp_content_without_a_final_url_is_not_rendered(config) -> None:
+    """A server that reports content but no URL cannot say where it landed,
+    so its body fails closed instead of rendering unjudged (R3)."""
+    (config.root / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"a": {"url": "https://a.test"}}}), encoding="utf-8"
+    )
+    provider = MCPProvider(config.tools.web.mcp, config.root)
+    spec = ServerSpec(name="a", url="https://a.test")
+    discovered = DiscoveredTool(
+        name="fetch_url", description="", properties={"url": {"type": "string"}}
+    )
+
+    async def _picked(*_args, **_kwargs):
+        return spec, discovered
+
+    async def _called(*_args, **_kwargs):
+        return json.dumps({"markdown": "instance secret"})
+
+    provider._pick = _picked  # type: ignore[method-assign]
+    provider._call = _called  # type: ignore[method-assign]
+    tool = make_tool(config, provider)
+
+    result = await tool.invoke({"action": "fetch", "url": "https://x.test"}, None)
+
+    assert not result.ok
+    assert "instance secret" not in result.text
+    assert "without a final URL" in result.text  # the fetch really ran and failed closed
+
+
 async def test_fetch_attempt_lines_are_fenced(config) -> None:
     """A page can start with a failure prefix on purpose; its text is then
     reported as an attempt, which must still read as data, not framing."""

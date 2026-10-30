@@ -572,6 +572,44 @@ def test_awk_program_and_variable_indirection_are_zoned() -> None:
     assert verdict("awk '{print $1}' /etc/passwd").tier is safety.Tier.ALLOW
 
 
+def test_busybox_applets_awk_file_programs_and_glued_chdir_are_judged(
+    tmp_path: Path,
+) -> None:
+    # R10: busybox runs the named applet unchanged, so without it on the
+    # delegating list the stop token was `busybox` itself and the applet's
+    # program text was never zoned.
+    assert verdict("""busybox awk 'BEGIN{print "pwned" > "/etc/X"}'""").blocked
+    assert verdict("busybox sh -c 'cp NOTES.md /etc/X'").blocked
+    assert verdict("busybox cat NOTES.md").tier is safety.Tier.ALLOW
+    # R11: a redirect inside an awk program is never a `>` token on the line -
+    # it sits inside one quoted word - so the destination has to be resolved
+    # against the directory the program actually runs in.
+    assert verdict("""cd /etc && awk -v f=pwned 'BEGIN{print "pwned" > f}'""").blocked
+    # R12: `-f` runs the program stored in a file, so the file gets the same
+    # freshness gate an interpreter script gets.
+    root, workspace, home = _session_project(tmp_path)
+    (workspace / "fresh.awk").write_text("BEGIN{print 1}")
+    for command in (
+        "awk -f fresh.awk",
+        "awk --file=fresh.awk",
+        "awk -ffresh.awk",
+        "awk -i fresh.awk NOTES.md",
+    ):
+        result = _session_verdict(command, root, workspace, home)
+        assert result.needs_approval, command
+        assert result.rule == "exec:recent-script", command
+    # R13: the glued chdir spellings move the directory just like the spaced
+    # ones, so the operands are judged against where the command really runs.
+    for command in (
+        "env --chdir=/etc cp NOTES.md X",
+        "env -C/etc cp NOTES.md X",
+        "env --chdir /etc cp NOTES.md X",
+        "env -C /etc cp NOTES.md X",
+    ):
+        assert verdict(command).blocked, command
+    assert verdict("env FOO=1 cp NOTES.md copied.md").tier is safety.Tier.ALLOW
+
+
 def test_a_variable_inside_a_zoned_shell_script_is_judged_by_its_command() -> None:
     # The 13.2 variable check is for an interpreter's *program* operand
     # (`bash $X`); inside a shell `-c` script the same word is zoned exactly
@@ -621,9 +659,15 @@ def test_env_split_behind_a_wrapper_and_deno_flag_tokens_are_zoned() -> None:
     assert verdict('deno eval --ext ts "rm -rf /etc/X"').blocked  # value flag
     assert verdict('deno eval --quiet "rm -rf /etc/X"').blocked  # bool flag
     assert verdict('deno --quiet eval "rm -rf /etc/X"').blocked  # flag before
+    # R7: a flag after the subcommand is not the code — judging it as such
+    # left the payload behind it unzoned.
+    assert verdict('deno eval -A "rm -rf /etc/X"').blocked  # unknown flag
+    assert verdict('deno eval --ext=ts "rm -rf /etc/X"').blocked  # glued value
+    assert verdict('deno eval --seed 42 "rm -rf /etc/X"').blocked  # spaced value
     # Benign forms stay free.
     assert verdict("env -S 'echo hi'").tier is safety.Tier.ALLOW
     assert verdict("deno run file.ts").tier is safety.Tier.ALLOW
+    assert verdict("deno eval -A").tier is safety.Tier.ALLOW  # no code to run
 
 
 def test_glued_flag_values_do_not_hide_the_inline_payload() -> None:
@@ -1220,6 +1264,31 @@ def test_a_missing_secret_name_is_not_a_denial(tmp_path: Path) -> None:
     assert _verdict("cat ../.env", root, home).tier is safety.Tier.ALLOW
 
 
+def test_credential_shaped_basenames_are_read_denied(tmp_path: Path) -> None:
+    # R19: the secret list only caught `.env`-shaped names, so a token dump,
+    # an auth bundle or a rotated key read back like any source file.
+    root, home = _project(tmp_path)
+    for name in (
+        "credentials.json",
+        "credentials.yaml",
+        "credentials.yml",
+        "token.txt",
+        "token.json",
+        "secrets.json",
+        "secrets.yaml",
+        "secrets.yml",
+        "auth.json",
+        "id_rsa.old",
+        "id_ed25519.bak",
+        "server.keystore",
+    ):
+        (root / name).write_text("secret", encoding="utf-8")
+        assert _verdict(f"cat ../{name}", root, home).blocked, name
+    # The public half of a key is published by definition; it stays readable.
+    (root / "id_rsa.pub").write_text("ssh-ed25519 AAAA", encoding="utf-8")
+    assert _verdict("cat ../id_rsa.pub", root, home).tier is safety.Tier.ALLOW
+
+
 # --------------------------------------------------------------------------- #
 # the read path outside the project
 # --------------------------------------------------------------------------- #
@@ -1312,6 +1381,94 @@ def test_per_chat_memory_and_history_are_not_shell_material(tmp_path: Path) -> N
     assert _verdict("rm -rf ../data/history", root, home).blocked
     # The project's own MEMORY.md is the owner's file and stays readable.
     assert _verdict("cat MEMORY.md", root, home).tier is safety.Tier.ALLOW
+
+
+# --------------------------------------------------------------------------- #
+# skill files: writable on purpose, but a write asks (R8)
+# --------------------------------------------------------------------------- #
+
+
+def test_writing_a_skill_asks_even_when_the_project_is_the_write_zone(
+    tmp_path: Path,
+) -> None:
+    """R8: ``data/skills`` is model-writable, and its ``SKILL.md`` files are
+    catalogued into the system prompt of every chat. With the default shell
+    write zone (the whole project) creating one used to run silently, so a
+    fetched page could plant a skill that speaks to every later turn. The
+    write now asks; reading stays free, because loading a skill is the point."""
+    root, home = _project(tmp_path)
+
+    def v(command: str) -> safety.Verdict:
+        return safety.classify(
+            command, cwd=root / "workspace", project_root=root, home=home, write_root=root
+        )
+
+    for command in (
+        "mkdir -p ../data/skills/evil",
+        "echo pwned > ../data/skills/evil/SKILL.md",
+        "cd ../data/skills/evil && echo pwned > SKILL.md",  # bare name after cd
+        "tee ../data/skills/evil/SKILL.md",
+        "cp ../workspace/x ../data/skills/evil/SKILL.md",
+    ):
+        verdict = v(command)
+        assert verdict.tier is safety.Tier.CONFIRM, (command, verdict)
+        assert verdict.rule == "zone:approval-state", (command, verdict)
+
+    # A "read-only" command that writes, and an interpreter naming the skill
+    # only inside its script, are the same write by another spelling.
+    for command in (
+        "sed -i 's/a/b/' ../data/skills/evil/SKILL.md",
+        "cd ../data/skills/evil && sed -i 's/a/b/' SKILL.md",
+        "sort -o ../data/skills/evil/SKILL.md ../workspace/in",
+        "uniq ../workspace/in ../data/skills/evil/SKILL.md",
+        "cd ../data/skills/evil && python3 -c \"open('SKILL.md','w').write('x')\"",
+    ):
+        assert v(command).needs_approval, command
+
+    # Reading a skill is what the tool is for.
+    assert v("cat ../data/skills/evil/SKILL.md").tier is safety.Tier.ALLOW
+    # An ordinary project write is untouched by the rule.
+    assert v("touch notes.md").tier is safety.Tier.ALLOW
+    assert v("echo hi > ../workspace/notes.md").tier is safety.Tier.ALLOW
+
+
+def test_parallel_templates_are_judged_like_a_shell_line(tmp_path: Path) -> None:
+    """GNU parallel runs its first non-flag word through a shell itself, so a
+    template is code — not the program name a delegator normally hands over.
+    Without reading it, `parallel ::: '<cmd>'` (and the `-j1`/`-N1` spellings)
+    skipped every check the same command gets on its own line (§7.3.1), which
+    was both an R8 shell-tap gap and an R9-class bypass of the state denies."""
+    root, home = _project(tmp_path)
+    memory = root / "data" / "memory" / "-1002" / "MEMORY.md"
+    memory.parent.mkdir(parents=True)
+    memory.write_text("# Memory\n", encoding="utf-8")
+
+    def v(command: str) -> safety.Verdict:
+        return safety.classify(
+            command, cwd=root / "workspace", project_root=root, home=home, write_root=root
+        )
+
+    # The command template is judged, wherever the input separator sits.
+    for command in (
+        "parallel ::: 'cp NOTES.md /etc/X'",
+        "parallel -j1 'cp NOTES.md /etc/X'",
+        "parallel -N1 'cp NOTES.md /etc/X'",
+        "parallel -j 2 'cp NOTES.md /etc/X'",
+        "parallel --jobs 2 'cp NOTES.md /etc/X'",
+        "parallel ::: 'cat ../data/memory/-1002/MEMORY.md'",
+    ):
+        assert v(command).blocked, command
+
+    # A skill write behind a template is the same write and asks (R8).
+    for command in (
+        "parallel ::: 'cat > ../data/skills/good/SKILL.md'",
+        "parallel -j1 'echo pwned > ../data/skills/good/SKILL.md'",
+    ):
+        assert v(command).needs_approval, command
+
+    # Benign templates stay free.
+    assert v("parallel echo ::: a b").tier is safety.Tier.ALLOW
+    assert v("parallel 'cp a b' ::: x y").tier is safety.Tier.ALLOW
 
 
 # --------------------------------------------------------------------------- #

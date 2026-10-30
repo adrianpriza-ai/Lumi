@@ -479,7 +479,12 @@ def _render_library_matches(library_name: str, matches: list[LibraryMatch]) -> s
             f"context7: no libraries for {library_name!r}. "
             "Try a more specific name, or call query_docs directly with a known ID."
         )
-    lines = [f"context7 matches for {library_name!r}:"]
+    # Match titles, descriptions and ids are third-party registry text, so
+    # they go into the prompt inside the same fence the snippets use (finding
+    # H fixed query_docs only; resolve_library_id is the other entry point,
+    # R15) — only our own one-line header stays unfenced. The closing hint
+    # quotes a third-party id, so it sits inside the fence too.
+    lines = []
     for index, match in enumerate(matches, start=1):
         head = f"[{index}] {match.title or match.id}  ({match.id})"
         if match.score is not None:
@@ -489,7 +494,10 @@ def _render_library_matches(library_name: str, matches: list[LibraryMatch]) -> s
             lines.append(truncate(match.description, 240, "…"))
     lines.append("")
     lines.append(f"Use `library_id` (e.g. '{matches[0].id}') with action='query_docs'.")
-    return "\n".join(lines)
+    return (
+        f"context7 matches for {library_name!r}:\n"
+        + fence_untrusted("\n".join(lines).strip())
+    )
 
 
 def _render_snippets(

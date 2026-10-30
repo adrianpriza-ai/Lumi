@@ -402,6 +402,15 @@ PROTECTED_PROJECT_PATHS: frozenset[tuple[str, ...]] = frozenset(
     }
 )
 
+#: Project paths that stay writable on purpose but whose contents are read
+#: back into the bot later, so a write asks first instead of running silently.
+#: ``data/skills`` is the one: every ``SKILL.md`` catalogued there lands in the
+#: system prompt of every chat, which makes a silent write a persistent
+#: prompt-injection sink — the same consequence that made ``data/memory`` a
+#: hard deny. Skills differ in intent: they are the model's to maintain, so the
+#: owner taps once instead of the write being refused. See lumi/tools/skills.py.
+APPROVAL_SUBPATHS: frozenset[tuple[str, ...]] = frozenset({("data", "skills")})
+
 #: Files whose *contents* are credentials. The write guards above protect
 #: files because changing them changes what the machine does; this list
 #: protects files because *reading* one hands the model exactly what the
@@ -422,11 +431,30 @@ SECRET_FILE_BASENAMES: frozenset[str] = frozenset(
         "id_rsa",
         "id_ed25519",
         "id_ecdsa",
+        # Credential-shaped under an ordinary-looking name: an auth bundle, a
+        # token dump, a credentials export — same contents, no dotenv spelling
+        # for the suffix list to catch (R19).
+        "credentials.json",
+        "credentials.yaml",
+        "credentials.yml",
+        "token.txt",
+        "token.json",
+        "secrets.json",
+        "secrets.yaml",
+        "secrets.yml",
+        "auth.json",
     }
 )
 
 #: Key material, named by extension because the issuer decided the basename.
-SECRET_FILE_SUFFIXES: tuple[str, ...] = (".pem", ".key", ".p12", ".pfx")
+SECRET_FILE_SUFFIXES: tuple[str, ...] = (".pem", ".key", ".p12", ".pfx", ".keystore")
+
+#: Private-key stems: a rotated or backed-up key keeps the name with a
+#: suffix — ``id_rsa.old``, ``id_ed25519.bak`` (R19). The public half ends
+#: in ``.pub`` and stays readable; it is published by definition.
+PRIVATE_KEY_STEMS: frozenset[str] = frozenset(
+    {"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
+)
 
 #: System files that hold credentials under names that look ordinary. A
 #: read-only command may read a system path — ``cat /etc/passwd`` is fine —
@@ -563,7 +591,10 @@ READ_ONLY_UNLESS: dict[str, frozenset[str]] = {
 #: its scheduling siblings run the named program unchanged, so leaving them out
 #: let ``nice bash -c '...'`` land on ``nice`` as the judged program with the
 #: script behind it never tokenised; ``command`` and ``builtin`` do the same
-#: from inside the read-only list.
+#: from inside the read-only list. ``busybox`` is the same shape from the
+#: other side: it runs the named applet unchanged, so without it the stop
+#: token is ``busybox`` itself and ``busybox awk 'BEGIN{... > "/etc/X"}'``
+#: judges nothing (R10).
 DELEGATING_COMMANDS: frozenset[str] = frozenset(
     {
         "xargs",
@@ -586,6 +617,8 @@ DELEGATING_COMMANDS: frozenset[str] = frozenset(
         "watch",
         "exec",
         "setarch",
+        "busybox",
+        "busybox64",
     }
 )
 
@@ -612,16 +645,24 @@ _DELEGATOR_VALUE_FLAGS: dict[str, frozenset[str]] = {
         {
             "-S",
             "--sshlogin",
+            "--sshloginfile",
+            "-a",
             "--arg-file",
+            "-d",
+            "--delimiter",
             "--arg-sep",
             "--colsep",
             "-I",
             "--replace-str",
+            "-j",
             "-N",
             "-P",
             "--jobs",
             "--joblog",
             "--results",
+            "--tmpdir",
+            "--workdir",
+            "--wd",
         }
     ),
     "xargs": frozenset(
@@ -721,11 +762,18 @@ SUBCOMMAND_CODE: dict[str, frozenset[str]] = {
 
 #: Subcommand flags that swallow the next token, and plain subcommand flags,
 #: for :data:`SUBCOMMAND_CODE`. ``deno eval --ext ts "code"`` must skip both
-#: ``--ext`` and ``ts`` before reaching the code; an *unknown* flag-shaped
-#: word is taken as the code itself rather than skipped, because guessing
-#: would zone the flag and miss the payload behind it.
+#: ``--ext`` and ``ts`` before reaching the code. A flag-shaped word is never
+#: the code: returning it judges the flag and leaves the payload behind it
+#: unzoned, so ``deno eval -A "cp a /etc/X"`` read as a bare ``-A`` and
+#: reached ALLOW (R7). Every ``-``-prefixed word after the subcommand is
+#: skipped - known plain flags, glued values (``--ext=ts``) and unknown flags
+#: alike - and the first word that is not one is the code. If only flags
+#: remain there is no code for the subcommand to run at all, so finding
+#: nothing is the truth, not a guess.
 SUBCOMMAND_VALUE_FLAGS: dict[str, frozenset[str]] = {
-    "deno": frozenset({"--ext", "--config", "--import-map", "--lock"}),
+    "deno": frozenset(
+        {"--ext", "--config", "--import-map", "--lock", "--seed", "--location", "--v8-flags"}
+    ),
 }
 SUBCOMMAND_FLAGS: dict[str, frozenset[str]] = {
     "deno": frozenset(
@@ -1213,11 +1261,32 @@ def effective_cwd(tokens: list[str], cwd: Path, home: Path | None) -> Path | Non
             if "$" in target or "`" in target:
                 return None
             base = _absolute(target, base, home)
-        elif program == "env" and ("-C" in segment or "--chdir" in segment):
-            index = segment.index("-C") if "-C" in segment else segment.index("--chdir")
-            if index + 1 >= len(segment):
-                return None
-            base = _absolute(segment[index + 1], base, home)
+        elif program == "env":
+            # `-C /etc`, `-C/etc`, `--chdir /etc` and `--chdir=/etc` all move
+            # the same directory. Only the two spaced spellings were followed,
+            # so a glued one ran its command in /etc while every operand was
+            # still judged against the workspace (R13).
+            target: str | None = None
+            found = False
+            for position in range(1, len(segment)):
+                word = segment[position]
+                if word in {"-C", "--chdir"}:
+                    found = True
+                    if position + 1 < len(segment):
+                        target = segment[position + 1]
+                    break
+                if word.startswith("--chdir="):
+                    found = True
+                    target = word.split("=", 1)[1]
+                    break
+                if word.startswith("-C") and len(word) > 2:
+                    found = True
+                    target = word[2:]
+                    break
+            if found:
+                if target is None:
+                    return None  # the flag is there but its value is not
+                base = _absolute(target, base, home)
     return base
 
 
@@ -1403,7 +1472,7 @@ def _inline_script_value(tokens: list[str]) -> tuple[int, str] | None:
                 if word in sub_value_flags:
                     inner_position += 2
                     continue
-                if word in sub_flags:
+                if word in sub_flags or (word.startswith("-") and len(word) > 1):
                     inner_position += 1
                     continue
                 return inner_position, word
@@ -1455,9 +1524,10 @@ def _wrapper_script_value(tokens: list[str]) -> tuple[int, str] | None:
     """Index and text of a wrapper argument that is really a shell script.
 
     ``env -S "cp a /etc/X"`` splits its argument on whitespace and runs the
-    result as a command line, ``flock -c "cmd"`` hands it to ``sh -c``, and
+    result as a command line, ``flock -c "cmd"`` hands it to ``sh -c``,
     ``watch`` joins its remaining arguments into one string and runs that the
-    same way, on repeat. In all three the string is code - the same payload as
+    same way, on repeat, and ``parallel`` runs its command template through a
+    shell for every job. In all four the string is code - the same payload as
     a ``-c`` value. Judged as one token it was a nonsense path, and the write
     it carries never reached the zone check. These are wrappers, so the search
     walks the same chain :func:`_interpreter_index` walks: ``timeout 5 env -S
@@ -1586,6 +1656,37 @@ def _wrapper_script_value(tokens: list[str]) -> tuple[int, str] | None:
             while end < len(tokens) and tokens[end] not in _SEPARATORS:
                 end += 1
             return position, " ".join(tokens[position:end])
+        if name == "parallel":
+            # GNU parallel does not take a program and arguments: the first
+            # non-flag word is a command *template* that parallel hands to a
+            # shell itself. Judging it as a bare program word (or, with a
+            # leading ``:::``, as the separator) left the template unzoned, so
+            # `parallel ::: 'cp NOTES.md /etc/X'` and a skill write behind the
+            # same spelling reached ALLOW (§7.3.1). Everything from the
+            # template to the end of the segment is shell code, exactly like
+            # watch's tail; a leading ``:::`` only separates input arguments.
+            value_flags = _DELEGATOR_VALUE_FLAGS.get("parallel", frozenset())
+            position = index + 1
+            while position < len(tokens):
+                word = tokens[position]
+                if word in _SEPARATORS:
+                    return None
+                if word in value_flags:
+                    position += 2
+                    continue
+                if word == ":::":
+                    position += 1
+                    continue
+                if word.startswith("-") and len(word) > 1:
+                    position += 1
+                    continue
+                break
+            if position >= len(tokens):
+                return None
+            end = position
+            while end < len(tokens) and tokens[end] not in _SEPARATORS:
+                end += 1
+            return position, " ".join(tokens[position:end])
         if name in DELEGATING_COMMANDS:
             index += 1
             value_flags = _DELEGATOR_VALUE_FLAGS.get(name, frozenset())
@@ -1647,6 +1748,34 @@ def script_paths(tokens: list[str], cwd: Path, home: Path | None) -> list[Path]:
     if index is None:
         return []
     program = Path(tokens[index]).name
+    if program in INLINE_PROGRAM_COMMANDS:
+        # `awk -f prog.awk` runs the program stored in that file - the same
+        # write-then-run as an interpreter script, and until now the one
+        # execution path with no freshness gate at all (R12). Only the file
+        # flags name a program: `-v` names a variable and `-F` a separator.
+        file_flags = _AWK_FILE_FLAGS | {"-i", "--include"}
+        word_index = index + 1
+        while word_index < len(tokens):
+            word = tokens[word_index]
+            if word in _SEPARATORS:
+                break
+            if word in file_flags:
+                if word_index + 1 < len(tokens) and tokens[word_index + 1] not in _SEPARATORS:
+                    return [_absolute(tokens[word_index + 1], cwd, home)]
+                break
+            if word.split("=", 1)[0] in file_flags and "=" in word:
+                return [_absolute(word.split("=", 1)[1], cwd, home)]
+            if word.startswith("-") and len(word) > 2 and not word.startswith("--"):
+                glued = next(
+                    (flag for flag in file_flags if not flag.startswith("--") and word.startswith(flag)),
+                    None,
+                )
+                if glued:
+                    return [_absolute(word[len(glued) :], cwd, home)]
+                word_index += 1
+                continue
+            break  # the first bare operand is inline program text, not a file
+        return []
     if program not in SCRIPT_RUNNERS:
         return []
     value_flags = INTERPRETER_VALUE_FLAGS.get(program, frozenset())
@@ -1881,6 +2010,29 @@ def _protected_project_path(path: Path, project_root: Path | None) -> str | None
     return None
 
 
+def _approval_project_path(path: Path, project_root: Path | None) -> str | None:
+    """The approval directory inside the project that *path* sits under, if any.
+
+    Same resolution rule as :func:`_protected_project_path`, but matching a
+    prefix rather than one exact file: anything under ``data/skills`` is a
+    skill file or a file that skill will point at.
+    """
+    if project_root is None:
+        return None
+    try:
+        resolved = path.resolve()
+        root = project_root.resolve()
+    except OSError:  # pragma: no cover - broken symlink loop
+        return None
+    if not (resolved == root or root in resolved.parents):
+        return None
+    relative = tuple(resolved.relative_to(root).parts)
+    for approval in APPROVAL_SUBPATHS:
+        if relative[: len(approval)] == approval:
+            return "/".join(approval)
+    return None
+
+
 def protected_write(path: Path, project_root: Path | None = None) -> str | None:
     """What a write to *path* trips, if anything, under the protected-path rules.
 
@@ -1915,7 +2067,13 @@ def _is_secret_name(name: str) -> bool:
     # .env.local, .env.production, .envrc — dotenv files under any spelling.
     if name.startswith(".env"):
         return True
-    return name.endswith(SECRET_FILE_SUFFIXES)
+    if name.endswith(SECRET_FILE_SUFFIXES):
+        return True
+    # A rotated private key: id_rsa.old, id_ed25519.bak. Split on the first
+    # dot so `id_rsa.old` is the stem `id_rsa` plus an extension, while the
+    # plain key name itself keeps coming from the basename set above.
+    stem, dot, _ext = name.partition(".")
+    return bool(dot) and stem in PRIVATE_KEY_STEMS and not name.endswith(".pub")
 
 
 def credential_dir(path: Path) -> tuple[str, Path] | None:
@@ -2395,7 +2553,10 @@ def explain(
             # A command classified read-only can still name its output as an
             # operand (`sed -i`, `sort -o`, `uniq in out`). Judge only those
             # actual outputs, so the input file beside them stays a read.
-            for target in dict.fromkeys(_readonly_write_targets(segment, base, home)):
+            # Resolved against the segment's own base, like every other target:
+            # `cd data/skills/x && sed -i ... SKILL.md` writes the skill, not a
+            # file beside the original working directory.
+            for target in dict.fromkeys(_readonly_write_targets(segment, segment_base, home)):
                 try:
                     resolved = target.resolve()
                 except OSError:  # pragma: no cover - broken symlink loop
@@ -2407,6 +2568,15 @@ def explain(
                             Tier.DENY,
                             f"{guard} is protected; this command would write it",
                             "zone:protected-write",
+                        )
+                    )
+                elif (approval_path := _approval_project_path(resolved, project_root)) is not None:
+                    verdicts.append(
+                        Verdict(
+                            Tier.CONFIRM,
+                            f"{approval_path} holds instruction files that are read into "
+                            "every chat's system prompt; a write there asks first",
+                            "zone:approval-state",
                         )
                     )
             continue
@@ -2495,6 +2665,17 @@ def explain(
         # so the path-shapedness test above cannot see it. Gated on the program,
         # because `kill 1234` takes a pid and not a path.
         targets += operand_paths(zone_tokens, segment_program, segment_base, home)
+        # A redirect destination is a write target even when it is a bare
+        # identifier: `print "x" > f` inside an awk program writes `f` in the
+        # directory the program runs in, and `cd /etc && awk ... > f` writes
+        # it in /etc. Section 5 judges the line's own `>` tokens, but this
+        # one sits inside one quoted token at the top level and in an inner
+        # segment at all, so it was never resolved against segment_base (R11).
+        targets += [
+            _absolute(word, segment_base, home)
+            for word in _redirect_destinations(zone_tokens)
+            if word and not _path_like(word)
+        ]
         # A commit message is prose. `git commit -m 'stop touching /etc'` names
         # a path the same way `rm /etc/passwd` does, and reading it as a write
         # target makes those messages impossible to commit.
@@ -2516,7 +2697,20 @@ def explain(
                 denied = _read_deny(target, project_root, chat_id)
                 if denied is not None:
                     verdicts.append(denied)
-            targets += quoted_paths(segment_text, base, home)
+                elif (approval_path := _approval_project_path(target, project_root)) is not None:
+                    # A bare `open('SKILL.md', 'w')` after `cd data/skills/...`
+                    # names a skill file without a separator, so no target walk
+                    # sees it. The quoted span is resolved at the directory the
+                    # interpreter runs in, which is exactly the skill's own.
+                    verdicts.append(
+                        Verdict(
+                            Tier.CONFIRM,
+                            f"{approval_path} holds instruction files that are read into "
+                            "every chat's system prompt; a write there asks first",
+                            "zone:approval-state",
+                        )
+                    )
+            targets += quoted_paths(segment_text, segment_base, home)
         # What the segment *reads*, noted before the destination truncation
         # below throws the sources away: a mutating command still reads its
         # operands, and the read-only pass never runs for it, so `cp
@@ -2614,6 +2808,15 @@ def explain(
                         "zone:protected-subpath",
                     )
                 )
+            elif (approval_path := _approval_project_path(resolved, project_root)) is not None:
+                verdicts.append(
+                    Verdict(
+                        Tier.CONFIRM,
+                        f"{approval_path} holds instruction files that are read into "
+                        "every chat's system prompt; a write there asks first",
+                        "zone:approval-state",
+                    )
+                )
             elif not _is_within(path, write_root):
                 # Inside the project but outside the workspace. Escalated to a
                 # deny for a recursive delete, which is the irreversible case.
@@ -2657,6 +2860,29 @@ def explain(
                         Tier.CONFIRM,
                         f"would write outside the project ({path})",
                         "zone:outside-write",
+                    )
+                )
+
+        # A redirect names its destination on the other side of `>`, where the
+        # per-segment target walk above only sees it when it looks like a path:
+        # `cd data/skills/x && echo pwned > SKILL.md` writes a skill body with
+        # a bare name. Judge every redirect destination at the segment's own
+        # base, so an inner `cd` cannot move the write out from under the
+        # approval rule. Path-shaped destinations were judged above already;
+        # the final dedup folds the two findings into one.
+        for path in dict.fromkeys(
+            _absolute(word, segment_base, home) for word in _redirect_destinations(zone_tokens)
+        ):
+            if _is_dev_sink(path):
+                continue
+            approval_path = _approval_project_path(path, project_root)
+            if approval_path is not None:
+                verdicts.append(
+                    Verdict(
+                        Tier.CONFIRM,
+                        f"{approval_path} holds instruction files that are read into "
+                        "every chat's system prompt; a write there asks first",
+                        "zone:approval-state",
                     )
                 )
 
@@ -2755,6 +2981,7 @@ def describe_policy() -> str:
         f"{len(DENY_RULES)} hard-deny rules, {len(CONFIRM_RULES)} confirm rules, "
         f"{len(SYSTEM_PREFIXES)} protected system prefixes, "
         f"{len(PROTECTED_SUBPATHS)} protected subpaths, "
+        f"{len(APPROVAL_SUBPATHS)} approval subpaths, "
         f"{len(SECRET_FILE_BASENAMES)} secret files refused on read, "
         f"{len(PIPE_TARGETS)} pipe targets blocked"
     )
@@ -2781,4 +3008,5 @@ __all__ = [
     "READ_ONLY_UNLESS",
     "PIPE_TARGETS",
     "PROTECTED_SUBPATHS",
+    "APPROVAL_SUBPATHS",
 ]

@@ -102,7 +102,9 @@ One exception: a file that was created or changed *during this session* gets
 one owner approval on its first write, append or edit, then goes on normally.
 That is the write half of the write-then-run chain — a file this session
 authored may come from fetched content, so its authorship is shown to the
-owner once before it changes.
+owner once before it changes. Skill files under `data/skills/` always get
+that one approval, even when they predate the session: their text is put in
+front of every chat, so the owner always sees the first change.
 
 Set `upload: true` on a write or an edit to also send the finished file to the
 chat as a document — use it whenever the owner asked for "a file" they can
@@ -229,6 +231,15 @@ it validates the path, caps the size, and shows a diff before it overwrites.
                     f"writing to {resolved} is not allowed. Writable locations: {allowed}. "
                     "Ask the owner to widen tools.files.writable in config.toml if this is intended."
                 )
+            # Writes are per chat exactly like reads: an upload that predates
+            # this session carries no mtime freshness, so editing another
+            # chat's file used to land with no tap at all (R14) — the
+            # first-write prompt only ever fired for session-authored files.
+            if (foreign := foreign_uploads(resolved, self.root, chat_id)) is not None:
+                raise ToolError(
+                    f"writing to {resolved} is not allowed: workspace/uploads/{foreign} "
+                    "belongs to another chat. Each chat only sees its own uploads."
+                )
             guard = protected_write(resolved, self.root)
             if guard is not None:
                 raise ToolError(
@@ -259,17 +270,29 @@ it validates the path, caps the size, and shows a diff before it overwrites.
     def _display(self, path: Path) -> str:
         return relative_to_root(path)
 
+    def _is_project_skill(self, path: Path) -> bool:
+        """Whether *path* is a skill file the system prompt will read back."""
+        return is_within(path, self.config.data_dir / "skills")
+
     def _session_authored(self, path: Path) -> bool:
-        """Whether *path* was not readable as a pre-existing file at session start.
+        """Whether *path* still needs its one owner approval this session.
 
         True for a file that does not exist yet and for one whose mtime is at
         or after :data:`SESSION_START` — in both cases the content the next
         write would replace or extend was produced during this run, which is
         the provenance finding 3 cares about. False once the owner has approved
         this path, so a file costs one confirmation per session.
+
+        A file under ``data/skills`` is always True until approved, whatever
+        its mtime. Skill text is catalogued into the system prompt of every
+        chat, so a skill that predates the session is not thereby trustworthy:
+        the model can edit it, and an edit made after reading a hostile page
+        would otherwise reach every future turn with no tap (R8).
         """
         if str(path) in self._approved:
             return False
+        if self._is_project_skill(path):
+            return True
         try:
             return path.stat().st_mtime >= SESSION_START
         except OSError:
@@ -279,13 +302,21 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         """Raise :class:`NeedsApproval` unless *path* is already cleared."""
         if ctx.confirmed or not self._session_authored(path):
             return
+        if self._is_project_skill(path):
+            reason = (
+                f"{self._display(path)} is a skill file, and its text is read into "
+                "every chat's system prompt, so the owner approves the first write to "
+                "it this session"
+            )
+        else:
+            reason = (
+                f"{self._display(path)} was created or changed during this session, "
+                "so the owner approves the first write to it"
+            )
         raise NeedsApproval(
             tool=self.name,
             arguments=dict(arguments),
-            reason=(
-                f"{self._display(path)} was created or changed during this session, "
-                "so the owner approves the first write to it"
-            ),
+            reason=reason,
             preview=preview,
         )
 
@@ -337,7 +368,7 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         )
 
     async def _write(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        path = self._resolve(arguments.get("path"), for_write=True)
+        path = self._resolve(arguments.get("path"), for_write=True, chat_id=ctx.chat_id)
         content = arguments.get("content")
         if not isinstance(content, str):
             raise ToolError("content must be a string")
@@ -429,7 +460,7 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         return result
 
     async def _append(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        path = self._resolve(arguments.get("path"), for_write=True)
+        path = self._resolve(arguments.get("path"), for_write=True, chat_id=ctx.chat_id)
         content = arguments.get("content")
         if not isinstance(content, str):
             raise ToolError("content must be a string")
@@ -469,7 +500,7 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         goes through :meth:`_require_owner`, because ``old_string`` matching
         is no reassurance when the whole file arrived from fetched content.
         """
-        path = self._resolve(arguments.get("path"), for_write=True)
+        path = self._resolve(arguments.get("path"), for_write=True, chat_id=ctx.chat_id)
         old = arguments.get("old_string")
         new = arguments.get("new_string")
         if not isinstance(old, str) or not old:
