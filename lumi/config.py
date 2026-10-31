@@ -762,6 +762,12 @@ class MCPConfig:
     #: turns the user-level file off.
     user_config_file: str = "~/.agents/mcp.json"
     timeout_seconds: int = 60
+    #: Every ``call`` through the standalone ``mcp`` tool asks the owner first
+    #: (the Confirm/Cancel prompt): an MCP tool reaches an external service the
+    #: owner configured, and no tool name tells a read from a write. Set false
+    #: for a hands-off agent. The ``list`` action never asks either way — it
+    #: only reads what the server already advertised.
+    ask_before_call: bool = True
     search_tools: list[str] = field(
         default_factory=lambda: ["tavily_search", "firecrawl_search", "search"]
     )
@@ -875,6 +881,7 @@ class ToolsConfig:
             "memory",
             "more_context",
             "web",
+            "mcp",
             "context7",
             "ocr",
             "send",
@@ -1286,6 +1293,8 @@ def validate(config: Config) -> list[str]:
         problems.append("tools.ocr.render_scale must be a positive number (1.0 = 72 DPI)")
     if config.tools.ocr.timeout_seconds <= 0:
         problems.append("tools.ocr.timeout_seconds must be a positive number of seconds")
+    if config.tools.web.mcp.timeout_seconds <= 0:
+        problems.append("tools.web.providers.mcp.timeout_seconds must be a positive number of seconds")
     if problem := config.tools.ocr.endpoint_problem():
         problems.append(problem)
     # A route states what differs from [llm]; an unknown rotation strategy in
@@ -1346,6 +1355,7 @@ def validate(config: Config) -> list[str]:
             "memory",
             "more_context",
             "web",
+            "mcp",
             "context7",
             "ocr",
             "send",

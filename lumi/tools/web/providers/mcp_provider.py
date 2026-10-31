@@ -28,6 +28,7 @@ import os
 import re
 from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass, field
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,46 @@ _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
 #: How long a discovered tool list stays valid before we re-ask the server.
 TOOL_CACHE_TTL = 300.0
+
+#: Cap on the cursor walk in :meth:`MCPProvider._list_tools`. Servers paginate
+#: at their own discretion, and one that hands the same cursor back forever
+#: must not be able to keep us paging.
+LIST_PAGES_MAX = 10
+
+
+def _read_timeout(seconds: float | int) -> timedelta:
+    """The ``read_timeout_seconds`` the MCP SDK actually accepts.
+
+    It is a ``timedelta`` — the SDK calls ``.total_seconds()`` on whatever it
+    is handed, so a bare float raises ``AttributeError`` the moment the request
+    goes out. The stub sessions in the tests accept anything, which is how a
+    float survived this long: it only ever failed against a real server.
+    """
+    return timedelta(seconds=float(seconds))
+
+
+try:  # mcp is optional: the provider imports without it, only usage needs it
+    from mcp.shared.exceptions import McpError
+except ImportError:  # pragma: no cover - older SDKs used a different module
+    try:
+        from mcp.exceptions import McpError
+    except ImportError:
+        McpError = None  # type: ignore[assignment,misc]
+
+
+def _session_died(exc: BaseException) -> bool:
+    """Whether *exc* is a dead session (re-spawn once) or the server answering.
+
+    Only a dead transport earns a retry. A timeout means the request went out
+    and may already have been acted on — re-sending it could run a write twice
+    — and an ``McpError`` is a reply, however unhappy, so there is nothing to
+    reconnect to either.
+    """
+    if isinstance(exc, TimeoutError):  # requires-python >= 3.11: asyncio's is this
+        return False
+    if McpError is None:  # pragma: no cover - a live session implies mcp is importable
+        return type(exc).__name__ != "McpError"
+    return not isinstance(exc, McpError)
 
 
 def expand_env(value: str) -> str:
@@ -78,7 +119,7 @@ class ServerSpec:
         """Return the first variable this server needs but the environment lacks."""
         for candidate in self.raw or [self.url, *self.args, *self.env.values(), *self.headers.values()]:
             match = _ENV_PATTERN.search(str(candidate))
-            if match and not os.environ.get(match.group(1)):
+            if match and match.group(2) is None and not os.environ.get(match.group(1)):
                 return match.group(1)
         return None
 
@@ -91,10 +132,21 @@ class ServerSpec:
             command_parts = [str(command)]
         else:
             command_parts = []
-        args = [str(a) for a in raw.get("args", [])]
+        raw_args = raw.get("args", [])
+        args = [str(a) for a in raw_args] if isinstance(raw_args, list) else []
         raw_url = str(raw.get("url") or "")
-        raw_env = {str(k): str(v) for k, v in (raw.get("env") or {}).items()}
-        raw_headers = {str(k): str(v) for k, v in (raw.get("headers") or {}).items()}
+        raw_env_value = raw.get("env") or {}
+        raw_headers_value = raw.get("headers") or {}
+        raw_env = (
+            {str(k): str(v) for k, v in raw_env_value.items()}
+            if isinstance(raw_env_value, dict)
+            else {}
+        )
+        raw_headers = (
+            {str(k): str(v) for k, v in raw_headers_value.items()}
+            if isinstance(raw_headers_value, dict)
+            else {}
+        )
 
         return cls(
             name=name,
@@ -124,6 +176,10 @@ class DiscoveredTool:
     name: str
     description: str
     properties: dict[str, Any]
+    #: Which parameters the server marks required — the ``mcp`` tool's
+    #: ``list`` action shows it, so a call to a six-argument tool is built
+    #: right the first time instead of by trial and error.
+    required: list[str] = field(default_factory=list)
 
     def arg_for(self, candidates: tuple[str, ...]) -> str | None:
         """Which of *candidates* this tool actually accepts as a parameter."""
@@ -195,15 +251,23 @@ class MCPProvider(WebProvider):
         except (OSError, json.JSONDecodeError) as exc:
             log.warning("could not read %s: %s", path, exc)
             return {}
+        if not isinstance(raw, dict):
+            log.warning("%s has no usable object at the top level", path)
+            return {}
         block = raw.get("mcpServers") or raw.get("servers") or {}
         if not isinstance(block, dict):
             log.warning("%s has no usable mcpServers object", path)
             return {}
-        return {
-            name: ServerSpec.from_json(name, cfg)
-            for name, cfg in block.items()
-            if isinstance(cfg, dict)
-        }
+        servers: dict[str, ServerSpec] = {}
+        for name, cfg in block.items():
+            if not isinstance(name, str) or not isinstance(cfg, dict):
+                log.warning("%s contains an invalid MCP server entry %r", path, name)
+                continue
+            try:
+                servers[name] = ServerSpec.from_json(name, cfg)
+            except (TypeError, ValueError) as exc:
+                log.warning("could not parse MCP server %r from %s: %s", name, path, exc)
+        return servers
 
     def servers(self) -> list[ServerSpec]:
         """Servers from every configured file, merged.
@@ -319,22 +383,30 @@ class MCPProvider(WebProvider):
 
         A server that went away between queries must not poison every later
         call: the dead session is dropped and the operation retried on a fresh
-        one, so the worst a dead server costs is one extra launch.
+        one, so the worst a dead server costs is one extra launch. Only a dead
+        transport is retried — a timeout or a server reply may mean the call
+        already ran, and retrying it could repeat a write.
         """
+        session = await self._session_for(spec)
         try:
-            return await op(await self._session_for(spec))
-        except Exception:
-            log.debug("mcp session for %r failed; re-spawning once", spec.name)
+            return await op(session)
+        except Exception as exc:
+            if not _session_died(exc):
+                raise
+            log.debug("mcp session for %r died; re-spawning once", spec.name)
             await self._drop_session(spec.name)
             try:
                 return await op(await self._session_for(spec))
-            except Exception:
-                await self._drop_session(spec.name)
+            except Exception as retry_exc:
+                if _session_died(retry_exc):
+                    await self._drop_session(spec.name)
                 raise
 
     async def aclose(self) -> None:
         """Close every cached session. Called at shutdown via the web tool."""
-        for name in list(self._sessions):
+        # Reverse open order: each transport entered an anyio scope in this
+        # task, and anyio requires scopes to unwind last-in-first-out.
+        for name in reversed(list(self._sessions)):
             await self._drop_session(name)
 
     async def _list_tools(self, spec: ServerSpec) -> list[DiscoveredTool]:
@@ -343,21 +415,48 @@ class MCPProvider(WebProvider):
         if cached and now - cached[0] < TOOL_CACHE_TTL:
             return cached[1]
 
-        response = await self._reuse(spec, lambda session: session.list_tools())
+        async def walk(session: Any) -> list[Any]:
+            """Every tool across pages, stopping at the last or a stuck cursor."""
+            found: list[Any] = []
+            cursor: str | None = None
+            seen: set[str] = set()
+            for _ in range(LIST_PAGES_MAX):
+                if cursor is not None:
+                    if cursor in seen:
+                        log.warning(
+                            "mcp server %r repeated the tools cursor %r; stopping",
+                            spec.name, cursor,
+                        )
+                        return found
+                    seen.add(cursor)
+                response = await session.list_tools(cursor=cursor)
+                found.extend(_page_tools(response))
+                cursor = _next_cursor(response)
+                if not cursor:
+                    return found
+            log.warning(
+                "mcp server %r still paginating after %d page(s); using %d tool(s) so far",
+                spec.name, LIST_PAGES_MAX, len(found),
+            )
+            return found
+
+        raw_tools = await self._reuse(spec, walk)
 
         tools = []
-        for tool in getattr(response, "tools", []) or []:
+        for tool in raw_tools:
             schema = (
                 getattr(tool, "input_schema", None)
                 or getattr(tool, "inputSchema", None)
                 or {}
             )
             properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
+            required = schema.get("required") if isinstance(schema, dict) else None
             tools.append(
                 DiscoveredTool(
                     name=getattr(tool, "name", ""),
                     description=str(getattr(tool, "description", "") or ""),
                     properties=properties if isinstance(properties, dict) else {},
+                    required=[str(r) for r in required] if isinstance(required, list) else [],
                 )
             )
         self._tool_cache[spec.name] = (now, tools)
@@ -395,7 +494,7 @@ class MCPProvider(WebProvider):
         result = await self._reuse(
             spec,
             lambda session: session.call_tool(
-                tool.name, arguments, read_timeout_seconds=timeout
+                tool.name, arguments, read_timeout_seconds=_read_timeout(timeout)
             ),
         )
         return _flatten(result)
@@ -539,30 +638,69 @@ def _mcp_freshness(days: int, schema: Any) -> str:
     return _mcp_time_range(days)
 
 
+def _page_tools(response: Any) -> list[Any]:
+    """The tools on one ``ListToolsResult`` page, in object or dict shape."""
+    tools = response.get("tools") if isinstance(response, dict) else getattr(response, "tools", None)
+    return list(tools) if isinstance(tools, list) else []
+
+
+def _next_cursor(response: Any) -> str | None:
+    """The cursor for the next tool page, if the server named one."""
+    if isinstance(response, dict):
+        cursor = response.get("nextCursor") or response.get("next_cursor")
+    else:
+        cursor = getattr(response, "nextCursor", None)
+    return str(cursor) if cursor else None
+
+
+def _structured(result: Any) -> Any:
+    """The ``structuredContent`` payload, if any, in object or dict shape."""
+    if isinstance(result, dict):
+        value = result.get("structuredContent")
+        return value if value is not None else result.get("structured_content")
+    return getattr(result, "structuredContent", None)
+
+
 def _flatten(result: Any) -> str:
     """Turn a CallToolResult into plain text.
 
     MCP servers return structured content blocks, sometimes with JSON inside a
-    text block, sometimes bare text. Handle both.
+    text block, sometimes bare text. Handle both, and fall back to
+    ``structuredContent`` when a tool answers with data and no text block at
+    all — otherwise a perfectly good result would read as nothing.
     """
     content = getattr(result, "content", None)
     if content is None and isinstance(result, dict):
         content = result.get("content")
-    if content is None:
-        return "" if result is None else str(result)
 
     parts: list[str] = []
-    for block in content if isinstance(content, list) else [content]:
-        text = getattr(block, "text", None)
-        if text is None and isinstance(block, dict):
-            text = block.get("text")
-        if text is None:
-            # Resource or image blocks: describe rather than ignore.
-            kind = getattr(block, "type", None) or (block.get("type") if isinstance(block, dict) else None)
-            parts.append(f"[{kind} content omitted]")
-        else:
-            parts.append(str(text))
-    return "\n".join(parts)
+    if content is not None:
+        for block in content if isinstance(content, list) else [content]:
+            text = getattr(block, "text", None)
+            if text is None and isinstance(block, dict):
+                text = block.get("text")
+            if text is None:
+                # Resource or image blocks: describe rather than ignore.
+                kind = getattr(block, "type", None) or (block.get("type") if isinstance(block, dict) else None)
+                parts.append(f"[{kind} content omitted]")
+            else:
+                parts.append(str(text))
+    text = "\n".join(parts)
+    if text.strip():
+        return text
+
+    structured = _structured(result)
+    if structured is not None and structured != {} and structured != []:
+        if isinstance(structured, str):
+            return structured
+        try:
+            return json.dumps(structured, ensure_ascii=False, indent=2)
+        except (TypeError, ValueError):
+            return str(structured)
+
+    if content is None:
+        return "" if result is None else str(result)
+    return text
 
 
 def _try_json(text: str) -> Any:

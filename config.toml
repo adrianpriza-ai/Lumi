@@ -78,7 +78,7 @@ show_reasoning = true
 
 [tools]
 # Remove a tool from this list to disable it everywhere.
-enabled = ["shell", "files", "read_file", "list_files", "grep", "memory", "more_context", "web", "context7", "ocr", "send", "skills"]
+enabled = ["shell", "files", "read_file", "list_files", "grep", "memory", "more_context", "web", "mcp", "context7", "ocr", "send", "skills"]
 
 [tools.shell]
 enabled = true
@@ -171,6 +171,9 @@ enabled = true
 config_file = ".mcp.json"
 user_config_file = "~/.agents/mcp.json"
 timeout_seconds = 60
+# Every `mcp` tool call asks the owner first; false = hands-off agent.
+# (The `list` action never asks — it only reads.)
+ask_before_call = true
 # Tool name patterns; first match wins.
 search_tools = ["web_search_exa", "tavily_search", "firecrawl_search", "search"]
 fetch_tools = ["crawl_urls", "tavily_extract", "firecrawl_scrape", "scrape", "extract"]

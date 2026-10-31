@@ -192,6 +192,7 @@ def test_defaults_apply_with_no_config_file(project) -> None:
         "memory",
         "more_context",
         "web",
+        "mcp",
         "context7",
         "ocr",
         "send",
@@ -668,6 +669,11 @@ def test_network_settings_can_come_from_the_environment(project, monkeypatch) ->
 def test_a_non_positive_connect_timeout_is_reported(config) -> None:
     config.bot.connect_timeout = 0
     assert any("connect_timeout" in p for p in validate(config))
+
+
+def test_a_non_positive_mcp_timeout_is_reported(config) -> None:
+    config.tools.web.mcp.timeout_seconds = 0
+    assert any("mcp.timeout_seconds" in p for p in validate(config))
 
 
 def test_below_minus_one_bootstrap_retries_are_reported(config) -> None:

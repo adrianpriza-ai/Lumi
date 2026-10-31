@@ -291,7 +291,12 @@ def _render_config(config: Config, memory_limit: int) -> str:
                 " + ".join(v for v in (web.mcp.user_config_file, web.mcp.config_file) if v)
                 or "none"
             )
-            + f" · timeout {web.mcp.timeout_seconds}s",
+            + f" · timeout {web.mcp.timeout_seconds}s"
+            + (
+                " · asks before each call"
+                if web.mcp.ask_before_call
+                else " · no approval prompt"
+            ),
             f"- call timeout {web.timeout_seconds}s · page content {web_content}",
             "",
             f"<b>shell</b> — cwd {escape_html(str(shell.cwd))} · timeout {shell.timeout_seconds}s"
@@ -971,6 +976,9 @@ STEP_LABELS = {
     # a page fetch another. Keys come from Tool.step_detail.
     "web.search": "🌐 Web Search",
     "web.fetch": "🌐 Web Fetch",
+    "mcp": "🔌 MCP",
+    "mcp.list": "🔌 MCP List",
+    "mcp.call": "🔌 MCP Call",
     "memory": "📌 Memory",
     "more_context": "🕒 More Context",
     "context7": "📚 Context7",

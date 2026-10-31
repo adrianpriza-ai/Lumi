@@ -13,6 +13,7 @@
 | `more_context` | Up to 10 messages of room chatter the bot never answered (`offset` ≤ 9, ~30k-token cap), dropped media included with its saved path |
 | `ocr` | Extract text from PDFs, scans, and document images |
 | `web` | Search and fetch, across three interchangeable providers |
+| `mcp` | Call any tool an MCP server exposes (`.mcp.json`) — Linear, GitHub, Hugging Face: `list` the servers, `call` a tool, owner approval before each call |
 | `context7` | Up-to-date library docs from https://context7.com; auto-enables on `CONTEXT7_API_KEY` |
 | `send` | Send the owner a message *mid-turn*, so one reply can arrive in parts |
 | `skills` | List and read the owner's skills (`data/skills/`, `~/.agents/skills/`), no approval to read |
@@ -315,7 +316,7 @@ provider_order = ["firecrawl", "exa", "tavily", "you", "mcp"]
 - **exa** — neural search built for agents: natural-language queries in, semantically ranked pages out, with highlights or full text per hit. Needs an `EXA_API_KEY` (no keyless tier); same rotation rules as the others (`tools.web.exa.key_strategy`). Optional `search_type` (`auto` / `neural` / `keyword`) and `category` (`news`, `github`, `paper`, `pdf`, ...) knobs in `[tools.web.providers.exa]`.
 - **tavily** — best for agentic search. LLM-ready snippets, optional bundled answer. **Works without an API key** — the SDK runs in its free tier (low rate limit; `search` and `extract` only) when `TAVILY_API_KEY` is unset. With one or more keys, a failed key is parked for a minute and the next one answers; `tools.web.tavily.key_strategy` picks `fallback` / `round_robin` / `random`.
 - **you** — You.com's hosted MCP endpoint, `https://api.you.com/mcp?profile=free`. **Keyless by design**: no account and no API key, so a fresh clone still has a working search (low rate limit). A `YOU_API_KEY`, when set, is sent as an `X-API-Key` header. Disable it with `enabled = false` in `[tools.web.providers.you]`.
-- **mcp** — reads `.mcp.json` from the project root and `~/.agents/mcp.json` (for servers configured once for every project; the project file wins on a duplicate server name, and `tools.web.providers.mcp.user_config_file = ""` turns the user file off), expands `${VAR}` from the environment, and speaks MCP over streamable HTTP or stdio. It discovers each server's tools and reads their input schemas, so it works with a server whose parameter is called `q` instead of `query`.
+- **mcp** — reads `.mcp.json` from the project root and `~/.agents/mcp.json` (for servers configured once for every project; the project file wins on a duplicate server name, and `tools.web.providers.mcp.user_config_file = ""` turns the user file off), expands `${VAR}` from the environment, and speaks MCP over streamable HTTP or stdio. It discovers each server's tools and reads their input schemas, so it works with a server whose parameter is called `q` instead of `query`. It only ever calls a tool that looks like a search or a page read — the server's *other* tools belong to the [`mcp` tool](#mcp-action-surface) below.
 
 ```json
 {
@@ -344,6 +345,41 @@ Local servers work too:
 A search returns `tools.web.max_results` hits (10 by default) and page text is not truncated: `tools.web.max_content_chars` is `0`, so a hit the model can actually read is a hit it will not have to search for again. The model is told it may ask for more than the default, up to 50.
 
 A thin result set is topped up rather than answered — if the first provider returns fewer than `min_results` hits, the next provider in the order fills the gap (deduplicated by URL) before the model sees it. Every result carries the date it was searched and, where the provider knows it, the publish date, so a stale page cannot pass for a current one.
+
+## MCP (action surface)
+
+`.mcp.json` feeds two surfaces. The **web provider** above borrows a server's
+search and fetch tools as one more search fallback. The **`mcp` tool** is the
+whole server: every tool it advertises, callable directly — which is what
+turns MCP from a search backend into an agent capability. A Linear server has
+no `search` tool, so the provider can see it and never use it; through this
+tool its `create_issue` is as ordinary as a shell command.
+
+Two actions:
+
+- `list` — every configured server with the tools it advertises: each tool's
+  description and its argument schema, with required parameters marked.
+  Unreachable servers and servers missing an environment variable say so
+  instead of disappearing. Read-only, so it never asks for approval.
+- `call` — run `server.tool` with an `arguments` object matching that schema.
+  The output comes back fenced as untrusted data, and a server that answers
+  with an MCP error is reported as a failure, not as output.
+
+**Every `call` asks the owner first** — a Confirm/Cancel prompt naming the
+server, the tool and the arguments — because no tool name tells a read from a
+write, and the destination is a service outside this machine. Turn the prompt
+off for a hands-off agent:
+
+```toml
+[tools.web.providers.mcp]
+ask_before_call = false
+```
+
+The servers, the files, the `${VAR}` expansion and the transports are the web
+provider's: one `[tools.web.providers.mcp]` section configures both surfaces,
+so `.mcp.json` stays the single place a server is written down. Remove `"mcp"`
+from `tools.enabled` to take the tool away — the web provider keeps working,
+and vice versa.
 
 ## Context7 (library docs)
 

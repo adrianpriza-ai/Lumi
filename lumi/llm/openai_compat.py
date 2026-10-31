@@ -300,9 +300,9 @@ class OpenAICompatClient(LLMClient):
             retry_number = 0
             stop_after_key = False
             while True:
-                completion, error, retryable = await self._try(key, variants)
+                completion, raw_error, retryable = await self._try(key, variants)
                 empty = False
-                if error is None:
+                if raw_error is None:
                     if completion is None:
                         error = LLMError("the model returned no completion")
                     else:
@@ -319,9 +319,10 @@ class OpenAICompatClient(LLMClient):
                         error = LLMError("the model returned an empty response")
                     empty = True
                     retryable = True
+                else:
+                    error = raw_error
 
                 failure = error
-                assert error is not None  # noqa: S101 - set above when successful-but-empty
                 can_retry = empty or self._retry_same_key(error)
                 if can_retry and retry_number < self.config.inference_retries:
                     retry_number += 1

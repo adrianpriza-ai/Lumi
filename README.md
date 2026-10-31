@@ -48,6 +48,8 @@ expected, and it is why the two steps above are always both needed.
 
 **Web access is pluggable five ways.** The Firecrawl SDK, the Exa SDK, the Tavily SDK, You.com's keyless MCP search, and a generic MCP client that reads `.mcp.json` (plus `~/.agents/mcp.json`, for servers shared across every project). They normalise to the same interface, so adding another is one file. The MCP path means a Tavily, Firecrawl, or Exa MCP server works with no code change at all — just add it to `.mcp.json`.
 
+**MCP is also a standalone tool.** The web provider only borrows a server's search and fetch tools; the `mcp` tool exposes *every* tool a configured server advertises, so an MCP server becomes an agent capability — create a Linear issue, drive GitHub, list models on Hugging Face — not just another search backend. `list` shows the servers and their schemas, `call` runs one, and each call waits for the owner's Confirm unless `ask_before_call = false`.
+
 ## Commands
 
 | Command | What it does |
@@ -75,7 +77,7 @@ In group chats the bot only answers when **mentioned** (`@Lumi_a_bot ...`), **re
 | Document | Covers |
 |-|-|
 | [CONFIGURATION.md](docs/CONFIGURATION.md) | `config.toml` and precedence, picking an endpoint, reasoning models and thinking traces, key pools and rotation |
-| [TOOLS.md](docs/TOOLS.md) | The tools, shell safety and its threat model, web providers (Firecrawl / Exa / Tavily / MCP), Context7, mid-turn messages, and how to add a tool |
+| [TOOLS.md](docs/TOOLS.md) | The tools, shell safety and its threat model, web providers (Firecrawl / Exa / Tavily / MCP), the standalone `mcp` tool, Context7, mid-turn messages, and how to add a tool |
 | [TELEGRAM.md](docs/TELEGRAM.md) | Group chats and when the bot answers, and getting past `api.telegram.org` timeouts |
 | [DEPLOYMENT.md](docs/DEPLOYMENT.md) | What the safety controls assume about the machine: unprivileged user, protected state files, egress, systemd |
 
@@ -108,6 +110,7 @@ lumi/
 │   ├── memory_tool.py
 │   ├── context7.py    version-specific library docs
 │   ├── send.py        mid-turn owner messages
+│   ├── mcp_tool.py    call any tool an MCP server exposes
 │   └── web/           tool + providers/{firecrawl,exa,tavily,you,mcp}
 ├── util/
 │   ├── keys.py        comma-separated key parsing

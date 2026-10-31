@@ -9,6 +9,7 @@ seen before.
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -770,6 +771,30 @@ def test_malformed_mcp_file_is_not_fatal(config) -> None:
     assert MCPProvider(config.tools.web.mcp, config.root).servers() == []
 
 
+def test_non_object_mcp_file_is_not_fatal(config) -> None:
+    (config.root / ".mcp.json").write_text("[]", encoding="utf-8")
+    assert MCPProvider(config.tools.web.mcp, config.root).servers() == []
+
+
+def test_malformed_server_fields_are_tolerated(config) -> None:
+    (config.root / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "valid": {"url": "https://valid.test"},
+                    "bad-args": {"url": "https://bad.test", "args": "not-a-list"},
+                    "bad-env": {"url": "https://bad-env.test", "env": "not-a-map"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    servers = MCPProvider(config.tools.web.mcp, config.root).servers()
+    assert [server.name for server in servers] == ["valid", "bad-args", "bad-env"]
+    assert servers[1].args == []
+    assert servers[2].env == {}
+
+
 def test_unresolved_variables_are_reported(config: Path, monkeypatch) -> None:
     monkeypatch.delenv("TAVILY_KEY", raising=False)
     (config.root / ".mcp.json").write_text(json.dumps({
@@ -790,6 +815,19 @@ def test_resolved_variables_clear_the_check(config: Path, monkeypatch) -> None:
     }), encoding="utf-8")
     provider = MCPProvider(config.tools.web.mcp, config.root)
     assert provider.available()[0] is True
+    assert provider.servers()[0].unresolved() is None
+
+
+def test_default_env_values_are_not_reported_as_unresolved(config: Path, monkeypatch) -> None:
+    monkeypatch.delenv("TAVILY_KEY", raising=False)
+    (config.root / ".mcp.json").write_text(
+        json.dumps(
+            {"mcpServers": {"tavily": {"url": "https://mcp.test/?key=${TAVILY_KEY:-fallback}"}}}
+        ),
+        encoding="utf-8",
+    )
+    provider = MCPProvider(config.tools.web.mcp, config.root)
+    assert provider.servers()[0].url.endswith("key=fallback")
     assert provider.servers()[0].unresolved() is None
 
 
@@ -936,6 +974,31 @@ def test_flatten_describes_non_text_blocks() -> None:
     assert "image content omitted" in _flatten(Result([Block(None, "image")]))
 
 
+def test_flatten_uses_structured_content_when_there_are_no_text_blocks() -> None:
+    """Some servers answer with data only; an empty content list must not
+    read as an empty answer."""
+
+    class Structured:
+        content: list = []
+        structuredContent = {"issues": [{"id": "ABC-1"}]}
+
+    assert json.loads(_flatten(Structured()))["issues"][0]["id"] == "ABC-1"
+
+
+def test_flatten_uses_structured_content_on_the_dict_shape() -> None:
+    assert json.loads(_flatten({"content": [], "structuredContent": {"count": 2}})) == {
+        "count": 2
+    }
+
+
+def test_flatten_prefers_text_over_structured_content() -> None:
+    class Both:
+        content = [Block("readable")]
+        structuredContent = {"raw": True}
+
+    assert _flatten(Both()) == "readable"
+
+
 def test_parse_tavily_shaped_payload() -> None:
     payload = json.dumps({
         "answer": "the answer",
@@ -1070,9 +1133,9 @@ class FakeSession:
         self.listed = 0
         self.called = 0
         self.call_arguments: list[dict] = []
-        self.read_timeouts: list[float | None] = []
+        self.read_timeouts: list[timedelta | None] = []
 
-    async def list_tools(self):
+    async def list_tools(self, cursor=None):
         self.listed += 1
         tool = type("T", (), {
             "name": "tavily_search",
@@ -1117,7 +1180,9 @@ async def test_mcp_search_maps_count_and_freshness_arguments(config) -> None:
 
     assert result.ok
     assert session.call_arguments == [{"query": "q", "count": 5, "freshness": "week"}]
-    assert session.read_timeouts == [60]
+    # The SDK calls .total_seconds() on this argument; a float raises against
+    # a real server even though a stub session accepts anything.
+    assert session.read_timeouts == [timedelta(seconds=60)]
     await provider.aclose()
 
 
@@ -1171,6 +1236,153 @@ async def test_a_dead_session_is_replaced_rather_than_poisoning_later_calls(conf
 
     assert result.ok  # the retry on a fresh session made it through
     assert len(opened) == 2
+    await provider.aclose()
+
+
+async def test_mcp_lists_tools_across_every_page(config) -> None:
+    """Servers may paginate list_tools; dropping nextCursor would hide tools
+    that the `mcp` tool's list action is supposed to show."""
+    _mcp_project(config)
+    provider = MCPProvider(config.tools.web.mcp, config.root)
+    pages = {
+        None: ("page-2", ["one", "two"]),
+        "page-2": (None, ["three"]),
+    }
+    cursors: list[str | None] = []
+
+    class Paged:
+        async def list_tools(self, cursor=None):
+            cursors.append(cursor)
+            next_cursor, names = pages[cursor]
+            tools = [
+                type("T", (), {
+                    "name": name,
+                    "description": "",
+                    "input_schema": {"properties": {}},
+                })()
+                for name in names
+            ]
+            return type("R", (), {"tools": tools, "nextCursor": next_cursor})()
+
+    async def fake_open(stack, spec):
+        return Paged()
+
+    provider._open = fake_open  # type: ignore[method-assign]
+
+    tools = await provider._list_tools(provider.servers()[0])
+
+    assert [t.name for t in tools] == ["one", "two", "three"]
+    assert cursors == [None, "page-2"]
+    await provider.aclose()
+
+
+async def test_mcp_stops_when_a_server_repeats_a_cursor(config) -> None:
+    _mcp_project(config)
+    provider = MCPProvider(config.tools.web.mcp, config.root)
+    cursors: list[str | None] = []
+
+    class Stuck:
+        async def list_tools(self, cursor=None):
+            cursors.append(cursor)
+            tool = type("T", (), {
+                "name": "same",
+                "description": "",
+                "input_schema": {"properties": {}},
+            })()
+            return type("R", (), {"tools": [tool], "nextCursor": "again"})()
+
+    async def fake_open(stack, spec):
+        return Stuck()
+
+    provider._open = fake_open  # type: ignore[method-assign]
+
+    tools = await provider._list_tools(provider.servers()[0])
+
+    assert [t.name for t in tools] == ["same", "same"]
+    assert cursors == [None, "again"]  # stops rather than paging forever
+    await provider.aclose()
+
+
+async def test_mcp_stops_after_the_page_cap(config) -> None:
+    from lumi.tools.web.providers.mcp_provider import LIST_PAGES_MAX
+
+    _mcp_project(config)
+    provider = MCPProvider(config.tools.web.mcp, config.root)
+    cursors: list[str | None] = []
+
+    class Endless:
+        async def list_tools(self, cursor=None):
+            cursors.append(cursor)
+            step = 0 if cursor is None else int(cursor.removeprefix("page-"))
+            tool = type("T", (), {
+                "name": f"t{step}",
+                "description": "",
+                "input_schema": {"properties": {}},
+            })()
+            return type("R", (), {"tools": [tool], "nextCursor": f"page-{step + 1}"})()
+
+    async def fake_open(stack, spec):
+        return Endless()
+
+    provider._open = fake_open  # type: ignore[method-assign]
+
+    tools = await provider._list_tools(provider.servers()[0])
+
+    assert len(cursors) == LIST_PAGES_MAX
+    assert len(tools) == LIST_PAGES_MAX
+    await provider.aclose()
+
+
+async def test_a_timeout_is_not_retried(config) -> None:
+    """The request may already have run server-side; re-sending it could
+    repeat a write, so only a dead transport is respawned."""
+    payload = _mcp_project(config)
+    provider = MCPProvider(config.tools.web.mcp, config.root)
+    opened: list[str] = []
+
+    class Slow(FakeSession):
+        async def call_tool(self, name, arguments, read_timeout_seconds=None):
+            raise TimeoutError("read timed out")
+
+    async def fake_open(stack, spec):
+        opened.append(spec.name)
+        return Slow(payload)
+
+    provider._open = fake_open  # type: ignore[method-assign]
+
+    with pytest.raises(TimeoutError):
+        await provider._reuse(provider.servers()[0], lambda s: s.call_tool("t", {}))
+
+    assert opened == ["tavily"]  # one attempt, no respawn
+    await provider.aclose()
+
+
+async def test_a_protocol_error_is_not_retried(config) -> None:
+    """McpError is the server answering, not a dead transport."""
+    try:
+        from mcp.shared.exceptions import McpError
+        from mcp.types import ErrorData
+    except ImportError:  # pragma: no cover - older SDK layout
+        pytest.skip("mcp SDK exception layout not available")
+
+    payload = _mcp_project(config)
+    provider = MCPProvider(config.tools.web.mcp, config.root)
+    opened: list[str] = []
+
+    class Refusing(FakeSession):
+        async def call_tool(self, name, arguments, read_timeout_seconds=None):
+            raise McpError(ErrorData(code=-32602, message="bad arguments"))
+
+    async def fake_open(stack, spec):
+        opened.append(spec.name)
+        return Refusing(payload)
+
+    provider._open = fake_open  # type: ignore[method-assign]
+
+    with pytest.raises(McpError):
+        await provider._reuse(provider.servers()[0], lambda s: s.call_tool("t", {}))
+
+    assert opened == ["tavily"]  # one attempt, no respawn
     await provider.aclose()
 
 
