@@ -56,6 +56,14 @@ named as what it was instead. If Telegram cannot provide the original message,
 the selected quote excerpt is used when one is available. Messages that are not
 replies reach the model unchanged.
 
+**Media in the chain**: a quoted photo or document is fetched, saved under
+`workspace/uploads/<chat>/`, and its content goes into the quote block — a
+photo through the vision model (what it shows), a PDF through the OCR path
+(its first pages, with the saved path so the model can read the rest with
+`read_file`). Up to **2 media items per chain** are processed, and a failure
+degrades to the old "(a photo with no text)" line rather than blocking the
+reply.
+
 Replies themselves chain — a reply to a reply to a reply — and one link is
 rarely the whole story ("no it isn't" answers the message *above* the quote).
 So the chain is walked too, up to **5 links**, rendered oldest first:

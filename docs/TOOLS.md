@@ -6,11 +6,11 @@
 |-|-|
 | `run_shell` | Shell commands, with the allow/confirm/deny engine |
 | `files` | Read anywhere in the project, write and edit only in `workspace/`, send files to the chat |
-| `read_file` | Read a file by line window (`offset`/`limit`), capped at ~30k tokens per call |
+| `read_file` | Read a file by line window (`offset`/`limit`), capped at ~30k tokens per call; PDFs through OCR, images attached for the model to look at |
 | `list_files` | List one directory, like `ls` |
 | `grep` | Multi-word content search across the project |
 | `memory` | Remember and recall, scoped to the chat it is used in; forgetting is human-only by design |
-| `more_context` | Up to 10 messages of room chatter the bot never answered (`offset` ≤ 9, ~30k-token cap) |
+| `more_context` | Up to 10 messages of room chatter the bot never answered (`offset` ≤ 9, ~30k-token cap), dropped media included with its saved path |
 | `ocr` | Extract text from PDFs, scans, and document images |
 | `web` | Search and fetch, across three interchangeable providers |
 | `context7` | Up-to-date library docs from https://context7.com; auto-enables on `CONTEXT7_API_KEY` |
@@ -31,6 +31,17 @@ write/edit/upload tool.
   A *single* line longer than the cap is a dead end for `offset`/`limit` — no
   window can include it — so the refusal names the line and points at
   `run_shell` for that one line.
+- **Media reads**: a PDF is read through OCR — embedded text is extracted for
+  free, scanned pages are rendered and transcribed by a vision model — and
+  comes back as page-marked text, with `offset`/`limit` paging *pages* instead
+  of lines. An image file (png, jpg, webp, gif) is attached to the result as a
+  picture the model looks at directly; the LLM client routes that request to
+  the configured vision model, exactly the path an owner-sent photo takes.
+  `files: read` takes the same two routes, sharing the machinery
+  (`lumi/tools/docread.py`) with the `ocr` tool so the tools cannot drift
+  apart. All the read guards still apply: secrets are refused, another chat's
+  uploads are invisible, and `tools.ocr.enabled = false` turns media reads off
+  with the `ocr` tool.
 - `list_files` is `ls`: one directory, directories first with entry counts,
   files with sizes. Venvs, `node_modules` and caches stay hidden. A listing
   longer than 500 entries is cut, and the body says how many were hidden —
@@ -69,8 +80,11 @@ how the model asks for it.
 It reads a per-chat log of exactly the messages the bot *dropped*
 (`lumi/chatlog.py`): never the ones addressed to it, which are already in the
 conversation, and never a private chat, where every message already became a
-turn. Photos, files and other attachments stay out of the log, caption or not:
-the log is the room's conversation, not its inbox.
+turn. Media is in the log too: when a dropped photo or document can be saved,
+the bot stores it under `workspace/uploads/<chat>/` (the same place a document
+sent *to* the bot lands) and the log line names the path, so the model can
+`read_file` it — PDFs and images included. An attachment that cannot be saved
+still shows, marked "not saved".
 
 - `offset` (0-9): skip this many of the newest messages before reading — use
   it to walk further back.
@@ -100,6 +114,12 @@ keeps the input-type routing explicit:
   dedicated OCR API is configured;
 - a dedicated `tools.ocr` provider can process whole PDFs and public document
   URLs through a Mistral-compatible `POST /ocr` endpoint.
+
+The local machinery — rendering, guards, page windows — lives in
+`lumi/tools/docread.py` and is shared with `read_file` and `files: read`, so
+those tools read media the same way. What `ocr` keeps to itself is the
+transcription contract: *text out*, never an attached image (attaching is
+`read_file`'s route), plus the URL route above.
 
 The committed configuration enables the tool. Remove `"ocr"` from
 `tools.enabled` or set `tools.ocr.enabled = false` to disable it. Set

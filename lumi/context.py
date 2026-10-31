@@ -566,6 +566,39 @@ class ContextWindow:
             if message.get("role") != "tool" or message.get(ELIDED_FLAG):
                 continue
             content = message.get("content")
+            if isinstance(content, list):
+                # A multimodal tool result. The image parts are what cost —
+                # base64 the provider re-reads on every request — so the elide
+                # for these keeps the text and drops only the pictures, rather
+                # than treating the message as untouchable and letting one
+                # attached screenshot hold the window open forever.
+                images = [
+                    part for part in content
+                    if isinstance(part, dict) and "image_url" in part
+                ]
+                if not images:
+                    continue
+                saved_total += sum(
+                    self.tokens_for(str(part.get("image_url", {}).get("url", "")))
+                    for part in images
+                )
+                message["content"] = [
+                    *(part for part in content if not (isinstance(part, dict) and "image_url" in part)),
+                    {
+                        "type": "text",
+                        "text": "[attached image(s) dropped to fit the context window — "
+                        "read the file again if you need to see them]",
+                    },
+                ]
+                message[ELIDED_FLAG] = True
+                conv.elided += 1
+                if saved_total >= over:
+                    log.info(
+                        "elided %d tool result(s) for chat %s to fit the window",
+                        conv.elided, conv.chat_id,
+                    )
+                    return
+                continue
             if not isinstance(content, str) or self.tokens_for(content) < MIN_ELIDE_TOKENS:
                 continue
             saved_total += self.tokens_for(content)

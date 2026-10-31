@@ -90,7 +90,9 @@ Read, write, edit, list, search and upload files inside this project.
 Paths are relative to the project root. Reads work anywhere in the project
 except secret files (.env, keys, credentials), which are refused; writes only
 work inside the project's workspace directory, and overwriting an existing
-file needs the owner's approval.
+file needs the owner's approval. PDFs are read through OCR (page-marked text)
+and image files are attached as pictures the model can look at directly —
+prefer `read_file` for reading either.
 
 `edit` is how you change an existing file: give the exact `old_string` you
 found and the `new_string` that replaces it. It needs no approval (it can
@@ -187,6 +189,10 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         # Lazily created: the store needs the bot's upload cap, which lives in
         # the bot config section.
         self._store: ArtifactStore | None = None
+        #: Lazily created: the shared PDF/image reader, used by the read action
+        #: when the file turns out to be media. Imported lazily with it (see
+        #: _read_media — docread.top-level imports this module).
+        self._reader: Any = None
         #: Files the owner has already let this session touch (or that predate
         #: the session). One tap per file, not one tap per call — a gate the
         #: model has to clear on every keystroke would be tapped blind.
@@ -348,6 +354,15 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         if path.is_dir():
             return await self._list(arguments, ctx)
 
+        # Media before the text read: a PDF is full of NUL bytes and a photo
+        # is over the char cap, and both are readable — just not as text.
+        # Lazy import: docread.top-level imports this module (foreign_uploads),
+        # so a top-level import here would close a cycle.
+        from .docread import media_kind
+
+        if media := media_kind(path):
+            return await self._read_media(path, *media, ctx=ctx)
+
         # 0 (from the argument or the setting) means "no cap".
         cap = int(arguments.get("max_bytes") or 0) or self.settings.max_read_chars
         try:
@@ -366,6 +381,34 @@ it validates the path, caps the size, and shows a diff before it overwrites.
             data={"path": str(path), "size": size, "truncated": truncated},
             summary=f"read {self._display(path)} ({size} bytes)",
         )
+
+    async def _read_media(self, path: Path, kind: str, mime: str, ctx: ToolContext) -> ToolResult:
+        """A PDF or an image: the shared reader's routes, behind the same guards.
+
+        PDFs come back as page-marked text (scanned pages transcribed by a
+        vision model), images as an attached picture the model looks at
+        directly. The path was resolved and secret-checked by ``_resolve``;
+        the reader re-asks anyway — it is the component that ships bytes to a
+        model, and a credential that slips past one check becomes a
+        transcription on someone else's API.
+        """
+        from .docread import DocumentReader
+
+        if self._reader is None:
+            self._reader = DocumentReader(self.config)
+        display = self._display(path)
+        ok, reason = self._reader.available()
+        if not ok:
+            return ToolResult.failure(
+                f"{display} is a {'PDF' if kind == 'pdf' else 'picture'}, but reading it "
+                f"is {reason}. Ask the owner to enable tools.ocr, or process the file "
+                "with run_shell."
+            )
+        if problem := self._reader.read_problem(path, ctx.chat_id):
+            return ToolResult.failure(f"cannot read {display}: {problem}.")
+        if kind == "pdf":
+            return await self._reader.read_pdf(path)
+        return await self._reader.read_image(path, mime)
 
     async def _write(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         path = self._resolve(arguments.get("path"), for_write=True, chat_id=ctx.chat_id)

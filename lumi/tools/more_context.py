@@ -78,9 +78,10 @@ refused with the remedy (re-issue with a smaller `limit`) instead of being
 truncated into something that looks complete. Only messages the bot did *not*
 answer are logged — anything addressed to you is already in your
 conversation, and private chats log nothing because there your conversation
-holds everything. Files, photos and other attachments are skipped too, even
-when they carry a caption: this is the room's conversation, not its inbox.
-The log lives in memory, so it starts fresh on a restart."""
+holds everything. Photos and files sent to the room are logged too (with
+their captions): the attachment is saved under `workspace/uploads/` and the
+log line names its path, so you can read it with `read_file` — which handles
+PDFs and images. The log lives in memory, so it starts fresh on a restart."""
     parameters = {
         "type": "object",
         "properties": {

@@ -8,7 +8,10 @@ any other way, so "as they said above" has nothing behind it.
 
 This log is the missing half. Every text message the bot *dropped* is kept
 here — in memory, per chat — and the ``more_context`` tool reads it back on
-demand. Deliberately not the transcript: :class:`~lumi.memory.History` on disk
+demand. Media dropped the same way is kept too: the bot layer saves the
+attachment under ``workspace/uploads/<chat>/`` and the log line names the
+path, so "as they said above" works for a photo with a caption as well.
+Deliberately not the transcript: :class:`~lumi.memory.History` on disk
 stays the bot's own conversation, and a restart starts the log fresh rather
 than replaying a room the owner may consider settled.
 """
@@ -40,10 +43,24 @@ class LogEntry:
     #: timestamp leaves the model guessing whether "the build is broken" is
     #: from this morning or from the message it is answering now.
     clock: str
+    #: Media messages: ``"photo"`` or ``"document"``, empty for plain text.
+    #: The attachment itself is saved under ``workspace/uploads/<chat>/`` and
+    #: named by :attr:`path`, so the model can read it with ``read_file`` —
+    #: which understands PDFs and images too.
+    kind: str = ""
+    #: Project-relative path of the saved attachment, empty when there is none
+    #: (plain text, or media that could not be saved).
+    path: str = ""
 
     def render(self, index: int) -> str:
-        """One line of the tool's output."""
-        return f"[{index}] {self.clock} {self.author}: {self.text}"
+        """One line of the tool's output (two, when an attachment rides along)."""
+        line = f"[{index}] {self.clock} {self.author}: {self.text}"
+        if self.kind:
+            if self.path:
+                line += f"\n    [attached {self.kind}: {self.path} — readable with `read_file`]"
+            else:
+                line += f"\n    [attached {self.kind}: not saved]"
+        return line
 
 
 class ChatLog:
@@ -89,8 +106,9 @@ def entry_from(message: Any) -> LogEntry | None:
     sticker or other media (caption or not), a service notice, or a message
     with no sender or usable clock. Callers have already decided the message
     is group chatter the bot dropped; this only decides whether it is
-    loggable. Media is skipped on purpose: this log is the room's conversation,
-    and an attachment is not a line of it.
+    loggable. Media goes through :func:`media_entry_from` instead — the bot
+    layer saves the attachment first, because a log line pointing at nothing
+    is the pointer-to-nothing problem all over again.
     """
     text = (getattr(message, "text", None) or "").strip()
     if not text:
@@ -106,6 +124,33 @@ def entry_from(message: Any) -> LogEntry | None:
         author=author,
         text=text,
         clock=clock,
+    )
+
+
+def media_entry_from(message: Any, kind: str, path: str = "") -> LogEntry | None:
+    """A :class:`LogEntry` for a dropped media message — photo or document.
+
+    The caption, if any, is the message's text; the attachment itself is
+    saved by the caller (the bot layer, which can download) and named by
+    *path*. A media message is always loggable, caption or not: the file is
+    the content, and "nobody said anything" is not true of a photo.
+    """
+    sender = getattr(message, "from_user", None)
+    author = "someone"
+    if sender is not None:
+        author = sender.first_name or sender.username or "someone"
+    date = getattr(message, "date", None)
+    clock = date.astimezone().strftime("%H:%M") if date is not None else "??:??"
+    caption = (getattr(message, "caption", None) or "").strip()
+    if not caption and not path:
+        caption = f"(a {kind} that could not be saved)"
+    return LogEntry(
+        message_id=int(getattr(message, "message_id", 0) or 0),
+        author=author,
+        text=caption,
+        clock=clock,
+        kind=kind,
+        path=path,
     )
 
 

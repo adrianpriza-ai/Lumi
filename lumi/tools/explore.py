@@ -26,6 +26,7 @@ from typing import Any
 from ..config import Config
 from ..paths import is_within, relative_to_root
 from .base import Tool, ToolContext, ToolError, ToolResult
+from .docread import DocumentReader, media_kind
 from .files import MAX_LIST_ENTRIES, READABLE_SYSTEM_PATHS, foreign_uploads
 from .safety import read_guard
 
@@ -141,20 +142,27 @@ def _is_binary_head(path: Path, problems: list[str] | None = None) -> bool | Non
 class ReadFileTool(Tool):
     name = "read_file"
     description = """\
-Read a text file in this project, with line numbers.
+Read a file in this project, with line numbers.
 
 Parameters:
 - `path` (required): file relative to the project root.
-- `offset`: 1-based line number to start from. Default 1.
-- `limit`: how many lines to return from `offset`.
+- `offset`: 1-based line number to start from. Default 1. For a PDF this is
+  the 1-based *page* number.
+- `limit`: how many lines to return from `offset`. For a PDF, how many pages.
+
+Text files return numbered lines. PDFs are read through OCR: text embedded in
+the document is extracted, and scanned pages are rendered and transcribed by a
+vision model — the result is page-marked text. Image files (png, jpg, webp,
+gif) are attached to the result as pictures the model can look at directly.
 
 One call returns at most ~30k tokens. If a whole-file read would exceed that
 it is refused, not truncated — re-issue with `offset` and `limit` (start at
 `offset=1 limit=500`, then raise `offset` to the line after the last one you
-saw; the result tells you the next offset). A single line longer than the cap
-cannot be read this way at all: the refusal says so and names the line, and
-`run_shell` is the way to see it. The result also reports the file's total line
-count, so you can plan the windows.
+saw; the result tells you the next offset). For PDFs the same paging applies
+in pages: read `offset=1`, then raise `offset` to the page after the last one
+you saw. A single line longer than the cap cannot be read this way at all: the
+refusal says so and names the line, and `run_shell` is the way to see it. The
+result also reports the file's total line count, so you can plan the windows.
 
 Prefer this over `run_shell cat/head/tail`: it is confined to the project,
 never hangs, and the line numbers make `files.edit` calls unambiguous. Use the
@@ -183,6 +191,10 @@ never hangs, and the line numbers make `files.edit` calls unambiguous. Use the
 
     def __init__(self, config: Config) -> None:
         self.root = config.root
+        self._config = config
+        #: Built on first use — the shared PDF/image machinery. None until a
+        #: media file actually shows up, so a text-only process never builds it.
+        self._reader: DocumentReader | None = None
 
     async def invoke(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         path = _resolve_read(self.root, arguments.get("path"), ctx.chat_id)
@@ -202,6 +214,14 @@ never hangs, and the line numbers make `files.edit` calls unambiguous. Use the
             size = path.stat().st_size
         except OSError as exc:
             return ToolResult.failure(f"could not read {display}: {exc}")
+
+        # Media before the text gates: a PDF is full of NUL bytes and a photo
+        # is over the whole-file byte cap, and both are readable — just not as
+        # lines. offset/limit carry over as the page window for PDFs.
+        media = media_kind(path)
+        if media is not None:
+            return await self._read_media(path, *media, offset=offset, limit=limit, ctx=ctx)
+
         whole_file = offset == 1 and limit is None
         if whole_file and size > MAX_READ_BYTES:
             return ToolResult.failure(
@@ -304,6 +324,41 @@ never hangs, and the line numbers make `files.edit` calls unambiguous. Use the
             },
             summary=f"read {display} lines {collected[0][0]}-{last_line}",
         )
+
+    async def _read_media(
+        self,
+        path: Path,
+        kind: str,
+        mime: str,
+        *,
+        offset: int,
+        limit: int | None,
+        ctx: ToolContext,
+    ) -> ToolResult:
+        """A PDF or an image: the shared reader decides, this tool only frames it.
+
+        PDFs come back as page-marked text (scanned pages transcribed by a
+        vision model), images as an attached picture the model looks at
+        directly. The guards were already run by ``_resolve_read``; the reader
+        asks again, because it is also the component that ships bytes to a
+        model, and a credential that slips past one check becomes a
+        transcription on someone else's API.
+        """
+        if self._reader is None:
+            self._reader = DocumentReader(self._config)
+        display = _display(self.root, path)
+        ok, reason = self._reader.available()
+        if not ok:
+            return ToolResult.failure(
+                f"{display} is a {'PDF' if kind == 'pdf' else 'picture'}, but reading it "
+                f"is {reason}. Ask the owner to enable tools.ocr, or process the file "
+                "with `run_shell`."
+            )
+        if problem := self._reader.read_problem(path, ctx.chat_id):
+            return ToolResult.failure(f"cannot read {display}: {problem}.")
+        if kind == "pdf":
+            return await self._reader.read_pdf(path, start_page=offset, max_pages=limit)
+        return await self._reader.read_image(path, mime)
 
     def _render(
         self,

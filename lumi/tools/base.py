@@ -87,6 +87,14 @@ class ToolResult:
     #: owner see progress while the turn is still running — and falls back to
     #: :attr:`lumi.agent.TurnResult.messages` when no live channel is wired.
     messages: list[str] = field(default_factory=list)
+    #: Images the model should *look at*, as ``(mime, base64)`` pairs. The agent
+    #: loop turns each into an ``image_url`` part of the tool message, and the
+    #: LLM client routes that request to the configured vision model — the same
+    #: rule that shows a chat photo to the model. Never put anything in here
+    #: the model could not also be told in *text*: the transcript store and the
+    #: elider keep text only, so an image is the one part of a tool result that
+    #: does not survive into the long record.
+    images: list[tuple[str, str]] = field(default_factory=list)
 
     @classmethod
     def failure(cls, text: str, **data: Any) -> ToolResult:

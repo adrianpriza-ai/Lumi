@@ -744,7 +744,7 @@ class Agent:
                 "role": "tool",
                 "tool_call_id": call.id,
                 "name": call.name,
-                "content": tool_result.for_model(),
+                "content": _tool_message_content(tool_result),
             }
         )
         # Messages the model asked to send right now, mid-turn (the `send`
@@ -925,6 +925,26 @@ class Agent:
             self._refresh_system_prompt(conv)
             self.history.append(chat_id, "system", "reloaded personality and memory")
         return notes
+
+
+def _tool_message_content(tool_result: Any) -> str | list[dict[str, Any]]:
+    """The ``role: "tool"`` message body for *tool_result*.
+
+    Plain text for the ordinary result. When the tool attached images the
+    body becomes a multimodal content array — text first, then the images —
+    which the LLM client routes to the configured vision model, exactly the
+    shape and path an owner-sent photo already takes. Tools are told to keep
+    :attr:`~lumi.tools.base.ToolResult.images` for things the model must
+    *look at*; everything else belongs in the text.
+    """
+    if not tool_result.images:
+        return tool_result.for_model()
+    content: list[dict[str, Any]] = [{"type": "text", "text": tool_result.for_model()}]
+    content.extend(
+        {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{data}"}}
+        for mime, data in tool_result.images
+    )
+    return content
 
 
 def _assistant_message(reply: LLMReply) -> dict[str, Any]:

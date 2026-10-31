@@ -1335,9 +1335,13 @@ async def test_an_unaddressed_group_message_is_kept_for_the_model(config) -> Non
     ]
 
 
-async def test_a_group_document_is_not_logged(config) -> None:
-    """Files are skipped even with a caption: the log is conversation, not an
-    inbox the model can recall."""
+async def test_a_dropped_group_document_is_logged_with_its_saved_path(config) -> None:
+    """A captioned document the bot drops is logged as media, with the path.
+
+    Same as the dropped-photo rule: the attachment is saved under the chat's
+    uploads and the log line names it, so `more_context` hands the model
+    something it can read instead of a hole.
+    """
     application, bot, _ = build(config, [make_reply("never sent")])
     await application.initialize()
     try:
@@ -1352,11 +1356,20 @@ async def test_a_group_document_is_not_logged(config) -> None:
     finally:
         await application.shutdown()
     assert bot.sent == []
-    assert CHATLOG.entries(GROUP_CHAT) == []
+    entries = CHATLOG.entries(GROUP_CHAT)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.kind == "document"
+    assert entry.text == "see attached"
+    assert entry.path.startswith(f"workspace/uploads/{GROUP_CHAT}/")
 
 
-async def test_a_group_photo_is_not_logged(config) -> None:
-    """A captioned photo is media, not room chatter."""
+async def test_a_dropped_group_photo_is_logged_with_its_saved_path(config) -> None:
+    """A captioned photo the bot drops is logged as media, with the saved path.
+
+    It used to be logged as nothing at all, which left "as they said above"
+    with a hole exactly where someone had sent the thing being talked about.
+    """
     application, bot, _ = build(config, [make_reply("never sent")])
     await application.initialize()
     try:
@@ -1371,7 +1384,12 @@ async def test_a_group_photo_is_not_logged(config) -> None:
     finally:
         await application.shutdown()
     assert bot.sent == []
-    assert CHATLOG.entries(GROUP_CHAT) == []
+    entries = CHATLOG.entries(GROUP_CHAT)
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.kind == "photo"
+    assert entry.text == "look at this"
+    assert entry.path.startswith(f"workspace/uploads/{GROUP_CHAT}/photo-")
 
 
 async def test_a_mentioned_group_message_is_not_logged(config) -> None:

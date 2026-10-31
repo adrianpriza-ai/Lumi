@@ -40,11 +40,12 @@ from telegram.ext import (
 
 from .agent import Agent, PendingAction, TurnHooks, TurnResult
 from .artifacts import Artifact, ArtifactError, ArtifactStore
-from .chatlog import CHATLOG, entry_from
+from .chatlog import CHATLOG, entry_from, media_entry_from
 from .config import Config, ConfigError, validate
 from .doctor import platform_line, run_checks
 from .memory import History, MemoryFile, MemoryStore
 from .personality import Personality
+from .tools.docread import DocumentReader
 from .util.log import get_logger
 from .util.text import (
     escape_html,
@@ -493,6 +494,12 @@ def _is_addressed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
 REPLY_CHAIN_MAX = 5
 
 
+def _who(quoted: Any) -> str:
+    """Display name of a quoted message's sender — ``"someone"`` as the floor."""
+    sender = getattr(quoted, "from_user", None)
+    return "someone" if sender is None else (sender.first_name or sender.username or "someone")
+
+
 def _quote_body(quoted: Any, excerpt: str = "") -> tuple[str, str]:
     """``(sender, text)`` for one replied-to message.
 
@@ -502,8 +509,7 @@ def _quote_body(quoted: Any, excerpt: str = "") -> tuple[str, str]:
     inaccessible reply target plus a selected quote excerpt, so *excerpt* is
     used as the best available text in that case.
     """
-    sender = getattr(quoted, "from_user", None)
-    who = "someone" if sender is None else (sender.first_name or sender.username or "someone")
+    who = _who(quoted)
     body = (getattr(quoted, "text", None) or getattr(quoted, "caption", None) or "").strip()
     excerpt = excerpt.strip()
     if not body:
@@ -514,7 +520,7 @@ def _quote_body(quoted: Any, excerpt: str = "") -> tuple[str, str]:
     return who, body
 
 
-def _quoted_prefix(message: Any) -> str:
+def _quoted_prefix(message: Any, media: dict[int, str] | None = None) -> str:
     """The message *message* replies to, shaped as a prompt prefix.
 
     A reply carries its meaning in the thing it quotes: ``@lumi try this`` is
@@ -532,10 +538,17 @@ def _quoted_prefix(message: Any) -> str:
     A single link keeps the one-message format; deeper chains get numbered
     blocks. Returns ``""`` for a message that is not a reply, so the ordinary
     path is byte-for-byte what it was.
+
+    *media* — built by :func:`_chain_media` — maps a chain message id to a
+    note about that link's photo or document (what it shows, where it was
+    saved), because "look at the picture above" is not something a prompt
+    prefix can say. The note rides inside the link's quote block, so it is
+    fenced as data like everything else quoted.
     """
     quoted = getattr(message, "reply_to_message", None)
     if quoted is None:
         return ""
+    media = media or {}
 
     # Telegram may include the manually selected part of a reply separately
     # from the replied-to message. It is especially important when the target
@@ -557,14 +570,26 @@ def _quoted_prefix(message: Any) -> str:
             seen.add(marker)
         quoted = getattr(quoted, "reply_to_message", None)
 
+    def body_of(link: Any, excerpt: str = "") -> str:
+        who, body = _quote_body(link, excerpt)
+        if note := media.get(getattr(link, "message_id", None)):
+            # "(a photo with no text)" + the note would say the same nothing
+            # twice; the note is the real content, so it replaces the
+            # placeholder rather than stacking onto it.
+            body = (
+                note
+                if body.startswith("(") and body.endswith(")")
+                else f"{body}\n{note}"
+            )
+        return body
+
     if len(chain) == 1:
-        who, body = _quote_body(chain[0], excerpt)
-        return f'[the message this replies to, from {who}:\n"""\n{body}\n"""\n]\n\n'
+        return f'[the message this replies to, from {_who(chain[0])}:\n"""\n{body_of(chain[0], excerpt)}\n"""\n]\n\n'
 
     blocks: list[str] = []
     for index, link in enumerate(reversed(chain)):
-        who, body = _quote_body(link, excerpt if index == len(chain) - 1 else "")
-        blocks.append(f'(from {who}):\n"""\n{body}\n"""')
+        body = body_of(link, excerpt if index == len(chain) - 1 else "")
+        blocks.append(f'(from {_who(link)}):\n"""\n{body}\n"""')
     note = " — chain cut at the cap" if quoted is not None else ""
     head = f"[reply chain: the {len(chain)} message(s) this replies to, oldest first{note}:"
     return f"{head}\n" + "\n\n".join(blocks) + "\n]\n\n"
@@ -591,6 +616,153 @@ def _record_room(update: Update) -> None:
     entry = entry_from(message)
     if entry is not None:
         CHATLOG.record(chat.id, entry)
+
+
+async def _record_room_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Keep a dropped *media* message: save the attachment, log the pointer.
+
+    Text-only drops go through :func:`_record_room`; a photo or document used
+    to be logged as nothing at all, which meant "as they said above" hit a
+    hole exactly where someone had sent the thing being talked about. The
+    attachment lands under ``workspace/uploads/<chat>/`` — the same place a
+    document sent *to* the bot lands — and the log line names its path, so
+    ``more_context`` hands the model something it can actually read.
+
+    Every failure degrades to a log entry without a path (the caption still
+    shows, marked "not saved"): a dropped photo must never break the handler
+    that chose to stay silent.
+    """
+    chat = update.effective_chat
+    message = update.effective_message
+    if message is None or not _is_group(chat):
+        return
+    sender = message.from_user
+    if sender is not None and sender.is_bot:
+        return
+    if getattr(message, "photo", None):
+        kind, name, file_id = "photo", f"photo-{message.message_id}.jpg", message.photo[-1].file_id
+    elif getattr(message, "document", None):
+        kind = "document"
+        name = message.document.file_name or "upload.bin"
+        file_id = message.document.file_id
+    else:
+        return
+    path = ""
+    try:
+        file = await context.bot.get_file(file_id)
+        blob = bytes(await file.download_as_bytearray())
+        bot_data = context.application.bot_data
+        store: ArtifactStore = bot_data["artifacts"]
+        config: Config = bot_data["config"]
+        artifact = store.ingest(blob, name, chat.id, config.root)
+        path = artifact.path
+        log.info("dropped %s from chat %s saved as %s", kind, chat.id, path)
+    except (TelegramError, BadRequest, Forbidden, OSError, ArtifactError, KeyError) as exc:
+        log.warning("could not save dropped %s in chat %s: %s", kind, chat.id, exc)
+    if entry := media_entry_from(message, kind, path):
+        CHATLOG.record(chat.id, entry)
+
+
+#: How many media items one reply chain will fetch, describe or transcribe.
+#: The chain is walked newest-first and every item is a download plus a vision
+#: call, so a chain of screenshots could otherwise turn one "what do you mean?"
+#: into half a minute of fetching before the model is even asked.
+REPLY_CHAIN_MEDIA_MAX = 2
+
+#: One media note is capped at about this many characters: a full transcription
+#: belongs in the file the note names, not in front of the question.
+CHAIN_NOTE_CHARS = 3000
+
+#: The reply chain's shared reader, built on first use. One bot process, one
+#: config — the same singleton reasoning as CHATLOG.
+_DOCREADER: DocumentReader | None = None
+
+
+def _docreader(config: Config) -> DocumentReader:
+    global _DOCREADER
+    if _DOCREADER is None:
+        _DOCREADER = DocumentReader(config)
+    return _DOCREADER
+
+
+async def _chain_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> dict[int, str]:
+    """What the model needs to know about media inside the reply chain.
+
+    ``_quoted_prefix`` quotes a chain's text, but a photo in the chain
+    rendered as "(a photo with no text)" — the model held a pointer to
+    nothing. This walks the same chain and, for each photo or document
+    (up to :data:`REPLY_CHAIN_MEDIA_MAX`), saves the attachment the way
+    incoming media is saved, then asks the vision model what the photo shows
+    or the OCR path what the PDF says. The returned map — chain message id →
+    note — rides inside the quote block, so the model sees the content *and*
+    the path it can re-read with ``read_file``.
+
+    Every failure degrades to no note for that link; media never blocks the
+    reply the owner actually typed.
+    """
+    message = update.effective_message
+    quoted = getattr(message, "reply_to_message", None)
+    if quoted is None:
+        return {}
+
+    chain: list[Any] = []
+    seen: set[int] = set()
+    while quoted is not None and len(chain) < REPLY_CHAIN_MAX:
+        chain.append(quoted)
+        marker = getattr(quoted, "message_id", None)
+        if marker is not None:
+            if marker in seen:
+                break
+            seen.add(marker)
+        quoted = getattr(quoted, "reply_to_message", None)
+
+    bot_data = context.application.bot_data
+    config: Config = bot_data["config"]
+    store: ArtifactStore = bot_data["artifacts"]
+    chat = update.effective_chat
+    reader = _docreader(config)
+
+    notes: dict[int, str] = {}
+    processed = 0
+    for link in chain:
+        if processed >= REPLY_CHAIN_MEDIA_MAX:
+            break
+        mid = int(getattr(link, "message_id", 0) or 0)
+        try:
+            if getattr(link, "photo", None):
+                kind, name, file_id = "photo", f"photo-{mid}.jpg", link.photo[-1].file_id
+            elif getattr(link, "document", None):
+                kind, name, file_id = "document", link.document.file_name or "upload.bin", link.document.file_id
+            else:
+                continue
+            processed += 1
+
+            file = await context.bot.get_file(file_id)
+            blob = bytes(await file.download_as_bytearray())
+            artifact = store.ingest(blob, name, chat.id, config.root)
+            absolute = Path(config.root) / artifact.path
+
+            body = ""
+            if kind == "photo":
+                body = await reader.describe_file(absolute, "image/jpeg")
+                body = f'the image shows: "{truncate(body.strip(), CHAIN_NOTE_CHARS)}"'
+            elif artifact.path.lower().endswith(".pdf"):
+                result = await reader.read_pdf(absolute, start_page=1, max_pages=3)
+                body = (
+                    f'its first pages say: "{truncate(result.text, CHAIN_NOTE_CHARS)}" '
+                    "(read the file for the rest)"
+                    if result.ok
+                    else f"reading it failed: {result.text}"
+                )
+            notes[mid] = (
+                f"[this is a {kind}, saved as {artifact.path} — readable with `read_file`"
+                + (f"]\n{body}" if body else "]")
+            )
+        except (TelegramError, BadRequest, Forbidden, OSError, ArtifactError) as exc:
+            log.warning("reply-chain media in chat %s not readable: %s", chat.id, exc)
+        except Exception as exc:  # noqa: BLE001 - a media note must never kill the reply
+            log.warning("reply-chain media in chat %s failed: %s", chat.id, exc)
+    return notes
 
 
 # --------------------------------------------------------------------------- #
@@ -1699,6 +1871,7 @@ def build_handlers(config: Config) -> list[Any]:
             # Same as on_text: a dropped message is the only kind worth
             # logging — anything the bot answers is already in its history.
             _record_room(update)
+            await _record_room_media(update, context)
             return
         if not await authorised(update):
             return
@@ -1748,6 +1921,7 @@ def build_handlers(config: Config) -> list[Any]:
             # A stranger talking to the room, not to the bot. Silent, but not
             # invisible: it goes to the log `more_context` reads.
             _record_room(update)
+            await _record_room_media(update, context)
             log.debug(
                 "ignoring an unaddressed group message from user %s",
                 update.effective_user and update.effective_user.id,
@@ -1790,8 +1964,11 @@ def build_handlers(config: Config) -> list[Any]:
         hooks = hooks_for(update, context)
         # If this message is a reply, the message it quotes goes in front of
         # the text — see _quoted_prefix: it is the only place that quote can
-        # still be recovered, and without it "try this" has no referent.
-        text = _quoted_prefix(update.effective_message) + text
+        # still be recovered, and without it "try this" has no referent. Media
+        # in the chain is fetched, described or transcribed first, so a photo
+        # in the quote is content the model can see, not "(a photo with no
+        # text)".
+        text = _quoted_prefix(update.effective_message, await _chain_media(update, context)) + text
         async with _Typing(context.bot, chat_id):
             try:
                 result = await agent.handle(
