@@ -48,6 +48,7 @@ from .memory import History, MemoryFile, MemoryStore
 from .personality import Personality
 from .tools.docread import DocumentReader
 from .tools.mcp_tool import CheckOutcome
+from .tools.web.providers.mcp_oauth import authorize_server as mcp_authorize_server
 from .util.env import SECRET_PATTERN
 from .util.log import get_logger
 from .util.text import (
@@ -120,7 +121,7 @@ OWNER_HELP_TEXT = """\
 <code>/config</code> — the resolved configuration this process runs on
 <code>/env</code> — which credentials are set, values masked
 <code>/forget [n]</code> — drop the newest n saved facts (erasing memory is a human decision, and yours)
-<code>/mcp help|list|check &lt;name&gt;</code> — the configured MCP servers: what they are, and whether one answers
+<code>/mcp help|list|check|approve|revoke</code> — the configured MCP servers: what they are, whether one answers, and which project entries you have approved to connect
 <code>/reload</code> — re-read personality, memory and config
 <code>/reset</code> — forget this conversation (keeps long-term memory)
 <code>/whitelist</code> — show whitelisted users and groups
@@ -142,7 +143,11 @@ NOT_OWNER_ACTION = "only the owner can change what this bot remembers there."
 
 #: ``/mcp check`` with no name, and the fallback for a subcommand it does not
 #: know. ``/mcp`` with *no* argument shows :data:`MCP_HELP` instead.
-MCP_USAGE = "usage: <code>/mcp help</code>, <code>/mcp list</code>, <code>/mcp check &lt;name&gt;</code>"
+MCP_USAGE = (
+    "usage: <code>/mcp help</code>, <code>/mcp list</code>, "
+    "<code>/mcp check &lt;name&gt;</code>, <code>/mcp auth &lt;name&gt;</code>, "
+    "<code>/mcp approve [name]</code>, <code>/mcp revoke &lt;name&gt;</code>"
+)
 
 MCP_HELP = """\
 <b>mcp help</b>
@@ -152,6 +157,9 @@ file wins when a name appears in both.
 
 <code>/mcp list</code> — the configured servers: transport, command or URL, env
 <code>/mcp check &lt;name&gt;</code> — connect and report, retrying a server that fails
+<code>/mcp auth &lt;name&gt;</code> — browser login for a server with <code>"auth": "oauth"</code>
+<code>/mcp approve [name]</code> — allow a project-file server to connect (see below)
+<code>/mcp revoke &lt;name&gt;</code> — withdraw that approval
 <code>/mcp help</code> — this message
 
 Both transports are supported: <b>stdio</b> (a local command spawned with
@@ -159,6 +167,24 @@ Both transports are supported: <b>stdio</b> (a local command spawned with
 entry sets its own <code>cwd</code>) and <b>streamable HTTP</b> (a <code>url</code>,
 with <code>headers</code> if it wants them). A config with a <code>command</code>
 and no <code>type</code> is stdio already.
+
+<b>Approvals</b> — the project <code>.mcp.json</code> can arrive by <code>git
+clone</code> as easily as by your own hand, so its entries connect only once
+you approve them: <code>/mcp approve</code> lists what is waiting,
+<code>/mcp approve &lt;name&gt;</code> allows that exact entry (the command or
+URL, as it stands right now), and nothing connects before you have. Editing an
+entry asks again; <code>/mcp revoke &lt;name&gt;</code> withdraws it. Entries in
+<code>~/.agents/mcp.json</code> are yours already and need no approval.
+
+<b>OAuth</b> — a server whose entry says <code>"auth": "oauth"</code> wants your
+own account, not a static key. Run <code>/mcp auth &lt;name&gt;</code>: i send you a
+link, you approve in the browser, and the tokens are stored under
+<code>.mcp-tokens/</code> (mode 0600, never sent to any chat) and refreshed on
+their own from then on. The browser redirect lands on this machine's
+localhost, so this works when your browser and the bot share one; otherwise
+give the server a header token instead. If the provider only grants access
+for named scopes (Atlassian is one), write them into the entry:
+<code>"auth": {"type": "oauth", "scopes": "read:jira-work offline_access"}</code>.
 
 Neither command calls a server's tools — that is the model's <code>mcp</code> tool, and it asks you first."""
 
@@ -430,7 +456,14 @@ def _mcp_pairs(pairs: dict[str, str], label: str) -> str:
 
 def _mcp_transport(spec: Any) -> str:
     """How *spec* is spoken to — stdio or streamable HTTP, in chat words."""
-    return "stdio (local command)" if spec.is_local else "streamable HTTP"
+    kind = "stdio (local command)" if spec.is_local else "streamable HTTP"
+    if getattr(spec, "oauth", False):
+        kind += " · oauth"
+        if getattr(spec, "oauth_scope", ""):
+            # What the authorization request will ask for, so an owner can
+            # spot a missing/extra scope without re-reading the config file.
+            kind += f" · scopes: <code>{escape_html(spec.oauth_scope)}</code>"
+    return kind
 
 
 def _mcp_endpoint(spec: Any) -> str:
@@ -471,6 +504,8 @@ def _render_mcp_list(tool: Any) -> str:
             lines.append(f"  {endpoint}")
         if missing := spec.unresolved():
             lines.append(f"  <i>needs <code>${{{escape_html(missing)}}}</code> set in the environment</i>")
+        if tool.provider._trust_refusal(spec):
+            lines.append(f"  <i>not approved to connect — <code>/mcp approve {escape_html(spec.name)}</code></i>")
     lines += [
         "",
         "<code>/mcp check &lt;name&gt;</code> connects to one and reports"
@@ -1760,7 +1795,8 @@ def build_handlers(config: Config) -> list[Any]:
         await reply(update, "<b>doctor</b>\n" + sanitize_html("\n".join(check.render() for check in checks)))
 
     async def mcp_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """``/mcp help`` · ``/mcp list`` · ``/mcp check <server>``.
+        """``/mcp help`` · ``/mcp list`` · ``/mcp check <server>`` · ``/mcp auth <server>``
+        · ``/mcp approve [name]`` · ``/mcp revoke <name>``.
 
         Owner-only on the same rule as ``/config`` and ``/env``: the body
         names the commands, URLs and variables the configured servers run with
@@ -1770,7 +1806,12 @@ def build_handlers(config: Config) -> list[Any]:
         ``list`` reads the config files and touches no network; ``check`` is
         the one that connects, through :meth:`~lumi.tools.mcp_tool.MCPTool.check`
         so stdio and remote servers are probed exactly the way the model's own
-        calls reach them.
+        calls reach them. ``auth`` is the OAuth login: owner-only for the same
+        reason *and* because the tokens minted are the owner's own account.
+        ``approve`` and ``revoke`` are the trust store's hands: an entry in the
+        project ``.mcp.json`` — which a clone delivers as easily as the owner's
+        own edit — spawns or dials nothing until approved here, so granting
+        that is the owner's decision and nobody else's.
         """
         if not await authorised(update):
             return
@@ -1820,6 +1861,160 @@ def build_handlers(config: Config) -> list[Any]:
                 )
                 return
             await reply(update, _render_mcp_check(await tool.check(spec), spec))
+            return
+
+        if sub == "auth":
+            if len(args) < 2:
+                await reply(update, f"{MCP_USAGE} — the name comes from <code>/mcp list</code>")
+                return
+            servers = tool.provider.servers()
+            spec = next((s for s in servers if s.name == args[1]), None)
+            if spec is None:
+                names = ", ".join(escape_html(s.name) for s in servers) or "none"
+                await reply(
+                    update,
+                    f"no server named <code>{escape_html(args[1])}</code>; configured: {names}",
+                )
+                return
+            if spec.is_local:
+                await reply(
+                    update,
+                    f"<code>{escape_html(spec.name)}</code> is a local stdio server — "
+                    "oauth only applies to remote ones (a <code>url</code> entry).",
+                )
+                return
+            if not spec.oauth:
+                await reply(
+                    update,
+                    f"<code>{escape_html(spec.name)}</code> does not ask for oauth. to make "
+                    f'it, add <code>"auth": "oauth"</code> to its entry in the config file.',
+                )
+                return
+            await reply(
+                update,
+                f"starting the login for <b>{escape_html(spec.name)}</b> — "
+                "the link follows in my next message; approve access in your browser.",
+            )
+
+            async def send_link(url: str) -> None:
+                await reply(
+                    update,
+                    f"open this and approve <b>{escape_html(spec.name)}</b>'s access "
+                    f"(the page confirms, then you can close it):\n{escape_html(url)}",
+                )
+
+            try:
+                summary = await mcp_authorize_server(spec, config.root, on_redirect=send_link)
+            except TimeoutError:
+                # asyncio.timeout's own cancellation, not the server's word:
+                # the owner never came back to the browser. Worth its own
+                # sentence — the default rendering would be "TimeoutError: ".
+                await reply(
+                    update,
+                    f"the login for <code>{escape_html(spec.name)}</code> timed out — the "
+                    "link expired before the browser came back. run "
+                    f"<code>/mcp auth {escape_html(spec.name)}</code> again when you are ready.",
+                )
+                return
+            except Exception as exc:  # noqa: BLE001 - every failure is chat feedback
+                await reply(
+                    update,
+                    f"the login for <code>{escape_html(spec.name)}</code> did not complete: "
+                    f"<i>{escape_html(truncate(f'{type(exc).__name__}: {exc}', 300, ' …'))}</i>",
+                )
+                return
+            scopes = escape_html(summary["scopes"]) if summary["scopes"] else "none named"
+            fresh = "registered this bot as a new client; " if summary["registered"] else ""
+            await reply(
+                update,
+                f"<b>{escape_html(spec.name)}</b> is authorized. {fresh}token stored under "
+                f"<code>.mcp-tokens/</code> (never sent here), scopes: {scopes}. "
+                f"<code>/mcp check {escape_html(spec.name)}</code> to confirm.",
+            )
+            return
+
+        if sub in {"approve", "revoke"}:
+            servers = tool.provider.servers()
+            if sub == "approve" and len(args) < 2:
+                # No name: show what is waiting, so the owner can decide from
+                # the list without paging through config files first.
+                pending = [s for s in servers if tool.provider._trust_refusal(s)]
+                if not pending:
+                    await reply(
+                        update,
+                        "nothing is waiting — every project server that can connect "
+                        "is approved. <code>/mcp approve &lt;name&gt;</code> is only "
+                        "needed after a new or edited entry in <code>.mcp.json</code>.",
+                    )
+                    return
+                lines = [
+                    "<b>mcp approve</b> — these entries in <code>.mcp.json</code> have "
+                    "never been approved, and connect to nothing until they are:"
+                ]
+                for spec in pending:
+                    lines.append(f"• <b>{escape_html(spec.name)}</b> — {_mcp_transport(spec)}")
+                    if endpoint := _mcp_endpoint(spec):
+                        lines.append(f"  {endpoint}")
+                lines += [
+                    "",
+                    "read what each one runs or dials, then "
+                    "<code>/mcp approve &lt;name&gt;</code> the ones you want.",
+                ]
+                await reply(update, "\n".join(lines))
+                return
+            if len(args) < 2:
+                await reply(update, f"{MCP_USAGE} — the name comes from <code>/mcp list</code>")
+                return
+            spec = next((s for s in servers if s.name == args[1]), None)
+            if spec is None:
+                names = ", ".join(escape_html(s.name) for s in servers) or "none"
+                await reply(
+                    update,
+                    f"no server named <code>{escape_html(args[1])}</code>; configured: {names}",
+                )
+                return
+            if spec.origin != "project":
+                await reply(
+                    update,
+                    f"<code>{escape_html(spec.name)}</code> comes from your user-level "
+                    "<code>~/.agents/mcp.json</code> — you wrote that file yourself, so it "
+                    "needs no approval.",
+                )
+                return
+            if sub == "revoke":
+                if tool.provider.trust.revoke(spec.name):
+                    await reply(
+                        update,
+                        f"approval for <b>{escape_html(spec.name)}</b> withdrawn — it will not "
+                        "connect again until you approve it. Any session still open closes "
+                        f"when the config next changes; <code>/mcp check {escape_html(spec.name)}</code> now reports it as waiting.",
+                    )
+                else:
+                    await reply(
+                        update,
+                        f"<code>{escape_html(spec.name)}</code> had no approval to withdraw — "
+                        "it was already waiting for one.",
+                    )
+                return
+            if not tool.provider._trust_refusal(spec):
+                await reply(
+                    update,
+                    f"<b>{escape_html(spec.name)}</b> is already approved exactly as it stands "
+                    "in the config. If you meant to re-check it, "
+                    f"<code>/mcp check {escape_html(spec.name)}</code>.",
+                )
+                return
+            # The one step that grants authority, so the reply restates what
+            # was approved: approving a name means approving this command or
+            # URL, and an edited entry asks again regardless.
+            tool.provider.trust.approve(spec.name, spec.digest)
+            await reply(
+                update,
+                f"<b>{escape_html(spec.name)}</b> is approved to connect:\n{_mcp_endpoint(spec)}\n\n"
+                "editing its entry will ask again, and "
+                f"<code>/mcp revoke {escape_html(spec.name)}</code> withdraws this. "
+                f"<code>/mcp check {escape_html(spec.name)}</code> to try it now.",
+            )
             return
 
         await reply(

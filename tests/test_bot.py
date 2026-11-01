@@ -888,9 +888,113 @@ async def test_mcp_help_lists_the_subcommands(config) -> None:
     body = texts(bot)
     assert "/mcp list" in body
     assert "/mcp check" in body
+    assert "/mcp auth" in body
     # The help says which transports a .mcp.json may declare.
     assert "stdio" in body
     assert "streamable HTTP" in body
+
+
+# --------------------------------------------------------------------------- #
+# /mcp auth — the OAuth browser login
+# --------------------------------------------------------------------------- #
+
+
+def _oauth_server_config(config, *, auth: bool) -> None:
+    entry: dict[str, Any] = {"type": "remote", "url": "https://linear.test"}
+    if auth:
+        entry["auth"] = "oauth"
+    (config.root / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"linear": entry}}), encoding="utf-8"
+    )
+
+
+async def test_mcp_auth_reports_an_unknown_server(config) -> None:
+    bot, _ = await send(config, [], "/mcp auth ghost")
+    body = texts(bot)
+    assert "no server named" in body
+
+
+async def test_mcp_auth_refuses_a_stdio_server(config) -> None:
+    (config.root / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"local": {"type": "stdio", "command": "srv"}}}),
+        encoding="utf-8",
+    )
+    bot, _ = await send(config, [], "/mcp auth local")
+    assert "local stdio server" in texts(bot)
+
+
+async def test_mcp_auth_says_when_the_server_does_not_ask_for_oauth(config) -> None:
+    _oauth_server_config(config, auth=False)
+    bot, _ = await send(config, [], "/mcp auth linear")
+    body = texts(bot)
+    assert "does not ask for oauth" in body
+    assert '"auth": "oauth"' in body  # the remedy names the exact key
+
+
+async def test_mcp_auth_sends_the_link_and_reports_the_token(config, monkeypatch) -> None:
+    """The happy path: the owner gets the link, approves, and the summary is
+    reported — with the flow itself stubbed, since no browser lives here."""
+    _oauth_server_config(config, auth=True)
+    seen_links: list[str] = []
+
+    async def fake_authorize(spec, root, on_redirect, **kwargs):
+        await on_redirect("https://auth.linear.test/oauth/authorize?state=abc")
+        seen_links.append("sent")
+        return {
+            "server": spec.name,
+            "scopes": "issues:write",
+            "expires_in": 3600,
+            "refreshable": True,
+            "registered": True,
+        }
+
+    monkeypatch.setattr("lumi.bot.mcp_authorize_server", fake_authorize)
+    bot, _ = await send(config, [], "/mcp auth linear")
+
+    body = texts(bot)
+    assert "starting the login" in body
+    assert "auth.linear.test" in body  # the link was sent, full URL
+    assert "authorized" in body
+    assert "issues:write" in body
+    assert ".mcp-tokens" in body
+    assert seen_links == ["sent"]
+
+
+async def test_mcp_auth_reports_a_declined_login(config, monkeypatch) -> None:
+    _oauth_server_config(config, auth=True)
+
+    async def fake_authorize(spec, root, on_redirect, **kwargs):
+        raise RuntimeError("the login was not approved: access_denied")
+
+    monkeypatch.setattr("lumi.bot.mcp_authorize_server", fake_authorize)
+    bot, _ = await send(config, [], "/mcp auth linear")
+
+    body = texts(bot)
+    assert "did not complete" in body
+    assert "access_denied" in body
+
+
+async def test_mcp_auth_reports_a_timeout_in_its_own_words(config, monkeypatch) -> None:
+    """The owner never came back to the browser: asyncio.timeout cancels the
+    flow, and the reply must say that — not render the bare exception name."""
+    _oauth_server_config(config, auth=True)
+
+    async def fake_authorize(spec, root, on_redirect, **kwargs):
+        raise TimeoutError
+
+    monkeypatch.setattr("lumi.bot.mcp_authorize_server", fake_authorize)
+    bot, _ = await send(config, [], "/mcp auth linear")
+
+    body = texts(bot)
+    assert "timed out" in body
+    assert "/mcp auth linear" in body  # the retry, named
+    assert "TimeoutError" not in body  # never the raw exception name
+
+
+async def test_mcp_list_marks_an_oauth_server(config) -> None:
+    _oauth_server_config(config, auth=True)
+    bot, _ = await send(config, [], "/mcp list")
+    assert "oauth" in texts(bot)
 
 
 async def test_mcp_list_shows_a_stdio_server_without_connecting(config) -> None:
@@ -949,6 +1053,9 @@ async def test_mcp_check_retries_a_server_that_never_starts(config, monkeypatch)
         ),
         encoding="utf-8",
     )
+    bot, _ = await send(config, [], "/mcp approve broken")
+    assert "is approved to connect" in texts(bot)
+
     monkeypatch.setattr("lumi.tools.mcp_tool.CHECK_BACKOFF_SECONDS", 0)
     bot, _ = await send(config, [], "/mcp check broken")
     body = texts(bot)
@@ -956,6 +1063,35 @@ async def test_mcp_check_retries_a_server_that_never_starts(config, monkeypatch)
     assert "stdio" in body
     assert "✗" in body
     assert "attempts: 3" in body
+
+
+async def test_mcp_approve_lists_pending_then_approves_and_revokes(config) -> None:
+    """`/mcp approve` shows what is waiting (so the owner can decide from the
+    chat), approving once covers the entry as it stands, and revoke takes it
+    back — after which the entry waits again."""
+    (config.root / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"srv": {"url": "https://x.test"}}}),
+        encoding="utf-8",
+    )
+
+    bot, _ = await send(config, [], "/mcp approve")
+    body = texts(bot)
+    assert "never been approved" in body
+    assert "srv" in body
+
+    bot, _ = await send(config, [], "/mcp approve srv")
+    body = texts(bot)
+    assert "is approved to connect" in body
+    assert "https://x.test" in body
+
+    bot, _ = await send(config, [], "/mcp approve srv")
+    assert "already approved" in texts(bot)
+
+    bot, _ = await send(config, [], "/mcp revoke srv")
+    assert "withdrawn" in texts(bot)
+
+    bot, _ = await send(config, [], "/mcp revoke srv")
+    assert "no approval to withdraw" in texts(bot)
 
 
 async def test_mcp_is_owner_only(config) -> None:

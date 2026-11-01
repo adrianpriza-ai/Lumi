@@ -236,3 +236,6 @@ __marimo__/
 
 # Codebuddy
 .codebuddy
+
+# OAuth tokens for MCP servers — bearer credentials for the owner accounts
+.mcp-tokens/

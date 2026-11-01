@@ -8,6 +8,14 @@ Firecrawl MCP server dropped into either file works immediately, with no code
 change. A locally spawned server (``npx -y some-mcp-server``) works the same
 way. When a server name appears in both files, the project file wins.
 
+One asymmetry between the two files: the user-level one is written by the
+owner's own hand, but the project one arrives by ``git clone`` exactly as it
+does by editing, so its entries connect only after the owner approved that
+exact entry — see :mod:`~lumi.tools.web.providers.mcp_trust`. The gate sits in
+:meth:`MCPProvider._open`, which every trigger flows through, so a fresh entry
+costs a ``/mcp approve`` before ``mcp list``, a web search or a call spawns or
+dials it.
+
 Two transport kinds are supported, under either spelling of ``"type"``:
 
 * ``"type": "remote"`` (or ``"http"``) — streamable HTTP, the shape opencode and
@@ -52,6 +60,7 @@ from ....paths import resolve
 from ....util.env import scrubbed_env
 from ....util.log import get_logger
 from .base import Page, SearchHit, SearchResult, WebProvider, final_url, recent_cutoff
+from .mcp_trust import MCPTrustError, MCPTrustStore, entry_digest, trust_path
 
 log = get_logger(__name__)
 
@@ -84,6 +93,15 @@ try:
 except ImportError:
     _McpErrorOld = None  # type: ignore[assignment]
 
+#: The error code the SDK hands pending requests when the transport's receive
+#: stream ends — its tombstone for "the wire died under you", not the server's
+#: word. Reserved by the JSON-RPC/MCP spec, so the fallback is exact even if a
+#: future SDK moves the constant.
+try:
+    from mcp.types import CONNECTION_CLOSED as _CONNECTION_CLOSED
+except ImportError:  # pragma: no cover - mcp always ships this constant
+    _CONNECTION_CLOSED = -32000
+
 #: Every class the installed SDK answers an MCP error with. Empty only when
 #: the mcp package is absent at all — each spelling the installed version
 #: lacks raises ImportError and contributes nothing. Importing only the 1.x
@@ -95,18 +113,38 @@ MCP_ERRORS: tuple[type[BaseException], ...] = tuple(
 )
 
 
-def _session_died(exc: BaseException) -> bool:
-    """Whether *exc* is a dead session (re-spawn once) or the server answering.
+def _error_code(exc: BaseException) -> int | None:
+    """The MCP error code *exc* carries, when it is an MCP error at all."""
+    code = getattr(getattr(exc, "error", None), "code", None)
+    try:
+        return int(code)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
 
-    Only a dead transport earns a retry. A timeout means the request went out
-    and may already have been acted on — re-sending it could run a write twice
-    — and an MCP error is a reply, however unhappy, so there is nothing to
-    reconnect to either.
+
+def _session_died(exc: BaseException) -> bool:
+    """Whether *exc* means the session is dead (drop it) or the server answered.
+
+    A trust refusal is neither death nor reply — it never came from the wire,
+    and the remedy is the owner's ``/mcp approve``, not a respawn — so it
+    returns False with the timeout. A timeout itself means the request went
+    out and may already have been acted on, so it is never a death either.
+
+    The subtle case is an MCP error whose code is ``CONNECTION_CLOSED``: it
+    *looks* like a reply, but it is the SDK's own tombstone — when the wire
+    dies while requests are in flight, pending requests each receive an MCP
+    error with that code rather than a transport exception. Validated against
+    the real stdio and streamable-HTTP transports: a server that acts on a
+    request and dies before replying surfaces exactly this way. Every other
+    MCP error is the server replying, however unhappy — nothing to reconnect
+    to. Any non-MCP exception is a dead transport.
     """
-    if isinstance(exc, TimeoutError):  # requires-python >= 3.11: asyncio's is this
+    if isinstance(exc, (MCPTrustError, TimeoutError)):  # >= 3.11: asyncio's is this
         return False
     if MCP_ERRORS:
-        return not isinstance(exc, MCP_ERRORS)
+        if isinstance(exc, MCP_ERRORS):
+            return _error_code(exc) == _CONNECTION_CLOSED
+        return True
     return type(exc).__name__ not in {"McpError", "MCPError"}
 
 
@@ -181,6 +219,25 @@ class ServerSpec:
     #: The unexpanded strings, kept so we can still tell "unset variable" apart
     #: from "variable set to the empty string" after expansion has run.
     raw: list[str] = field(default_factory=list)
+    #: ``"auth": "oauth"`` in the server's entry: the server wants the *owner's*
+    #: authorization, negotiated per :mod:`~lumi.tools.web.providers.mcp_oauth`
+    #: (browser login, stored tokens) rather than a static header token.
+    oauth: bool = False
+    #: Scopes the authorization request asks for (``"scopes"`` in the dict
+    #: form of ``auth``), space-joined. Most servers grant everything the
+    #: account can reach without being told anything, but some — Atlassian
+    #: above all — only mint a *refresh* token when the request names scopes,
+    #: which is the difference between logging in once and once an hour.
+    oauth_scope: str = ""
+    #: Where this entry was read from: ``"project"`` (``.mcp.json``, which
+    #: arrives by clone as easily as by hand and so needs the owner's
+    #: approval before it may connect) or ``"user"`` (``~/.agents/mcp.json``,
+    #: written by the owner's own hand, trusted as authored).
+    origin: str = "user"
+    #: Hash of the entry exactly as the config file wrote it — the key the
+    #: trust store approves against. Empty for a spec built in code rather
+    #: than parsed from a file, which reads as "not a project entry".
+    digest: str = ""
 
     @property
     def is_local(self) -> bool:
@@ -195,7 +252,7 @@ class ServerSpec:
         return None
 
     @classmethod
-    def from_json(cls, name: str, raw: dict[str, Any]) -> ServerSpec:
+    def from_json(cls, name: str, raw: dict[str, Any], origin: str = "user") -> ServerSpec:
         command = raw.get("command")
         if isinstance(command, list):  # opencode style: ["npx", "-y", "pkg"]
             command_parts = [str(part) for part in command]
@@ -209,6 +266,19 @@ class ServerSpec:
         raw_env_value = raw.get("env") or {}
         raw_headers_value = raw.get("headers") or {}
         raw_cwd = str(raw.get("cwd") or "")
+        raw_auth = raw.get("auth")
+        # "oauth" as a string or as {"type": "oauth"} — the dict shape is also
+        # where per-flow options live, currently "scopes" (string or list).
+        oauth = raw_auth == "oauth" or (
+            isinstance(raw_auth, dict) and raw_auth.get("type") == "oauth"
+        )
+        raw_scopes = ""
+        if isinstance(raw_auth, dict):
+            scopes = raw_auth.get("scopes")
+            if isinstance(scopes, str):
+                raw_scopes = scopes
+            elif isinstance(scopes, list):
+                raw_scopes = " ".join(str(item) for item in scopes)
         raw_env = (
             {str(k): str(v) for k, v in raw_env_value.items()}
             if isinstance(raw_env_value, dict)
@@ -236,12 +306,27 @@ class ServerSpec:
             env={k: expand_env(v) for k, v in raw_env.items()},
             headers={k: expand_env(v) for k, v in raw_headers.items()},
             cwd=expand_env(raw_cwd),
-            raw=[raw_url, *command_parts, *args, *raw_env.values(), *raw_headers.values(), raw_cwd],
+            raw=[
+                raw_url,
+                *command_parts,
+                *args,
+                *raw_env.values(),
+                *raw_headers.values(),
+                raw_cwd,
+                raw_scopes,
+            ],
+            oauth=oauth,
+            oauth_scope=expand_env(raw_scopes),
+            origin=origin,
+            # The hash covers the entry as *written* — placeholders intact —
+            # so an edit to anything the provider will act on asks for
+            # approval again, while a rotated variable's value does not.
+            digest=entry_digest(raw),
         )
 
 
-def _http_transport(spec: ServerSpec):
-    """The streamable-HTTP async context manager for *spec*, headers and all.
+def _http_transport(spec: ServerSpec, root: Path):
+    """The streamable-HTTP async context manager for *spec*, headers and auth.
 
     The transport was renamed twice and the way custom headers are passed
     moved with it: ``streamablehttp_client(url, headers=…)`` through 1.25,
@@ -251,17 +336,33 @@ def _http_transport(spec: ServerSpec):
     manager with *spec*'s headers applied — or one clear error when the
     installed version genuinely cannot carry them, instead of an ImportError
     that would read as "server unreachable".
+
+    An OAuth server (``"auth": "oauth"``) rides the same two shapes: the
+    factory takes the auth handler directly (``auth=``), the legacy
+    transport takes it as its own kwarg. Both factories exist across the
+    supported range, so the handler is built once in
+    :func:`~lumi.tools.web.providers.mcp_oauth.oauth_provider_for` and handed
+    to whichever transport the installed SDK answers with.
     """
     from mcp.client import streamable_http
 
+    auth = None
+    if spec.oauth:
+        from .mcp_oauth import oauth_provider_for
+
+        auth = oauth_provider_for(spec, root)
+
     factory = getattr(streamable_http, "create_mcp_http_client", None)
     transport = getattr(streamable_http, "streamable_http_client", None)
-    if transport is not None and (factory is not None or not spec.headers):
-        http_client = factory(headers=spec.headers) if (factory and spec.headers) else None
+    if transport is not None and (factory is not None or not (spec.headers or auth)):
+        if factory is not None and (spec.headers or auth):
+            http_client = factory(headers=spec.headers or None, auth=auth)
+        else:
+            http_client = None
         return transport(spec.url, http_client=http_client)
     legacy = getattr(streamable_http, "streamablehttp_client", None)
-    if legacy is not None:  # pre-2.0: headers are a direct kwarg
-        return legacy(spec.url, headers=spec.headers or None)
+    if legacy is not None:  # pre-2.0: headers and auth are direct kwargs
+        return legacy(spec.url, headers=spec.headers or None, auth=auth)
     raise RuntimeError(
         f"server {spec.name!r} declares custom headers, but the installed mcp "
         "package cannot carry them on streamable HTTP (needs mcp >= 2.3, or "
@@ -347,6 +448,9 @@ class MCPProvider(WebProvider):
     def __init__(self, config: MCPConfig, project_root: Path) -> None:
         self.config = config
         self.root = project_root
+        #: Owner approvals for project-file entries — the gate :meth:`_open`
+        #: enforces. See :mod:`~lumi.tools.web.providers.mcp_trust`.
+        self.trust = MCPTrustStore(trust_path(project_root))
         self._tool_cache: dict[str, tuple[float, list[DiscoveredTool]]] = {}
         #: Live session per server name: (stack owning the transport, session).
         #: Discovery plus a call used to pay for two spawns — and a local
@@ -390,7 +494,7 @@ class MCPProvider(WebProvider):
             )
         )
 
-    def _read_servers(self, path: Path) -> dict[str, ServerSpec]:
+    def _read_servers(self, path: Path, origin: str = "user") -> dict[str, ServerSpec]:
         if not path.is_file():
             return {}
         try:
@@ -411,7 +515,7 @@ class MCPProvider(WebProvider):
                 log.warning("%s contains an invalid MCP server entry %r", path, name)
                 continue
             try:
-                servers[name] = ServerSpec.from_json(name, cfg)
+                servers[name] = ServerSpec.from_json(name, cfg, origin=origin)
             except (TypeError, ValueError) as exc:
                 log.warning("could not parse MCP server %r from %s: %s", name, path, exc)
         return servers
@@ -421,9 +525,16 @@ class MCPProvider(WebProvider):
 
         The files are read in :attr:`config_paths` order, so the project file
         (last) both overrides a duplicate name and leads the list, shadowing a
-        user-level entry everywhere the list is walked.
+        user-level entry everywhere the list is walked. Each entry remembers
+        which file it came from: the project file's entries are the ones the
+        trust gate holds, since that file arrives by clone as easily as by
+        hand, while the user-level one is the owner's own writing.
         """
-        tables = [self._read_servers(path) for path in self.config_paths]
+        project = self.config_path
+        tables = [
+            self._read_servers(path, origin="project" if path == project else "user")
+            for path in self.config_paths
+        ]
         if not tables:
             return []
         merged: dict[str, ServerSpec] = {}
@@ -467,8 +578,38 @@ class MCPProvider(WebProvider):
             return resolve(spec.cwd, base=self.root)
         return self.root
 
+    def _trust_refusal(self, spec: ServerSpec) -> str | None:
+        """Why *spec* may not connect yet, or ``None`` when it may.
+
+        The invariant: an entry in the project config file — which a clone or
+        a pull delivers just as an owner's edit does — causes no connection,
+        spawn or HTTP, until the owner approved that exact entry. User-level
+        entries are the owner's own writing and skip the gate; so does a spec
+        built in code without a digest (the tests' stubs, mostly). The check
+        lives here rather than at each caller because every trigger — the web
+        tool's ``_pick``, the ``mcp`` tool's ``list`` and ``call``, ``check``
+        — funnels through :meth:`_open`.
+        """
+        if spec.origin != "project" or not spec.digest:
+            return None
+        if self.trust.is_trusted(spec.name, spec.digest):
+            return None
+        return (
+            f"server {spec.name!r} comes from the project config and has not been "
+            f"approved to connect — the owner can approve it once with "
+            f"`/mcp approve {spec.name}`"
+        )
+
     async def _open(self, stack: AsyncExitStack, spec: ServerSpec):
-        """Start a session against *spec* and return it, already initialised."""
+        """Start a session against *spec* and return it, already initialised.
+
+        The trust gate runs before anything is spawned or dialed: a refused
+        entry costs no subprocess, no HTTP request and no header — not even
+        the ones with expanded secrets in them.
+        """
+        if refusal := self._trust_refusal(spec):
+            raise MCPTrustError(refusal)
+
         from mcp import ClientSession
         from mcp.client.stdio import stdio_client
 
@@ -480,7 +621,7 @@ class MCPProvider(WebProvider):
         else:
             if not spec.url:
                 raise RuntimeError(f"server {spec.name} has no url")
-            transport = await stack.enter_async_context(_http_transport(spec))
+            transport = await stack.enter_async_context(_http_transport(spec, self.root))
             # An older stdio/HTTP transport yields 3 entries (the third is the
             # session id); only the first two are the session's read/write
             # channels, and the current one already yields exactly those two.
@@ -548,14 +689,28 @@ class MCPProvider(WebProvider):
             with suppress(Exception):  # shutdown is best-effort
                 await stack.aclose()
 
-    async def _reuse(self, spec: ServerSpec, op: Any) -> Any:
-        """Run *op(session)* on the cached session, re-spawning once if it died.
+    async def _reuse(self, spec: ServerSpec, op: Any, *, repeatable: bool) -> Any:
+        """Run *op(session)* on the cached session; handle a dead transport.
 
-        A server that went away between queries must not poison every later
-        call: the dead session is dropped and the operation retried on a fresh
-        one, so the worst a dead server costs is one extra launch. Only a dead
-        transport is retried — a timeout or a server reply may mean the call
-        already ran, and retrying it could repeat a write.
+        What a dead transport earns depends on what *op* is, so the caller
+        says:
+
+        * ``repeatable=True`` — *op* re-runs safely, which is tool discovery:
+          a re-sent ``tools/list`` cannot repeat anything the server did. The
+          dead session is dropped and *op* re-sent once on a fresh one, so a
+          server that went away between queries costs one extra launch, not
+          every later call.
+        * ``repeatable=False`` — *op* is a tool *call*. The request may
+          already have been acted on by the time the transport dies, and
+          which exception a mid-flight disconnect produces is the SDK's
+          business (the ``CONNECTION_CLOSED`` tombstone, a transport error,
+          an ``httpx.RemoteProtocolError``) — none of them proves the server
+          did *not* act. So the dead session is dropped and the error raised
+          as-is: this call fails, the next one spawns fresh. Recovery is
+          preserved across calls; the write is never risked twice.
+
+        A timeout is not a death in either mode — the session may be slow,
+        not gone — and a server reply is never a death either.
         """
         session = await self._session_for(spec)
         try:
@@ -563,8 +718,10 @@ class MCPProvider(WebProvider):
         except Exception as exc:
             if not _session_died(exc):
                 raise
-            log.debug("mcp session for %r died; re-spawning once", spec.name)
+            log.debug("mcp session for %r died; dropping it", spec.name)
             await self._drop_session(spec.name)
+            if not repeatable:
+                raise
             try:
                 return await op(await self._session_for(spec))
             except Exception as retry_exc:
@@ -637,7 +794,9 @@ class MCPProvider(WebProvider):
             )
             return found
 
-        raw_tools = await self._reuse(spec, walk)
+        # Discovery is idempotent: re-sending a tools/list can repeat nothing
+        # the server did, so a dead transport earns its one re-send here.
+        raw_tools = await self._reuse(spec, walk, repeatable=True)
 
         tools = []
         for tool in raw_tools:
@@ -672,6 +831,12 @@ class MCPProvider(WebProvider):
                     continue
                 try:
                     tools = await self._list_tools(spec)
+                except MCPTrustError as exc:
+                    # Distinct from unreachable: the server may be perfectly
+                    # healthy, the owner just has not approved the entry. The
+                    # search still fails closed — this server is skipped.
+                    log.info("mcp server %r awaits approval: %s", spec.name, exc)
+                    continue
                 except Exception as exc:  # noqa: BLE001
                     log.info("mcp server %r is unreachable: %s", spec.name, exc)
                     continue
@@ -693,6 +858,7 @@ class MCPProvider(WebProvider):
             lambda session: session.call_tool(
                 tool.name, arguments, read_timeout_seconds=_read_timeout(timeout)
             ),
+            repeatable=False,  # a call may already have run; never re-send it
         )
         return _flatten(result)
 
@@ -1027,4 +1193,4 @@ def _parse_search_payload(text: str, result: SearchResult) -> None:
         result.hits.append(SearchHit(title=f"result for {result.query!r}", url="", content=text))
 
 
-__all__ = ["MCPProvider", "ServerSpec", "DiscoveredTool", "expand_env"]
+__all__ = ["MCPProvider", "ServerSpec", "DiscoveredTool", "MCPTrustError", "expand_env"]

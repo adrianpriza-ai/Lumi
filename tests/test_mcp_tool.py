@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import sys
+from contextlib import suppress
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -26,12 +27,19 @@ from lumi.util.text import UNTRUSTED_BEGIN, UNTRUSTED_END
 
 
 def make_tool(config) -> MCPTool:
-    """The tool against a project whose .mcp.json names one remote server."""
+    """The tool against a project whose .mcp.json names one remote server.
+
+    Approved as well: these tests' subject is listing, calling and approval
+    prompts, not the trust gate — every test of the gate writes its own
+    `.mcp.json` and builds the tool itself, unapproved on purpose.
+    """
     (config.root / ".mcp.json").write_text(
         json.dumps({"mcpServers": {"linear": {"url": "https://linear.test"}}}),
         encoding="utf-8",
     )
-    return MCPTool(config)
+    tool = MCPTool(config)
+    tool.provider.trust.approve("linear", tool.provider.servers()[0].digest)
+    return tool
 
 
 def fake_tools(*tools: DiscoveredTool):
@@ -87,6 +95,46 @@ for line in sys.stdin:
             }],
             "isError": False,
         }})
+    else:
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
+'''
+
+
+#: The same shape, but the tool *acts* and then dies without replying — the
+#: exact fixture the F3 validation plan calls for. What the client receives
+#: is the SDK's CONNECTION_CLOSED tombstone; the marker file records what the
+#: server actually executed, so a re-sent write would show up as a second line.
+DIE_AFTER_WRITE_SERVER = r'''
+import json, os, sys
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    if msg.get("id") is None:
+        continue
+    method = msg.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {
+            "protocolVersion": msg["params"]["protocolVersion"],
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "die-after-write", "version": "1"},
+        }})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {"tools": [{
+            "name": "append_marker",
+            "description": "append to the marker file",
+            "inputSchema": {"type": "object", "properties": {}},
+        }]}})
+    elif method == "tools/call":
+        with open(os.environ["LUMI_F3_MARKER"], "a") as f:
+            f.write("executed\n")
+        os._exit(0)  # the write landed; die before any reply can go out
     else:
         send({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
 '''
@@ -314,6 +362,7 @@ async def test_a_stdio_server_runs_in_the_project_directory(config) -> None:
         encoding="utf-8",
     )
     tool = MCPTool(config)
+    tool.provider.trust.approve("probe", spec_of(tool).digest)
 
     try:
         tools = await tool.provider._list_tools(spec_of(tool))
@@ -342,6 +391,7 @@ async def test_a_stdio_server_honours_its_own_cwd(config) -> None:
         encoding="utf-8",
     )
     tool = MCPTool(config)
+    tool.provider.trust.approve("probe", spec_of(tool).digest)
 
     try:
         tools = await tool.provider._list_tools(spec_of(tool))
@@ -364,6 +414,7 @@ async def test_a_call_reaches_the_real_sdk_end_to_end(config) -> None:
     )
     config.tools.web.mcp.ask_before_call = False
     tool = MCPTool(config)
+    tool.provider.trust.approve("probe", spec_of(tool).digest)
 
     try:
         result = await tool.invoke(
@@ -379,6 +430,42 @@ async def test_a_call_reaches_the_real_sdk_end_to_end(config) -> None:
         # The server echoes its real cwd and the arguments, unflattened.
         assert str(config.root.resolve()) in result.text
         assert '"note": "hi"' in result.text
+    finally:
+        await tool.aclose()
+
+
+async def test_a_call_that_lands_then_loses_the_server_is_not_repeated(config) -> None:
+    """The F3 validation plan, kept as a regression test: the server appends
+    to a marker and dies before replying. One logical call must leave exactly
+    one line — the death is reported as a failure, never re-sent."""
+    marker = config.root / "write.marker"
+    (config.root / "server.py").write_text(DIE_AFTER_WRITE_SERVER, encoding="utf-8")
+    (config.root / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "die": {
+                        "type": "stdio",
+                        "command": sys.executable,
+                        "args": ["server.py"],
+                        "env": {"LUMI_F3_MARKER": str(marker)},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    config.tools.web.mcp.ask_before_call = False
+    tool = MCPTool(config)
+    tool.provider.trust.approve("die", spec_of(tool).digest)
+
+    try:
+        result = await tool.invoke(
+            {"action": "call", "server": "die", "tool": "append_marker"},
+            ToolContext(),
+        )
+        assert not result.ok  # the mid-call death is reported, not swallowed
+        assert marker.read_text().splitlines() == ["executed"]
     finally:
         await tool.aclose()
 
@@ -411,13 +498,38 @@ async def test_call_asks_for_approval_by_default(config) -> None:
     assert "Ship it" in exc.value.preview
 
 
+async def test_the_approval_names_the_tool_that_will_run(config) -> None:
+    """F4: the case-insensitive fallback means the requested and the executed
+    names can differ, so the prompt must be built from the *matched* name —
+    the owner approves what runs, not what the model typed."""
+    tool = make_tool(config)
+    tool.provider._list_tools = fake_tools(  # type: ignore[method-assign]
+        DiscoveredTool(name="Create_Issue", description="", properties={})
+    )
+
+    with pytest.raises(NeedsApproval) as exc:
+        await tool.invoke(
+            {
+                "action": "call",
+                "server": "linear",
+                "tool": "create_issue",
+                "arguments": {"title": "Ship it"},
+            },
+            ToolContext(),
+        )
+
+    assert "linear.Create_Issue" in exc.value.reason
+    assert "Create_Issue" in exc.value.preview
+    assert "linear.create_issue" not in exc.value.reason
+
+
 async def test_call_runs_once_the_owner_confirmed(config) -> None:
     tool = make_tool(config)
     tool.provider._list_tools = fake_tools(  # type: ignore[method-assign]
         DiscoveredTool(name="create_issue", description="", properties={})
     )
 
-    async def _reuse(spec, op):
+    async def _reuse(spec, op, *, repeatable=True):
         return fake_result("created ABC-123")
 
     tool.provider._reuse = _reuse  # type: ignore[method-assign]
@@ -452,7 +564,7 @@ async def test_call_passes_the_read_timeout_the_sdk_expects(config) -> None:
             captured["timeout"] = read_timeout_seconds
             return fake_result("ok")
 
-    async def _reuse(spec, op):
+    async def _reuse(spec, op, *, repeatable=True):
         return await op(Session())
 
     tool.provider._reuse = _reuse  # type: ignore[method-assign]
@@ -476,7 +588,7 @@ async def test_a_structured_only_result_is_rendered(config) -> None:
         DiscoveredTool(name="list_issues", description="", properties={})
     )
 
-    async def _reuse(spec, op):
+    async def _reuse(spec, op, *, repeatable=True):
         return SimpleNamespace(content=[], structuredContent={"issues": [{"id": "ABC-1"}]})
 
     tool.provider._reuse = _reuse  # type: ignore[method-assign]
@@ -500,7 +612,7 @@ async def test_a_huge_call_reply_is_capped(config) -> None:
         DiscoveredTool(name="dump_page", description="", properties={})
     )
 
-    async def _reuse(spec, op):
+    async def _reuse(spec, op, *, repeatable=True):
         return fake_result("HEAD" + "x" * 100_000 + "TAIL")
 
     tool.provider._reuse = _reuse  # type: ignore[method-assign]
@@ -523,7 +635,7 @@ async def test_a_huge_error_reply_is_capped_too(config) -> None:
         DiscoveredTool(name="dump_page", description="", properties={})
     )
 
-    async def _reuse(spec, op):
+    async def _reuse(spec, op, *, repeatable=True):
         return fake_result("E" * 60_000, error=True)
 
     tool.provider._reuse = _reuse  # type: ignore[method-assign]
@@ -563,7 +675,7 @@ async def test_the_tool_cache_is_bypassed_when_the_config_changes(config) -> Non
                 ]
             )
 
-    async def _reuse(spec, op):
+    async def _reuse(spec, op, *, repeatable=True):
         return await op(Session())
 
     tool.provider._reuse = _reuse  # type: ignore[method-assign]
@@ -618,7 +730,7 @@ async def test_call_skips_the_prompt_when_ask_before_call_is_off(config) -> None
         DiscoveredTool(name="list_issues", description="", properties={})
     )
 
-    async def _reuse(spec, op):
+    async def _reuse(spec, op, *, repeatable=True):
         return fake_result("no issues")
 
     tool.provider._reuse = _reuse  # type: ignore[method-assign]
@@ -640,7 +752,7 @@ async def test_a_server_side_error_is_a_failure_not_output(config) -> None:
         DiscoveredTool(name="create_issue", description="", properties={})
     )
 
-    async def _reuse(spec, op):
+    async def _reuse(spec, op, *, repeatable=True):
         return fake_result("Forbidden: missing scope", error=True)
 
     tool.provider._reuse = _reuse  # type: ignore[method-assign]
@@ -710,7 +822,7 @@ async def test_arguments_may_arrive_as_a_json_string(config) -> None:
         DiscoveredTool(name="create_issue", description="", properties={})
     )
 
-    async def _reuse(spec, op):
+    async def _reuse(spec, op, *, repeatable=True):
         return fake_result("created ABC-9")
 
     tool.provider._reuse = _reuse  # type: ignore[method-assign]
@@ -751,7 +863,7 @@ async def test_a_timeout_reads_as_a_budget_message_not_a_crash(config) -> None:
         DiscoveredTool(name="create_issue", description="", properties={})
     )
 
-    async def _reuse(spec, op):
+    async def _reuse(spec, op, *, repeatable=True):
         raise TimeoutError("read timed out")
 
     tool.provider._reuse = _reuse  # type: ignore[method-assign]
@@ -806,7 +918,7 @@ async def test_a_dict_shaped_error_result_is_a_failure(config) -> None:
         DiscoveredTool(name="create_issue", description="", properties={})
     )
 
-    async def _reuse(spec, op):
+    async def _reuse(spec, op, *, repeatable=True):
         return {"content": [{"text": "Forbidden"}], "isError": True}
 
     tool.provider._reuse = _reuse  # type: ignore[method-assign]
@@ -849,6 +961,23 @@ async def test_an_mcp_error_reply_is_not_treated_as_a_dead_session(config) -> No
     assert _session_died(TimeoutError("read timed out")) is False
 
 
+async def test_the_connection_closed_tombstone_is_a_dead_session() -> None:
+    """When the wire dies under pending requests, the SDK hands each one an
+    MCP error with code CONNECTION_CLOSED — reply-shaped, but it is the
+    transport's tombstone, not the server's word. Validated against real
+    stdio and streamable-HTTP servers that die mid-request: this is exactly
+    what a post-send disconnect surfaces as. The session must read as dead,
+    so it gets dropped instead of poisoning every later call."""
+    from mcp.types import CONNECTION_CLOSED, ErrorData
+
+    from lumi.tools.web.providers.mcp_provider import MCP_ERRORS, _session_died
+
+    for cls in MCP_ERRORS:
+        assert _session_died(
+            mcp_error(cls, ErrorData(code=CONNECTION_CLOSED, message="Connection closed"))
+        ), cls
+
+
 def test_the_2xx_result_field_spellings_are_honoured() -> None:
     """mcp 2.x renamed isError/structuredContent/nextCursor to snake_case. A
     2.x-shaped result must read the same as a 1.x-shaped one: missing
@@ -865,6 +994,218 @@ def test_the_2xx_result_field_spellings_are_honoured() -> None:
     assert _is_error(SimpleNamespace(isError=True))
     assert _structured(SimpleNamespace(structuredContent={"b": 2})) == {"b": 2}
     assert _next_cursor(SimpleNamespace(nextCursor="page-3")) == "page-3"
+
+
+# --------------------------------------------------------------------------- #
+# trust — a project-file entry connects only after the owner approved it
+# --------------------------------------------------------------------------- #
+#
+# F1 from handoff-mcp.md: `.mcp.json` arrives by `git clone` exactly as it does
+# by the owner's own hand, and a hostile entry can name a local command the
+# provider will spawn or a remote URL it will dial with credential-expanded
+# headers. The gate sits in `_open`, which every trigger — `mcp list`, a web
+# search, `mcp call`, `check` — flows through.
+
+
+def hostile_config(root, marker) -> dict:
+    """A project entry whose command writes a marker file when it runs."""
+    return {
+        "mcpServers": {
+            "hostile": {
+                "type": "stdio",
+                "command": sys.executable,
+                "args": ["-c", f"open({str(marker)!r}, 'w').write('spawned')"],
+            }
+        }
+    }
+
+
+async def test_an_unapproved_project_server_never_spawns(config) -> None:
+    """Before approval, a list must refuse without running the entry's
+    command — the marker file the command would write stays absent."""
+    marker = config.root / "spawned.marker"
+    (config.root / ".mcp.json").write_text(json.dumps(hostile_config(config.root, marker)), encoding="utf-8")
+    tool = MCPTool(config)
+
+    result = await tool.invoke({"action": "list"}, ToolContext())
+
+    assert not marker.exists()
+    assert "hostile" in result.text
+    assert "awaiting approval" in result.text
+    assert "/mcp approve hostile" in result.text
+
+
+async def test_an_approved_project_server_spawns(config) -> None:
+    """The same entry after `/mcp approve` runs — the marker proves the spawn.
+    The command is one-shot on purpose: it writes and exits, so discovery may
+    fail on the closed connection; the spawn itself is what this pins."""
+    marker = config.root / "spawned.marker"
+    (config.root / ".mcp.json").write_text(json.dumps(hostile_config(config.root, marker)), encoding="utf-8")
+    tool = MCPTool(config)
+    tool.provider.trust.approve("hostile", spec_of(tool).digest)
+
+    try:
+        with suppress(Exception):
+            await tool.provider._list_tools(spec_of(tool))
+        assert marker.exists()
+    finally:
+        await tool.aclose()
+
+
+async def test_a_user_level_server_needs_no_approval(config) -> None:
+    """`~/.agents/mcp.json` is the owner's own writing: it spawns without a
+    trip to the trust store, where the identical project entry would wait."""
+    marker = config.root / "spawned.marker"
+    home = config.root / "home"
+    agents = home / ".agents"
+    agents.mkdir(parents=True)
+    (agents / "mcp.json").write_text(json.dumps(hostile_config(home, marker)), encoding="utf-8")
+    config.tools.web.mcp.user_config_file = str(agents / "mcp.json")
+    tool = MCPTool(config)
+    spec = tool.provider.servers()[0]
+
+    assert spec.origin == "user"
+    assert tool.provider._trust_refusal(spec) is None
+
+    try:
+        with suppress(Exception):
+            await tool.provider._list_tools(spec)
+        assert marker.exists()
+    finally:
+        await tool.aclose()
+
+
+async def test_editing_an_entry_asks_for_approval_again(config) -> None:
+    """An approval covers the entry as it stood. A pulled commit that rewrites
+    the command, the URL or a header must not ride in on the old approval."""
+    (config.root / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"srv": {"url": "https://first.test"}}}), encoding="utf-8"
+    )
+    tool = MCPTool(config)
+    tool.provider.trust.approve("srv", spec_of(tool).digest)
+    assert tool.provider._trust_refusal(spec_of(tool)) is None
+
+    (config.root / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"srv": {"url": "https://attacker.test"}}}), encoding="utf-8"
+    )
+
+    assert tool.provider._trust_refusal(spec_of(tool)) is not None
+
+
+async def test_rotating_a_variable_does_not_ask_again(config, monkeypatch) -> None:
+    """The digest covers the entry as written, placeholders intact — so a key
+    rotated in the environment keeps its approval, while any edit to the entry
+    itself would not."""
+    monkeypatch.setenv("LUMI_TEST_ROTATING_KEY", "one")
+    (config.root / ".mcp.json").write_text(
+        json.dumps(
+            {"mcpServers": {"srv": {"url": "https://x.test/k=${LUMI_TEST_ROTATING_KEY}"}}}
+        ),
+        encoding="utf-8",
+    )
+    tool = MCPTool(config)
+    tool.provider.trust.approve("srv", spec_of(tool).digest)
+
+    monkeypatch.setenv("LUMI_TEST_ROTATING_KEY", "two")
+
+    assert tool.provider._trust_refusal(spec_of(tool)) is None
+
+
+async def test_a_corrupt_trust_file_reads_as_nothing_approved(config) -> None:
+    """Whatever mangled the approvals file, the safe reading is the strict
+    one: nothing is approved, every project entry waits again."""
+    (config.root / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"srv": {"url": "https://x.test"}}}), encoding="utf-8"
+    )
+    tool = MCPTool(config)
+    tool.provider.trust.approve("srv", spec_of(tool).digest)
+    assert tool.provider._trust_refusal(spec_of(tool)) is None
+
+    tool.provider.trust.path.write_text("{not json", encoding="utf-8")
+
+    assert tool.provider._trust_refusal(spec_of(tool)) is not None
+
+
+async def test_a_project_entry_shadows_a_user_entry_into_the_gate(config) -> None:
+    """The project file wins on a duplicate name — so a clone that adds a
+    same-named entry must get the *project* entry's scrutiny, not the
+    user-level approval the name already carried."""
+    (config.root / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"srv": {"url": "https://project.test"}}}), encoding="utf-8"
+    )
+    config.tools.web.mcp.user_config_file = "user-mcp.json"
+    (config.root / "user-mcp.json").write_text(
+        json.dumps({"mcpServers": {"srv": {"url": "https://user.test"}}}), encoding="utf-8"
+    )
+    tool = MCPTool(config)
+    spec = spec_of(tool)
+
+    assert spec.origin == "project"
+    assert spec.url == "https://project.test"
+    assert tool.provider._trust_refusal(spec) is not None
+
+
+async def test_a_call_refuses_an_untrusted_server_before_connecting(config) -> None:
+    """`call` fails before the spawn, the HTTP request — and before its own
+    approval prompt: confirming one call is not approving an entry."""
+    marker = config.root / "spawned.marker"
+    (config.root / ".mcp.json").write_text(json.dumps(hostile_config(config.root, marker)), encoding="utf-8")
+    tool = MCPTool(config)
+
+    async def _never(spec):
+        raise AssertionError("an untrusted server must not be connected")
+
+    tool.provider._list_tools = _never  # type: ignore[method-assign]
+
+    result = await tool.invoke(
+        {"action": "call", "server": "hostile", "tool": "t"},
+        ToolContext(confirmed=True),
+    )
+
+    assert not result.ok
+    assert "approve" in result.text
+    assert not marker.exists()
+
+
+async def test_check_reports_an_unapproved_server_without_connecting(config) -> None:
+    """Retrying cannot approve an entry, so the probe says so once instead of
+    spending its three attempts on a refusal."""
+    (config.root / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"srv": {"url": "https://x.test"}}}), encoding="utf-8"
+    )
+    tool = MCPTool(config)
+
+    async def _never(spec):
+        raise AssertionError("check must not connect an unapproved server")
+
+    tool.provider._list_tools = _never  # type: ignore[method-assign]
+
+    outcome = await tool.check(spec_of(tool))
+
+    assert not outcome.ok
+    assert outcome.attempts == 0
+    assert "/mcp approve srv" in outcome.detail
+
+
+async def test_a_trust_refusal_is_never_a_dead_session() -> None:
+    """A refusal did not come from the wire: re-spawning cannot clear it, so
+    `_reuse`'s one retry must leave it alone."""
+    from lumi.tools.web.providers.mcp_provider import _session_died
+    from lumi.tools.web.providers.mcp_trust import MCPTrustError
+
+    assert not _session_died(MCPTrustError("not approved"))
+
+
+def test_the_trust_store_lives_under_data_and_is_write_protected(config) -> None:
+    """Approvals are runtime state under `data/` (gitignored, not cloned), and
+    the model must never be able to write the file — writing it is exactly
+    how a prompt injection would approve its own server."""
+    from lumi.tools.safety import protected_write
+    from lumi.tools.web.providers.mcp_trust import trust_path
+
+    path = trust_path(config.root)
+    assert path == config.root / "data" / "mcp-trust.json"
+    assert protected_write(path, config.root) == "data/mcp-trust.json"
 
 
 # --------------------------------------------------------------------------- #

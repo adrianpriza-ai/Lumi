@@ -226,7 +226,8 @@ Three tiers, resolved in order, strictest wins:
 - **deny** — never runs, not even with approval. `rm -rf /`, `sudo`, piping a
   download into a shell, writing to `/dev/sda`, touching `.bashrc` or `.ssh`,
   writing to a `.git/hooks` file, rewriting the bot's own state
-  (`data/whitelist.json`, `.mcp.json`, `config.toml`), persistent
+  (`data/whitelist.json`, `.mcp.json`, `data/mcp-trust.json`, `config.toml`),
+  persistent
   `git config --global`, reverse shells, `find / -delete`, power state
   changes, fork bombs.
 - **confirm** — the owner gets a Confirm/Cancel button in the chat. Anything
@@ -316,7 +317,7 @@ provider_order = ["firecrawl", "exa", "tavily", "you", "mcp"]
 - **exa** — neural search built for agents: natural-language queries in, semantically ranked pages out, with highlights or full text per hit. Needs an `EXA_API_KEY` (no keyless tier); same rotation rules as the others (`tools.web.exa.key_strategy`). Optional `search_type` (`auto` / `neural` / `keyword`) and `category` (`news`, `github`, `paper`, `pdf`, ...) knobs in `[tools.web.providers.exa]`.
 - **tavily** — best for agentic search. LLM-ready snippets, optional bundled answer. **Works without an API key** — the SDK runs in its free tier (low rate limit; `search` and `extract` only) when `TAVILY_API_KEY` is unset. With one or more keys, a failed key is parked for a minute and the next one answers; `tools.web.tavily.key_strategy` picks `fallback` / `round_robin` / `random`.
 - **you** — You.com's hosted MCP endpoint, `https://api.you.com/mcp?profile=free`. **Keyless by design**: no account and no API key, so a fresh clone still has a working search (low rate limit). A `YOU_API_KEY`, when set, is sent as an `X-API-Key` header. Disable it with `enabled = false` in `[tools.web.providers.you]`.
-- **mcp** — reads `.mcp.json` from the project root and `~/.agents/mcp.json` (for servers configured once for every project; the project file wins on a duplicate server name, and `tools.web.providers.mcp.user_config_file = ""` turns the user file off), expands `${VAR}` from the environment, and speaks MCP over streamable HTTP or stdio. It discovers each server's tools and reads their input schemas, so it works with a server whose parameter is called `q` instead of `query`. It only ever calls a tool that looks like a search or a page read — the server's *other* tools belong to the [`mcp` tool](#mcp-action-surface) below.
+- **mcp** — reads `.mcp.json` from the project root and `~/.agents/mcp.json` (for servers configured once for every project; the project file wins on a duplicate server name, and `tools.web.providers.mcp.user_config_file = ""` turns the user file off), expands `${VAR}` from the environment, and speaks MCP over streamable HTTP or stdio. It discovers each server's tools and reads their input schemas, so it works with a server whose parameter is called `q` instead of `query`. It only ever calls a tool that looks like a search or a page read — the server's *other* tools belong to the [`mcp` tool](#mcp-action-surface) below. A project-file entry connects only after the owner approved it (see [MCP (action surface)](#mcp-action-surface)); unapproved servers are skipped, so a search never dials one.
 
 ```json
 {
@@ -364,6 +365,17 @@ Two actions:
 - `call` — run `server.tool` with an `arguments` object matching that schema.
   The output comes back fenced as untrusted data, and a server that answers
   with an MCP error is reported as a failure, not as output.
+
+**Project-file servers need one approval.** `~/.agents/mcp.json` is written by
+your own hand, but `.mcp.json` arrives by `git clone` and `git pull` exactly as
+it does by editing — so its entries connect to nothing until you approve them:
+`/mcp approve` lists what is waiting, `/mcp approve <name>` allows that exact
+entry (the command or URL as it stands right now), and `/mcp revoke <name>`
+withdraws it. Approvals live in `data/mcp-trust.json`, keyed by a hash of the
+entry, so editing an entry asks again — a pulled commit cannot ride in on the
+old approval — while rotating a `${VAR}` value does not. Until the approval,
+`mcp list`, `mcp call`, a web search falling through to that server, and
+`/mcp check` all refuse it before spawning or dialing anything.
 
 **Every `call` asks the owner first** — a Confirm/Cancel prompt naming the
 server, the tool and the arguments — because no tool name tells a read from a

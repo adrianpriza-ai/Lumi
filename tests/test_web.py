@@ -1279,18 +1279,17 @@ async def test_a_server_is_spawned_once_per_query_not_once_per_step(config) -> N
 
 async def test_a_dead_session_is_replaced_rather_than_poisoning_later_calls(config) -> None:
     """A server that went away between queries must cost one extra launch,
-    not every later call: the dead session is dropped and the call retried."""
+    not every later call: discovery cannot repeat a write, so it is re-sent
+    once on a fresh session, and the search then runs against it."""
     payload = _mcp_project(config)
     provider = MCPProvider(config.tools.web.mcp, config.root)
     opened: list[str] = []
 
     class Flaky(FakeSession):
-        async def call_tool(self, name, arguments, read_timeout_seconds=None):
+        async def list_tools(self, cursor=None):
             if len(opened) == 1:
                 raise RuntimeError("connection lost")
-            return await super().call_tool(
-                name, arguments, read_timeout_seconds=read_timeout_seconds
-            )
+            return await super().list_tools(cursor=cursor)
 
     async def fake_open(stack, spec):
         opened.append(spec.name)
@@ -1301,6 +1300,43 @@ async def test_a_dead_session_is_replaced_rather_than_poisoning_later_calls(conf
     result = await provider.search("q", 5)
 
     assert result.ok  # the retry on a fresh session made it through
+    assert len(opened) == 2
+    await provider.aclose()
+
+
+async def test_a_dead_transport_during_a_call_is_not_re_sent(config) -> None:
+    """F3: a tool call whose transport dies mid-flight may already have been
+    acted on — no exception flavor proves it was not — so the call fails as-is
+    instead of being re-sent. The dead session is dropped, so the *next* call
+    recovers on a fresh one."""
+    payload = _mcp_project(config)
+    provider = MCPProvider(config.tools.web.mcp, config.root)
+    opened: list[str] = []
+
+    class OnceDead(FakeSession):
+        async def call_tool(self, name, arguments, read_timeout_seconds=None):
+            if len(opened) == 1:
+                raise RuntimeError("connection lost")
+            return await super().call_tool(
+                name, arguments, read_timeout_seconds=read_timeout_seconds
+            )
+
+    async def fake_open(stack, spec):
+        opened.append(spec.name)
+        return OnceDead(payload)
+
+    provider._open = fake_open  # type: ignore[method-assign]
+    spec = provider.servers()[0]
+
+    with pytest.raises(RuntimeError):
+        await provider._reuse(spec, lambda s: s.call_tool("t", {}), repeatable=False)
+
+    assert opened == ["tavily"]  # one attempt — the write was never re-sent
+    assert spec.name not in provider._sessions  # dropped, not left to poison
+
+    # The next call spawns fresh and runs exactly once.
+    result = await provider.search("q", 5)
+    assert result.ok
     assert len(opened) == 2
     await provider.aclose()
 
@@ -1417,7 +1453,7 @@ async def test_a_timeout_is_not_retried(config) -> None:
     provider._open = fake_open  # type: ignore[method-assign]
 
     with pytest.raises(TimeoutError):
-        await provider._reuse(provider.servers()[0], lambda s: s.call_tool("t", {}))
+        await provider._reuse(provider.servers()[0], lambda s: s.call_tool("t", {}), repeatable=False)
 
     assert opened == ["tavily"]  # one attempt, no respawn
     await provider.aclose()
@@ -1448,7 +1484,7 @@ async def test_a_protocol_error_is_not_retried(config) -> None:
     provider._open = fake_open  # type: ignore[method-assign]
 
     with pytest.raises(error_cls):
-        await provider._reuse(provider.servers()[0], lambda s: s.call_tool("t", {}))
+        await provider._reuse(provider.servers()[0], lambda s: s.call_tool("t", {}), repeatable=False)
 
     assert opened == ["tavily"]  # one attempt, no respawn
     await provider.aclose()

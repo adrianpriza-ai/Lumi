@@ -595,6 +595,17 @@ async def test_read_of_a_credential_directory_is_refused(files: FilesTool, confi
         await files.invoke({"action": "read", "path": ".aws/credentials"}, ctx())
 
 
+async def test_read_of_an_mcp_token_file_is_refused(files: FilesTool, config) -> None:
+    """F2: `.mcp-tokens/<server>.json` holds OAuth bearer tokens for the
+    owner's connected accounts; the filename says nothing, so only the
+    directory names it."""
+    tokens = config.root / ".mcp-tokens"
+    tokens.mkdir(exist_ok=True)
+    (tokens / "github.json").write_text('{"access_token": "x"}', encoding="utf-8")
+    with pytest.raises(ToolError, match="holds credentials"):
+        await files.invoke({"action": "read", "path": ".mcp-tokens/github.json"}, ctx())
+
+
 async def test_stat_of_dotenv_is_refused(files: FilesTool) -> None:
     # stat goes through the same resolve, so a probe cannot even confirm the
     # file's size.

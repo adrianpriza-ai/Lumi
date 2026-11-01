@@ -391,14 +391,21 @@ PROTECTED_SUBPATHS: frozenset[tuple[str, ...]] = frozenset(
 #: zone check waves them through, and unlike ``.env`` they are not credentials:
 #: writing one is privilege escalation. ``data/whitelist.json`` awards the
 #: bot's tools to whoever it lists, ``.mcp.json`` names a local command the web
-#: provider will spawn, and ``config.toml`` decides the write roots and deny
-#: rules themselves.
+#: provider will spawn, ``data/mcp-trust.json`` is the approvals that let a
+#: cloned ``.mcp.json`` entry do exactly that (writing one is self-approval),
+#: and ``config.toml`` decides the write roots and deny rules themselves.
 PROTECTED_PROJECT_PATHS: frozenset[tuple[str, ...]] = frozenset(
     {
         ("data", "whitelist.json"),
+        ("data", "mcp-trust.json"),
         (".mcp.json",),
         ("config.toml",),
         ("config.local.toml",),
+        # OAuth bearer tokens for the owner's MCP-connected accounts, one file
+        # per server. Writing one plants a token the web provider will send on
+        # the owner's behalf; matched as a prefix so every file under the
+        # directory is covered, whatever it is called.
+        (".mcp-tokens",),
     }
 )
 
@@ -479,6 +486,10 @@ CREDENTIAL_DIRS: frozenset[str] = frozenset(
         ".aws",
         ".kube",
         ".docker",
+        # OAuth refresh/access tokens for the owner's MCP accounts, one file
+        # per server under an ordinary-looking name (github.json): the
+        # basename lists above never see them (F2).
+        ".mcp-tokens",
     }
 )
 
@@ -1993,6 +2004,10 @@ def _protected_project_path(path: Path, project_root: Path | None) -> str | None
     Matched after resolution and relative to *project_root*, so a symlink into
     the file is caught the same way the literal name is, and a nested
     ``config.toml`` in some other project is not.
+
+    Matched as a prefix, so an entry can also name a *directory* of protected
+    files: ``.mcp-tokens/`` holds one token file per server, and the invariant
+    is that every file under it is a credential whatever it is called.
     """
     if project_root is None:
         return None
@@ -2005,7 +2020,7 @@ def _protected_project_path(path: Path, project_root: Path | None) -> str | None
         return None
     relative = tuple(resolved.relative_to(root).parts)
     for protected in PROTECTED_PROJECT_PATHS:
-        if relative == protected:
+        if relative[: len(protected)] == protected:
             return "/".join(protected)
     return None
 

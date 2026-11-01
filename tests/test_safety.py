@@ -1334,6 +1334,37 @@ def test_reading_a_credential_directory_is_denied(tmp_path: Path) -> None:
     assert _verdict(f"cat {ssh / 'config'}", root, home).blocked
 
 
+def test_mcp_token_files_are_credentials_whatever_they_are_called(
+    tmp_path: Path,
+) -> None:
+    """F2: OAuth bearer tokens for the owner's MCP-connected accounts live
+    under ``.mcp-tokens/<server>.json`` — an ordinary-looking name that no
+    basename or suffix list catches, in a directory that was not on the
+    credential-dir list. Every read surface shares ``read_guard``, so the
+    directory being there has to be enough, and the write guard has to treat
+    planting a token like writing ``.mcp.json``."""
+    root, home = _project(tmp_path)
+    tokens = root / ".mcp-tokens"
+    tokens.mkdir()
+    (tokens / "github.json").write_text('{"access_token": "x"}', encoding="utf-8")
+
+    # The read side: the shell verdict and both shared guards.
+    assert _verdict("cat ../.mcp-tokens/github.json", root, home).blocked
+    assert safety.read_guard(tokens / "github.json") is not None
+    assert safety.protected_read(tokens / "github.json") is not None
+
+    # The write side: a new token file, a changed one, and the directory.
+    assert safety.protected_write(tokens / "evil.json", root) is not None
+    assert safety.protected_write(tokens / "github.json", root) is not None
+    assert safety.protected_write(tokens, root) is not None
+    assert _verdict("echo x > ../.mcp-tokens/evil.json", root, home).blocked
+
+    # The write rule is scoped to the project's token store: an unrelated
+    # nested path is untouched, and an ordinary workspace file still runs.
+    assert safety.protected_write(root / "notes" / "x.json", root) is None
+    assert _verdict("cat notes.md", root, home).tier is safety.Tier.ALLOW
+
+
 def test_reading_a_system_credential_file_is_denied(tmp_path: Path) -> None:
     root, home = _project(tmp_path)
     assert safety.protected_read(Path("/etc/shadow")) is not None

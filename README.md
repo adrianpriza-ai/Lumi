@@ -48,7 +48,7 @@ expected, and it is why the two steps above are always both needed.
 
 **Web access is pluggable five ways.** The Firecrawl SDK, the Exa SDK, the Tavily SDK, You.com's keyless MCP search, and a generic MCP client that reads `.mcp.json` (plus `~/.agents/mcp.json`, for servers shared across every project). They normalise to the same interface, so adding another is one file. The MCP path means a Tavily, Firecrawl, or Exa MCP server works with no code change at all — just add it to `.mcp.json`.
 
-**MCP is also a standalone tool.** The web provider only borrows a server's search and fetch tools; the `mcp` tool exposes *every* tool a configured server advertises, so an MCP server becomes an agent capability — create a Linear issue, drive GitHub, list models on Hugging Face — not just another search backend. `list` shows the servers and their schemas, `call` runs one, and each call waits for the owner's Confirm unless `ask_before_call = false`.
+**MCP is also a standalone tool.** The web provider only borrows a server's search and fetch tools; the `mcp` tool exposes *every* tool a configured server advertises, so an MCP server becomes an agent capability — create a Linear issue, drive GitHub, list models on Hugging Face — not just another search backend. `list` shows the servers and their schemas, `call` runs one, and each call waits for the owner's Confirm unless `ask_before_call = false`. Servers that only speak OAuth (Linear, Notion, Atlassian) get `"auth": "oauth"` in their entry; the owner runs `/mcp auth <name>` once, approves in the browser, and the tokens live under `.mcp-tokens/` (gitignored, mode 0600) and refresh on their own from then on.
 
 ## Commands
 
@@ -63,7 +63,7 @@ expected, and it is why the two steps above are always both needed.
 | `lumi doctor` | Full environment check |
 | `lumi config [--key llm.model]` | Print the resolved configuration |
 
-In Telegram: `/start` (the help), `/memory`, `/remember`, `/personality`, `/reasoning`, `/context`, `/status`, `/doctor`, plus `/approve` and `/deny`. Owner only: `/forget`, `/mcp` (`help` / `list` / `check <server>` — the configured MCP servers and whether one answers), `/reload`, `/reset`, and `/own_help` (lists `/config`, `/env`, and the whitelist commands). Anything else is just a message to the agent.
+In Telegram: `/start` (the help), `/memory`, `/remember`, `/personality`, `/reasoning`, `/context`, `/status`, `/doctor`, plus `/approve` and `/deny`. Owner only: `/forget`, `/mcp` (`help` / `list` / `check <server>` / `auth <server>` / `approve [name]` / `revoke <name>` — the configured MCP servers, whether one answers, the OAuth browser login, and which project-file servers you have approved to connect), `/reload`, `/reset`, and `/own_help` (lists `/config`, `/env`, and the whitelist commands). Anything else is just a message to the agent.
 
 Send the bot a photo and it looks at it. The caption becomes your question; a
 photo with no caption gets a default "what's in this image?". Images go to `llm.vision_model` when one is set, so `llm.model` can stay text-only. Unset, everything goes to `llm.model`, which then has to be vision-capable. See [CONFIGURATION.md](CONFIGURATION.md#the-llm) for the multimodal note and [Configuration](CONFIGURATION.md) for how the model is resolved.
