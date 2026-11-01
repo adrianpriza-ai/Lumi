@@ -142,3 +142,17 @@ def make_reply(
         finish_reason=finish_reason if not calls else "tool_calls",
         usage={"reasoning": reasoning_tokens} if reasoning_tokens else {},
     )
+
+
+def mcp_error(cls: type, error) -> BaseException:
+    """An instance of the MCP error class *cls* wrapping *error*.
+
+    1.x takes the ErrorData directly — ``McpError(error)``; 2.x takes
+    ``(code, message)`` and offers ``from_error_data`` to build from one,
+    so the direct shape raises ``TypeError`` there. Using the classmethod
+    when it exists keeps tests' construction on both major versions.
+    """
+    from_data = getattr(cls, "from_error_data", None)
+    if from_data is not None:
+        return from_data(error)
+    return cls(error)

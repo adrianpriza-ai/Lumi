@@ -13,6 +13,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from conftest import mcp_error
 
 from lumi.tools.base import ToolError
 from lumi.tools.web import WebTool, build_providers
@@ -1423,12 +1424,14 @@ async def test_a_timeout_is_not_retried(config) -> None:
 
 
 async def test_a_protocol_error_is_not_retried(config) -> None:
-    """McpError is the server answering, not a dead transport."""
-    try:
-        from mcp.shared.exceptions import McpError
-        from mcp.types import ErrorData
-    except ImportError:  # pragma: no cover - older SDK layout
-        pytest.skip("mcp SDK exception layout not available")
+    """McpError (1.x) / MCPError (2.x) is the server answering, not a dead
+    transport — re-sending it could repeat a write."""
+    from mcp.types import ErrorData
+
+    from lumi.tools.web.providers.mcp_provider import MCP_ERRORS
+
+    assert MCP_ERRORS  # mcp is a hard dependency, so the classes exist
+    error_cls = MCP_ERRORS[0]
 
     payload = _mcp_project(config)
     provider = MCPProvider(config.tools.web.mcp, config.root)
@@ -1436,7 +1439,7 @@ async def test_a_protocol_error_is_not_retried(config) -> None:
 
     class Refusing(FakeSession):
         async def call_tool(self, name, arguments, read_timeout_seconds=None):
-            raise McpError(ErrorData(code=-32602, message="bad arguments"))
+            raise mcp_error(error_cls, ErrorData(code=-32602, message="bad arguments"))
 
     async def fake_open(stack, spec):
         opened.append(spec.name)
@@ -1444,7 +1447,7 @@ async def test_a_protocol_error_is_not_retried(config) -> None:
 
     provider._open = fake_open  # type: ignore[method-assign]
 
-    with pytest.raises(McpError):
+    with pytest.raises(error_cls):
         await provider._reuse(provider.servers()[0], lambda s: s.call_tool("t", {}))
 
     assert opened == ["tavily"]  # one attempt, no respawn

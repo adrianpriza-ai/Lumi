@@ -15,7 +15,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
-from conftest import make_store
+from conftest import make_store, mcp_error
 from mcp.types import ErrorData
 
 from lumi.config import load_config
@@ -843,24 +843,10 @@ async def test_an_mcp_error_reply_is_not_treated_as_a_dead_session(config) -> No
 
     assert MCP_ERRORS  # mcp is a hard dependency, so the classes exist
     for cls in MCP_ERRORS:
-        assert not _session_died(_mcp_error(cls, ErrorData(code=-32603, message="nope"))), cls
+        assert not _session_died(mcp_error(cls, ErrorData(code=-32603, message="nope"))), cls
     # A dead transport still earns its one re-spawn.
     assert _session_died(ConnectionError("connection lost"))
     assert _session_died(TimeoutError("read timed out")) is False
-
-
-def _mcp_error(cls: type, error: ErrorData) -> BaseException:
-    """An instance of *cls* wrapping *error*, on whichever shape the SDK has.
-
-    1.x takes the ErrorData directly — ``McpError(error)``; 2.x takes
-    ``(code, message)`` and offers ``from_error_data`` to build from one,
-    so the direct shape raises ``TypeError`` there. Using the classmethod
-    when it exists keeps this test's construction on both major versions.
-    """
-    from_data = getattr(cls, "from_error_data", None)
-    if from_data is not None:
-        return from_data(error)
-    return cls(error)
 
 
 def test_the_2xx_result_field_spellings_are_honoured() -> None:
