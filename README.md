@@ -63,7 +63,7 @@ expected, and it is why the two steps above are always both needed.
 | `lumi doctor` | Full environment check |
 | `lumi config [--key llm.model]` | Print the resolved configuration |
 
-In Telegram: `/start` (the help), `/memory`, `/remember`, `/personality`, `/reasoning`, `/context`, `/status`, `/doctor`, plus `/approve` and `/deny`. Owner only: `/forget`, `/reload`, `/reset`, and `/own_help` (lists `/config`, `/env`, and the whitelist commands). Anything else is just a message to the agent.
+In Telegram: `/start` (the help), `/memory`, `/remember`, `/personality`, `/reasoning`, `/context`, `/status`, `/doctor`, plus `/approve` and `/deny`. Owner only: `/forget`, `/mcp` (`help` / `list` / `check <server>` — the configured MCP servers and whether one answers), `/reload`, `/reset`, and `/own_help` (lists `/config`, `/env`, and the whitelist commands). Anything else is just a message to the agent.
 
 Send the bot a photo and it looks at it. The caption becomes your question; a
 photo with no caption gets a default "what's in this image?". Images go to `llm.vision_model` when one is set, so `llm.model` can stay text-only. Unset, everything goes to `llm.model`, which then has to be vision-capable. See [CONFIGURATION.md](CONFIGURATION.md#the-llm) for the multimodal note and [Configuration](CONFIGURATION.md) for how the model is resolved.

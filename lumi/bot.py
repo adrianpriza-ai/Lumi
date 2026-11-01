@@ -18,6 +18,7 @@ import base64
 import contextlib
 import json
 import os
+import re
 import signal
 import time
 from collections.abc import Callable
@@ -46,6 +47,8 @@ from .doctor import platform_line, run_checks
 from .memory import History, MemoryFile, MemoryStore
 from .personality import Personality
 from .tools.docread import DocumentReader
+from .tools.mcp_tool import CheckOutcome
+from .util.env import SECRET_PATTERN
 from .util.log import get_logger
 from .util.text import (
     escape_html,
@@ -117,6 +120,7 @@ OWNER_HELP_TEXT = """\
 <code>/config</code> — the resolved configuration this process runs on
 <code>/env</code> — which credentials are set, values masked
 <code>/forget [n]</code> — drop the newest n saved facts (erasing memory is a human decision, and yours)
+<code>/mcp help|list|check &lt;name&gt;</code> — the configured MCP servers: what they are, and whether one answers
 <code>/reload</code> — re-read personality, memory and config
 <code>/reset</code> — forget this conversation (keeps long-term memory)
 <code>/whitelist</code> — show whitelisted users and groups
@@ -135,6 +139,28 @@ NOT_OWNER_APPROVAL = "only the owner can approve or deny a pending action."
 #: the owner does that, matching docs/policy/policy.md ("only the account ID
 #: registered by the person running the instance may … change stored notes").
 NOT_OWNER_ACTION = "only the owner can change what this bot remembers there."
+
+#: ``/mcp check`` with no name, and the fallback for a subcommand it does not
+#: know. ``/mcp`` with *no* argument shows :data:`MCP_HELP` instead.
+MCP_USAGE = "usage: <code>/mcp help</code>, <code>/mcp list</code>, <code>/mcp check &lt;name&gt;</code>"
+
+MCP_HELP = """\
+<b>mcp help</b>
+Servers come from <code>.mcp.json</code> in this project and
+<code>~/.agents/mcp.json</code> for servers shared across projects; the project
+file wins when a name appears in both.
+
+<code>/mcp list</code> — the configured servers: transport, command or URL, env
+<code>/mcp check &lt;name&gt;</code> — connect and report, retrying a server that fails
+<code>/mcp help</code> — this message
+
+Both transports are supported: <b>stdio</b> (a local command spawned with
+<code>command</code>/<code>args</code>, run in the project directory unless the
+entry sets its own <code>cwd</code>) and <b>streamable HTTP</b> (a <code>url</code>,
+with <code>headers</code> if it wants them). A config with a <code>command</code>
+and no <code>type</code> is stdio already.
+
+Neither command calls a server's tools — that is the model's <code>mcp</code> tool, and it asks you first."""
 
 
 def _mask(value: str | None) -> str:
@@ -319,6 +345,167 @@ def _render_config(config: Config, memory_limit: int) -> str:
             f"- config file: {escape_html(str(config.config_path)) if config.config_path else 'none (built-in defaults)'}",
         ]
     )
+
+
+# --------------------------------------------------------------------------- #
+# /mcp — the configured servers, and whether one answers
+# --------------------------------------------------------------------------- #
+
+
+#: One word inside a config key: split on case changes as well as punctuation,
+#: so ``tavilyApiKey`` is seen as ``tavily`` + ``Api`` + ``Key`` and its value
+#: can be judged word by word.
+_CAMEL_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
+
+
+def _secret_name(name: str) -> bool:
+    """Whether a config key reads like a credential.
+
+    :data:`~lumi.util.env.SECRET_PATTERN` needs a non-letter in front of the
+    secret word, which a camelCase key never gives it — ``tavilyApiKey`` has an
+    ``y`` before the ``A``, so the pattern sees no boundary and lets the value
+    through. So the name is broken into words first (``tavily``, ``Api``,
+    ``Key``) and each word is judged alone, where the boundary rules hold and
+    the documented exceptions (``monkey``, ``passport``) still pass.
+    """
+    if SECRET_PATTERN.search(name):
+        return True
+    for chunk in re.split(r"[^A-Za-z0-9]+", name):
+        for word in _CAMEL_WORD.findall(chunk):
+            if SECRET_PATTERN.search(word):
+                return True
+    return False
+
+
+def _redact_word(word: str) -> str:
+    """One command-line word, with a credential-shaped value masked.
+
+    A server is usually spawned as ``npx -y pkg --token=ghp_…``, and this text
+    is headed for Telegram, so a ``key=value`` whose key reads like a secret
+    (and a bare value that looks like one) goes through :func:`_mask`. Flag
+    names are kept — ``--token`` says what the server wants without saying
+    what it is.
+    """
+    key, sep, value = word.partition("=")
+    if sep and _secret_name(key):
+        return f"{key}={_mask(value)}"
+    if (
+        not sep
+        and not word.startswith("-")
+        and len(word) >= 12
+        and _secret_name(word)
+    ):
+        return _mask(word)
+    return word
+
+
+def _redact_url(url: str) -> str:
+    """*url* with the value of every secret-looking query parameter masked.
+
+    The documented Tavily URL is ``…/mcp/?tavilyApiKey=${TAVILY_API_KEY}``, so
+    a URL in this project routinely *is* the credential.
+    """
+    base, sep, query = url.partition("?")
+    if not sep:
+        return url
+    pairs = []
+    for pair in query.split("&"):
+        key, eq, value = pair.partition("=")
+        pairs.append(f"{key}={_mask(value)}" if eq and _secret_name(key) else pair)
+    return base + sep + "&".join(pairs)
+
+
+def _mcp_pairs(pairs: dict[str, str], label: str) -> str:
+    """``env: <code>TOKEN=(len 8)</code>, <code>PORT=8080</code>`` — values masked
+    when the name reads like a credential, truncated when it does not.
+    """
+    if not pairs:
+        return ""
+    rendered = []
+    for key, value in pairs.items():
+        shown = _mask(value) if _secret_name(key) else truncate(value, 40, " …")
+        rendered.append(f"<code>{escape_html(key)}={escape_html(shown)}</code>")
+    return f"{label}: " + ", ".join(rendered)
+
+
+def _mcp_transport(spec: Any) -> str:
+    """How *spec* is spoken to — stdio or streamable HTTP, in chat words."""
+    return "stdio (local command)" if spec.is_local else "streamable HTTP"
+
+
+def _mcp_endpoint(spec: Any) -> str:
+    """The command or URL a server runs, plus its cwd/env/headers. HTML, masked."""
+    if spec.is_local:
+        parts = [
+            f"<code>{escape_html(' '.join(_redact_word(w) for w in (spec.command, *spec.args)))}</code>"
+        ]
+        if spec.cwd:
+            # Only worth a line when it differs from the default (the project
+            # root), which is what the command's relative paths already mean.
+            parts.append(f"cwd: <code>{escape_html(spec.cwd)}</code>")
+        extra = _mcp_pairs(spec.env, "env")
+    else:
+        parts = [f"<code>{escape_html(_redact_url(spec.url))}</code>"]
+        extra = _mcp_pairs(spec.headers, "headers")
+    if extra:
+        parts.append(extra)
+    return "\n  ".join(parts)
+
+
+def _render_mcp_list(tool: Any) -> str:
+    """The ``/mcp list`` body: the inventory, read straight from the config files.
+
+    Deliberately connects to nothing — a list that dialed every server would
+    be slow whenever one is down, and *that* is what ``/mcp check`` is for.
+    """
+    servers = tool.provider.servers()
+    sources = ", ".join(f"<code>{escape_html(s)}</code>" for s in tool.provider.sources)
+    lines = [f"<b>mcp</b> — {len(servers)} server(s) from {sources or 'the configured files'}"]
+    ok, reason = tool.available()
+    if not ok:
+        lines.append(f"<i>unavailable: {escape_html(reason)}</i>")
+    lines.append("")
+    for spec in servers:
+        lines.append(f"• <b>{escape_html(spec.name)}</b> — {_mcp_transport(spec)}")
+        if endpoint := _mcp_endpoint(spec):
+            lines.append(f"  {endpoint}")
+        if missing := spec.unresolved():
+            lines.append(f"  <i>needs <code>${{{escape_html(missing)}}}</code> set in the environment</i>")
+    lines += [
+        "",
+        "<code>/mcp check &lt;name&gt;</code> connects to one and reports"
+        " · <code>/mcp help</code> for usage",
+    ]
+    return "\n".join(lines)
+
+
+def _render_mcp_check(outcome: CheckOutcome, spec: Any) -> str:
+    """The ``/mcp check <name>`` body: the verdict, then the attempts behind it."""
+    lines = [
+        f"<b>mcp check — {escape_html(outcome.name)}</b>",
+        f"transport: {_mcp_transport(spec)}",
+    ]
+    if outcome.ok or not outcome.attempts:
+        # Connected, or refused before any attempt (an unset variable, the tool
+        # off) — one line either way, and the reason *is* the verdict.
+        lines.append(("✓ " if outcome.ok else "✗ ") + escape_html(outcome.detail))
+    else:
+        # A server that was tried and refused: the verdict stays short, and
+        # whatever it said back arrives already fenced as data.
+        lines.append("✗ did not connect")
+        lines.append(escape_html(outcome.detail))
+    if outcome.attempts:
+        stats = f"attempts: {outcome.attempts} · {outcome.seconds:.1f}s"
+        if outcome.ok:
+            stats += f" · {outcome.tools} tool(s)"
+        lines.append(stats)
+    # One attempt failing reads in the line above; a retry that finally worked
+    # (or a server that refused three times) earns the trail.
+    if len(outcome.trail) > 1:
+        lines += ["", f"<pre>{escape_html(chr(10).join(outcome.trail))}</pre>"]
+    if outcome.attempts and not outcome.ok:
+        lines += ["", "<i>it retried on its own; if it still fails, the server or its config is the place to look.</i>"]
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -1572,6 +1759,74 @@ def build_handlers(config: Config) -> list[Any]:
         checks = run_checks(config, agent_of(context).registry)
         await reply(update, "<b>doctor</b>\n" + sanitize_html("\n".join(check.render() for check in checks)))
 
+    async def mcp_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """``/mcp help`` · ``/mcp list`` · ``/mcp check <server>``.
+
+        Owner-only on the same rule as ``/config`` and ``/env``: the body
+        names the commands, URLs and variables the configured servers run with
+        — backend inventory — and ``check`` spawns a process, which a
+        whitelisted user in a shared group has no business starting.
+
+        ``list`` reads the config files and touches no network; ``check`` is
+        the one that connects, through :meth:`~lumi.tools.mcp_tool.MCPTool.check`
+        so stdio and remote servers are probed exactly the way the model's own
+        calls reach them.
+        """
+        if not await authorised(update):
+            return
+        user = update.effective_user
+        if user is None or not _is_owner(user, config):
+            await reply(update, NOT_OWNER_SENSITIVE)
+            return
+
+        args = [part for part in context.args if part]
+        sub = args[0].lower() if args else "help"
+        if sub in {"help", "-h", "--help"}:
+            await reply(update, MCP_HELP)
+            return
+
+        tool = agent_of(context).registry.get("mcp")
+        if tool is None:
+            await reply(
+                update,
+                "the <code>mcp</code> tool is switched off "
+                "(<code>tools.enabled</code>), so there is nothing to show.",
+            )
+            return
+
+        if sub == "list":
+            if not tool.provider.servers():
+                await reply(
+                    update,
+                    "no MCP servers are configured. add them to <code>.mcp.json</code> "
+                    "(this project) or <code>~/.agents/mcp.json</code> (every project), "
+                    "then run <code>/mcp list</code> again.",
+                )
+                return
+            await reply(update, _render_mcp_list(tool))
+            return
+
+        if sub == "check":
+            if len(args) < 2:
+                await reply(update, f"{MCP_USAGE} — the name comes from <code>/mcp list</code>")
+                return
+            servers = tool.provider.servers()
+            spec = next((s for s in servers if s.name == args[1]), None)
+            if spec is None:
+                names = ", ".join(escape_html(s.name) for s in servers) or "none"
+                await reply(
+                    update,
+                    f"no server named <code>{escape_html(args[1])}</code>; configured: {names}",
+                )
+                return
+            await reply(update, _render_mcp_check(await tool.check(spec), spec))
+            return
+
+        await reply(
+            update,
+            f"{MCP_USAGE} — i don't know <code>/mcp {escape_html(truncate(sub, 30))}</code>",
+        )
+
     async def config_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Owner-only view of the resolved configuration.
 
@@ -2095,6 +2350,7 @@ def build_handlers(config: Config) -> list[Any]:
         CommandHandler("context", gated(context_command), filters=allowed_filter),
         CommandHandler("status", gated(status_command), filters=allowed_filter),
         CommandHandler("doctor", gated(doctor_command), filters=allowed_filter),
+        CommandHandler("mcp", gated(mcp_command), filters=allowed_filter),
         # Owner only, checked inside each handler on top of the filter: these
         # expose the backend (endpoint, layout, credential inventory).
         # Owner-only help: the backend commands, for the owner alone.

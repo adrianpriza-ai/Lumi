@@ -21,27 +21,57 @@ Two actions:
   owner first unless ``tools.web.providers.mcp.ask_before_call = false``:
   a tool reaches an external service the owner configured, and no name tells
   a read from a write.
+
+Besides the two actions, :meth:`MCPTool.check` is a connection probe — one
+server, fresh session, retried — which is what the chat's ``/mcp check`` runs.
+It is deliberately not a third action: a health check is the owner's question,
+not the model's.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import time
+from dataclasses import dataclass, field
 from typing import Any
 
 from ..config import Config
 from ..util.text import fence_untrusted, truncate
 from .base import NeedsApproval, Tool, ToolContext, ToolError, ToolResult
-from .web.providers.mcp_provider import MCPProvider, _flatten, _read_timeout
+from .web.providers.mcp_provider import MCPProvider, ServerSpec, _flatten, _read_timeout
 
 #: Cap on a ``list`` body. One server with a hundred tools must not fill the
 #: window on its own; the cut is named in the output so the model knows to
 #: narrow with ``server`` instead of guessing at the rest.
 LIST_MAX_CHARS = 24000
 
+#: Cap on one ``call``'s reply. A tool that answers with a whole page, a file
+#: dump or a huge JSON blob would otherwise fill the window on its own — the
+#: same bound every other output surface applies. The marker tells the model
+#: the reply was cut rather than complete, which matters for anything it
+#: might quote as the whole answer.
+CALL_MAX_CHARS = 24000
+
 #: How much of one tool's description survives into ``list`` — the first line
 #: only, because a schema is what the model actually needs to build a call.
 DESC_CHARS = 200
+
+#: How many times ``check`` connects before it gives up: one try plus retries.
+#: A local server that is still booting comes up on the second attempt, and a
+#: remote one behind a cold start answers on the third.
+CHECK_ATTEMPTS = 3
+
+#: Seconds one connection attempt may take. Deliberately below the call budget
+#: (``timeout_seconds``): a check is a chat command, so it must answer even when
+#: a server hangs — and a server that needs longer than this to accept a
+#: connection is not one the agent's own calls would have survived either.
+CHECK_ATTEMPT_SECONDS = 20.0
+
+#: Pause after a failed attempt, growing each time — long enough for a booting
+#: server, short enough that a dead one still answers within the command's
+#: overall patience.
+CHECK_BACKOFF_SECONDS = 0.5
 
 
 class MCPTool(Tool):
@@ -127,6 +157,82 @@ Use it when the owner asks for something that lives in an external service: crea
             return await self._call(arguments, ctx)
         raise ToolError(f"unknown action {action!r}; use list or call")
 
+    # -- check ------------------------------------------------------------- #
+
+    async def check(self, spec: ServerSpec) -> CheckOutcome:
+        """Connect to *spec* from scratch and report whether it answers.
+
+        This is the engine behind the chat's ``/mcp check <server>``: not a tool
+        action (the model never needs it) but a health probe the owner runs.
+
+        Every attempt starts cold — the cached session is dropped and the tool
+        cache cleared first — so a half-open session cannot pass as connected,
+        and the discovery round trip is what proves the server is actually
+        answering rather than merely spawned. A failure is retried up to
+        :data:`CHECK_ATTEMPTS` times with a growing pause: a stdio server that
+        is still booting, or an HTTP endpoint coming up behind it, tends to
+        answer on the next attempt.
+
+        Read-only throughout: nothing here calls a server tool, it only
+        connects and asks what the server advertises.
+        """
+        started = time.monotonic()
+        if missing := spec.unresolved():
+            # Nothing to retry: the answer will not change until the owner
+            # exports the variable, so one look at the config is the report.
+            return CheckOutcome(
+                name=spec.name,
+                ok=False,
+                detail=f"needs ${{{missing}}} set in the environment",
+                attempts=0,
+                seconds=0.0,
+            )
+        ok, reason = self.available()
+        if not ok:
+            return CheckOutcome(
+                name=spec.name, ok=False, detail=reason, attempts=0, seconds=0.0
+            )
+
+        budget = min(float(self.settings.timeout_seconds), CHECK_ATTEMPT_SECONDS)
+        trail: list[str] = []
+        last = "did not run"
+        for attempt in range(1, CHECK_ATTEMPTS + 1):
+            await self.provider._drop_session(spec.name)
+            self.provider._tool_cache.pop(spec.name, None)
+            try:
+                async with asyncio.timeout(budget):
+                    tools = await self.provider._list_tools(spec)
+            except TimeoutError:
+                last = f"no answer within {budget:g}s"
+                trail.append(f"✗ attempt {attempt}: {last}")
+            except Exception as exc:  # noqa: BLE001 - the failure *is* the report
+                # The exception can carry text the server wrote, so it is fenced
+                # like any other server-authored output before it reaches chat.
+                last = fence_untrusted(truncate(f"{type(exc).__name__}: {exc}", 400, " …"))
+                trail.append(f"✗ attempt {attempt}: {truncate(str(exc), 200, ' …')}")
+            else:
+                elapsed = time.monotonic() - started
+                trail.append(f"✓ attempt {attempt}: connected, {len(tools)} tool(s)")
+                return CheckOutcome(
+                    name=spec.name,
+                    ok=True,
+                    detail=f"connected — {len(tools)} tool(s) advertised",
+                    attempts=attempt,
+                    seconds=elapsed,
+                    tools=len(tools),
+                    trail=trail,
+                )
+            if attempt < CHECK_ATTEMPTS:
+                await asyncio.sleep(CHECK_BACKOFF_SECONDS * attempt)
+        return CheckOutcome(
+            name=spec.name,
+            ok=False,
+            detail=last,
+            attempts=CHECK_ATTEMPTS,
+            seconds=time.monotonic() - started,
+            trail=trail,
+        )
+
     # -- actions ----------------------------------------------------------- #
 
     async def _list(self, arguments: dict[str, Any]) -> ToolResult:
@@ -170,7 +276,11 @@ Use it when the owner asks for something that lives in an external service: crea
                 if tool.properties:
                     lines.append(f"    arguments: {_arguments_line(tool)}")
 
-        body = truncate("\n".join(lines), LIST_MAX_CHARS)
+        body = truncate(
+            "\n".join(lines),
+            LIST_MAX_CHARS,
+            "\n… [truncated — re-run with server=<name> to see one server's tools]",
+        )
         return ToolResult(
             text=fence_untrusted(body),
             data={"servers": [s.name for s in servers]},
@@ -250,7 +360,7 @@ Use it when the owner asks for something that lives in an external service: crea
                 )
             )
 
-        text = _flatten(result) or "(the server returned nothing)"
+        text = truncate(_flatten(result) or "(the server returned nothing)", CALL_MAX_CHARS)
         if _is_error(result):
             return ToolResult.failure(
                 f"{server}.{tool_name} reported an error:\n{fence_untrusted(text)}",
@@ -282,6 +392,30 @@ Use it when the owner asks for something that lives in an external service: crea
             raise ToolError(
                 f"the MCP server did not answer within {self.settings.timeout_seconds}s"
             ) from exc
+
+
+# --------------------------------------------------------------------------- #
+# Check
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(slots=True)
+class CheckOutcome:
+    """One ``/mcp check`` run: what the chat is told, and how it got there.
+
+    ``attempts`` is 0 for a failure the retry loop never entered (an unset
+    variable, the tool switched off) — the caller reports those differently
+    from a server that was tried and refused.
+    """
+
+    name: str
+    ok: bool
+    detail: str
+    attempts: int
+    seconds: float
+    tools: int = 0
+    #: One line per attempt, so a retry that eventually worked shows its work.
+    trail: list[str] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -319,11 +453,14 @@ def _is_error(result: Any) -> bool:
 
     The SDK answers with a ``CallToolResult`` object; a dict-shaped result
     (raw JSON over a custom transport, and what the tests hand back) counts
-    too — a failure must not read as output on either shape.
+    too — a failure must not read as output on either shape. Both field
+    spellings count as well: the SDK renamed ``isError`` to ``is_error`` in
+    2.x, and on a real 2.x server the old reading alone would present a
+    "Forbidden" as a successful result.
     """
     if isinstance(result, dict):
-        return bool(result.get("isError"))
-    return bool(getattr(result, "isError", False))
+        return bool(result.get("isError") or result.get("is_error"))
+    return bool(getattr(result, "isError", None) or getattr(result, "is_error", None))
 
 
 def _one_line(text: str) -> str:
@@ -356,4 +493,4 @@ def _preview(server: str, tool_name: str, raw: dict[str, Any]) -> str:
     return f"{server}.{tool_name}\n{rendered}"
 
 
-__all__ = ["MCPTool"]
+__all__ = ["MCPTool", "CheckOutcome"]

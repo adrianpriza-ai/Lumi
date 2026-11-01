@@ -32,6 +32,7 @@ from lumi.tools.web.providers.mcp_provider import (
     _flatten,
     _mcp_freshness,
     _parse_search_payload,
+    _read_timeout,
     _stdio_env,
     expand_env,
 )
@@ -753,6 +754,69 @@ def test_parse_local_server_with_split_command_and_args(config) -> None:
     assert server.args == ["-y", "server-memory"]
 
 
+def test_parse_stdio_server_uses_the_specs_own_type_name(config) -> None:
+    """The MCP spec and Claude Code write ``"stdio"`` where this project writes
+    ``"local"``. Both must land on the spawned transport — a file copied from
+    either world works without being rewritten.
+    """
+    (config.root / ".mcp.json").write_text(json.dumps({
+        "mcpServers": {"gh": {"type": "stdio", "command": "npx", "args": ["-y", "pkg"]}}
+    }), encoding="utf-8")
+    server = MCPProvider(config.tools.web.mcp, config.root).servers()[0]
+
+    assert server.kind == "local"
+    assert server.is_local is True
+
+
+def test_parse_stdio_server_without_a_type_is_still_local(config) -> None:
+    """A bare ``command`` entry is the Claude Desktop shape; no ``type`` at all
+    must not turn it into an HTTP server with no URL."""
+    (config.root / ".mcp.json").write_text(json.dumps({
+        "mcpServers": {"mem": {"command": "python", "args": ["-m", "memory"]}}
+    }), encoding="utf-8")
+    server = MCPProvider(config.tools.web.mcp, config.root).servers()[0]
+
+    assert server.is_local is True
+
+
+def test_local_server_defaults_to_the_project_directory(config) -> None:
+    """A relative ``args`` path must not mean "relative to whatever directory
+    started the bot" — the child runs in the project root unless told otherwise.
+    """
+    (config.root / ".mcp.json").write_text(json.dumps({
+        "mcpServers": {"mem": {"command": "python", "args": ["server.py"]}}
+    }), encoding="utf-8")
+    provider = MCPProvider(config.tools.web.mcp, config.root)
+
+    spec = provider.servers()[0]
+    assert spec.cwd == ""
+    assert provider._cwd_for(spec) == config.root
+
+
+def test_local_server_cwd_resolves_against_the_project(config) -> None:
+    (config.root / ".mcp.json").write_text(json.dumps({
+        "mcpServers": {
+            "dev": {"command": "python", "args": ["server.py"], "cwd": "servers/dev"}
+        }
+    }), encoding="utf-8")
+    provider = MCPProvider(config.tools.web.mcp, config.root)
+
+    spec = provider.servers()[0]
+    assert spec.cwd == "servers/dev"
+    assert provider._cwd_for(spec) == (config.root / "servers/dev").resolve()
+
+
+def test_local_server_cwd_expands_env_and_flags_it_when_unset(config) -> None:
+    """``cwd`` joins every other field under ``${VAR}`` expansion — and an
+    unset one is reported rather than silently resolved to a path that exists."""
+    (config.root / ".mcp.json").write_text(json.dumps({
+        "mcpServers": {"dev": {"command": "python", "cwd": "${LUMI_TEST_UNSET_CWD}"}}
+    }), encoding="utf-8")
+    spec = MCPProvider(config.tools.web.mcp, config.root).servers()[0]
+
+    assert spec.unresolved() == "LUMI_TEST_UNSET_CWD"
+
+
 def test_servers_accepts_the_alternate_key(config) -> None:
     (config.root / ".mcp.json").write_text(json.dumps({"servers": {"a": {"url": "https://a"}}}))
     assert [s.name for s in MCPProvider(config.tools.web.mcp, config.root).servers()] == ["a"]
@@ -1180,9 +1244,10 @@ async def test_mcp_search_maps_count_and_freshness_arguments(config) -> None:
 
     assert result.ok
     assert session.call_arguments == [{"query": "q", "count": 5, "freshness": "week"}]
-    # The SDK calls .total_seconds() on this argument; a float raises against
-    # a real server even though a stub session accepts anything.
-    assert session.read_timeouts == [timedelta(seconds=60)]
+    # The timeout's *type* follows the installed SDK (timedelta on 1.x, float
+    # on 2.x); the wrong one raises against a real server even though a stub
+    # session accepts anything.
+    assert session.read_timeouts == [_read_timeout(60)]
     await provider.aclose()
 
 

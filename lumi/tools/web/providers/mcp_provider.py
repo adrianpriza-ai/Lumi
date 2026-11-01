@@ -8,16 +8,31 @@ Firecrawl MCP server dropped into either file works immediately, with no code
 change. A locally spawned server (``npx -y some-mcp-server``) works the same
 way. When a server name appears in both files, the project file wins.
 
-Two transport kinds are supported:
+Two transport kinds are supported, under either spelling of ``"type"``:
 
-* ``"type": "remote"`` — streamable HTTP, the shape opencode and Claude Code use
-  for hosted servers like ``https://mcp.tavily.com/mcp/``.
-* ``"type": "local"``  — a subprocess over stdio, spawned with ``command``/``args``.
+* ``"type": "remote"`` (or ``"http"``) — streamable HTTP, the shape opencode and
+  Claude Code use for hosted servers like ``https://mcp.tavily.com/mcp/``.
+* ``"type": "local"`` (or ``"stdio"``) — a subprocess over stdio, spawned with
+  ``command``/``args``. A config with a ``command`` and no ``type`` is local too,
+  so the two common file formats both work as written.
+
+A local server runs in the project root — or in its own ``cwd`` entry, when
+the config names one — so a relative path in ``args`` means what it looks like
+relative to the project that configured it, rather than to wherever Lumi
+ehappened to be launched from.
 
 Tool names are not hardcoded. The provider asks each server what it offers and
 picks the first tool matching the configured preference list, then reads that
 tool's own input schema to work out whether it wants ``query``, ``q`` or
 something else. That is what lets one implementation front an arbitrary server.
+
+The provider spans the whole ``mcp`` package line the dependency allows
+(``mcp>=1.2``): the places where the SDK renamed things between major
+versions — the HTTP transport and its headers, ``list_tools`` pagination,
+the read-timeout type, the error class, and the result field spellings —
+each resolve against the installed SDK at use time rather than assuming one
+version. The stub sessions in the tests accept anything, so an unadapted
+shape only ever failed against a real server.
 """
 
 from __future__ import annotations
@@ -42,6 +57,11 @@ log = get_logger(__name__)
 
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
+#: Alternate spellings of ``"type"``, normalised as the config is parsed, so a
+#: file written against the MCP spec (``"stdio"``) and one written against this
+#: project (``"local"``) describe the same transport everywhere downstream.
+_KIND_ALIASES = {"stdio": "local", "http": "remote"}
+
 #: How long a discovered tool list stays valid before we re-ask the server.
 TOOL_CACHE_TTL = 300.0
 
@@ -51,24 +71,28 @@ TOOL_CACHE_TTL = 300.0
 LIST_PAGES_MAX = 10
 
 
-def _read_timeout(seconds: float | int) -> timedelta:
-    """The ``read_timeout_seconds`` the MCP SDK actually accepts.
-
-    It is a ``timedelta`` — the SDK calls ``.total_seconds()`` on whatever it
-    is handed, so a bare float raises ``AttributeError`` the moment the request
-    goes out. The stub sessions in the tests accept anything, which is how a
-    float survived this long: it only ever failed against a real server.
-    """
-    return timedelta(seconds=float(seconds))
-
-
 try:  # mcp is optional: the provider imports without it, only usage needs it
-    from mcp.shared.exceptions import McpError
-except ImportError:  # pragma: no cover - older SDKs used a different module
-    try:
-        from mcp.exceptions import McpError
-    except ImportError:
-        McpError = None  # type: ignore[assignment,misc]
+    from mcp.shared.exceptions import McpError as _McpErrorV1
+except ImportError:
+    _McpErrorV1 = None  # type: ignore[assignment]
+try:  # mcp 2.0 renamed the class; the old spelling is gone, not aliased
+    from mcp.shared.exceptions import MCPError as _McpErrorV2
+except ImportError:
+    _McpErrorV2 = None  # type: ignore[assignment]
+try:
+    from mcp.exceptions import McpError as _McpErrorOld
+except ImportError:
+    _McpErrorOld = None  # type: ignore[assignment]
+
+#: Every class the installed SDK answers an MCP error with. Empty only when
+#: the mcp package is absent at all — each spelling the installed version
+#: lacks raises ImportError and contributes nothing. Importing only the 1.x
+#: name used to degrade silently to ``None`` on 2.x, which made every
+#: server-side *reply* look like a dead transport (see
+#: :func:`_session_died`).
+MCP_ERRORS: tuple[type[BaseException], ...] = tuple(
+    cls for cls in (_McpErrorV1, _McpErrorV2, _McpErrorOld) if cls is not None
+)
 
 
 def _session_died(exc: BaseException) -> bool:
@@ -76,14 +100,57 @@ def _session_died(exc: BaseException) -> bool:
 
     Only a dead transport earns a retry. A timeout means the request went out
     and may already have been acted on — re-sending it could run a write twice
-    — and an ``McpError`` is a reply, however unhappy, so there is nothing to
+    — and an MCP error is a reply, however unhappy, so there is nothing to
     reconnect to either.
     """
     if isinstance(exc, TimeoutError):  # requires-python >= 3.11: asyncio's is this
         return False
-    if McpError is None:  # pragma: no cover - a live session implies mcp is importable
-        return type(exc).__name__ != "McpError"
-    return not isinstance(exc, McpError)
+    if MCP_ERRORS:
+        return not isinstance(exc, MCP_ERRORS)
+    return type(exc).__name__ not in {"McpError", "MCPError"}
+
+
+#: Decided once from the installed SDK's own signature: does
+#: ``read_timeout_seconds`` want a ``timedelta`` (1.x) or a float of seconds
+#: (2.x)? ``None`` until :func:`_read_timeout` first runs.
+_READ_TIMEOUT_WANTS_TD: bool | None = None
+
+
+def _sdk_timeout_is_timedelta() -> bool:
+    """Whether the installed ``ClientSession.call_tool`` wants a timedelta.
+
+    Falls back to the 1.x shape when the signature cannot be read, so a
+    future SDK surprise costs one timeout type, not a crash.
+    """
+    import inspect
+
+    try:
+        from mcp import ClientSession
+
+        annotation = inspect.signature(ClientSession.call_tool).parameters[
+            "read_timeout_seconds"
+        ].annotation
+    except Exception:  # noqa: BLE001 - mcp absent or unreadable: 1.x shape it is
+        return True
+    return "timedelta" in str(annotation)
+
+
+def _read_timeout(seconds: float | int) -> timedelta | float:
+    """The ``read_timeout_seconds`` the installed MCP SDK actually accepts.
+
+    The SDK reversed the type between major versions: 1.x typed it
+    ``timedelta | None`` and called ``.total_seconds()`` on whatever it was
+    handed (a bare float raised ``AttributeError`` the moment the request went
+    out), while 2.x spends the budget as arithmetic on a float of seconds (a
+    ``timedelta`` raises there). The stub sessions in the tests accept
+    anything, which is how each wrong shape survived against one SDK: it only
+    ever failed against a real server. So the installed SDK's own signature
+    decides — the same evidence a real server would force.
+    """
+    global _READ_TIMEOUT_WANTS_TD
+    if _READ_TIMEOUT_WANTS_TD is None:
+        _READ_TIMEOUT_WANTS_TD = _sdk_timeout_is_timedelta()
+    return timedelta(seconds=float(seconds)) if _READ_TIMEOUT_WANTS_TD else float(seconds)
 
 
 def expand_env(value: str) -> str:
@@ -107,6 +174,10 @@ class ServerSpec:
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     headers: dict[str, str] = field(default_factory=dict)
+    #: Directory a local server is spawned in (``cwd`` in the config). Empty
+    #: means the project root — never "wherever the bot was launched", which
+    #: would make a relative ``args`` path depend on the shell it started in.
+    cwd: str = ""
     #: The unexpanded strings, kept so we can still tell "unset variable" apart
     #: from "variable set to the empty string" after expansion has run.
     raw: list[str] = field(default_factory=list)
@@ -137,6 +208,7 @@ class ServerSpec:
         raw_url = str(raw.get("url") or "")
         raw_env_value = raw.get("env") or {}
         raw_headers_value = raw.get("headers") or {}
+        raw_cwd = str(raw.get("cwd") or "")
         raw_env = (
             {str(k): str(v) for k, v in raw_env_value.items()}
             if isinstance(raw_env_value, dict)
@@ -150,14 +222,51 @@ class ServerSpec:
 
         return cls(
             name=name,
-            kind=str(raw.get("type") or ("local" if command_parts else "remote")),
+            # "stdio" is the spelling the MCP spec and Claude Code use for a
+            # spawned server; "local" is this project's word for the same thing.
+            # Normalising keeps `is_local` — and every message that reports a
+            # transport — true whatever the file called it.
+            kind=_KIND_ALIASES.get(
+                str(raw.get("type") or "").strip().lower(),
+                str(raw.get("type") or ("local" if command_parts else "remote")),
+            ),
             url=expand_env(raw_url),
             command=command_parts[0] if command_parts else "",
             args=[expand_env(a) for a in command_parts[1:] + args],
             env={k: expand_env(v) for k, v in raw_env.items()},
             headers={k: expand_env(v) for k, v in raw_headers.items()},
-            raw=[raw_url, *command_parts, *args, *raw_env.values(), *raw_headers.values()],
+            cwd=expand_env(raw_cwd),
+            raw=[raw_url, *command_parts, *args, *raw_env.values(), *raw_headers.values(), raw_cwd],
         )
+
+
+def _http_transport(spec: ServerSpec):
+    """The streamable-HTTP async context manager for *spec*, headers and all.
+
+    The transport was renamed twice and the way custom headers are passed
+    moved with it: ``streamablehttp_client(url, headers=…)`` through 1.25,
+    ``streamable_http_client(url, http_client=…)`` from 1.26, and only from
+    2.3 a factory (``create_mcp_http_client``) to build that client with
+    headers. Whichever shape the installed SDK has, this returns one context
+    manager with *spec*'s headers applied — or one clear error when the
+    installed version genuinely cannot carry them, instead of an ImportError
+    that would read as "server unreachable".
+    """
+    from mcp.client import streamable_http
+
+    factory = getattr(streamable_http, "create_mcp_http_client", None)
+    transport = getattr(streamable_http, "streamable_http_client", None)
+    if transport is not None and (factory is not None or not spec.headers):
+        http_client = factory(headers=spec.headers) if (factory and spec.headers) else None
+        return transport(spec.url, http_client=http_client)
+    legacy = getattr(streamable_http, "streamablehttp_client", None)
+    if legacy is not None:  # pre-2.0: headers are a direct kwarg
+        return legacy(spec.url, headers=spec.headers or None)
+    raise RuntimeError(
+        f"server {spec.name!r} declares custom headers, but the installed mcp "
+        "package cannot carry them on streamable HTTP (needs mcp >= 2.3, or "
+        "the pre-2.0 transport); upgrade the mcp package or use stdio"
+    )
 
 
 def _stdio_env(spec: ServerSpec) -> dict[str, str]:
@@ -169,6 +278,41 @@ def _stdio_env(spec: ServerSpec) -> dict[str, str]:
     names in the server's ``env`` block are explicit and still pass through.
     """
     return scrubbed_env(overrides=spec.env)
+
+
+def _stdio_parameters(spec: ServerSpec, cwd: Path):
+    """The SDK's spawn parameters for *spec*, running in *cwd*.
+
+    ``cwd`` is the whole point of a local server's directory: without it the
+    child inherits Lumi's working directory, so a relative ``args`` path (and
+    every file the server opens itself) resolves against wherever the bot was
+    launched instead of against the project that configured it.
+
+    It is passed conditionally because ``StdioServerParameters`` is not the
+    same shape across SDK versions — an older one takes these as a dataclass
+    and would raise on an unknown keyword. The field is only omitted when the
+    installed version genuinely lacks it, and the log line says so rather than
+    leaving the wrong directory unexplained.
+    """
+    from mcp import StdioServerParameters
+
+    kwargs: dict[str, Any] = {
+        "command": spec.command,
+        "args": spec.args,
+        "env": _stdio_env(spec),
+    }
+    known = getattr(StdioServerParameters, "__annotations__", None) or {}
+    if "cwd" in known:
+        kwargs["cwd"] = str(cwd)
+    else:  # pragma: no cover - only an SDK older than the cwd field lands here
+        log.warning(
+            "the installed mcp package has no StdioServerParameters.cwd; "
+            "server %r runs in %s instead of %s",
+            spec.name,
+            Path.cwd(),
+            cwd,
+        )
+    return StdioServerParameters(**kwargs)
 
 
 @dataclass(slots=True)
@@ -209,6 +353,9 @@ class MCPProvider(WebProvider):
         #: ``npx`` server spends most of that booting.
         self._sessions: dict[str, tuple[AsyncExitStack, Any]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        #: mtime fingerprint of the config files at the moment the caches were
+        #: filled — :meth:`_expire_stale_caches` compares against it.
+        self._config_stamp: tuple[tuple[str, int], ...] | None = None
 
     # -- configuration ----------------------------------------------------- #
 
@@ -306,31 +453,37 @@ class MCPProvider(WebProvider):
 
     # -- session plumbing -------------------------------------------------- #
 
+    def _cwd_for(self, spec: ServerSpec) -> Path:
+        """The directory a local server is spawned in.
+
+        The project root by default: ``args`` in ``.mcp.json`` are written by
+        someone thinking about the project, and whatever started Lumi is not
+        part of that picture — a systemd unit, a wrapper script or a stray
+        shell must not change what ``server.py`` resolves to. An explicit
+        ``cwd`` in the config wins, resolved against the project root the same
+        way ``config_file`` is, so ``~`` and relatives behave predictably.
+        """
+        if spec.cwd:
+            return resolve(spec.cwd, base=self.root)
+        return self.root
+
     async def _open(self, stack: AsyncExitStack, spec: ServerSpec):
         """Start a session against *spec* and return it, already initialised."""
-        from mcp import ClientSession, StdioServerParameters
+        from mcp import ClientSession
         from mcp.client.stdio import stdio_client
 
         if spec.is_local:
             if not spec.command:
                 raise RuntimeError(f"server {spec.name} has no command")
-            params = StdioServerParameters(
-                command=spec.command, args=spec.args, env=_stdio_env(spec)
-            )
+            params = _stdio_parameters(spec, self._cwd_for(spec))
             streams = await stack.enter_async_context(stdio_client(params))
         else:
-            from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
-
             if not spec.url:
                 raise RuntimeError(f"server {spec.name} has no url")
-            http_client = None
-            if spec.headers:
-                http_client = create_mcp_http_client(headers=spec.headers)
-            transport = await stack.enter_async_context(
-                streamable_http_client(spec.url, http_client=http_client)
-            )
-            # stdio yields 3 streams, streamable HTTP yields 2; only the first two
-            # are the session's read/write channels.
+            transport = await stack.enter_async_context(_http_transport(spec))
+            # An older stdio/HTTP transport yields 3 entries (the third is the
+            # session id); only the first two are the session's read/write
+            # channels, and the current one already yields exactly those two.
             streams = transport[:2]
 
         read_stream, write_stream = streams[0], streams[1]
@@ -370,13 +523,30 @@ class MCPProvider(WebProvider):
         return self._sessions[spec.name][1]
 
     async def _drop_session(self, name: str) -> None:
-        """Close and forget the cached session for *name*, if there is one."""
-        entry = self._sessions.pop(name, None)
-        if entry is None:
+        """Close and forget the cached session for *name*, if there is one.
+
+        Every session opened *after* it is closed too, newest first. Each
+        transport entered an anyio scope in this task, and those scopes unwind
+        last-in-first-out: closing an older stack while a newer one is still
+        open corrupts the task's cancel-scope bookkeeping, and the *next* await
+        dies with ``Cancelled via cancel scope`` rather than doing any work.
+        That is not hypothetical — it is what ``/mcp check`` did whenever
+        another server was already connected (and what a dead session in
+        ``_reuse`` would do too).
+
+        The extra closes cost one re-spawn each, paid on demand the next time
+        those servers are used.
+        """
+        names = list(self._sessions)
+        if name not in self._sessions:
             return
-        stack, _session = entry
-        with suppress(Exception):  # shutdown is best-effort
-            await stack.aclose()
+        for later in reversed(names[names.index(name) :]):
+            entry = self._sessions.pop(later, None)
+            if entry is None:
+                continue
+            stack, _session = entry
+            with suppress(Exception):  # shutdown is best-effort
+                await stack.aclose()
 
     async def _reuse(self, spec: ServerSpec, op: Any) -> Any:
         """Run *op(session)* on the cached session, re-spawning once if it died.
@@ -409,7 +579,34 @@ class MCPProvider(WebProvider):
         for name in reversed(list(self._sessions)):
             await self._drop_session(name)
 
+    async def _expire_stale_caches(self) -> None:
+        """Drop the tool cache and every session when a config file changed.
+
+        The registry — and therefore this provider — lives across ``/reload``,
+        which re-reads only personality and memory. Without this check an
+        owner who edits ``.mcp.json`` waited out :data:`TOOL_CACHE_TTL` with
+        sessions still pinned to servers the file no longer describes, and a
+        renamed ``command`` kept respawning the old process. A ``stat()`` per
+        discovery costs nothing next to an MCP round trip, and the first call
+        only *records* the stamp — there is nothing stale before the first use.
+        """
+        stamp = tuple(
+            (str(path), path.stat().st_mtime_ns if path.exists() else -1)
+            for path in self.config_paths
+        )
+        if stamp == self._config_stamp:
+            return
+        first_use = self._config_stamp is None
+        self._config_stamp = stamp
+        if first_use:
+            return
+        log.info("mcp config file(s) changed on disk; dropping cached tools and sessions")
+        self._tool_cache.clear()
+        for name in reversed(list(self._sessions)):
+            await self._drop_session(name)
+
     async def _list_tools(self, spec: ServerSpec) -> list[DiscoveredTool]:
+        await self._expire_stale_caches()
         cached = self._tool_cache.get(spec.name)
         now = asyncio.get_running_loop().time()
         if cached and now - cached[0] < TOOL_CACHE_TTL:
@@ -429,7 +626,7 @@ class MCPProvider(WebProvider):
                         )
                         return found
                     seen.add(cursor)
-                response = await session.list_tools(cursor=cursor)
+                response = await _list_page(session, cursor)
                 found.extend(_page_tools(response))
                 cursor = _next_cursor(response)
                 if not cursor:
@@ -638,6 +835,38 @@ def _mcp_freshness(days: int, schema: Any) -> str:
     return _mcp_time_range(days)
 
 
+async def _list_page(session: Any, cursor: str | None) -> Any:
+    """One ``tools/list`` page, on whichever calling convention the SDK has.
+
+    mcp 2.0 replaced ``list_tools(cursor=…)`` with
+    ``list_tools(params=PaginatedRequestParams(cursor=…))``; calling the old
+    shape on a new SDK raises ``TypeError`` on the very first page, which
+    killed discovery entirely. The installed session's own signature decides
+    — and the test stubs, which declare ``cursor=None`` (or take ``**kwargs``),
+    keep the 1.x shape.
+    """
+    if cursor is None:
+        return await session.list_tools()
+    if _takes_cursor_kwarg(session):
+        return await session.list_tools(cursor=cursor)
+    from mcp.types import PaginatedRequestParams
+
+    return await session.list_tools(params=PaginatedRequestParams(cursor=cursor))
+
+
+def _takes_cursor_kwarg(session: Any) -> bool:
+    """Whether *session*'s ``list_tools`` takes 1.x's ``cursor=`` kwarg."""
+    import inspect
+
+    try:
+        parameters = inspect.signature(session.list_tools).parameters
+    except (TypeError, ValueError):  # pragma: no cover - an opaque callable
+        return True
+    return "cursor" in parameters or any(
+        p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+    )
+
+
 def _page_tools(response: Any) -> list[Any]:
     """The tools on one ``ListToolsResult`` page, in object or dict shape."""
     tools = response.get("tools") if isinstance(response, dict) else getattr(response, "tools", None)
@@ -645,20 +874,34 @@ def _page_tools(response: Any) -> list[Any]:
 
 
 def _next_cursor(response: Any) -> str | None:
-    """The cursor for the next tool page, if the server named one."""
+    """The cursor for the next tool page, if the server named one.
+
+    Both field spellings: 1.x called it ``nextCursor``, 2.x renamed it
+    ``next_cursor`` — and a raw server dict can carry either. Reading only
+    the camel spelling made a paginated server silently lose every tool
+    after its first page.
+    """
     if isinstance(response, dict):
         cursor = response.get("nextCursor") or response.get("next_cursor")
     else:
-        cursor = getattr(response, "nextCursor", None)
+        cursor = getattr(response, "nextCursor", None) or getattr(
+            response, "next_cursor", None
+        )
     return str(cursor) if cursor else None
 
 
 def _structured(result: Any) -> Any:
-    """The ``structuredContent`` payload, if any, in object or dict shape."""
+    """The ``structuredContent`` payload, if any, in object or dict shape.
+
+    Both field spellings: 1.x called it ``structuredContent``, 2.x renamed
+    it ``structured_content`` — missing the installed one would render a
+    perfectly good structured-only result as nothing.
+    """
     if isinstance(result, dict):
         value = result.get("structuredContent")
         return value if value is not None else result.get("structured_content")
-    return getattr(result, "structuredContent", None)
+    value = getattr(result, "structuredContent", None)
+    return value if value is not None else getattr(result, "structured_content", None)
 
 
 def _flatten(result: Any) -> str:

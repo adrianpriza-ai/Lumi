@@ -878,6 +878,94 @@ async def test_doctor_reports_a_set_context7_key(config, monkeypatch) -> None:
     assert "set" in body.lower()
 
 
+# --------------------------------------------------------------------------- #
+# /mcp — the configured servers, and whether one answers
+# --------------------------------------------------------------------------- #
+
+
+async def test_mcp_help_lists_the_subcommands(config) -> None:
+    bot, _ = await send(config, [], "/mcp help")
+    body = texts(bot)
+    assert "/mcp list" in body
+    assert "/mcp check" in body
+    # The help says which transports a .mcp.json may declare.
+    assert "stdio" in body
+    assert "streamable HTTP" in body
+
+
+async def test_mcp_list_shows_a_stdio_server_without_connecting(config) -> None:
+    """The inventory reads the config file only: listing must answer even when
+    every server is down, which is what /mcp check is for."""
+    (config.root / ".mcp.json").write_text(
+        json.dumps(
+            {"mcpServers": {"local-tools": {"type": "stdio", "command": "npx", "args": ["-y", "pkg"]}}}
+        ),
+        encoding="utf-8",
+    )
+    bot, _ = await send(config, [], "/mcp list")
+    body = texts(bot)
+    assert "local-tools" in body
+    assert "stdio" in body
+    assert "npx -y pkg" in body
+
+
+async def test_mcp_list_masks_a_token_in_the_url(config) -> None:
+    (config.root / ".mcp.json").write_text(
+        json.dumps(
+            {"mcpServers": {"tavily": {"type": "remote", "url": "https://x.test/mcp/?tavilyApiKey=super-secret-value"}}}
+        ),
+        encoding="utf-8",
+    )
+    bot, _ = await send(config, [], "/mcp list")
+    body = texts(bot)
+    assert "tavily" in body
+    assert "super-secret-value" not in body  # it is headed for Telegram's servers
+
+
+async def test_mcp_list_without_servers_says_where_they_go(config) -> None:
+    bot, _ = await send(config, [], "/mcp list")
+    body = texts(bot)
+    assert "no MCP servers are configured" in body
+    assert ".mcp.json" in body
+
+
+async def test_mcp_check_offers_the_configured_names(config) -> None:
+    (config.root / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"linear": {"type": "remote", "url": "https://linear.test"}}}),
+        encoding="utf-8",
+    )
+    bot, _ = await send(config, [], "/mcp check ghost")
+    body = texts(bot)
+    assert "no server named" in body
+    assert "linear" in body
+
+
+async def test_mcp_check_retries_a_server_that_never_starts(config, monkeypatch) -> None:
+    """A stdio server whose command does not exist is refused three times, and
+    the chat is told it was retried rather than left to guess."""
+    (config.root / ".mcp.json").write_text(
+        json.dumps(
+            {"mcpServers": {"broken": {"type": "stdio", "command": "lumi-no-such-binary-xyz"}}}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("lumi.tools.mcp_tool.CHECK_BACKOFF_SECONDS", 0)
+    bot, _ = await send(config, [], "/mcp check broken")
+    body = texts(bot)
+    assert "mcp check — broken" in body
+    assert "stdio" in body
+    assert "✗" in body
+    assert "attempts: 3" in body
+
+
+async def test_mcp_is_owner_only(config) -> None:
+    """Whitelisted users get the bot; the inventory of what it can spawn and
+    where it connects is the owner's, like /config and /env."""
+    config.bot.whitelisted_users = [str(WHITELISTED_USER)]
+    bot, _ = await send(config, [], "/mcp list", user_id=WHITELISTED_USER)
+    assert "only the owner" in texts(bot).lower()
+
+
 async def test_reload_command(config) -> None:
     (config.personality_file).write_text("You are a lighthouse keeper.\n", encoding="utf-8")
     bot, _ = await send(config, [], "/reload")

@@ -1,13 +1,15 @@
 {
   "mcpServers": {
-    "tavily-remote": {
+    "github": {
       "type": "remote",
-      "url": "${TAVILY_MCP_URL}",
-      "headers": {}
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_PAT}"
+      }
     },
-    "firecrawl-remote": {
+    "huggingface": {
       "type": "remote",
-      "url": "${FIRECRAWL_MCP_URL}",
+      "url": "https://huggingface.co/mcp",
       "headers": {}
     }
   }
