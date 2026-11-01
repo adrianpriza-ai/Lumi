@@ -56,6 +56,7 @@ expected, and it is why the two steps above are always both needed.
 |-|-|
 | `lumi run` | Start the Telegram bot |
 | `lumi chat` | REPL against the same agent, no Telegram required |
+| `lumi-tui` | Full-screen Codex-style Rust UI for the same agent — see [lumi-tui/](lumi-tui/) |
 | `lumi ask "..."` | One question, one answer, exits |
 | `lumi shell "git status"` | Run one command through the safety engine |
 | `lumi search "..."` | Web search from the terminal |

@@ -69,3 +69,39 @@ jobs:
       # credential, that is a bug in the test, not a reason to add a secret.
       - name: Pytest
         run: pytest -q
+
+  rust-test:
+    name: cargo test (lumi-tui)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: lumi-tui
+
+      # Same commands the lumi-tui README documents, so a green build means
+      # the documented workflow is the one that actually works.
+      - name: Test
+        run: cargo test --locked --manifest-path lumi-tui/Cargo.toml
+
+  rust-build:
+    name: cargo build --release (lumi-tui)
+    needs: rust-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: lumi-tui
+
+      # Prove the shipped artifact compiles, not just that the tests do.
+      - name: Build
+        run: cargo build --release --locked --manifest-path lumi-tui/Cargo.toml
