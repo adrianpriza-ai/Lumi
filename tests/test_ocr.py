@@ -81,7 +81,7 @@ class StubLLM:
         self.replies = list(replies)
         self.calls: list[list[dict]] = []
 
-    async def complete(self, messages, *, tools=None):
+    async def complete(self, messages, *, tools=None, on_delta=None):
         self.calls.append(messages)
         if not self.replies:
             raise AssertionError("the vision model was called unexpectedly")

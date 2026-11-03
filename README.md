@@ -2,7 +2,8 @@
 
 # Lumi
 
-[![CI](https://github.com/adrianpriza-ai/Lumi/actions/workflows/ci.yml/badge.svg?branch=main&label=CI)](https://github.com/adrianpriza-ai/Lumi/actions/workflows/ci.yml)![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB.svg?logo=python&logoColor=fff&labelColor=3A454F)
+[![CI](https://github.com/adrianpriza-ai/Lumi/actions/workflows/ci.yml/badge.svg?branch=main&label=CI)](https://github.com/adrianpriza-ai/Lumi/actions/workflows/ci.yml)
+![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB.svg?logo=python&logoColor=fff&labelColor=3A454F)
 ![License](https://img.shields.io/badge/MIT-EF4C32.svg?logo=mit&logoColor=fff&label=MIT&color=EF4C32&labelColor=3A454F)
 
 </div>
@@ -56,7 +57,7 @@ expected, and it is why the two steps above are always both needed.
 |-|-|
 | `lumi run` | Start the Telegram bot |
 | `lumi chat` | REPL against the same agent, no Telegram required |
-| `lumi-tui` | Full-screen Codex-style Rust UI for the same agent — see [lumi-tui/](lumi-tui/) |
+| `lumi-tui` | Full-screen Rust frontend for the same agent — it spawns `lumi tui`, so tools, safety and memory are the Python ones. See [lumi-tui/](lumi-tui/) |
 | `lumi ask "..."` | One question, one answer, exits |
 | `lumi shell "git status"` | Run one command through the safety engine |
 | `lumi search "..."` | Web search from the terminal |

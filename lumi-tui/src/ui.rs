@@ -3,7 +3,7 @@
 //! glyph labels, everything else quiet.
 
 use crate::app::App;
-use crate::llm;
+use crate::backend;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use unicode_width::UnicodeWidthChar;
 use ratatui::style::{Color, Modifier, Style};
@@ -33,8 +33,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_transcript(frame, app, rows[1]);
     draw_status(frame, app, rows[2]);
     draw_composer(frame, app, rows[3]);
-    if app.approval.is_some() {
-        draw_approval(frame, app, area);
+    if let Some(approval) = app.approvals.front() {
+        draw_approval(frame, approval, area, app.approvals.len());
     }
 }
 
@@ -108,9 +108,19 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
-    let left = if app.approval.is_some() {
+    let left = if let Some(head) = app.approvals.front() {
+        let more = if app.approvals.len() > 1 {
+            format!(" · {} more waiting", app.approvals.len() - 1)
+        } else {
+            String::new()
+        };
+        let label = if head.tool.is_empty() {
+            "approval needed".to_string()
+        } else {
+            format!("{} asks", head.tool)
+        };
         Line::from(Span::styled(
-            " ⚠ approval needed — y to run, n to decline",
+            format!(" ⚠ {label} — y to run, n to decline{more}"),
             Style::default().fg(Color::Yellow),
         ))
     } else if app.busy {
@@ -224,21 +234,33 @@ fn split_at_col(text: &str, col: usize) -> (String, String, String) {
     (head, caret, tail)
 }
 
-fn draw_approval(frame: &mut Frame, app: &App, area: Rect) {
-    let Some((_, command)) = &app.approval else { return };
+fn draw_approval(frame: &mut Frame, approval: &crate::app::Approval, area: Rect, waiting: usize) {
     let width = (area.width.saturating_sub(8)).min(72).max(24) as usize;
-    let command_lines = llm::truncate(command, 600);
+    let command_lines = backend::truncate(&approval.preview, 600);
 
     let block = TuiBlock::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(Color::Yellow))
         .title(Span::styled(
-            " ⚠ run this command? ",
+            format!(
+                " ⚠ run {}?{} ",
+                if approval.tool.is_empty() { "this" } else { &approval.tool },
+                if waiting > 1 { format!(" ({waiting} waiting)") } else { String::new() }
+            ),
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
         ));
 
     let mut lines: Vec<Line> = Vec::new();
+    if !approval.reason.is_empty() {
+        for raw in approval.reason.lines() {
+            lines.extend(crate::markdown::span_line(
+                &format!("  {raw}"),
+                Style::default().fg(Color::Yellow),
+                width.saturating_sub(2),
+            ));
+        }
+    }
     for raw in command_lines.lines() {
         lines.extend(crate::markdown::span_line(
             &format!("  $ {raw}"),

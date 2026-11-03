@@ -2,7 +2,7 @@
 name = "lumi-tui"
 version = "0.1.0"
 edition = "2021"
-description = "Codex-style terminal UI for Lumi: streaming chat, tool calls, web search"
+description = "Terminal UI frontend for Lumi: a ratatui shell over the `lumi tui` Python backend"
 license = "MIT"
 
 [[bin]]
@@ -12,14 +12,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 crossterm = "0.28"
-dotenvy = "0.15"
-futures-util = "0.3"
 ratatui = "0.29"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "charset", "gzip"] }
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-toml = "0.8"
 unicode-width = "0.2"
 
 [profile.release]

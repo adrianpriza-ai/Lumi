@@ -1,20 +1,18 @@
 //! lumi-tui — a Codex-style terminal UI for Lumi.
 //!
-//! Talks to any OpenAI-compatible endpoint with SSE streaming, runs tools
-//! (web search via Tavily/Firecrawl, page fetch, approved shell, project file
-//! reads), and reuses Lumi's `.env` / `config.toml` / `PERSONALITY.md`.
+//! A frontend, not a second agent: the whole brain — model, tools, safety,
+//! memory — lives in Python (`lumi/tui.py`), served over JSON lines by a
+//! `lumi tui` child process this binary spawns and owns. Rust keeps the
+//! terminal: raw mode, the composer, scrollback, markdown, the approval modal.
 
-mod agent;
 mod app;
-mod config;
-mod llm;
+mod backend;
 mod markdown;
-mod search;
 mod ui;
 
-use agent::{AgentEvent, AgentMsg};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use app::{App, Submit};
+use backend::{AgentEvent, AgentMsg};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
     KeyEventKind, KeyModifiers, MouseEventKind,
@@ -31,17 +29,18 @@ pub fn help_text() -> String {
     "\
 ## Commands
 - `/help` — this list
-- `/search <query>` — run a web search now (Tavily, fallback Firecrawl)
-- `/model [name]` — show or switch the model
-- `/reasoning on|off` — show the model's thinking live
-- `/tools` — list the tools and which search provider is live
+- `/search <query>` — run a web search now, through the backend
+- `/reasoning on|off` — show the model's thinking steps live
+- `/tools` — the tools the backend has loaded
+- `/context` — the context window: tokens in use, compactions
+- `/memory` — this chat's long-term memory as it enters the prompt
 - `/reset` — clear the conversation (memory file stays)
 - `/quit` — leave
 
 ## Keys
 - `enter` send · `shift+enter` (or `ctrl+j`, `alt+enter`) new line
 - `↑/↓` input history and multi-line cursor · `pgup/pgdn`, wheel scrollback
-- `esc` cancel the running turn · `ctrl+c` cancel, then quit on empty input"
+- `y`/`n` answer the approval modal · `esc` cancel the running turn · `ctrl+c` cancel, then quit on empty input"
         .to_string()
 }
 
@@ -60,13 +59,12 @@ fn main() -> Result<()> {
         default_panic(info);
     }));
 
-    let config = config::Config::load()?;
-    // Multi-threaded: the agent task must keep streaming while this thread
-    // runs the blocking terminal loop below.
+    // Multi-threaded: the backend task must keep reading its child while this
+    // thread runs the blocking terminal loop below.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let (msg_tx, mut event_rx) = runtime.block_on(async { agent::Agent::spawn(config.clone()) });
+    let (msg_tx, mut event_rx) = runtime.block_on(async { backend::spawn() });
 
     enable_raw_mode()?;
     let mut out = stdout();
@@ -80,10 +78,10 @@ fn main() -> Result<()> {
         )
     );
 
-    let backend = CrosstermBackend::new(out);
-    let mut terminal = Terminal::new(backend)?;
+    let backend_ui = CrosstermBackend::new(out);
+    let mut terminal = Terminal::new(backend_ui)?;
 
-    let result = run_ui(&mut terminal, &msg_tx, &mut event_rx, &config);
+    let result = run_ui(&mut terminal, &msg_tx, &mut event_rx);
 
     let _ = crossterm::execute!(
         terminal.backend_mut(),
@@ -100,13 +98,10 @@ fn run_ui(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     msg_tx: &tokio::sync::mpsc::UnboundedSender<AgentMsg>,
     event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
-    config: &config::Config,
 ) -> Result<()> {
-    let mut app = App::new(
-        config.model.clone(),
-        config.host(),
-        config.search_status(),
-    );
+    // The header starts blank; the backend's `ready` event fills it in the
+    // moment the child is up. No local config is parsed — Python owns it.
+    let mut app = App::new(String::new(), String::new(), String::new());
 
     let mut needs_draw = true;
     loop {
@@ -115,12 +110,25 @@ fn run_ui(
             needs_draw = false;
         }
 
-        // Drain everything the agent produced, then wait for input briefly
+        // Drain everything the backend produced, then wait for input briefly
         // so the spinner keeps ticking while a turn runs.
         let mut got_events = false;
-        while let Ok(event) = event_rx.try_recv() {
-            app.handle_agent_event(event);
-            got_events = true;
+        loop {
+            match event_rx.try_recv() {
+                Ok(event) => {
+                    app.handle_agent_event(event);
+                    got_events = true;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    // The backend task ended: the child died and its fate is
+                    // already on the transcript. Leave via a terminal-safe
+                    // path so main() restores the screen before reporting.
+                    return Err(anyhow!(
+                        "the lumi backend went away — see data/logs/lumi-tui-backend.log"
+                    ));
+                }
+            }
         }
         if got_events {
             needs_draw = true;
@@ -143,7 +151,7 @@ fn run_ui(
                     MouseEventKind::ScrollDown => scroll(&mut app, 8),
                     _ => {}
                 },
-                Event::Paste(text) if app.approval.is_none() => {
+                Event::Paste(text) if app.approvals.is_empty() => {
                     app.composer.insert_str(&text)
                 }
                 Event::Resize(w, _h) => app.set_width(w),
@@ -179,19 +187,19 @@ fn handle_key(
 ) -> bool {
     use crossterm::event::KeyCode;
 
-    // The approval modal swallows everything while it is up.
-    if app.approval.is_some() {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => app.answer_approval(true),
-            // Decline and kill the turn; Busy(false) also clears the modal.
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.answer_approval(false);
-                let _ = msg_tx.send(AgentMsg::Cancel);
+    // The approval modal swallows everything while it is up. Each answer
+    // goes to the backend by its id; the next queued one takes its place.
+    if !app.approvals.is_empty() {
+        let approved = match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => Some(true),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => Some(false),
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(false),
+            _ => None,
+        };
+        if let Some(approved) = approved {
+            if let Some(answer) = app.pop_approval() {
+                let _ = msg_tx.send(AgentMsg::Approval { id: answer.id, approved });
             }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
-                app.answer_approval(false)
-            }
-            _ => {}
         }
         return false;
     }

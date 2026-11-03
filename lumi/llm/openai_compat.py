@@ -21,18 +21,29 @@ retried on the next key when the failure looks like a key problem, so a 429
 mid-conversation is invisible to the user. A successful but empty completion is
 also retried briefly on the same key, which helps local servers such as Ollama
 recover from a reasoning-only response without replaying any tools.
+
+Passing ``on_delta`` to :meth:`OpenAICompatClient.complete` switches the same
+call to ``stream=True`` and forwards each piece as it lands. The ladder above
+keeps working because of where it bites: a parameter rejection and a key
+failure both happen before the first token, and once a piece of answer text is
+out the attempt is committed — see :class:`_StreamState` — so no retry can
+text a viewer has already seen.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Awaitable, Callable
+from types import SimpleNamespace
 from typing import Any
 
 from ..config import OPENAI_DEFAULT_BASE_URL, LLMConfig
 from ..util.log import get_logger
 from ..util.text import format_error
 from .base import (
+    DELTA_TEXT,
+    DELTA_THINKING,
     USAGE_COMPLETION,
     USAGE_PROMPT,
     USAGE_REASONING,
@@ -43,6 +54,7 @@ from .base import (
 )
 from .keypool import KeyPool, is_retryable, mask
 from .reasoning import (
+    TRACE_FIELDS,
     completion_ceiling,
     is_context_overflow,
     rejects_param,
@@ -57,6 +69,95 @@ log = get_logger(__name__)
 # 200 with only a thinking trace and no final message. The retry budget lives in
 # LLMConfig so it is visible and tunable rather than hidden in this adapter.
 MAX_RETRY_DELAY_SECONDS = 8.0
+
+
+class _StreamBroken(LLMError):
+    """The stream died after answer text had already gone out.
+
+    Another attempt would deliver those pieces again, so the call fails
+    instead: no retry, no key rotation — and the key is not at fault, because
+    the request itself succeeded. Raised only by :meth:`_stream` once
+    :attr:`_StreamState.sent_text` is set.
+    """
+
+
+class _StreamState:
+    """What one :meth:`OpenAICompatClient.complete` call has put on the wire.
+
+    Streaming shares its entry point with the retry ladder, so the ladder has
+    to know what a live viewer has already seen:
+
+    - :attr:`sent_text` **commits** the call: an empty-completion retry, a key
+      rotation and a parameter step-down are all pre-first-token events, and
+      none may run once a piece of the answer has been delivered.
+    - :attr:`sent_thinking` makes the reasoning trace single-delivery: the
+      retry after a thinking-only completion (the shape some local servers
+      return) re-thinks, and replaying that would show the same thought twice.
+      The *reply* still carries the attempt that succeeded's trace; only the
+      wire is silenced.
+    """
+
+    __slots__ = ("sent_text", "sent_thinking")
+
+    def __init__(self) -> None:
+        self.sent_text = False
+        self.sent_thinking = False
+
+
+class _Pieces:
+    """One streamed attempt, assembled into the shape :meth:`_parse` reads.
+
+    Reusing ``_parse`` is the point: a streamed reply and a whole one go
+    through the same ``split_think``, tool-argument decoding and usage mapping,
+    so the two can never disagree about what the model said.
+    """
+
+    __slots__ = ("text", "reasoning", "tools", "finish", "usage")
+
+    def __init__(self) -> None:
+        self.text: list[str] = []
+        self.reasoning: list[str] = []
+        #: Stream index → [id, name, argument chunks]; tool calls arrive in
+        #: pieces, and the id and name only appear in the first of them.
+        self.tools: dict[int, list[Any]] = {}
+        self.finish = ""
+        self.usage: Any = None
+
+    def add_tool(self, raw: Any) -> None:
+        index = getattr(raw, "index", None)
+        if not isinstance(index, int):
+            index = len(self.tools)
+        slot = self.tools.setdefault(index, ["", "", []])
+        call_id = getattr(raw, "id", "") or ""
+        if call_id and not slot[0]:
+            slot[0] = call_id
+        function = getattr(raw, "function", None)
+        name = getattr(function, "name", "") or ""
+        if name and not slot[1]:
+            slot[1] = name
+        arguments = getattr(function, "arguments", "") or ""
+        if arguments:
+            slot[2].append(arguments)
+
+    def completion(self) -> Any:
+        calls = None
+        if self.tools:
+            calls = [
+                SimpleNamespace(
+                    id=slot[0],
+                    function=SimpleNamespace(name=slot[1], arguments="".join(slot[2])),
+                )
+                for _, slot in sorted(self.tools.items())
+            ]
+        message = SimpleNamespace(content="".join(self.text), tool_calls=calls)
+        reasoning = "".join(self.reasoning).strip()
+        if reasoning:
+            # ``trace_of`` in :meth:`_parse` probes exactly these names.
+            message.reasoning_content = reasoning
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=message, finish_reason=self.finish)],
+            usage=self.usage,
+        )
 
 
 def has_image_part(messages: list[dict[str, Any]]) -> bool:
@@ -216,17 +317,33 @@ class OpenAICompatClient(LLMClient):
         return variants
 
     async def _try(
-        self, key: str, variants: list[dict[str, Any]]
+        self,
+        key: str,
+        variants: list[dict[str, Any]],
+        on_delta: Callable[[str, str], Awaitable[None]] | None = None,
+        state: _StreamState | None = None,
     ) -> tuple[Any | None, BaseException | None, bool]:
         """Call the endpoint on one key, stepping down *variants* as it refuses.
 
         Returns ``(completion, failure, retryable)``. ``completion`` is set only
         on success; ``failure`` carries the last error, which is the most
         informative one because it names the parameter that finally stuck.
+
+        With *on_delta* each attempt streams instead. A rejection still
+        arrives at ``create`` — before a single token exists — so the ladder
+        behaves exactly as it does unstreamed; a failure *after* text went out
+        is not a request failure at all and leaves as :class:`_StreamBroken`.
         """
         for index, params in enumerate(variants):
             try:
-                completion = await self._client_for(key).chat.completions.create(**params)
+                if on_delta is None:
+                    completion = await self._client_for(key).chat.completions.create(**params)
+                else:
+                    completion = await self._stream(
+                        key, params, on_delta, state if state is not None else _StreamState()
+                    )
+            except _StreamBroken:
+                raise
             except Exception as exc:  # noqa: BLE001 - normalised for the owner
                 if rejects_param(exc) and index + 1 < len(variants):
                     log.warning(
@@ -239,6 +356,96 @@ class OpenAICompatClient(LLMClient):
                 log.info("endpoint accepted the request once %s was dropped", _dropped(params))
             return completion, None, False
         raise LLMError("no parameter variant left to try")  # pragma: no cover
+
+    async def _stream(
+        self,
+        key: str,
+        params: dict[str, Any],
+        on_delta: Callable[[str, str], Awaitable[None]],
+        state: _StreamState,
+    ) -> Any:
+        """One streaming attempt: ``stream=True``, pieces forwarded as they land.
+
+        Returns a completion-shaped object (see :class:`_Pieces`), so the reply
+        is parsed by the same code an unstreamed one is.
+
+        Failure handling splits on what the viewer has seen. Before the first
+        piece of answer text, nothing has been delivered: the exception
+        propagates to :meth:`_try`, which steps the parameter ladder and
+        rotates keys as always. After it, a replay would show the answer
+        twice, so the failure leaves as :class:`_StreamBroken` — terminal, and
+        not the key's fault. A reasoning trace alone does not commit: that is
+        exactly the thinking-only response the empty-completion retry exists
+        for, and the retry must still be able to run (the trace it re-thinks
+        with stays off the wire — see :attr:`_StreamState.sent_thinking`).
+        """
+        show_thinking = not state.sent_thinking
+        stream = await self._client_for(key).chat.completions.create(**params, stream=True)
+        pieces = _Pieces()
+        try:
+            async for chunk in stream:
+                await self._feed(chunk, pieces, on_delta, state, show_thinking)
+        except _StreamBroken:
+            raise
+        except Exception as exc:  # noqa: BLE001 - mid-stream transport failure
+            if state.sent_text:
+                raise _StreamBroken(str(exc)) from exc
+            raise
+        return pieces.completion()
+
+    async def _feed(
+        self,
+        chunk: Any,
+        pieces: _Pieces,
+        on_delta: Callable[[str, str], Awaitable[None]],
+        state: _StreamState,
+        show_thinking: bool,
+    ) -> None:
+        """Fold one stream chunk into *pieces*, forwarding what a viewer should see.
+
+        ``usage`` is read from any chunk that carries it (the SDK only attaches
+        one when ``stream_options`` asked for it, which not every endpoint
+        accepts — a streamed reply therefore usually reaches the context
+        window as estimates rather than exact counts, same as a provider that
+        never reports usage).
+        """
+        usage = getattr(chunk, "usage", None)
+        if usage is not None:
+            pieces.usage = usage
+        choices = getattr(chunk, "choices", None) or []
+        if not choices:
+            return
+        choice = choices[0]
+        finish = getattr(choice, "finish_reason", None)
+        if finish:
+            pieces.finish = finish
+        delta = getattr(choice, "delta", None)
+        if delta is None:
+            return
+
+        # The trace, under whichever name this provider invented for it —
+        # the same fields ``trace_of`` probes on a whole message. Accumulated
+        # unstripped (a fragment's whitespace is real); forwarded only when
+        # no earlier attempt of this call already sent one.
+        for name in TRACE_FIELDS:
+            fragment = getattr(delta, name, None)
+            if isinstance(fragment, str) and fragment:
+                pieces.reasoning.append(fragment)
+                if show_thinking:
+                    state.sent_thinking = True
+                    await on_delta(DELTA_THINKING, fragment)
+                break
+
+        text = getattr(delta, "content", None)
+        if isinstance(text, str) and text:
+            pieces.text.append(text)
+            # Committed before the forward: the text exists for the reply
+            # either way, so a hook that raises must still stop the ladder.
+            state.sent_text = True
+            await on_delta(DELTA_TEXT, text)
+
+        for raw in getattr(delta, "tool_calls", None) or []:
+            pieces.add_tool(raw)
 
     def _retry_same_key(self, error: BaseException) -> bool:
         """Whether a retry should wait and use this key again.
@@ -270,6 +477,7 @@ class OpenAICompatClient(LLMClient):
         messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]] | None = None,
+        on_delta: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> LLMReply:
         if not self._pool:
             raise LLMError(
@@ -281,7 +489,7 @@ class OpenAICompatClient(LLMClient):
             # [llm.vision] owns this request: separate provider, endpoint and
             # key. The sub-client does its own retries and error explanation,
             # naming its own endpoint — which is the point of the route.
-            return await self.vision.complete(messages, tools=tools)
+            return await self.vision.complete(messages, tools=tools, on_delta=on_delta)
 
         variants = self._variants(self._params(messages, tools))
         # Remember which model this call went out under so a failure can name
@@ -290,6 +498,9 @@ class OpenAICompatClient(LLMClient):
             request_model(messages, self.config),
             has_image_part(messages),
         )
+        # One state for the whole call: what has been delivered is what every
+        # later attempt (and its retry decision) has to be measured against.
+        state = _StreamState() if on_delta is not None else None
         tried: list[str] = []
         failure: BaseException | None = None
         # The adapter owns one bounded retry budget for transient provider
@@ -300,7 +511,22 @@ class OpenAICompatClient(LLMClient):
             retry_number = 0
             stop_after_key = False
             while True:
-                completion, raw_error, retryable = await self._try(key, variants)
+                try:
+                    completion, raw_error, retryable = await self._try(
+                        key, variants, on_delta, state
+                    )
+                except _StreamBroken as exc:
+                    # Text is already on its way out, so the ladder stops
+                    # here — and the key did nothing wrong, so it is neither
+                    # parked nor rotated. Name the endpoint anyway: it is the
+                    # one fact that makes this message actionable.
+                    raise LLMError(
+                        "the connection dropped while the answer was streaming: "
+                        f"{format_error(exc)}\n\n"
+                        f"Endpoint: {self.config.base_url_of()} "
+                        f"(from {self.config.where_from()})\n"
+                        f"Model: {self.config.model_of()}"
+                    ) from exc
                 empty = False
                 if raw_error is None:
                     if completion is None:
@@ -323,7 +549,12 @@ class OpenAICompatClient(LLMClient):
                     error = raw_error
 
                 failure = error
-                can_retry = empty or self._retry_same_key(error)
+                # An answer that already went out commits the call: an "empty"
+                # this late means the stream was whitespace or inline think
+                # tags (split_think stripped them), and replaying it would
+                # show the viewer the same pieces again.
+                committed = state is not None and state.sent_text
+                can_retry = (empty or self._retry_same_key(error)) and not committed
                 if can_retry and retry_number < self.config.inference_retries:
                     retry_number += 1
                     delay = self._retry_delay(retry_number)

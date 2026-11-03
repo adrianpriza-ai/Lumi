@@ -1242,10 +1242,6 @@ class StepFeed:
         self._steps: list[str] = []
         self._message: Any = None
 
-    @property
-    def steps(self) -> list[str]:
-        return list(self._steps)
-
     async def step(self, kind: str, detail: str = "") -> None:
         """Append one step (deduplicated against the previous line) and render."""
         label = step_label(kind, detail)

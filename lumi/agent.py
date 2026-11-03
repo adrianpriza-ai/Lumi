@@ -34,7 +34,7 @@ from .artifacts import Artifact
 from .config import Config
 from .context import ContextReport, ContextWindow
 from .llm import LLMClient, ToolCall, build_llm
-from .llm.base import USAGE_REASONING, LLMError, LLMReply
+from .llm.base import DELTA_TEXT, USAGE_REASONING, LLMError, LLMReply
 from .memory import History, MemoryFile, MemoryStore
 from .paths import relative_to_root
 from .personality import Personality
@@ -162,6 +162,10 @@ one never needs approval.
 {catalog}
 """
 
+#: The format block for the Telegram frontend, which parses HTML and nothing
+#: else. Only :meth:`Agent.system_prompt` picks it, and only for
+#: ``source == "chat"`` — every terminal frontend gets
+#: :data:`MARKDOWN_FORMAT_PREAMBLE` instead.
 FORMAT_PREAMBLE = """\
 ## Formatting (important)
 
@@ -200,6 +204,44 @@ Telegraph-style HTML tags — they are the only thing that renders:
 If a tool result contains Markdown (a web page, a README), convert it: do not
 paste **double asterisks**, # headings or [links](https://example.com) raw —
 say the link's text and put the URL in <code></code>, or just describe it.
+"""
+
+#: The format block for every terminal frontend — ``lumi chat``, ``lumi ask``
+#: and the Rust TUI. They render Markdown (or print it verbatim), so the HTML
+#: dialect above would arrive as literal angle brackets in the owner's
+#: terminal. Same job as :data:`FORMAT_PREAMBLE`, opposite dialect.
+MARKDOWN_FORMAT_PREAMBLE = """\
+## Formatting (important)
+
+Your messages go to a terminal that renders Markdown, not HTML. Write Markdown:
+
+- Headings (`## like this`), `**bold**`, `*italic*`, `> quotes` and `- bullets`
+  all render. Use them the way a well-formatted README does — and leave them
+  out of a short answer, which stays plain prose.
+- Inline code: `like this`. Code blocks: ``` like this ```. Short fragments (a
+  path, a command, a version) stay inline in backticks.
+- Reach for a fenced code block whenever a piece of content is big: command
+  output, file contents or excerpts, code, logs, error tracebacks, file
+  listings, structured data. Anything over a couple of lines — or with
+  whitespace or alignment worth keeping — belongs in a fence, not flattened
+  into prose and not quoted line by line. Small answers stay prose; do not wrap
+  a two-sentence reply in a code block.
+- Never write Telegram-style HTML (`<b>`, `<pre>`, `&lt;` and friends): nothing
+  parses it here, so every tag shows up as literal angle brackets. If a tool
+  result or a fetched page arrives as HTML, convert it to Markdown instead of
+  pasting it, and never wrap your own answer in tags.
+- Never output a table in any syntax: a terminal wraps long lines and destroys
+  pipe alignment, so `| like | this |` reads as junk. Restructure the data as
+  one short line per row ("Name — 30 — Oslo"), or hand-align an ASCII table
+  inside a ``` fence. This holds even if the user asks for "a table" or a tool
+  result contains one.
+- Formatting is for messages that need it: bold for a short headline, code
+  style for anything you could type into a terminal. At most one emoji per
+  message.
+
+If a tool result contains HTML (a web page, an email), convert it: do not paste
+`<b>bold</b>` or `<a href=...>` raw — say the link's text and put the URL in
+backticks, or just describe it.
 """
 
 
@@ -256,6 +298,14 @@ class TurnHooks:
     #: ``("tool", <tool name>)`` when a tool call starts — the raw material
     #: for the chat's live step list (🧠 Thinking / 💻 Run Bash).
     on_step: Callable[[str, str], Awaitable[None]] | None = None
+    #: Called for each piece of a streamed reply as it arrives —
+    #: ``("delta", <answer text>)`` and ``("thinking_delta", <trace>)``, the
+    #: :data:`~lumi.llm.base.DELTA_TEXT` / :data:`~lumi.llm.base.DELTA_THINKING`
+    #: kinds. Wired only by a frontend that can render tokens as they land
+    #: (the TUI); the bot and the REPL watch steps and receive the answer
+    #: whole. The LLM client's streaming guarantees (see
+    #: :meth:`~lumi.llm.base.LLMClient.complete`) hold whatever this does.
+    on_delta: Callable[[str, str], Awaitable[None]] | None = None
 
 
 @dataclass(slots=True)
@@ -289,6 +339,11 @@ class TurnResult:
     #: the turn-tail flush instead of vanishing. With a working live channel
     #: they go out the moment the model sends them and this stays empty.
     messages: list[str] = field(default_factory=list)
+    #: Whether :attr:`text` was already delivered live through
+    #: :class:`TurnHooks.on_delta`. A frontend that streamed the answer must
+    #: not render ``text`` a second time from this result — the protocol says
+    #: so with its ``result.streamed`` field.
+    streamed: bool = False
 
     @property
     def ok(self) -> bool:
@@ -326,6 +381,10 @@ class Conversation:
     truncated: bool = False
     #: Monotonic clock of last use, for evicting the quietest chat.
     touched: float = 0.0
+    #: Which frontend is driving this chat. It decides the format block in the
+    #: system prompt — Telegram gets HTML, a terminal gets Markdown — so it is
+    #: recorded here rather than passed to every refresh by hand.
+    source: str = "chat"
 
 
 class Agent:
@@ -391,7 +450,7 @@ class Agent:
             provenance=SKILL_PROVENANCE, catalog=fence_skill("\n".join(lines))
         )
 
-    def system_prompt(self, chat_id: int | str | None = None) -> str:
+    def system_prompt(self, chat_id: int | str | None = None, *, source: str = "chat") -> str:
         now = datetime.now(UTC)
         limit = self.memory_limit()
         memory_block = self.memory_for(chat_id).for_prompt(limit)
@@ -408,7 +467,10 @@ class Agent:
             ),
             TOOL_PREAMBLE.format(tools=self.registry.describe(available_only=True) or "_none_"),
             self.skills_prompt(),
-            FORMAT_PREAMBLE,
+            # The one part of the prompt that names its own frontend: Telegram
+            # renders HTML, a terminal renders Markdown, and a terminal told to
+            # emit <b> shows the owner literal angle brackets.
+            FORMAT_PREAMBLE if source == "chat" else MARKDOWN_FORMAT_PREAMBLE,
             "## Long-term memory\n\n"
             + (
                 "This is the long-term memory for this chat. It persists across "
@@ -426,16 +488,32 @@ class Agent:
 
     # -- conversation plumbing --------------------------------------------- #
 
-    def conversation(self, chat_id: int | str) -> Conversation:
+    def conversation(self, chat_id: int | str, *, source: str | None = None) -> Conversation:
+        """The live conversation for *chat_id*, created and seeded on first use.
+
+        *source* is which frontend is asking. It is remembered on the
+        conversation so every later prompt refresh keeps that frontend's
+        dialect, and a chat that starts in one client and continues in another
+        switches instead of inheriting the first client's format block. Left
+        unset (``/context``, ``/reset``) it changes nothing.
+        """
         conv = self._conversations.get(chat_id)
         if conv is None:
-            conv = Conversation(chat_id=chat_id, session=self.history.new_session(chat_id))
+            conv = Conversation(
+                chat_id=chat_id,
+                session=self.history.new_session(chat_id),
+                source=source or "chat",
+            )
             self._conversations[chat_id] = conv
             self._evict_quietest(keep=chat_id)
+        elif source is not None:
+            conv.source = source
         conv.touched = time.monotonic()
         if not conv.seeded:
             conv.seeded = True
-            conv.messages.append({"role": "system", "content": self.system_prompt(chat_id)})
+            conv.messages.append(
+                {"role": "system", "content": self.system_prompt(chat_id, source=conv.source)}
+            )
             self.context.replay(conv)
         return conv
 
@@ -511,6 +589,52 @@ class Agent:
         self._conversations.pop(chat_id, None)
         log.info("conversation reset for chat %s", chat_id)
 
+    def seal_dangling_tool_calls(self, chat_id: int | str) -> int:
+        """Close tool calls a cancelled turn left without their results.
+
+        A turn killed between appending the assistant message that carries
+        ``tool_calls`` and appending the matching ``role: "tool"`` replies
+        leaves a conversation the provider rejects with a 400 on every later
+        request — until ``/reset``. The TUI's cancel runs this sweep so the
+        next turn can proceed. Returns the number of results it added.
+        """
+        conv = self._conversations.get(chat_id)
+        if conv is None:
+            return 0
+        messages = conv.messages
+        idx = next(
+            (
+                i
+                for i in range(len(messages) - 1, -1, -1)
+                if messages[i].get("tool_calls")
+            ),
+            None,
+        )
+        if idx is None:
+            return 0
+        answered = {
+            message.get("tool_call_id")
+            for message in messages[idx + 1 :]
+            if message.get("role") == "tool"
+        }
+        missing = [
+            call for call in messages[idx]["tool_calls"] if call.get("id") not in answered
+        ]
+        for call in missing:
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.get("id"),
+                    "name": (call.get("function") or {}).get("name", ""),
+                    "content": "cancelled by user",
+                }
+            )
+        if missing:
+            log.info(
+                "sealed %d dangling tool call(s) for chat %s", len(missing), chat_id
+            )
+        return len(missing)
+
     def context_report(self, chat_id: int | str) -> ContextReport:
         """What the context for *chat_id* currently holds. For ``/context``."""
         return self.context.report(self.conversation(chat_id))
@@ -541,7 +665,7 @@ class Agent:
     def _refresh_system_prompt(self, conv: Conversation) -> None:
         """Keep the system prompt current without losing the message history."""
         if conv.messages and conv.messages[0].get("role") == "system":
-            conv.messages[0]["content"] = self.system_prompt(conv.chat_id)
+            conv.messages[0]["content"] = self.system_prompt(conv.chat_id, source=conv.source)
 
     # -- the loop ---------------------------------------------------------- #
 
@@ -562,7 +686,7 @@ class Agent:
         *hooks* wire the turn to a live presentation channel; see
         :class:`TurnHooks`.
         """
-        conv = self.conversation(chat_id)
+        conv = self.conversation(chat_id, source=source)
         self._refresh_system_prompt(conv)
         content: str | list[dict[str, Any]]
         if image_b64:
@@ -619,7 +743,12 @@ class Agent:
             try:
                 await self._step(hooks, "thinking")
                 asked = time.monotonic()
-                reply = await self.llm.complete(conv.messages, tools=specs or None)
+                # Fresh per model call: `streamed` must describe the reply
+                # that is about to come back, not the whole turn.
+                on_delta, streamed = _delta_sink(hooks)
+                reply = await self.llm.complete(
+                    conv.messages, tools=specs or None, on_delta=on_delta
+                )
             except LLMError as exc:
                 result.error = str(exc)
                 result.elapsed = time.monotonic() - started
@@ -656,6 +785,11 @@ class Agent:
 
             if not reply.wants_tools:
                 result.text = reply.text
+                # True only when the frontend confirmed delivery of this very
+                # reply's text — a client that ignored on_delta, or a hook
+                # that failed, leaves this False and the result carries the
+                # text whole.
+                result.streamed = streamed()
                 result.tools_used = tools
                 result.elapsed = time.monotonic() - started
                 if reply.text:
@@ -821,7 +955,7 @@ class Agent:
         hooks: TurnHooks | None = None,
     ) -> TurnResult:
         """Run a pending action for real, or record the refusal, then continue."""
-        conv = self.conversation(chat_id)
+        conv = self.conversation(chat_id, source=source)
         ctx = self._context(source, chat_id, hooks)
 
         action = next((p for p in conv.pending if p.id == action_id), None)
@@ -876,7 +1010,7 @@ class Agent:
         model turn first, and the model is then asked to narrate the result so
         the chat still reads like a conversation.
         """
-        conv = self.conversation(chat_id)
+        conv = self.conversation(chat_id, source=source)
         self._refresh_system_prompt(conv)
         ctx = self._context(source, chat_id, hooks)
 
@@ -969,6 +1103,35 @@ def _assistant_message(reply: LLMReply) -> dict[str, Any]:
             for call in reply.tool_calls
         ],
     }
+
+
+def _delta_sink(
+    hooks: TurnHooks | None,
+) -> tuple[Callable[[str, str], Awaitable[None]] | None, Callable[[], bool]]:
+    """The ``on_delta`` for one ``complete()`` call, plus a predicate for it.
+
+    Returns ``(on_delta, streamed)``. The callback forwards to the hooks'
+    presentation channel with the same best-effort rule as :meth:`Agent._step`
+    — a dead channel must not fail the turn — and the predicate says whether
+    answer text actually went out *for this call*, which is what the turn later
+    records as :attr:`TurnResult.streamed`. A hook that keeps failing leaves it
+    False, so the frontend gets the text from the result instead of a hole.
+    """
+    if hooks is None or hooks.on_delta is None:
+        return None, lambda: False
+    forward = hooks.on_delta
+    delivered = {"text": False}
+
+    async def on_delta(kind: str, text: str) -> None:
+        try:
+            await forward(kind, text)
+        except Exception:  # noqa: BLE001 - progress reporting is expendable
+            log.warning("on_delta hook failed", exc_info=True)
+            return
+        if kind == DELTA_TEXT:
+            delivered["text"] = True
+
+    return on_delta, lambda: delivered["text"]
 
 
 __all__ = [

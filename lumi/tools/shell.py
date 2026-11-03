@@ -249,6 +249,11 @@ Rules:
         try:
             raw_out, raw_err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             return proc.returncode or 0, _decode(raw_out), _decode(raw_err), False
+        except asyncio.CancelledError:
+            # A cancelled turn (the TUI's esc) must not leave the command
+            # running behind the transcript it just abandoned.
+            _kill_group(proc)
+            raise
         except TimeoutError:
             log.warning(
                 "command timed out after %ss, killing the process group: %s", timeout, command

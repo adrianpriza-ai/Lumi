@@ -20,7 +20,7 @@ def test_every_command_is_registered() -> None:
     actions = [a for a in parser._actions if a.dest == "command_name"]
     assert actions
     assert set(actions[0].choices) == {
-        "run", "chat", "ask", "shell", "search", "memory", "doctor", "config"
+        "run", "chat", "ask", "tui", "shell", "search", "memory", "doctor", "config"
     }
 
 

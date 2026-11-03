@@ -1,10 +1,21 @@
 //! UI-side state: the transcript as raw blocks plus a cached rendering, the
 //! multi-line composer, scroll tracking, and the pending approval prompt.
 
-use crate::agent::AgentEvent;
+use crate::backend::{self, AgentEvent};
 use crate::markdown::{render, Role};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use std::collections::VecDeque;
+
+/// One question from the backend: a tool that stopped, waiting for yes or no.
+/// Answered by id — several can be queued, and the modal shows the head.
+#[derive(Debug, Clone)]
+pub struct Approval {
+    pub id: String,
+    pub tool: String,
+    pub preview: String,
+    pub reason: String,
+}
 
 /// One transcript entry, kept raw so it can be re-wrapped on resize.
 #[derive(Debug, Clone)]
@@ -292,7 +303,9 @@ pub struct App {
     pub composer: Composer,
     pub busy: bool,
     pub spinner: usize,
-    pub approval: Option<(tokio::sync::oneshot::Sender<bool>, String)>,
+    /// Approvals the backend has asked and the user has not answered; the
+    /// modal shows the front one (§4: queue, answer by explicit id).
+    pub approvals: VecDeque<Approval>,
     pub model: String,
     pub host: String,
     pub search_status: String,
@@ -311,7 +324,7 @@ impl App {
             composer: Composer::default(),
             busy: false,
             spinner: 0,
-            approval: None,
+            approvals: VecDeque::new(),
             model,
             host,
             search_status,
@@ -357,11 +370,15 @@ impl App {
                 };
                 let style = Style::default().fg(accent);
                 let detail_short =
-                    crate::llm::truncate(detail.replace('\n', " ").trim(), 72);
+                    backend::truncate(detail.replace('\n', " ").trim(), 72);
+                let head = if detail_short.is_empty() {
+                    format!("{mark} {name}")
+                } else {
+                    format!("{mark} {name}({detail_short})")
+                };
                 vec![Line::from(vec![
-                    Span::styled(format!("{mark} {name}("), style),
-                    Span::styled(detail_short, Style::default().fg(Color::DarkGray)),
-                    Span::styled(format!("){suffix}"), style),
+                    Span::styled(head, style),
+                    Span::styled(suffix, style),
                 ])]
             }
         };
@@ -388,9 +405,14 @@ impl App {
     pub fn handle_agent_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::Delta(text) => {
-                // Any text delta stops the live thinking cursor.
-                if matches!(self.blocks.last(), Some(Block::Thinking { live: true, .. })) {
-                    let i = self.blocks.len() - 1;
+                // Any text delta stops the live thinking cursor — wherever the
+                // thinking block sits, since a tool step may have been pushed
+                // after it opened.
+                if let Some(i) = self
+                    .blocks
+                    .iter()
+                    .rposition(|b| matches!(b, Block::Thinking { live: true, .. }))
+                {
                     if let Block::Thinking { live, .. } = &mut self.blocks[i] {
                         *live = false;
                     }
@@ -426,9 +448,16 @@ impl App {
                 self.rerender_block(idx);
             }
             AgentEvent::AssistantDone => {
-                if let Some(Block::Thinking { live, .. }) = self.blocks.last_mut() {
-                    *live = false;
-                    let i = self.blocks.len() - 1;
+                // Close the newest *live* trace, not just the last block: the
+                // answer or an error may already sit on top of it.
+                if let Some(i) = self
+                    .blocks
+                    .iter()
+                    .rposition(|b| matches!(b, Block::Thinking { live: true, .. }))
+                {
+                    if let Block::Thinking { live, .. } = &mut self.blocks[i] {
+                        *live = false;
+                    }
                     self.rerender_block(i);
                 }
             }
@@ -462,24 +491,22 @@ impl App {
                     text: format!("**error** — {text}"),
                 });
             }
-            AgentEvent::ApprovalRequest { command, responder } => {
-                self.approval = Some((responder, command));
+            AgentEvent::ApprovalRequest { id, tool, preview, reason } => {
+                self.approvals.push_back(Approval { id, tool, preview, reason });
             }
-            AgentEvent::Busy(on) => {
-                self.busy = on;
-                if !on {
-                    // Whatever owned the approval modal is finished (ran,
-                    // declined, or cancelled) — never leave it on screen.
-                    self.answer_approval(false);
-                }
-            }
+            AgentEvent::Busy(on) => self.busy = on,
             AgentEvent::ConversationCleared => {
                 self.blocks.clear();
                 self.rendered.clear();
                 self.scroll_top = None;
                 self.turns = 0;
+                self.approvals.clear();
             }
-            AgentEvent::ModelChanged(model) => self.model = model,
+            AgentEvent::Ready { model, host, search } => {
+                self.model = model;
+                self.host = host;
+                self.search_status = search;
+            }
             AgentEvent::TurnDone => {
                 self.turns = self
                     .blocks
@@ -499,11 +526,9 @@ impl App {
         self.rendered.iter().map(|b| b.len()).sum()
     }
 
-    /// Answer the pending approval directly on its responder.
-    pub fn answer_approval(&mut self, approved: bool) {
-        if let Some((responder, _)) = self.approval.take() {
-            let _ = responder.send(approved);
-        }
+    /// Take the question the modal is showing; the caller answers it by id.
+    pub fn pop_approval(&mut self) -> Option<Approval> {
+        self.approvals.pop_front()
     }
 }
 

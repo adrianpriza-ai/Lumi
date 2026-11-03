@@ -5,6 +5,7 @@ Commands
 ``run``      start the Telegram bot (long polling)
 ``chat``     talk to the agent in this terminal — same agent, no Telegram needed
 ``ask``      one-shot question, prints the answer, exits
+``tui``      serve the agent to a frontend over stdin/stdout as JSON lines
 ``shell``    run one command through the safety engine
 ``search``   web search from the terminal
 ``memory``   show or edit a chat's MEMORY.md
@@ -266,6 +267,23 @@ def cmd_chat(args: argparse.Namespace) -> int:
     return asyncio.run(_chat(config))
 
 
+def cmd_tui(args: argparse.Namespace) -> int:
+    """Serve the agent to a frontend over stdio — see :mod:`lumi.tui`.
+
+    No banner and no prompts: stdout is the protocol, so every human-readable
+    line this path produces goes to stderr, where the logging console handler
+    already lives.
+    """
+    from . import tui
+
+    config = _config_and_log(args)
+    if not _report_problems(config, fatal=True):
+        return 2
+    agent = _build_agent(config)
+    asyncio.run(tui.serve(agent, config))
+    return 0
+
+
 def cmd_shell(args: argparse.Namespace) -> int:
     config = _config_and_log(args)
     from .tools.base import NeedsApproval, ToolContext
@@ -432,6 +450,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     chat_parser = sub.add_parser("chat", help="talk to the agent in this terminal")
     chat_parser.set_defaults(func=cmd_chat)
+
+    tui_parser = sub.add_parser(
+        "tui", help="serve the agent to a frontend over stdin/stdout (JSON lines)"
+    )
+    tui_parser.set_defaults(func=cmd_tui)
 
     ask_parser = sub.add_parser("ask", help="ask one question and exit")
     ask_parser.add_argument("question", nargs="+")

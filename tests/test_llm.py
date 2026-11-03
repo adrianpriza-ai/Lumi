@@ -14,7 +14,7 @@ import pytest
 
 from lumi.context import ContextWindow
 from lumi.llm import build_llm
-from lumi.llm.base import USAGE_PROMPT, USAGE_REASONING, LLMError
+from lumi.llm.base import DELTA_TEXT, DELTA_THINKING, USAGE_PROMPT, USAGE_REASONING, LLMError
 from lumi.llm.keypool import mask
 from lumi.llm.openai_compat import OpenAICompatClient
 
@@ -933,3 +933,280 @@ async def test_image_turns_go_to_the_vision_client(config) -> None:
     assert vision_used != []
     # The vision client sent its own model id.
     assert vision_completions.requests[0]["model"] == "vision-model"
+
+
+# --------------------------------------------------------------------------- #
+# streaming (§7b): on_delta, and the ladder around it
+# --------------------------------------------------------------------------- #
+
+
+def chunk(*, content=None, reasoning=None, tool=None, finish=None, usage=None):
+    """One streamed chunk, shaped like the SDK's.
+
+    *tool* is ``(index, id, name, arguments)`` — the id and name only appear
+    in the first fragment of a call, exactly as providers send them.
+    """
+    delta = SimpleNamespace()
+    if content is not None:
+        delta.content = content
+    if reasoning is not None:
+        delta.reasoning_content = reasoning
+    if tool is not None:
+        index, call_id, name, arguments = tool
+        delta.tool_calls = [
+            SimpleNamespace(
+                index=index,
+                id=call_id,
+                function=SimpleNamespace(name=name, arguments=arguments),
+            )
+        ]
+    return SimpleNamespace(
+        choices=[SimpleNamespace(delta=delta, finish_reason=finish)],
+        usage=usage,
+    )
+
+
+class _Iterator:
+    def __init__(self, items: list) -> None:
+        self._items = list(items)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._items:
+            raise StopAsyncIteration
+        return self._items.pop(0)
+
+
+class DyingStream(_Iterator):
+    """Yields its chunks, then raises *error* instead of ending — a
+    connection that drops mid-answer."""
+
+    def __init__(self, items: list, error: BaseException) -> None:
+        super().__init__(items)
+        self._error = error
+
+    async def __anext__(self):
+        if not self._items:
+            raise self._error
+        return self._items.pop(0)
+
+
+class StreamCompletions:
+    """``create(stream=True)`` hands back an async iterator of chunks.
+
+    Each entry of *attempts* is one request: an exception (raised at
+    ``create``, before a single chunk), a list of chunks, or a stream object
+    for a mid-stream failure. Entries are consumed in order and the last one
+    repeats, so a single-attempt test also survives an unexpected retry —
+    which the request count then exposes.
+    """
+
+    def __init__(self, *attempts) -> None:
+        self.attempts = list(attempts)
+        self.requests: list[dict] = []
+
+    async def create(self, **params):
+        self.requests.append(params)
+        if not params.get("stream"):
+            raise AssertionError("the streaming path must ask for stream=True")
+        if not self.attempts:
+            raise AssertionError(f"unexpected request #{len(self.requests)}")
+        attempt = self.attempts.pop(0) if len(self.attempts) > 1 else self.attempts[0]
+        if isinstance(attempt, BaseException):
+            raise attempt
+        if isinstance(attempt, list):
+            return _Iterator(attempt)
+        return attempt
+
+
+def collector(into: list) -> Callable:
+    async def on_delta(kind: str, text: str) -> None:
+        into.append((kind, text))
+
+    return on_delta
+
+
+async def test_deltas_arrive_in_order_and_the_reply_parses_like_a_whole_one(config) -> None:
+    stream = StreamCompletions(
+        [chunk(), chunk(content="Hel"), chunk(content="lo, world"), chunk(finish="stop")]
+    )
+    seen: list[tuple[str, str]] = []
+
+    result = await client_with(config, stream).complete(
+        [{"role": "user", "content": "q"}], on_delta=collector(seen)
+    )
+
+    assert seen == [(DELTA_TEXT, "Hel"), (DELTA_TEXT, "lo, world")]
+    assert result.text == "Hello, world"
+    assert stream.requests[0]["stream"] is True
+    # No usage arrives unless the request asked for stream_options, which not
+    # every endpoint accepts — so a streamed reply falls back to the context
+    # window's estimator, like a provider that never reports usage.
+    assert result.usage == {}
+
+
+async def test_without_a_callback_nothing_streams(config) -> None:
+    """The bot and the REPL must keep their exact request shape."""
+    completions = StubCompletions(reply("hi"))
+
+    await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+
+    assert "stream" not in completions.requests[0]
+
+
+async def test_the_ladder_steps_down_before_any_delta_is_sent(config) -> None:
+    """A parameter rejection arrives at ``create`` — pre-token — so stepping
+    down to a plainer variant shows the viewer nothing twice."""
+    reasoning_config(config, max_tokens=4000)
+    stream = StreamCompletions(
+        RuntimeError("Unsupported parameter: 'max_completion_tokens'"),
+        [chunk(content="answered"), chunk(finish="stop")],
+    )
+    seen: list[tuple[str, str]] = []
+
+    result = await client_with(config, stream).complete(
+        [{"role": "user", "content": "q"}], on_delta=collector(seen)
+    )
+
+    assert [text for _, text in seen] == ["answered"]
+    assert result.text == "answered"
+    assert len(stream.requests) == 2
+    assert "max_completion_tokens" not in stream.requests[1]
+
+
+async def test_a_key_rotation_before_the_first_token_duplicates_nothing(
+    config, monkeypatch
+) -> None:
+    pooled(config, monkeypatch, "sk-90", "sk-91")
+    stream = StreamCompletions(
+        status_error(429),
+        [chunk(content="one answer"), chunk(finish="stop")],
+    )
+    seen: list[tuple[str, str]] = []
+    client = client_with(config, stream)
+
+    result = await client.complete([{"role": "user", "content": "q"}], on_delta=collector(seen))
+
+    assert [text for _, text in seen] == ["one answer"]
+    assert result.text == "one answer"
+    assert client.used_keys == ["sk-90", "sk-91"]
+
+
+async def test_an_empty_retry_never_replays_the_thinking(config, monkeypatch) -> None:
+    """The thinking-only response some servers return: attempt 1 thinks and
+    says nothing, attempt 2 answers. The viewer saw attempt 1's trace, so
+    attempt 2's stays off the wire — its content still streams, and the reply
+    carries the attempt that succeeded."""
+
+    async def no_wait(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("lumi.llm.openai_compat.asyncio.sleep", no_wait)
+    stream = StreamCompletions(
+        [chunk(reasoning="first thought"), chunk(finish="stop")],
+        [
+            chunk(reasoning="second thought"),
+            chunk(content="the answer"),
+            chunk(finish="stop"),
+        ],
+    )
+    seen: list[tuple[str, str]] = []
+
+    result = await client_with(config, stream).complete(
+        [{"role": "user", "content": "q"}], on_delta=collector(seen)
+    )
+
+    assert seen == [(DELTA_THINKING, "first thought"), (DELTA_TEXT, "the answer")]
+    assert len(stream.requests) == 2
+    assert result.text == "the answer"
+    assert result.reasoning == "second thought"
+
+
+async def test_a_stream_that_dies_after_text_does_not_retry(config) -> None:
+    """The first token commits the call: replaying would show the answer
+    twice, so the failure is terminal — and the key is not parked for it."""
+    stream = StreamCompletions(
+        DyingStream([chunk(content="partial")], status_error(503))
+    )
+    seen: list[tuple[str, str]] = []
+
+    with pytest.raises(LLMError, match="while the answer was streaming") as caught:
+        await client_with(config, stream).complete(
+            [{"role": "user", "content": "q"}], on_delta=collector(seen)
+        )
+
+    assert [text for _, text in seen] == ["partial"]
+    assert len(stream.requests) == 1, "no retry, no rotation once text is out"
+    assert "test-model" in str(caught.value)  # the endpoint is named anyway
+
+
+async def test_a_stream_that_dies_before_anything_is_streamed_is_retried(
+    config, monkeypatch
+) -> None:
+    async def no_wait(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr("lumi.llm.openai_compat.asyncio.sleep", no_wait)
+    stream = StreamCompletions(
+        DyingStream([], status_error(503)),
+        [chunk(content="recovered"), chunk(finish="stop")],
+    )
+    seen: list[tuple[str, str]] = []
+
+    result = await client_with(config, stream).complete(
+        [{"role": "user", "content": "q"}], on_delta=collector(seen)
+    )
+
+    assert [text for _, text in seen] == ["recovered"]
+    assert result.text == "recovered"
+    assert len(stream.requests) == 2
+
+
+async def test_streamed_tool_calls_assemble_their_arguments(config) -> None:
+    stream = StreamCompletions(
+        [
+            chunk(tool=(0, "c1", "run_shell", '{"comm')),
+            chunk(tool=(0, None, None, 'and": "ls"}')),
+            chunk(finish="tool_calls"),
+        ]
+    )
+    seen: list[tuple[str, str]] = []
+
+    result = await client_with(config, stream).complete(
+        [{"role": "user", "content": "q"}], on_delta=collector(seen)
+    )
+
+    assert result.wants_tools
+    call = result.tool_calls[0]
+    assert (call.id, call.name) == ("c1", "run_shell")
+    assert call.arguments == {"command": "ls"}
+    assert seen == [], "tool-call plumbing is not answer text"
+
+
+async def test_the_vision_route_forwards_on_delta(config) -> None:
+    main = client_with(config, StubCompletions(reply("unused")))
+    seen: dict[str, Any] = {}
+
+    class RecordingVision:
+        async def complete(self, messages, *, tools=None, on_delta=None):
+            seen["on_delta"] = on_delta
+            return SimpleNamespace(text="from vision")
+
+    main.vision = RecordingVision()
+    with_image = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is this?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            ],
+        }
+    ]
+    callback = collector([])
+
+    result = await main.complete(with_image, on_delta=callback)
+
+    assert result.text == "from vision"
+    assert seen["on_delta"] is callback

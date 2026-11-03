@@ -15,6 +15,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from lumi.config import load_config  # noqa: E402
+from lumi.llm.base import DELTA_TEXT, DELTA_THINKING  # noqa: E402
 from lumi.tools.safety import SESSION_START  # noqa: E402
 
 
@@ -98,9 +99,14 @@ class FakeLLM:
     Feed it a list of :class:`ScriptedReply` and it returns them in order,
     recording every messages array it was handed so tests can assert on the
     conversation the agent actually built.
+
+    With ``stream=True`` it plays a streaming client too: the reasoning trace
+    and then the answer (in two pieces) go to ``on_delta`` before the reply is
+    returned — the shape the TUI's ``delta``/``thinking_delta`` events are
+    tested against, with no network and no SDK.
     """
 
-    def __init__(self, replies: list) -> None:
+    def __init__(self, replies: list, *, stream: bool = False) -> None:
         from lumi.llm.base import LLMReply
 
         self.replies = [
@@ -108,13 +114,22 @@ class FakeLLM:
         ]
         self.calls: list[list[dict]] = []
         self.index = 0
+        self.stream = stream
 
-    async def complete(self, messages, *, tools=None):
+    async def complete(self, messages, *, tools=None, on_delta=None):
         self.calls.append([dict(m) for m in messages])
         if self.index >= len(self.replies):
             raise AssertionError(f"LLM called {self.index + 1} times, only {len(self.replies)} scripted")
         reply = self.replies[self.index]
         self.index += 1
+        if self.stream and on_delta is not None:
+            if reply.reasoning:
+                await on_delta(DELTA_THINKING, reply.reasoning)
+            if reply.text:
+                middle = len(reply.text) // 2
+                for piece in (reply.text[:middle], reply.text[middle:]):
+                    if piece:
+                        await on_delta(DELTA_TEXT, piece)
         return reply
 
     def describe(self) -> str:

@@ -33,7 +33,7 @@ class CondensingLLM(FakeLLM):
         self.answer = answer
         self.condensed = 0
 
-    async def complete(self, messages, *, tools=None):
+    async def complete(self, messages, *, tools=None, on_delta=None):
         self.calls.append([dict(m) for m in messages])
         first = str((messages[0] if messages else {}).get("content", ""))
         if "condensing the earlier part" in first:
@@ -124,6 +124,39 @@ async def test_system_prompt_teaches_telegram_html(config) -> None:
     assert "## Formatting" in content
     assert "<b>like this</b>" in content
     assert "Never use backticks" in content
+
+
+async def test_the_format_block_follows_the_source(config) -> None:
+    """Telegram gets HTML, a terminal gets Markdown.
+
+    ``lumi chat`` and ``lumi ask`` print the reply straight to a terminal, so
+    the Telegram dialect leaves literal ``<b>`` tags in the owner's output —
+    and once the TUI speaks this protocol its renderer expects Markdown. The
+    format block is the one part of the prompt that must know who is asking.
+    """
+    agent = make_agent(config, [make_reply("ok"), make_reply("ok")])
+
+    await agent.handle(CHAT, "hi")
+    await agent.handle("cli", "hi", source="cli")
+    telegram, cli = agent.llm.calls[0][0]["content"], agent.llm.calls[1][0]["content"]
+
+    assert "parses HTML" in telegram
+    assert "<b>like this</b>" in telegram
+
+    assert "renders Markdown" in cli
+    assert "parses HTML" not in cli
+    assert "<b>like this</b>" not in cli
+    # Nothing else about the prompt changes with the frontend: the owner's
+    # rules, the tool list and the memory block are shared by every client.
+    assert "## Boundaries" in cli
+    assert "## Tools" in cli
+
+    # A conversation seeded before any frontend claimed it (a `/context` first)
+    # still refreshes into the dialect of the one that actually drives it.
+    seeded = make_agent(config, [make_reply("ok")])
+    seeded.conversation(CHAT)
+    await seeded.handle(CHAT, "hi", source="cli")
+    assert "renders Markdown" in seeded.llm.calls[0][0]["content"]
 
 
 async def test_conduct_and_boundaries_are_hardcoded(config) -> None:
@@ -280,7 +313,7 @@ async def test_turn_is_written_to_history(config) -> None:
 
 async def test_llm_error_is_reported_not_raised(config) -> None:
     class Broken(FakeLLM):
-        async def complete(self, messages, *, tools=None):
+        async def complete(self, messages, *, tools=None, on_delta=None):
             raise LLMError("upstream is on fire")
 
     memory = make_store(config)
@@ -602,6 +635,44 @@ async def test_approval_in_a_parallel_set_answers_every_tool_call(config) -> Non
     assert "Not executed" in by_id["c1"]
     assert "Not executed" not in by_id["c2"]
     assert "Not executed" not in by_id["c3"]
+
+
+async def test_seal_dangling_tool_calls_closes_only_the_unanswered(config) -> None:
+    """The repair after a cancel: every call id needs exactly one tool reply."""
+    agent = make_agent(config, [])
+    conv = agent.conversation(CHAT)
+    conv.messages.append(
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "run_shell", "arguments": "{}"},
+                },
+                {
+                    "id": "c2",
+                    "type": "function",
+                    "function": {"name": "web", "arguments": "{}"},
+                },
+            ],
+        }
+    )
+    conv.messages.append(
+        {"role": "tool", "tool_call_id": "c1", "name": "run_shell", "content": "ok"}
+    )
+
+    assert agent.seal_dangling_tool_calls(CHAT) == 1
+
+    tools = [m for m in conv.messages if m.get("role") == "tool"]
+    assert [m["tool_call_id"] for m in tools] == ["c1", "c2"]
+    assert tools[1]["name"] == "web"
+    assert tools[1]["content"] == "cancelled by user"
+
+    # Idempotent, and a chat that never existed is not a conversation.
+    assert agent.seal_dangling_tool_calls(CHAT) == 0
+    assert agent.seal_dangling_tool_calls("never-seen") == 0
 
 
 async def test_approving_runs_the_command_and_continues(config) -> None:
