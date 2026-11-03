@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 from . import __version__
 from .config import Config
-from .paths import relative_to_root
+from .paths import relative_to_root, ui_binary
 from .tools import safety
 from .tools.registry import ToolRegistry
 from .util.log import get_logger
@@ -116,6 +116,24 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
         status = OK if exists else WARN
         detail = relative_to_root(path) if exists else f"{relative_to_root(path)} (will be created on demand)"
         checks.append(Check(label, status, detail))
+
+    # -- terminal UI ------------------------------------------------------- #
+    # A wheel bundles the Rust binary (`lumi/_bin`, see hatch_build.py); a
+    # checkout builds it under `lumi-tui/target`. Missing is a warning, not a
+    # failure: the bot and `lumi chat` never need it.
+    ui = ui_binary()
+    if ui is None:
+        checks.append(
+            Check(
+                "rust ui",
+                WARN,
+                "not built — `lumi` needs `cargo build --release --manifest-path "
+                "lumi-tui/Cargo.toml` or a wheel from `pip install .`",
+            )
+        )
+    else:
+        where = "bundled" if ui.parent.name == "_bin" else "built"
+        checks.append(Check("rust ui", OK, f"{where}: {ui}"))
 
     # -- credentials ------------------------------------------------------- #
     token = config.telegram_token

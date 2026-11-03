@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import pytest
 
-from lumi.__main__ import build_parser, main
+from lumi.__main__ import _tui_binary, build_parser, cmd_tui_serve, cmd_ui, main
+from lumi.paths import UI_BINARY_NAME
 
 # --------------------------------------------------------------------------- #
 # parsing
@@ -20,13 +21,49 @@ def test_every_command_is_registered() -> None:
     actions = [a for a in parser._actions if a.dest == "command_name"]
     assert actions
     assert set(actions[0].choices) == {
-        "run", "chat", "ask", "tui", "shell", "search", "memory", "doctor", "config"
+        "run",
+        "chat",
+        "ask",
+        "tui",
+        "tui-serve",
+        "shell",
+        "search",
+        "memory",
+        "doctor",
+        "config",
     }
 
 
-def test_no_command_is_an_error() -> None:
-    with pytest.raises(SystemExit):
-        build_parser().parse_args([])
+def test_no_command_opens_the_ui() -> None:
+    """One command, like `vibe`: bare `lumi` is the Rust UI, not a usage error."""
+    args = build_parser().parse_args([])
+    assert args.command_name is None
+    assert args.func is cmd_ui
+
+
+def test_tui_opens_the_same_ui() -> None:
+    assert build_parser().parse_args(["tui"]).func is cmd_ui
+
+
+def test_tui_serve_is_the_internal_transport() -> None:
+    assert build_parser().parse_args(["tui-serve"]).func is cmd_tui_serve
+
+
+def test_ui_binary_honours_the_override(monkeypatch) -> None:
+    monkeypatch.setenv("LUMI_TUI", "/opt/lumi/lumi-tui")
+    assert _tui_binary() == "/opt/lumi/lumi-tui"
+
+
+def test_a_bundled_ui_wins_over_the_checkout(monkeypatch, tmp_path) -> None:
+    """`pip install .` puts the binary in `lumi/_bin`, like Vibe's `vibe-rs`."""
+    import lumi.paths as paths
+
+    binary = tmp_path / "_bin" / UI_BINARY_NAME
+    binary.parent.mkdir()
+    binary.write_text("")
+    monkeypatch.setattr(paths, "PACKAGE_DIR", tmp_path)
+    monkeypatch.delenv("LUMI_TUI", raising=False)
+    assert _tui_binary() == str(binary)
 
 
 def test_shell_keeps_the_command_verbatim() -> None:
@@ -150,6 +187,27 @@ def test_doctor_reports_the_exa_key(config, capsys) -> None:
     """Exa sits in the default provider_order, so the doctor must name its key."""
     assert main(["doctor"]) == 0
     assert "EXA_API_KEY" in capsys.readouterr().out
+
+
+def test_doctor_reports_a_bundled_ui(config, monkeypatch, tmp_path, capsys) -> None:
+    """The wheel's `lumi/_bin/lumi-tui` is the UI an installed `lumi` runs."""
+    import lumi.paths as paths
+
+    binary = tmp_path / "_bin" / UI_BINARY_NAME
+    binary.parent.mkdir()
+    binary.write_text("")
+    monkeypatch.setattr(paths, "PACKAGE_DIR", tmp_path)
+    monkeypatch.delenv("LUMI_TUI", raising=False)
+    assert main(["doctor"]) == 0
+    assert f"rust ui — bundled: {binary}" in capsys.readouterr().out
+
+
+def test_doctor_reports_a_missing_ui(config, monkeypatch, capsys) -> None:
+    import lumi.doctor as doctor
+
+    monkeypatch.setattr(doctor, "ui_binary", lambda: None)
+    assert main(["doctor"]) == 0
+    assert "rust ui — not built" in capsys.readouterr().out
 
 
 def test_doctor_names_the_running_version(config, capsys) -> None:

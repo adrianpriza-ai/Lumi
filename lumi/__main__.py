@@ -5,7 +5,8 @@ Commands
 ``run``      start the Telegram bot (long polling)
 ``chat``     talk to the agent in this terminal — same agent, no Telegram needed
 ``ask``      one-shot question, prints the answer, exits
-``tui``      serve the agent to a frontend over stdin/stdout as JSON lines
+``tui``      open the terminal UI (the default: ``lumi`` with no command)
+``tui-serve`` serve the agent to the UI over stdin/stdout as JSON lines (internal)
 ``shell``    run one command through the safety engine
 ``search``   web search from the terminal
 ``memory``   show or edit a chat's MEMORY.md
@@ -14,17 +15,23 @@ Commands
 
 ``chat`` is the reason this project is debuggable: the agent loop, tools, memory
 and providers are all reachable without a bot token.
+
+There is one command for the UI, not a second binary to remember: ``lumi`` with
+no arguments hands the terminal to the Rust frontend, which this process execs
+in place. The Rust binary is an implementation detail, like Vibe's ``vibe-rs``.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from typing import Any
 
 from . import __version__
 from .config import Config, ConfigError, load_config, validate
+from .paths import ui_binary
 from .util.log import get_logger, setup_logging
 from .util.text import format_error
 
@@ -267,8 +274,45 @@ def cmd_chat(args: argparse.Namespace) -> int:
     return asyncio.run(_chat(config))
 
 
-def cmd_tui(args: argparse.Namespace) -> int:
-    """Serve the agent to a frontend over stdio — see :mod:`lumi.tui`.
+#: The Rust frontend is a bundled implementation detail, not a second command.
+#: `$LUMI_TUI` is the dev escape hatch for a build somewhere other than the
+#: wheel's `lumi/_bin/` or the repo's `lumi-tui/target/` (mirrors the Rust
+#: side's `$LUMI_BACKEND`).
+TUI_BUILD_HINT = (
+    "the Rust UI is not built yet. Build it once with:\n"
+    "  cargo build --release --manifest-path lumi-tui/Cargo.toml\n"
+    "or `pip install .` to ship a bundled UI, or point LUMI_TUI at an"
+    " already-built `lumi-tui` binary."
+)
+
+
+def _tui_binary() -> str | None:
+    """Path to the Rust UI binary, or None when it has not been built yet."""
+    found = ui_binary()
+    return str(found) if found else None
+
+
+def cmd_ui(args: argparse.Namespace) -> int:
+    """Hand the terminal to the Rust UI — the frontend, not a second agent.
+
+    `exec`, not `spawn`: the UI must own the terminal exactly as if it had been
+    started directly, so raw mode, signals and the exit status pass straight
+    through. Nothing runs after this returns.
+    """
+    binary = _tui_binary()
+    if binary is None:
+        print(TUI_BUILD_HINT, file=sys.stderr)
+        return 2
+    try:
+        os.execv(binary, [binary])
+    except OSError as exc:
+        print(f"cannot start the Rust UI at {binary}: {exc}\n\n{TUI_BUILD_HINT}", file=sys.stderr)
+        return 2
+    return 1  # unreachable: exec replaces this process
+
+
+def cmd_tui_serve(args: argparse.Namespace) -> int:
+    """Serve the agent to the UI over stdio — see :mod:`lumi.tui`.
 
     No banner and no prompts: stdout is the protocol, so every human-readable
     line this path produces goes to stderr, where the logging console handler
@@ -443,7 +487,9 @@ def build_parser() -> argparse.ArgumentParser:
         version=f"lumi {__version__}",
         help="print the installed version and exit",
     )
-    sub = parser.add_subparsers(dest="command_name", required=True)
+    # No subcommand is valid: bare `lumi` opens the UI, like bare `vibe`.
+    parser.set_defaults(func=cmd_ui)
+    sub = parser.add_subparsers(dest="command_name")
 
     run_parser = sub.add_parser("run", help="start the Telegram bot")
     run_parser.set_defaults(func=cmd_run)
@@ -451,10 +497,15 @@ def build_parser() -> argparse.ArgumentParser:
     chat_parser = sub.add_parser("chat", help="talk to the agent in this terminal")
     chat_parser.set_defaults(func=cmd_chat)
 
-    tui_parser = sub.add_parser(
-        "tui", help="serve the agent to a frontend over stdin/stdout (JSON lines)"
+    tui_parser = sub.add_parser("tui", help="open the full-screen terminal UI")
+    tui_parser.set_defaults(func=cmd_ui)
+
+    # Internal transport for the Rust UI: nobody runs this by hand, and
+    # `lumi tui` is the command that opens the UI.
+    serve_parser = sub.add_parser(
+        "tui-serve", help="internal: serve the agent to the UI over stdin/stdout"
     )
-    tui_parser.set_defaults(func=cmd_tui)
+    serve_parser.set_defaults(func=cmd_tui_serve)
 
     ask_parser = sub.add_parser("ask", help="ask one question and exit")
     ask_parser.add_argument("question", nargs="+")

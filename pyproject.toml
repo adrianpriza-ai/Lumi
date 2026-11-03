@@ -38,6 +38,12 @@ lumi = "lumi.__main__:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build.hooks.custom]
+# Compile the Rust UI into the wheel, so `pip install .` ships one artifact:
+# the `lumi` command plus the binary it execs, like Vibe bundles `vibe-rs`.
+# See hatch_build.py.
+path = "hatch_build.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["lumi"]
 

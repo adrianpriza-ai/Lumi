@@ -57,7 +57,7 @@ expected, and it is why the two steps above are always both needed.
 |-|-|
 | `lumi run` | Start the Telegram bot |
 | `lumi chat` | REPL against the same agent, no Telegram required |
-| `lumi-tui` | Full-screen Rust frontend for the same agent — it spawns `lumi tui`, so tools, safety and memory are the Python ones. See [lumi-tui/](lumi-tui/) |
+| `lumi` | Same agent, full-screen Rust UI. Bare `lumi` (or `lumi tui`) hands the terminal to it; the Rust binary is internal and there is no second command to build. See [lumi-tui/](lumi-tui/) |
 | `lumi ask "..."` | One question, one answer, exits |
 | `lumi shell "git status"` | Run one command through the safety engine |
 | `lumi search "..."` | Web search from the terminal |

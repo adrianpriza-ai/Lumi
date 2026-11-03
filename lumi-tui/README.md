@@ -3,9 +3,12 @@
 A Codex-CLI-style terminal UI for Lumi, written in Rust. It is a **frontend**,
 not a second agent: the whole brain — model, tools, safety engine, memory,
 context window — is the Python `lumi` package, served over JSON lines by a
-`lumi tui` child process that this binary spawns and owns. Rust keeps only the
-terminal: raw mode, the composer, scrollback, markdown rendering, the approval
-modal and the spinner.
+`lumi tui-serve` child process that this binary spawns and owns. Rust keeps only
+the terminal: raw mode, the composer, scrollback, markdown rendering, the
+approval modal and the spinner.
+
+Users do not run this binary. `lumi` with no arguments (or `lumi tui`) execs it,
+the way Vibe's `vibe` command runs its bundled `vibe-rs`.
 
 ```
  ◆ lumi  chat                                    gpt-4.1-mini · api.openai.com/v1
@@ -25,14 +28,22 @@ This week in Rust: ...
 
 Rust 1.75+ (any recent stable) and a working Python install of this repo:
 
+From the repo root:
+
 ```bash
-cd lumi-tui
-cargo build --release
-./target/release/lumi-tui
+cargo build --release --manifest-path lumi-tui/Cargo.toml   # once
+lumi                                                        # opens the UI
 ```
 
-The TUI starts `lumi tui` itself, so there is no server to run and no port to
-configure. Quitting the TUI kills the child.
+The TUI starts `lumi tui-serve` itself, so there is no server to run and no port
+to configure. Quitting the TUI kills the child. Running
+`./lumi-tui/target/release/lumi-tui` directly still works while you are working
+on the Rust side, and `$LUMI_TUI` points the launcher at a build elsewhere.
+
+`pip install .` compiles the crate during the wheel build and bundles the
+binary at `lumi/_bin/lumi-tui` inside the platform-tagged wheel, so an installed
+`lumi` needs no second build step — the same shape as Vibe bundling `vibe-rs`.
+Editable installs skip that copy and use the checkout's `target/release/` build.
 
 ## Configuration
 
@@ -48,8 +59,8 @@ backend's `ready` event, not from local parsing.
 
 In order:
 
-1. `$LUMI_BACKEND` if set — treated as a command line, with `tui` appended
-   (the dev escape hatch: `LUMI_BACKEND="uv run lumi"`,
+1. `$LUMI_BACKEND` if set — treated as a command line, with `tui-serve`
+   appended (the dev escape hatch: `LUMI_BACKEND="uv run lumi"`,
    `LUMI_BACKEND="/path/to/.venv/bin/lumi"`).
 2. `<root>/.venv/bin/lumi` if it exists.
 3. `lumi` on `PATH`.
@@ -128,5 +139,5 @@ malformed/unknown events, and the composer's multi-line behaviour
 The backend itself is tested on the Python side, with no Rust involved:
 
 ```bash
-printf '{"cmd":"submit","text":"hi"}\n' | lumi tui
+printf '{"cmd":"submit","text":"hi"}\n' | lumi tui-serve
 ```

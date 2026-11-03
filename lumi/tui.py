@@ -1,6 +1,6 @@
 """Serve the agent to a frontend over stdin/stdout, one JSON object per line.
 
-This is what makes ``lumi-tui`` a frontend instead of a second agent: Python
+This is what makes the Rust UI a frontend instead of a second agent: Python
 keeps the loop, tools, safety, memory, config and LLM client, and Rust keeps
 the terminal. ``lumi chat`` and the Telegram bot are the other two consumers of
 the same :class:`~lumi.agent.Agent`; this module adds no behaviour of its own,

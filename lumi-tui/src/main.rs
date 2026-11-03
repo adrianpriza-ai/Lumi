@@ -2,8 +2,11 @@
 //!
 //! A frontend, not a second agent: the whole brain — model, tools, safety,
 //! memory — lives in Python (`lumi/tui.py`), served over JSON lines by a
-//! `lumi tui` child process this binary spawns and owns. Rust keeps the
+//! `lumi tui-serve` child process this binary spawns and owns. Rust keeps the
 //! terminal: raw mode, the composer, scrollback, markdown, the approval modal.
+//!
+//! Users do not run this binary: `lumi` with no arguments execs it (see
+//! `cmd_ui` in `lumi/__main__.py`), the way `vibe` runs `vibe-rs`.
 
 mod app;
 mod backend;

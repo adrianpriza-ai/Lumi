@@ -8,7 +8,9 @@ practice: what we send, and how we read the reply.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 

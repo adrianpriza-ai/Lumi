@@ -1,4 +1,4 @@
-//! The backend: a `lumi tui` Python subprocess, spoken to over JSON lines.
+//! The backend: a `lumi tui-serve` Python subprocess, spoken to over JSON lines.
 //!
 //! This replaces the old Rust-side agent wholesale (handoff-tui.md §1): Python
 //! owns config, the loop, every tool, the safety engine, memory and the LLM
@@ -6,7 +6,7 @@
 //! `AgentEvent`, so the key routing and the transcript barely change —
 //! protocol events are mapped onto the same enum here.
 //!
-//! Spawn rule (§3): `$LUMI_BACKEND` (a command line, for dev, `tui` appended)
+//! Spawn rule (§3): `$LUMI_BACKEND` (a command line, for dev, `tui-serve` appended)
 //! → the project's `.venv/bin/lumi` → `lumi` on PATH → `python3 -m lumi`. The
 //! child runs with cwd at the root found by walking up for `config.toml`, so
 //! it resolves the same project the TUI was launched in. Its stderr goes to
@@ -106,7 +106,7 @@ pub fn find_root() -> PathBuf {
 }
 
 /// The child's argv. `$LUMI_BACKEND` is treated as a command line and gets
-/// `tui` appended — the dev escape hatch (`uv run lumi`, a venv path).
+/// `tui-serve` appended — the dev escape hatch (`uv run lumi`, a venv path).
 /// Windows `.venv/Scripts/` is deliberately unhandled (§10).
 fn resolve_argv(root: &Path) -> Vec<String> {
     let from_env = std::env::var("LUMI_BACKEND")
@@ -116,17 +116,17 @@ fn resolve_argv(root: &Path) -> Vec<String> {
         .collect::<Vec<_>>();
     if !from_env.is_empty() {
         let mut argv = from_env;
-        argv.push("tui".into());
+        argv.push("tui-serve".into());
         return argv;
     }
     let venv = root.join(".venv").join("bin").join("lumi");
     if venv.is_file() {
-        return vec![venv.display().to_string(), "tui".into()];
+        return vec![venv.display().to_string(), "tui-serve".into()];
     }
     if which("lumi") {
-        return vec!["lumi".into(), "tui".into()];
+        return vec!["lumi".into(), "tui-serve".into()];
     }
-    vec!["python3".into(), "-m".into(), "lumi".into(), "tui".into()]
+    vec!["python3".into(), "-m".into(), "lumi".into(), "tui-serve".into()]
 }
 
 fn which(name: &str) -> bool {
@@ -845,7 +845,7 @@ mod tests {
         // resolve_argv reads the real process env, so exercise the rule
         // through a root with no venv: PATH lookup or the last resort.
         let argv = resolve_argv(Path::new("/nonexistent-root-xyz"));
-        assert_eq!(argv.last().map(String::as_str), Some("tui"));
+        assert_eq!(argv.last().map(String::as_str), Some("tui-serve"));
         assert!(argv.len() >= 2);
     }
 }
