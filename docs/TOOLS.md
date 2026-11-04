@@ -271,6 +271,22 @@ written on the command line and the path used at run time are not the same
 path. Guessing "it is probably in the project" is how a guardrail silently
 becomes decoration.
 
+### Multi-line commands
+
+The command may contain literal newlines, and the policy reads them the way the
+shell does: every unquoted newline is a command separator, so each line is
+classified on its own — `echo hi` on one line and `rm -rf ~/x` on the next are
+two commands, and the second is judged as the command it is, not as an operand
+of the first. A newline after `|`, `&&` or `||` is a continuation, not a
+separator, and comments are ignored.
+
+Heredocs are handled too. A body fed to an interpreter (`python3 <<'EOF'`) is
+inspected exactly like a `-c` script — paths inside it are zoned like paths on
+the command line — while a data heredoc (`cat > notes.md <<EOF`) is file
+content: the write it lands in goes through the normal redirection zoning, and
+its text is covered by the deny and confirm tables. A heredoc with no
+terminator asks before running, since its body cannot be determined.
+
 Set `tools.shell.writable = ["workspace"]` to confine writes to the scratch
 folder; anything outside it then asks first, and a recursive delete outside it
 is denied. The default is empty, meaning the whole project, because a coding bot

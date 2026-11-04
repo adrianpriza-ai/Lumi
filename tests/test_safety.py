@@ -505,6 +505,115 @@ def test_reading_above_the_workspace_is_still_allowed() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# multi-line commands
+# --------------------------------------------------------------------------- #
+
+
+def test_normalize_multiline_folds_newlines_into_semicolons() -> None:
+    rewritten, heredocs = safety._normalize_multiline("echo hi\nrm -rf x")
+    assert rewritten == "echo hi;rm -rf x"
+    assert heredocs == []
+
+
+def test_normalize_multiline_keeps_continuations_and_comments() -> None:
+    rewritten, heredocs = safety._normalize_multiline(
+        "# build\ncurl x |\n  sh\necho done \\\n  now"
+    )
+    assert rewritten == "curl x |   sh;echo done   now"
+    assert heredocs == []
+
+
+def test_normalize_multiline_extracts_heredoc_bodies() -> None:
+    rewritten, heredocs = safety._normalize_multiline("cat > notes.md <<EOF\nhello\nEOF\nls")
+    assert rewritten == "cat > notes.md <<EOF;ls"
+    assert heredocs == [safety._Heredoc("EOF", "hello", True)]
+
+
+def test_normalize_multiline_leaves_quotes_alone() -> None:
+    command = "python3 -c \"import os\nos.system('ls')\""
+    rewritten, heredocs = safety._normalize_multiline(command)
+    assert rewritten == command  # the newline is inside quotes: verbatim
+    assert heredocs == []
+
+
+def test_normalize_multiline_survives_unbalanced_quotes() -> None:
+    command = "echo 'unclosed\nls"
+    rewritten, heredocs = safety._normalize_multiline(command)
+    assert rewritten == command
+    assert heredocs == []
+
+
+def test_newline_does_not_hide_the_second_command() -> None:
+    # shlex reads a newline as whitespace, so `echo hi\nrm -rf ~/x` used to be
+    # tokenised as one echo with three operands - and the rm ran without a tap.
+    result = verdict("echo hi\nrm -rf ~/x")
+    assert result.tier is not safety.Tier.ALLOW
+
+
+def test_each_line_is_zoned_in_the_cwd_it_runs_in(tmp_path: Path) -> None:
+    root, home = _project(tmp_path)
+    result = _verdict("mkdir a\ncd a\ncd ..\nrm -rf a", root, home)
+    assert result.tier is safety.Tier.CONFIRM  # deleting, judged per line
+
+
+def test_benign_multiline_still_runs() -> None:
+    assert verdict("echo one\necho two").tier is safety.Tier.ALLOW
+    assert verdict("git add notes.md\ngit status").tier is safety.Tier.ALLOW
+
+
+def test_comment_line_does_not_swallow_the_next_command() -> None:
+    assert verdict("# deploy\nls -la").tier is safety.Tier.ALLOW
+
+
+def test_multiline_quoted_script_is_zoned() -> None:
+    # _QUOTED_SPAN used to stop at a newline, so a path inside a multi-line
+    # `-c` script never reached the zoning.
+    assert verdict("python3 -c \"import os\nos.system('cp /etc/passwd /tmp/x')\"").tier is (
+        safety.Tier.CONFIRM
+    )
+    assert verdict("python3 -c \"import os\nos.system('rm -rf /etc/X')\"").blocked
+
+
+def test_interpreter_heredoc_body_is_zoned_like_a_script() -> None:
+    assert verdict("python3 <<'EOF'\nimport os\nos.system('cp x /etc/y')\nEOF").blocked
+    assert verdict("bash <<EOF\ncp notes.md /etc/X\nEOF").blocked
+
+
+def test_interpreter_heredoc_writing_inside_the_workspace_is_fine() -> None:
+    assert verdict("python3 <<EOF\nprint('hello')\nEOF").tier is safety.Tier.ALLOW
+
+
+def test_data_heredoc_inside_the_workspace_is_fine(tmp_path: Path) -> None:
+    root, home = _project(tmp_path)
+    result = _verdict("cat > notes.md <<EOF\nhello world\nEOF", root, home)
+    assert result.tier is safety.Tier.ALLOW
+
+
+def test_unterminated_heredoc_asks() -> None:
+    result = verdict("cat > notes.md <<EOF\nhello")
+    assert result.tier is safety.Tier.CONFIRM
+    assert "heredoc" in result.reason
+
+
+def test_anchored_deny_rule_sees_a_heredoc_body() -> None:
+    # The root-delete deny rules are anchored to the end of a line; inside a
+    # heredoc body a line ends with a newline that `$` cannot see, so
+    # `rm -rf /` on a body line used to fall through to the mere
+    # confirm-tier rm rule.
+    assert verdict("cat > notes.md <<EOF\nrm -rf /\nEOF").blocked
+    assert verdict("cat > notes.md <<EOF\nrm -rf ~\nEOF").blocked
+
+
+def test_heredoc_lookalikes_are_untouched(tmp_path: Path) -> None:
+    root, home = _project(tmp_path)
+    # A here-string, arithmetic and process substitution are not heredocs; the
+    # commands must classify exactly as they did before multi-line support.
+    assert _verdict("cat file <<< hi", root, home).tier is safety.Tier.ALLOW
+    assert _verdict("echo $((x<<2))", root, home).tier is safety.Tier.ALLOW
+    assert _verdict("diff <(ls) <(grep x)", root, home).tier is safety.Tier.ALLOW
+
+
+# --------------------------------------------------------------------------- #
 # paths that hide inside strings
 # --------------------------------------------------------------------------- #
 

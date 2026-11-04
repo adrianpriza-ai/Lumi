@@ -59,6 +59,9 @@ Rules:
   sneakier.
 - The working directory is judged after any `cd`, so `cd .. && rm -rf x` is
   checked against the directory it would actually delete from.
+- Multi-line commands are fine: each line is classified separately, and a
+  heredoc fed to an interpreter (`python3 <<'EOF'`) is inspected like a `-c`
+  script.
 - Output is sent whole. If a command produces a lot of it, the old results are
   what gets dropped from the context later, not this one — so redirect to a
   file and read that back when you only need part of it.
@@ -72,7 +75,11 @@ Rules:
         "properties": {
             "command": {
                 "type": "string",
-                "description": "The command line to run, e.g. `git status --short`.",
+                "description": (
+                    "The command to run, e.g. `git status --short`. Multi-line "
+                    "commands and heredocs are supported; the policy classifies "
+                    "each line separately, the same way the shell runs them."
+                ),
             },
             "cwd": {
                 "type": "string",

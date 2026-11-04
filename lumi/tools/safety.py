@@ -33,7 +33,7 @@ import time
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import TypeAlias
+from typing import NamedTuple, TypeAlias
 
 from ..util.log import get_logger
 
@@ -966,6 +966,182 @@ def tokenize(command: str) -> list[str]:
     return out
 
 
+#: A heredoc introducer: ``<<`` with an optional ``-`` and an identifier or
+#: quoted delimiter. ``<<<`` (here-string) is handled before this ever matches,
+#: and a delimiter that is not an identifier (``$((x << 2))`` arithmetic, a
+#: variable ``<<$EOF``) stays in the line untouched - its "body" then shows up
+#: as commands, which errs strict, never loose.
+_HEREDOC_START = re.compile(
+    r"<<(-?)[ \t]*(?:'([^']+)'|\"([^\"]+)\"|([A-Za-z_][A-Za-z0-9_]*))"
+)
+
+
+class _Heredoc(NamedTuple):
+    """One heredoc lifted out of a multi-line command."""
+
+    delimiter: str
+    body: str
+    terminated: bool
+
+
+def _normalize_multiline(command: str) -> tuple[str, list[_Heredoc]]:
+    """Fold a multi-line command into one line, extracting heredoc bodies.
+
+    ``shlex`` treats a newline as whitespace, so :func:`tokenize` reads
+    ``echo hi\nrm -rf ~/x`` as a single ``echo`` with three operands - while the
+    shell runs two commands, and the second one sailed through the policy as an
+    operand of the first. Every unquoted newline therefore becomes ``;`` here,
+    which is what bash does to it, so ``_segments`` and every check downstream
+    judges each line on its own. A newline that only continues the previous one
+    (after ``|``, ``&&``, ``||`` or an escaped line break) becomes a space
+    instead, so a command piped onto the next line is still seen as piped-on.
+
+    Quoted spans, including ones that span lines, pass through untouched, and an
+    unquoted ``#`` at a word start is dropped up to and including its newline:
+    stopping short of the newline would leave a ``;`` that turns the comment
+    into an empty command, which is harmless, but ``;``-joining with the comment
+    left in place would let shlex's commenter swallow the line that follows.
+
+    Heredoc bodies are data the shell never parses as commands, so they are
+    lifted out and returned separately; the ``<<`` introducer and its delimiter
+    stay in the line, so the token stream still shows which command feeds on
+    the body. Quotes left unbalanced at the end of input leave the command
+    untouched, matching the fallback :func:`tokenize` already has.
+    """
+    out: list[str] = []
+    heredocs: list[_Heredoc] = []
+    # Delimiters introduced but not yet fed their body: ``cat <<A <<B`` opens
+    # two on one line, and bash serves the bodies out in order.
+    pending: list[tuple[str, bool]] = []
+    in_single = in_double = in_backtick = False
+    index = 0
+    length = len(command)
+
+    def continuation() -> bool:
+        tail = "".join(out).rstrip()
+        return tail.endswith(("|", "&&", "||"))
+
+    def collect_body(delimiter: str, dash: bool, start: int) -> tuple[str, bool, int]:
+        """The body lines up to the terminator, and whether it was found."""
+        lines: list[str] = []
+        index = start
+        while index <= length:
+            end = command.find("\n", index)
+            line = command[index:] if end == -1 else command[index:end]
+            if line == delimiter or (dash and line.lstrip("\t") == delimiter):
+                next_index = length + 1 if end == -1 else end + 1
+                return "\n".join(lines), True, next_index
+            lines.append(line)
+            if end == -1:
+                break
+            index = end + 1
+        return "\n".join(lines), False, length + 1
+
+    while index < length:
+        char = command[index]
+        if in_single:
+            out.append(char)
+            if char == "'":
+                in_single = False
+            index += 1
+            continue
+        if in_double:
+            if char == "\\" and index + 1 < length:
+                if command[index + 1] == "\n":
+                    index += 2  # escaped newline: a line continuation
+                    continue
+                out.append(char)
+                out.append(command[index + 1])
+                index += 2
+                continue
+            out.append(char)
+            if char == '"':
+                in_double = False
+            index += 1
+            continue
+        if in_backtick:
+            out.append(char)
+            if char == "`":
+                in_backtick = False
+            index += 1
+            continue
+
+        # Unquoted.
+        if char == "'":
+            in_single = True
+            out.append(char)
+            index += 1
+            continue
+        if char == '"':
+            in_double = True
+            out.append(char)
+            index += 1
+            continue
+        if char == "`":
+            in_backtick = True
+            out.append(char)
+            index += 1
+            continue
+        if char == "\\":
+            if index + 1 < length:
+                if command[index + 1] == "\n":
+                    index += 2  # escaped newline: bash joins the lines as-is
+                    continue
+                out.append(char)
+                out.append(command[index + 1])
+                index += 2
+                continue
+            out.append(char)
+            index += 1
+            continue
+        if char == "\n":
+            if pending:
+                # The body starts on the line after the introducer; serve the
+                # pending heredocs their bodies in the order bash would. The
+                # newline after the terminator is a separator again, and it
+                # belongs to this line, not to the body.
+                index += 1
+                while pending:
+                    delimiter, dash = pending.pop(0)
+                    body, terminated, index = collect_body(delimiter, dash, index)
+                    heredocs.append(_Heredoc(delimiter, body, terminated))
+                out.append(";")
+                continue
+            out.append(" " if continuation() else ";")
+            index += 1
+            continue
+        if char == "#" and (not out or out[-1] in " \t;&|("):
+            end = command.find("\n", index)
+            index = length if end == -1 else end + 1
+            continue  # the comment owns its newline too
+        if char == "<" and command.startswith("<<<", index):
+            out.append("<<<")
+            index += 3
+            continue
+        if char == "<":
+            match = _HEREDOC_START.match(command, index)
+            if match is not None:
+                out.append(match.group(0))
+                delimiter = next(group for group in match.groups()[1:] if group is not None)
+                pending.append((delimiter, match.group(1) == "-"))
+                index = match.end()
+                continue
+            out.append(char)
+            index += 1
+            continue
+        out.append(char)
+        index += 1
+
+    if pending:
+        for delimiter, _dash in pending:
+            heredocs.append(_Heredoc(delimiter, "", False))
+    if in_single or in_double or in_backtick:
+        # Unbalanced quotes: tokenize will fall back to whitespace splitting
+        # anyway, so hand it the command as it arrived.
+        return command, []
+    return "".join(out), heredocs
+
+
 def _is_within(candidate: Path, root: Path) -> bool:
     try:
         c, r = candidate.resolve(), root.resolve()
@@ -1029,9 +1205,11 @@ def referenced_paths(tokens: list[str], cwd: Path, home: Path | None) -> list[Pa
     return found
 
 
-#: Quoted spans, single, double or backtick. ``shlex`` throws the quotes away, so
-#: this has to go back to the raw command to see them.
-_QUOTED_SPAN = re.compile(r"'([^'\n]*)'|\"([^\"\n]*)\"|`([^`\n]*)`")
+#: Quoted spans, single, double or backtick, including ones that span lines -
+#: a multi-line ``python3 -c "..."`` script is exactly where a hidden path
+#: lives. ``shlex`` throws the quotes away, so this has to go back to the raw
+#: command to see them.
+_QUOTED_SPAN = re.compile(r"'([^']*)'|\"([^\"]*)\"|`([^`]*)`")
 
 
 def quoted_paths(command: str, cwd: Path, home: Path | None) -> list[Path]:
@@ -2313,32 +2491,60 @@ def explain(
         write_root = project_root
 
     # 0. Your own rules take precedence over the built-ins.
-    for pattern in extra_deny:
-        try:
-            if re.search(pattern, command):
-                verdicts.append(Verdict(Tier.DENY, f"matches extra_deny {pattern!r}", "extra_deny"))
-        except re.error:
-            log.warning("extra_deny is not a valid regex, ignoring: %r", pattern)
-    for pattern in extra_confirm:
-        try:
-            if re.search(pattern, command):
-                verdicts.append(
-                    Verdict(Tier.CONFIRM, f"matches extra_confirm {pattern!r}", "extra_confirm")
-                )
-        except re.error:
-            log.warning("extra_confirm is not a valid regex, ignoring: %r", pattern)
+    #    The regex tables run twice: on the command as it arrived (your
+    #    patterns see the text you wrote) and on a flattened copy that keeps
+    #    heredoc bodies as `;`-joined lines. Anchored rules - `rm -rf /$` -
+    #    would otherwise miss a heredoc body, because a line inside a body
+    #    ends with a newline that `$` (without MULTILINE) cannot see. When
+    #    there is nothing to flatten the two copies are the same text and the
+    #    tables run once.
+    rewritten, heredocs = _normalize_multiline(command)
+    bodies = ";".join(
+        heredoc.body.replace("\n", ";") for heredoc in heredocs if heredoc.body
+    )
+    flattened = f"{rewritten};{bodies}" if bodies else rewritten
+    for text in dict.fromkeys((command, flattened)):
+        for pattern in extra_deny:
+            try:
+                if re.search(pattern, text):
+                    verdicts.append(Verdict(Tier.DENY, f"matches extra_deny {pattern!r}", "extra_deny"))
+            except re.error:
+                log.warning("extra_deny is not a valid regex, ignoring: %r", pattern)
+        for pattern in extra_confirm:
+            try:
+                if re.search(pattern, text):
+                    verdicts.append(
+                        Verdict(Tier.CONFIRM, f"matches extra_confirm {pattern!r}", "extra_confirm")
+                    )
+            except re.error:
+                log.warning("extra_confirm is not a valid regex, ignoring: %r", pattern)
 
     # 1. Hard denies.
-    for pattern, reason in DENY_RULES:
-        if pattern.search(command):
-            verdicts.append(Verdict(Tier.DENY, reason, pattern.pattern[:48]))
+    for text in dict.fromkeys((command, flattened)):
+        for pattern, reason in DENY_RULES:
+            if pattern.search(text):
+                verdicts.append(Verdict(Tier.DENY, reason, pattern.pattern[:48]))
 
     # 2. Confirm-worthy commands.
-    for pattern, reason in CONFIRM_RULES:
-        if pattern.search(command):
-            verdicts.append(Verdict(Tier.CONFIRM, reason, pattern.pattern[:48]))
+    for text in dict.fromkeys((command, flattened)):
+        for pattern, reason in CONFIRM_RULES:
+            if pattern.search(text):
+                verdicts.append(Verdict(Tier.CONFIRM, reason, pattern.pattern[:48]))
 
-    tokens = tokenize(command)
+    # Everything structural below runs on the folded line: unquoted newlines
+    # became `;`, so each line is judged as the command it really is, and the
+    # heredoc bodies are out of the token stream where they would otherwise be
+    # read as operands of the command that introduced them.
+    for heredoc in heredocs:
+        if not heredoc.terminated:
+            verdicts.append(
+                Verdict(
+                    Tier.CONFIRM,
+                    "a heredoc has no terminator, so its body cannot be determined",
+                    "heredoc:unterminated",
+                )
+            )
+    tokens = tokenize(rewritten)
     # Expand ``~`` the way the command will see it, before any path is
     # resolved. The child process gets HOME pinned to the project root, so
     # judging ``~/.aws/credentials`` against the owner's real home would
@@ -2434,6 +2640,28 @@ def explain(
         return out
 
     zoned_segments = inline_segments(tokens, 0, base)
+
+    # 4c. A heredoc body is data to the shell but code to the command that
+    #     feeds on it: `python3 <<'EOF'` runs the body exactly like a `-c`
+    #     script, so it gets the same walk. A data heredoc (`cat > notes.md
+    #     <<EOF`) needs nothing here - the regex tables above already judged
+    #     its body, and the write it lands in is zoned by the redirection
+    #     check below.
+    if heredocs:
+        heredoc_segments = [
+            segment
+            for segment in _segments(tokens)
+            if any(
+                segment[position] == "<" and segment[position + 1] == "<"
+                for position in range(len(segment) - 1)
+            )
+        ]
+        for index, heredoc in enumerate(heredocs):
+            segment = heredoc_segments[index] if index < len(heredoc_segments) else []
+            if _unwrap_program(segment) not in INTERPRETERS:
+                continue
+            inner = _expand_tilde(_script_tokens(heredoc.body), tilde_home_for_tokens)
+            zoned_segments.extend(inline_segments(inner, 1, base))
 
     # 5. Redirections write files too, and this is where "creates" and
     #    "clobbers" part ways: `> new.txt` inside the workspace just runs,

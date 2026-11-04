@@ -55,6 +55,15 @@ async def test_runs_a_simple_command(shell: ShellTool) -> None:
     assert result.data["exit_code"] == 0
 
 
+async def test_runs_a_multiline_command(shell: ShellTool) -> None:
+    result = await shell.invoke(
+        {"command": "echo one\necho two\necho three"}, ctx(source="cli")
+    )
+    assert result.ok
+    for word in ("one", "two", "three"):
+        assert word in result.text
+
+
 async def test_runs_in_the_workspace_by_default(shell: ShellTool, config) -> None:
     result = await shell.invoke({"command": "pwd"}, ctx(source="cli"))
     assert str(config.shell_cwd) in result.text
