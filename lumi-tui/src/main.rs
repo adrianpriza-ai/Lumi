@@ -11,6 +11,7 @@
 mod app;
 mod backend;
 mod markdown;
+mod theme;
 mod ui;
 
 use anyhow::{anyhow, Result};

@@ -2,6 +2,7 @@
 //! quotes, inline code and bold. No syntax highlighting dependency — a chat
 //! transcript needs shape, not a compiler.
 
+use crate::theme;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -14,36 +15,24 @@ pub enum Role {
     Error,
 }
 
-fn theme(role: Role) -> (Color, Style) {
-    match role {
-        Role::User => (Color::Cyan, Style::default().fg(Color::Cyan)),
-        Role::Assistant => (Color::Green, Style::default().fg(Color::Green)),
-        Role::System => (Color::Blue, Style::default().fg(Color::Blue)),
-        Role::Thinking => (Color::DarkGray, Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
-        Role::Error => (Color::Red, Style::default().fg(Color::Red)),
-    }
-}
-
 /// Render a markdown-ish chunk plus its speaker label into full-width lines.
 pub fn render(text: &str, role: Role, width: u16) -> Vec<Line<'static>> {
     let w = width.max(20) as usize;
-    let (accent, base) = theme(role);
+    let base = theme::role_style(role);
+    let (marker, label) = theme::role_marker(role);
     let mut out: Vec<Line<'static>> = Vec::new();
 
-    let label = match role {
-        Role::User => "you",
-        Role::Assistant => "lumi",
-        Role::System => "lumi ·",
-        Role::Thinking => "thinking",
-        Role::Error => "error",
-    };
     out.push(Line::from(vec![
-        Span::styled("● ".to_string(), Style::default().fg(accent)),
-        Span::styled(
-            label.to_string(),
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(format!("{marker} "), base),
+        Span::styled(label.to_string(), base.add_modifier(Modifier::BOLD)),
     ]));
+    if role == Role::User {
+        // The user's own turn gets the Codex-style subtle fill: the label and
+        // body lines are padded out to the pane width and given a background.
+        for line in &mut out {
+            fill_user_line(line, w + 4);
+        }
+    }
 
     if text.trim().is_empty() {
         return out;
@@ -79,8 +68,7 @@ pub fn render(text: &str, role: Role, width: u16) -> Vec<Line<'static>> {
         if let Some(rest) = trimmed.strip_prefix('#') {
             let level = rest.chars().take_while(|c| *c == '#').count().min(3);
             let body = rest.trim_start_matches('#').trim();
-            let style = Style::default()
-                .fg(accent)
+            let style = base
                 .add_modifier(Modifier::BOLD)
                 .add_modifier(if level == 1 { Modifier::UNDERLINED } else { Modifier::empty() });
             out.extend(span_line(body, style, w));
@@ -108,8 +96,38 @@ pub fn render(text: &str, role: Role, width: u16) -> Vec<Line<'static>> {
         }
         out.extend(span_line(line, base, w));
     }
+    if role == Role::User {
+        for line in &mut out {
+            fill_user_line(line, w + 4);
+        }
+    }
     out.push(Line::from(""));
     out
+}
+
+/// Pad a wrapped line out to `width` with background-filled spaces, so the
+/// user's turn reads as one solid block instead of a wash behind the words.
+/// The transcript clips rather than wraps, so padding past the pane edge is
+/// safe; the extra four columns cover the pane's side margins.
+fn fill_user_line(line: &mut Line<'static>, width: usize) {
+    for span in &mut line.spans {
+        span.style = span.style.bg(theme::USER_FILL);
+    }
+    let used: usize = line
+        .spans
+        .iter()
+        .map(|span| {
+            span.content
+                .chars()
+                .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1))
+                .sum::<usize>()
+        })
+        .sum();
+    if used < width {
+        let pad = " ".repeat(width - used);
+        line.spans
+            .push(Span::styled(pad, Style::default().bg(theme::USER_FILL)));
+    }
 }
 
 /// Wrap one source line into as many display lines as needed, honouring
@@ -124,7 +142,7 @@ fn inline_styles(text: &str, base: Style) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut plain = String::new();
     let mut chars = text.chars().peekable();
-    let code_style = Style::default().fg(Color::Cyan);
+    let code_style = Style::default().fg(theme::SECONDARY);
     let bold_style = base.add_modifier(Modifier::BOLD);
 
     let push_plain = |spans: &mut Vec<Span<'static>>, buf: &mut String| {

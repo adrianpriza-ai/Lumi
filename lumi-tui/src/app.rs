@@ -3,9 +3,11 @@
 
 use crate::backend::{self, AgentEvent};
 use crate::markdown::{render, Role};
-use ratatui::style::{Color, Style};
+use crate::theme;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use std::collections::VecDeque;
+use std::time::Instant;
 
 /// One question from the backend: a tool that stopped, waiting for yes or no.
 /// Answered by id — several can be queued, and the modal shows the head.
@@ -302,6 +304,8 @@ pub struct App {
     pub viewport: u16,
     pub composer: Composer,
     pub busy: bool,
+    /// When the current turn started, for the status row's elapsed clock.
+    pub busy_started_at: Option<Instant>,
     pub spinner: usize,
     /// Approvals the backend has asked and the user has not answered; the
     /// modal shows the front one (§4: queue, answer by explicit id).
@@ -323,6 +327,7 @@ impl App {
             viewport: 24,
             composer: Composer::default(),
             busy: false,
+            busy_started_at: None,
             spinner: 0,
             approvals: VecDeque::new(),
             model,
@@ -351,34 +356,35 @@ impl App {
                 let mut lines = render(text, Role::Thinking, self.render_width);
                 if *live {
                     if let Some(last) = lines.last_mut() {
-                        last.spans.push(Span::styled(
-                            " ▍",
-                            Style::default().fg(Color::DarkGray),
-                        ));
+                        last.spans
+                            .push(Span::styled(" ▍", Style::default().fg(theme::MUTED)));
                     }
                 }
                 lines
             }
             Block::Tool { name, detail, done } => {
-                let (accent, mark, suffix) = match done {
-                    Some((summary, ok)) => (
-                        if *ok { Color::Green } else { Color::Red },
-                        if *ok { "✓" } else { "✗" },
-                        format!(" · {summary}"),
-                    ),
-                    None => (Color::Yellow, "⚙", " …".to_string()),
+                // Codex's exec lines: the mark carries the only colour, the
+                // detail sits in gray, the summary stays dim.
+                let (mark, mark_style) = match done {
+                    Some((_, true)) => ("✓", Style::default().fg(theme::SUCCESS)),
+                    Some((_, false)) => ("✗", Style::default().fg(theme::FAILURE)),
+                    None => ("✳", Style::default().fg(theme::SECONDARY)),
                 };
-                let style = Style::default().fg(accent);
                 let detail_short =
                     backend::truncate(detail.replace('\n', " ").trim(), 72);
-                let head = if detail_short.is_empty() {
-                    format!("{mark} {name}")
+                let rest = if detail_short.is_empty() {
+                    name.clone()
                 } else {
-                    format!("{mark} {name}({detail_short})")
+                    format!("{name}({detail_short})")
+                };
+                let suffix = match done {
+                    Some((summary, _)) => format!(" · {summary}"),
+                    None => " …".to_string(),
                 };
                 vec![Line::from(vec![
-                    Span::styled(head, style),
-                    Span::styled(suffix, style),
+                    Span::styled(format!("{mark} "), mark_style),
+                    Span::styled(rest, Style::default().fg(theme::SECONDARY)),
+                    Span::styled(suffix, Style::default().fg(theme::MUTED)),
                 ])]
             }
         };
@@ -494,7 +500,11 @@ impl App {
             AgentEvent::ApprovalRequest { id, tool, preview, reason } => {
                 self.approvals.push_back(Approval { id, tool, preview, reason });
             }
-            AgentEvent::Busy(on) => self.busy = on,
+            AgentEvent::Busy(on) => {
+                self.busy = on;
+                // The clock restarts with every turn; it stops when the turn ends.
+                self.busy_started_at = if on { Some(Instant::now()) } else { None };
+            }
             AgentEvent::ConversationCleared => {
                 self.blocks.clear();
                 self.rendered.clear();
@@ -639,5 +649,17 @@ mod tests {
         // Unknown Ctrl combos must not leak letters into the composer.
         c.handle_key(key(KeyCode::Char('x'), KeyModifiers::CONTROL));
         assert_eq!(c.text(), "");
+    }
+
+    #[test]
+    fn busy_tracks_when_the_turn_started() {
+        let mut app = App::new(String::new(), String::new(), String::new());
+        assert!(app.busy_started_at.is_none());
+        app.handle_agent_event(AgentEvent::Busy(true));
+        assert!(app.busy);
+        assert!(app.busy_started_at.is_some());
+        app.handle_agent_event(AgentEvent::Busy(false));
+        assert!(!app.busy);
+        assert!(app.busy_started_at.is_none());
     }
 }

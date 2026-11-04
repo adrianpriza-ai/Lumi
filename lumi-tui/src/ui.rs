@@ -4,14 +4,13 @@
 
 use crate::app::App;
 use crate::backend;
+use crate::theme;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use unicode_width::UnicodeWidthChar;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as TuiBlock, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
-
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -40,19 +39,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let left = Line::from(vec![
-        Span::styled(" ◆ ", Style::default().fg(Color::Cyan)),
+        Span::styled(" ✳ ", Style::default().fg(theme::TEXT)),
         Span::styled(
             "lumi",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::TEXT)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  chat", Style::default().fg(Color::DarkGray)),
+        Span::styled("  chat", Style::default().fg(theme::MUTED)),
     ]);
     let right = Line::from(vec![
-        Span::styled(app.model.clone(), Style::default().fg(Color::DarkGray)),
-        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-        Span::styled(app.host.clone(), Style::default().fg(Color::DarkGray)),
+        Span::styled(app.model.clone(), Style::default().fg(theme::MUTED)),
+        Span::styled(" · ", Style::default().fg(theme::MUTED)),
+        Span::styled(app.host.clone(), Style::default().fg(theme::MUTED)),
         Span::raw("  "),
     ]);
     frame.render_widget(Paragraph::new(left), area);
@@ -86,16 +85,16 @@ fn draw_transcript(frame: &mut Frame, app: &mut App, area: Rect) {
         empty.push(Line::from(Span::styled(
             "  lumi chat",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme::TEXT)
                 .add_modifier(Modifier::BOLD),
         )));
         empty.push(Line::from(Span::styled(
             "  type a message, or /help for commands",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::MUTED),
         )));
         empty.push(Line::from(Span::styled(
             "  enter sends · shift+enter (or ctrl+j) adds a line",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::MUTED),
         )));
         frame.render_widget(Paragraph::new(empty), area);
         return;
@@ -121,28 +120,38 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         };
         Line::from(Span::styled(
             format!(" ⚠ {label} — y to run, n to decline{more}"),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(theme::ATTENTION),
         ))
     } else if app.busy {
-        let glyph = SPINNER[app.spinner % SPINNER.len()];
+        // Codex's status row: `✳ working (1m 05s · esc to interrupt)` — the
+        // spinner and verb carry the attention, the timing sits in dim.
+        let glyph = theme::SPINNER[app.spinner % theme::SPINNER.len()];
+        let elapsed = app
+            .busy_started_at
+            .map(|started| started.elapsed().as_secs())
+            .unwrap_or(0);
         Line::from(vec![
-            Span::styled(format!(" {glyph} "), Style::default().fg(Color::Cyan)),
-            Span::styled("working — esc to cancel", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!(" {glyph} "), Style::default().fg(theme::TEXT)),
+            Span::styled("working", Style::default().fg(theme::SECONDARY)),
+            Span::styled(
+                format!(" ({}) · esc to interrupt", theme::fmt_elapsed_compact(elapsed)),
+                Style::default().fg(theme::MUTED),
+            ),
         ])
     } else {
         Line::from(Span::styled(
             " enter send · shift+enter newline · ↑ history · /help commands",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::MUTED),
         ))
     };
 
     let right = Line::from(vec![
         Span::styled(
             format!("search: {}", app.search_status),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::MUTED),
         ),
-        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{} turns", app.turns), Style::default().fg(Color::DarkGray)),
+        Span::styled(" · ", Style::default().fg(theme::MUTED)),
+        Span::styled(format!("{} turns", app.turns), Style::default().fg(theme::MUTED)),
         Span::raw("  "),
     ]);
 
@@ -157,20 +166,18 @@ fn composer_height(app: &App) -> u16 {
 }
 
 fn draw_composer(frame: &mut Frame, app: &App, area: Rect) {
-    let accent = if app.busy { Color::DarkGray } else { Color::Cyan };
-    let label = if app.composer.is_empty() {
-        "you — type a message"
+    // Codex's composer: a quiet rounded box — dim while empty or busy, white
+    // while you are typing — with no title label; the empty box shows a dim
+    // placeholder line instead.
+    let border = if app.busy || app.composer.is_empty() {
+        theme::MUTED
     } else {
-        "you"
+        theme::TEXT
     };
     let block = TuiBlock::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(accent))
-        .title(Span::styled(
-            format!(" {label} "),
-            Style::default().fg(accent),
-        ));
+        .border_style(Style::default().fg(border));
 
     let visible = area.height.saturating_sub(2) as usize;
     // Stateless scroll: show a window ending at the cursor row once the text
@@ -194,8 +201,12 @@ fn draw_composer(frame: &mut Frame, app: &App, area: Rect) {
             lines.push(Line::from(Span::raw(format!(" {text}"))));
         }
     }
-    if lines.is_empty() {
-        lines.push(Line::from(" "));
+    if app.composer.is_empty() {
+        lines.clear();
+        lines.push(Line::from(Span::styled(
+            " ask lumi…",
+            Style::default().fg(theme::MUTED),
+        )));
     }
     frame.render_widget(Paragraph::new(lines).block(block), area);
 
@@ -241,14 +252,14 @@ fn draw_approval(frame: &mut Frame, approval: &crate::app::Approval, area: Rect,
     let block = TuiBlock::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Yellow))
+        .border_style(Style::default().fg(theme::ATTENTION))
         .title(Span::styled(
             format!(
                 " ⚠ run {}?{} ",
                 if approval.tool.is_empty() { "this" } else { &approval.tool },
                 if waiting > 1 { format!(" ({waiting} waiting)") } else { String::new() }
             ),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme::ATTENTION).add_modifier(Modifier::BOLD),
         ));
 
     let mut lines: Vec<Line> = Vec::new();
@@ -256,7 +267,7 @@ fn draw_approval(frame: &mut Frame, approval: &crate::app::Approval, area: Rect,
         for raw in approval.reason.lines() {
             lines.extend(crate::markdown::span_line(
                 &format!("  {raw}"),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme::ATTENTION),
                 width.saturating_sub(2),
             ));
         }
@@ -264,15 +275,21 @@ fn draw_approval(frame: &mut Frame, approval: &crate::app::Approval, area: Rect,
     for raw in command_lines.lines() {
         lines.extend(crate::markdown::span_line(
             &format!("  $ {raw}"),
-            Style::default().fg(Color::Gray),
+            Style::default().fg(theme::SECONDARY),
             width.saturating_sub(2),
         ));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled("  [y]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "  [y]",
+            Style::default().fg(theme::SUCCESS).add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" approve   "),
-        Span::styled("[n]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "[n]",
+            Style::default().fg(theme::FAILURE).add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" decline"),
     ]));
 
@@ -292,3 +309,80 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
         height,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::Block;
+    use ratatui::backend::TestBackend;
+
+    /// Render the app to a buffer and hand back the text, one row per line —
+    /// how the frame tests below "see" the screen.
+    fn render_screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_frame_shows_the_codex_layout() {
+        let mut app = App::new("test-model".into(), "local".into(), "off".into());
+        app.push_user("fix the tests");
+        app.blocks.push(Block::Tool {
+            name: "shell".into(),
+            detail: "cargo test".into(),
+            done: Some(("14 passed".into(), true)),
+        });
+        let screen = render_screen(&mut app, 80, 24);
+        let flat = screen.join("\n");
+
+        assert!(flat.contains("✳ lumi"), "header wordmark: {flat}");
+        assert!(flat.contains("● you"), "user label: {flat}");
+        assert!(flat.contains("✓ shell(cargo test) · 14 passed"), "tool step: {flat}");
+        assert!(flat.contains("ask lumi…"), "composer placeholder: {flat}");
+        assert!(flat.contains("enter send · shift+enter newline"), "idle hints: {flat}");
+    }
+
+    #[test]
+    fn the_busy_status_shows_the_elapsed_clock() {
+        let mut app = App::new("test-model".into(), "local".into(), "off".into());
+        app.handle_agent_event(crate::backend::AgentEvent::Busy(true));
+        let screen = render_screen(&mut app, 80, 24);
+        let flat = screen.join("\n");
+
+        assert!(flat.contains("working ("), "busy status: {flat}");
+        assert!(flat.contains("esc to interrupt"), "interrupt hint: {flat}");
+        assert!(flat.contains("working (0s"), "elapsed clock: {flat}");
+        // The composer stays live while busy: you can queue the next message.
+        assert!(flat.contains("ask lumi…"), "placeholder while busy: {flat}");
+    }
+
+    #[test]
+    fn user_lines_carry_the_fill_to_the_pane_edge() {
+        let mut app = App::new(String::new(), String::new(), String::new());
+        app.push_user("short");
+        let label_line = &app.rendered[0][0];
+        // The label line is padded well past its own text and every span on a
+        // user line carries the fill background.
+        let filled: Vec<bool> = label_line
+            .spans
+            .iter()
+            .map(|span| span.style.bg == Some(theme::USER_FILL))
+            .collect();
+        assert!(filled.iter().all(|b| *b), "spans lack fill: {filled:?}");
+        let total: usize = label_line
+            .spans
+            .iter()
+            .map(|span| span.content.chars().count())
+            .sum();
+        assert!(total > 24, "label line should span the pane width, got {total}");
+    }
+}
+
