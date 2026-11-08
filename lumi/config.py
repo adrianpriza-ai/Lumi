@@ -577,6 +577,15 @@ class OCRConfig:
         """The configured provider, normalised; empty means the local path."""
         return self.provider.strip().lower()
 
+    def needs_key(self) -> bool:
+        """Whether the endpoint cannot work without a key.
+
+        Only the hosted Mistral API bills per call. A ``custom`` endpoint may
+        be self-hosted and take no auth, so the key is optional there: when
+        it is unset the request goes out with no ``Authorization`` header.
+        """
+        return self.provider_of() == "mistral"
+
     def endpoint_problem(self) -> str:
         """Reject unusable OCR endpoints before a document can be uploaded."""
         provider = self.provider_of()
@@ -597,6 +606,100 @@ class OCRConfig:
             valid = False
         if not valid:
             return "tools.ocr.base_url must be an absolute http(s) URL"
+        return ""
+
+
+#: The image-generation endpoint spellings accepted. Both speak the same wire
+#: format — the OpenAI Images API, ``POST /images/generations``: a prompt in,
+#: ``data[0].b64_json`` or ``data[0].url`` out — which any compatible service
+#: can serve by pointing ``base_url`` at it. ``"openai"`` is the hosted
+#: default; ``"custom"`` means "my own host", and validate() insists on a
+#: ``base_url`` for it.
+IMAGEGEN_PROVIDERS = ("openai", "custom")
+
+IMAGEGEN_DEFAULT_BASE_URL = "https://api.openai.com/v1"
+IMAGEGEN_DEFAULT_MODEL = "gpt-image-1"
+
+
+@dataclass(slots=True)
+class ImageGenConfig:
+    """The ``image_gen`` tool: text-to-image via the OpenAI Images wire format.
+
+    .. code-block:: toml
+
+        [tools.image_gen]
+        provider = "openai"         # or "custom" + base_url = "https://…/v1"
+        api_key_env = "OPENAI_API_KEY"
+        # model = "gpt-image-1"
+        # size = "1024x1024"
+
+    The tool saves what comes back under ``output_dir`` (inside the project)
+    and hands it to the chat as an artifact — the same file-delivery path the
+    ``files`` tool's uploads use. ``custom`` is the same wire format pointed
+    at any compatible endpoint; it needs its own ``base_url``.
+    """
+
+    enabled: bool = True
+    #: Endpoint family. See :data:`IMAGEGEN_PROVIDERS`.
+    provider: str = "openai"
+    #: Root of the Images API. Only meaningful with ``provider`` set; a
+    #: ``custom`` provider pointing at the OpenAI default is a typo caught in
+    #: :meth:`endpoint_problem`.
+    base_url: str = IMAGEGEN_DEFAULT_BASE_URL
+    #: Image model id.
+    model: str = IMAGEGEN_DEFAULT_MODEL
+    #: Env var holding the image API key. Comma-separated values are accepted
+    #: by :meth:`api_key` like everywhere else; the first is used.
+    api_key_env: str = "OPENAI_API_KEY"
+    #: Default image size sent with every request, e.g. ``"1024x1024"``.
+    #: Empty or ``"auto"`` lets the provider pick.
+    size: str = "1024x1024"
+    #: Directory (relative to the project root) generated images land in.
+    output_dir: str = "workspace/images"
+    #: Image generation is slow — minutes on some providers — so the default
+    #: is generous. A timeout here kills the request, not the bot.
+    timeout_seconds: float = 300.0
+
+    def api_key(self) -> str | None:
+        """The image API key, or None when the variable is unset or empty."""
+        keys = parse_env_var(self.api_key_env)
+        return keys[0] if keys else None
+
+    def provider_of(self) -> str:
+        """The configured provider, normalised."""
+        return self.provider.strip().lower()
+
+    def needs_key(self) -> bool:
+        """Whether the endpoint cannot work without a key.
+
+        The hosted provider bills per call, so it does. A ``custom`` endpoint
+        may be self-hosted — a LAN server, a local queue — and take no auth
+        at all, so the key is optional there: when it is unset the tool runs
+        keyless and no ``Authorization`` header is sent.
+        """
+        return self.provider_of() == "openai"
+
+    def endpoint_problem(self) -> str:
+        """Reject unusable image endpoints before a prompt is sent."""
+        provider = self.provider_of()
+        if provider not in IMAGEGEN_PROVIDERS:
+            return (
+                f"unknown tools.image_gen.provider {self.provider!r}. "
+                f"Known: {', '.join(IMAGEGEN_PROVIDERS)}"
+            )
+        url = self.base_url.strip().rstrip("/")
+        if provider == "custom" and url in ("", IMAGEGEN_DEFAULT_BASE_URL):
+            return (
+                'tools.image_gen.provider = "custom" needs tools.image_gen.base_url '
+                "pointed at your own image endpoint"
+            )
+        try:
+            parsed = urlsplit(url)
+            valid = parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+        except ValueError:
+            valid = False
+        if not valid:
+            return "tools.image_gen.base_url must be an absolute http(s) URL"
         return ""
 
 
@@ -634,6 +737,10 @@ class TavilyConfig:
         keys = self.api_keys()
         return keys[0] if keys else None
 
+    def needs_key(self) -> bool:
+        """False: Tavily's hosted API has a keyless free tier (low rate limit)."""
+        return False
+
     def key_strategy_of(self) -> str:
         """The rotation strategy, normalised. Unknown values fall back to ``fallback``."""
         chosen = self.key_strategy.strip().lower() or "fallback"
@@ -666,6 +773,16 @@ class FirecrawlConfig:
         """The primary key, or None when the variable is unset or empty."""
         keys = self.api_keys()
         return keys[0] if keys else None
+
+    def needs_key(self) -> bool:
+        """Whether the endpoint cannot work without a key.
+
+        Firecrawl's hosted API bills per call. The service is also open
+        source and self-hostable, so a ``base_url`` pointed anywhere else is
+        taken at its word: the owner's own endpoint, which may take no auth.
+        The key is optional there.
+        """
+        return self.base_url.strip().rstrip("/") == "https://api.firecrawl.dev"
 
     def key_strategy_of(self) -> str:
         """The rotation strategy, normalised. Unknown values fall back to ``fallback``."""
@@ -705,6 +822,15 @@ class ExaConfig:
         keys = self.api_keys()
         return keys[0] if keys else None
 
+    def needs_key(self) -> bool:
+        """Whether the endpoint cannot work without a key.
+
+        Exa's own API bills per call. A ``base_url`` pointed anywhere else is
+        the owner's endpoint — a proxy, a compatible re-implementation — and
+        is taken at its word: the key is optional there.
+        """
+        return self.base_url.strip().rstrip("/") == "https://api.exa.ai"
+
     def key_strategy_of(self) -> str:
         """The rotation strategy, normalised. Unknown values fall back to ``fallback``."""
         chosen = self.key_strategy.strip().lower() or "fallback"
@@ -712,6 +838,71 @@ class ExaConfig:
             return chosen
         log.warning(
             "unknown tools.web.exa.key_strategy %r; falling back to %r. Known: %s",
+            self.key_strategy,
+            "fallback",
+            ", ".join(WEB_KEY_STRATEGIES),
+        )
+        return "fallback"
+
+
+@dataclass(slots=True)
+class ContextDevConfig:
+    """Context.dev (https://context.dev) — web search built for AI agents.
+
+    The wire format is its own REST API, not an SDK:
+
+    .. code-block:: bash
+
+        curl https://api.context.dev/v1/web/search \\
+          -H "Authorization: Bearer $CONTEXT_DEV_API_KEY" \\
+          -d '{"query": "how does hybrid search improve RAG retrieval?",
+               "numResults": 10}'
+
+    The hosted API has a free tier (1,000 credits a month, one credit per ten
+    results), so an unset key means the provider is skipped, not broken. An
+    overridden ``base_url`` is taken at its word: the owner's endpoint, which
+    may take no auth — the key is optional there.
+    """
+
+    enabled: bool = True
+    api_key_env: str = "CONTEXT_DEV_API_KEY"
+    base_url: str = "https://api.context.dev/v1"
+    #: Query-relevant passages per hit. They cost +1 credit per ten results
+    #: and are what turns a teaser snippet into something worth reading, so
+    #: they are on by default.
+    highlights: bool = True
+    #: Full-page markdown per hit costs one credit *per page*. Off by default:
+    #: the firecrawl top-up covers thin hits more cheaply, and the ``fetch``
+    #: action scrapes a page when the model really wants all of it.
+    include_markdown: bool = False
+    timeout_seconds: int = 90
+    #: How to spend several keys. See :data:`WEB_KEY_STRATEGIES`.
+    key_strategy: str = "fallback"
+
+    def api_keys(self) -> list[str]:
+        """Every key in ``api_key_env``, in the order they were written."""
+        return parse_env_var(self.api_key_env)
+
+    def api_key(self) -> str | None:
+        """The primary key, or None when the variable is unset or empty."""
+        keys = self.api_keys()
+        return keys[0] if keys else None
+
+    def needs_key(self) -> bool:
+        """Whether the endpoint cannot work without a key.
+
+        The hosted API bills per call. A ``base_url`` pointed anywhere else
+        is taken at its word: the owner's endpoint, which may take no auth.
+        """
+        return self.base_url.strip().rstrip("/") == "https://api.context.dev/v1"
+
+    def key_strategy_of(self) -> str:
+        """The rotation strategy, normalised. Unknown values fall back to ``fallback``."""
+        chosen = self.key_strategy.strip().lower() or "fallback"
+        if chosen in WEB_KEY_STRATEGIES:
+            return chosen
+        log.warning(
+            "unknown tools.web.contextdev.key_strategy %r; falling back to %r. Known: %s",
             self.key_strategy,
             "fallback",
             ", ".join(WEB_KEY_STRATEGIES),
@@ -740,6 +931,10 @@ class YouConfig:
         """The key, or None when the variable is unset or empty."""
         keys = parse_env_var(self.api_key_env)
         return keys[0] if keys else None
+
+    def needs_key(self) -> bool:
+        """False: ``profile=free`` is You.com's keyless tier."""
+        return False
 
     def api_keys(self) -> list[str]:
         """The single key as a list, for the doctor's uniform reporting.
@@ -846,7 +1041,7 @@ class Context7Config:
 class WebConfig:
     enabled: bool = True
     provider_order: list[str] = field(
-        default_factory=lambda: ["firecrawl", "exa", "tavily", "you", "mcp"]
+        default_factory=lambda: ["firecrawl", "exa", "tavily", "contextdev", "you", "mcp"]
     )
     #: How many hits a search returns. The ceiling is the provider's, not ours:
     #: 10 covers a hard question with room for the angles that do not pan out,
@@ -865,6 +1060,7 @@ class WebConfig:
     tavily: TavilyConfig = field(default_factory=TavilyConfig)
     firecrawl: FirecrawlConfig = field(default_factory=FirecrawlConfig)
     exa: ExaConfig = field(default_factory=ExaConfig)
+    contextdev: ContextDevConfig = field(default_factory=ContextDevConfig)
     you: YouConfig = field(default_factory=YouConfig)
     mcp: MCPConfig = field(default_factory=MCPConfig)
 
@@ -884,6 +1080,7 @@ class ToolsConfig:
             "mcp",
             "context7",
             "ocr",
+            "image_gen",
             "send",
             "skills",
         ]
@@ -894,6 +1091,7 @@ class ToolsConfig:
     web: WebConfig = field(default_factory=WebConfig)
     context7: Context7Config = field(default_factory=Context7Config)
     ocr: OCRConfig = field(default_factory=OCRConfig)
+    image_gen: ImageGenConfig = field(default_factory=ImageGenConfig)
 
     def is_enabled(self, name: str) -> bool:
         return name in self.enabled
@@ -1297,6 +1495,10 @@ def validate(config: Config) -> list[str]:
         problems.append("tools.web.providers.mcp.timeout_seconds must be a positive number of seconds")
     if problem := config.tools.ocr.endpoint_problem():
         problems.append(problem)
+    if problem := config.tools.image_gen.endpoint_problem():
+        problems.append(problem)
+    if config.tools.image_gen.timeout_seconds <= 0:
+        problems.append("tools.image_gen.timeout_seconds must be a positive number of seconds")
     # A route states what differs from [llm]; an unknown rotation strategy in
     # one is a typo worth naming, same as in the main block.
     for label, route in (("llm.vision", config.llm.vision), ("llm.ocr", config.llm.ocr)):
@@ -1358,6 +1560,7 @@ def validate(config: Config) -> list[str]:
             "mcp",
             "context7",
             "ocr",
+            "image_gen",
             "send",
             "skills",
         }:
@@ -1369,7 +1572,7 @@ def validate(config: Config) -> list[str]:
     providers = [
         p
         for p in config.tools.web.provider_order
-        if p not in {"tavily", "firecrawl", "exa", "you", "mcp"}
+        if p not in {"tavily", "firecrawl", "exa", "contextdev", "you", "mcp"}
     ]
     if providers:
         problems.append(
@@ -1398,6 +1601,11 @@ def validate(config: Config) -> list[str]:
             "tools.web.exa",
             config.tools.web.exa.enabled,
             config.tools.web.exa.key_strategy,
+        ),
+        (
+            "tools.web.contextdev",
+            config.tools.web.contextdev.enabled,
+            config.tools.web.contextdev.key_strategy,
         ),
     ):
         if enabled and strategy.strip().lower() not in WEB_KEY_STRATEGIES:

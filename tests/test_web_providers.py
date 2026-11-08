@@ -12,14 +12,21 @@ touches the network. The contract under test:
   available without a key.
 - **Exa multi-key** — same rotation rules; the provider is *not* available
   without a key; search highlights fall back to full text when missing.
+- **Context.dev** — raw httpx (no SDK): availability follows the key on the
+  hosted endpoint, an overridden base_url runs keyless, freshness maps to
+  its day buckets, highlights become the hit body, and the pool rotates.
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
-from lumi.config import ExaConfig, FirecrawlConfig, MCPConfig, TavilyConfig
+import httpx
+
+from lumi.config import ContextDevConfig, ExaConfig, FirecrawlConfig, MCPConfig, TavilyConfig
+from lumi.tools.web.providers.contextdev_provider import ContextDevProvider
 from lumi.tools.web.providers.exa_provider import ExaProvider
 from lumi.tools.web.providers.firecrawl_provider import FirecrawlProvider
 from lumi.tools.web.providers.mcp_provider import DiscoveredTool, MCPProvider
@@ -252,6 +259,55 @@ def test_firecrawl_is_available_with_a_key(monkeypatch) -> None:
     assert ok
 
 
+def test_firecrawl_self_hosted_is_available_without_a_key(monkeypatch) -> None:
+    """Firecrawl is open source: a self-hosted base_url may take no auth."""
+    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+    provider = FirecrawlProvider(FirecrawlConfig(base_url="http://localhost:9/"))
+    assert provider.available() == (True, "")
+
+
+async def test_firecrawl_keyless_search_makes_one_attempt(monkeypatch) -> None:
+    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+    provider = FirecrawlProvider(FirecrawlConfig(base_url="http://localhost:9/"))
+    fake = FakeFirecrawlClient(
+        search_reply={"web": [{"url": "https://ok", "title": "OK", "description": "d"}], "news": []}
+    )
+    provider._keyless = fake
+
+    result = await provider.search("hi", 5)
+
+    assert result.ok
+    assert len(result.hits) == 1
+    assert fake.search_calls == 1
+    assert not provider._clients  # the keyed pool was never touched
+
+
+async def test_firecrawl_keyless_fetch_shapes_the_page(monkeypatch) -> None:
+    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+    provider = FirecrawlProvider(FirecrawlConfig(base_url="http://localhost:9/"))
+    good = FakeFirecrawlClient(
+        scrape_reply={"metadata": {"title": "Hello"}, "markdown": "# body"}
+    )
+    provider._keyless = good
+
+    page = await provider.fetch("https://example.com")
+
+    assert page.title == "Hello"
+    assert "# body" in page.markdown
+    assert good.scrape_calls == 1
+
+
+async def test_firecrawl_keyless_failure_is_surfaced(monkeypatch) -> None:
+    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+    provider = FirecrawlProvider(FirecrawlConfig(base_url="http://localhost:9/"))
+    provider._keyless = FakeFirecrawlClient(search_error=RuntimeError("connection refused"))
+
+    result = await provider.search("hi", 5)
+
+    assert not result.ok
+    assert "connection refused" in result.error
+
+
 # --------------------------------------------------------------------------- #
 # Firecrawl — multi-key
 # --------------------------------------------------------------------------- #
@@ -345,6 +401,38 @@ def test_exa_is_available_with_a_key(monkeypatch) -> None:
     monkeypatch.setenv("EXA_API_KEY", "exa-91")
     provider = ExaProvider(ExaConfig())
     assert provider.available()[0]
+
+
+def test_exa_overridden_base_url_is_available_without_a_key(monkeypatch) -> None:
+    """An overridden base_url is the owner's endpoint; the key is optional there."""
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
+    provider = ExaProvider(ExaConfig(base_url="http://localhost:9/"))
+    assert provider.available() == (True, "")
+
+
+async def test_exa_keyless_search_makes_one_attempt(monkeypatch) -> None:
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
+    provider = ExaProvider(ExaConfig(base_url="http://localhost:9/"))
+    fake = FakeExaClient(search_reply={"results": [{"url": "https://ok", "text": "body"}]})
+    provider._keyless = fake
+
+    result = await provider.search("hi", 5)
+
+    assert result.ok
+    assert len(result.hits) == 1
+    assert fake.search_calls == 1
+    assert not provider._clients  # the keyed pool was never touched
+
+
+async def test_exa_keyless_failure_is_surfaced(monkeypatch) -> None:
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
+    provider = ExaProvider(ExaConfig(base_url="http://localhost:9/"))
+    provider._keyless = FakeExaClient(search_error=RuntimeError("connection refused"))
+
+    result = await provider.search("hi", 5)
+
+    assert not result.ok
+    assert "connection refused" in result.error
 
 
 # --------------------------------------------------------------------------- #
@@ -856,3 +944,211 @@ def test_mcp_fetch_fails_closed_without_a_result_url() -> None:
     assert page.url == "https://example.com"
     assert page.markdown.startswith("mcp fetch failed:")
     assert "without a final URL" in page.markdown
+
+
+# --------------------------------------------------------------------------- #
+# Context.dev — raw httpx, no SDK
+# --------------------------------------------------------------------------- #
+
+
+#: The real client class, saved before any test patches ``httpx.AsyncClient``
+#: — install_http may run several times in one test, and each patch must
+#: wrap the pristine class, not the previous test's factory.
+_REAL_ASYNC_CLIENT = httpx.AsyncClient
+
+
+def install_http(monkeypatch, respond) -> list[dict]:
+    """Route the provider's httpx calls through a MockTransport; return the
+    list the parsed JSON request bodies land in."""
+    bodies: list[dict] = []
+
+    def respond_and_record(request: httpx.Request) -> httpx.Response:
+        if request.content:
+            bodies.append(json.loads(request.content))
+        return respond(request)
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: _REAL_ASYNC_CLIENT(
+            transport=httpx.MockTransport(respond_and_record), **kwargs
+        ),
+    )
+    return bodies
+
+
+def search_response(results: list[dict]) -> httpx.Response:
+    return httpx.Response(200, json={"results": results})
+
+
+def a_hit(url: str, relevance: str = "high", highlights: list[str] | None = None) -> dict:
+    return {
+        "url": url,
+        "title": f"title of {url}",
+        "description": "a hit",
+        "relevance": relevance,
+        "highlights": {"highlights": highlights, "code": "SUCCESS"},
+        "markdown": {"markdown": None, "code": "NOT_REQUESTED"},
+    }
+
+
+def test_contextdev_is_not_available_without_a_key(monkeypatch) -> None:
+    monkeypatch.delenv("CONTEXT_DEV_API_KEY", raising=False)
+    ok, reason = ContextDevProvider(ContextDevConfig()).available()
+    assert not ok
+    assert "CONTEXT_DEV_API_KEY" in reason
+
+
+def test_contextdev_overridden_base_url_is_available_without_a_key(monkeypatch) -> None:
+    monkeypatch.delenv("CONTEXT_DEV_API_KEY", raising=False)
+    provider = ContextDevProvider(ContextDevConfig(base_url="http://localhost:9/v1"))
+    assert provider.available() == (True, "")
+
+
+async def test_contextdev_search_maps_results(monkeypatch) -> None:
+    monkeypatch.setenv("CONTEXT_DEV_API_KEY", "cd-91")
+    bodies = install_http(
+        monkeypatch,
+        lambda request: search_response(
+            [
+                a_hit("https://a.example/1", "high", ["passage one", "passage two"]),
+                a_hit("https://a.example/2", "low", None),
+            ]
+        ),
+    )
+    provider = ContextDevProvider(ContextDevConfig())
+
+    result = await provider.search("rag retrieval", 5)
+
+    assert result.ok
+    first, second = result.hits
+    assert (first.url, first.title, first.snippet) == ("https://a.example/1", "title of https://a.example/1", "a hit")
+    assert first.content == "passage one\n\npassage two"
+    assert first.score == 1.0
+    assert second.content == ""  # no highlights, markdown not requested
+    assert second.score == 0.0
+
+    (payload,) = bodies
+    assert payload["query"] == "rag retrieval"
+    assert payload["numResults"] == 5
+    assert payload["highlightsOptions"] == {"enabled": True}
+    assert "markdownOptions" not in payload  # off by default: credits
+    assert "freshness" not in payload  # days=None
+
+
+async def test_contextdev_maps_freshness_to_buckets(monkeypatch) -> None:
+    monkeypatch.setenv("CONTEXT_DEV_API_KEY", "cd-91")
+    # A bucket must fully contain the window, so 400 days has no bucket and
+    # the search goes out unfiltered rather than silently widened to a year.
+    for days, expected in ((1, "last_24_hours"), (3, "last_week"), (31, "last_month"), (400, None)):
+        bodies = install_http(monkeypatch, lambda request: search_response([]))
+        provider = ContextDevProvider(ContextDevConfig())
+
+        await provider.search("q", 5, days=days)
+
+        if expected is None:
+            assert "freshness" not in bodies[0], f"days={days}"
+        else:
+            assert bodies[0]["freshness"] == expected, f"days={days}"
+
+
+async def test_contextdev_keyless_sends_no_auth_header(monkeypatch) -> None:
+    monkeypatch.delenv("CONTEXT_DEV_API_KEY", raising=False)
+    client_kwargs: list[dict] = []
+
+    def factory(**kwargs):
+        client_kwargs.append(kwargs)
+        return _REAL_ASYNC_CLIENT(
+            transport=httpx.MockTransport(lambda request: search_response([])), **kwargs
+        )
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+    provider = ContextDevProvider(ContextDevConfig(base_url="http://localhost:9/v1"))
+
+    result = await provider.search("q", 5)
+
+    assert result.ok
+    assert "Authorization" not in (client_kwargs[0].get("headers") or {})
+
+
+async def test_contextdev_pool_rotates_on_failure(monkeypatch) -> None:
+    monkeypatch.setenv("CONTEXT_DEV_API_KEY", "cd-91, cd-92")
+    state = {"n": 0}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        state["n"] += 1
+        if state["n"] == 1:
+            return httpx.Response(500, json={"error_code": "INTERNAL_ERROR"})
+        return search_response([a_hit("https://a.example/1")])
+
+    install_http(monkeypatch, respond)
+    provider = ContextDevProvider(ContextDevConfig())
+
+    result = await provider.search("q", 5)
+
+    assert result.ok
+    assert len(result.hits) == 1
+    assert state["n"] == 2
+
+
+async def test_contextdev_fetch_scrapes_markdown(monkeypatch) -> None:
+    monkeypatch.setenv("CONTEXT_DEV_API_KEY", "cd-91")
+    bodies = install_http(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={
+                "markdown": {"requested": True, "success": True, "data": "# body"},
+                "metadata": {"title": "Hello", "url": "https://landed.example/"},
+            },
+        ),
+    )
+    provider = ContextDevProvider(ContextDevConfig())
+
+    page = await provider.fetch("https://example.com")
+
+    assert page.title == "Hello"
+    assert page.url == "https://landed.example/"  # the redirect the API followed
+    assert page.markdown == "# body"
+    assert bodies[0]["formats"] == {"markdown": True}
+
+
+async def test_contextdev_fetch_reports_a_failed_output(monkeypatch) -> None:
+    monkeypatch.setenv("CONTEXT_DEV_API_KEY", "cd-91")
+    install_http(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={
+                "markdown": {"requested": True, "success": False, "error_code": "WEBSITE_BLOCKED"},
+                "metadata": {},
+            },
+        ),
+    )
+    provider = ContextDevProvider(ContextDevConfig())
+
+    page = await provider.fetch("https://example.com")
+
+    assert page.markdown.startswith("scrape failed:")
+    assert "WEBSITE_BLOCKED" in page.markdown
+
+
+async def test_contextdev_non_json_body_rotates_instead_of_crashing(monkeypatch) -> None:
+    """A 200 with a non-JSON body is a failed attempt: the next key answers."""
+    monkeypatch.setenv("CONTEXT_DEV_API_KEY", "cd-91, cd-92")
+    state = {"n": 0}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        state["n"] += 1
+        if state["n"] == 1:
+            return httpx.Response(200, text="<html>not json</html>")
+        return search_response([a_hit("https://a.example/1")])
+
+    install_http(monkeypatch, respond)
+    provider = ContextDevProvider(ContextDevConfig())
+
+    result = await provider.search("q", 5)
+
+    assert result.ok
+    assert len(result.hits) == 1
+    assert state["n"] == 2

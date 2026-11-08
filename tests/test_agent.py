@@ -874,7 +874,7 @@ async def test_a_long_conversation_is_condensed_not_forgotten(config) -> None:
     never seen. Here the window is tiny, and what survives is the record plus
     the recent turns verbatim.
     """
-    config.llm.context_window = 4_000
+    config.llm.context_window = 4_800
     config.llm.context_headroom = 400
     config.llm.context_keep_recent = 4
     config.llm.max_tool_iterations = 1
@@ -911,7 +911,7 @@ async def test_the_window_is_not_managed_by_message_count(config) -> None:
 async def test_a_restart_replays_the_record_and_the_turns_after_it(config) -> None:
     """A condensed record is written to the transcript, so a fresh process
     resumes the thread instead of starting the conversation over."""
-    config.llm.context_window = 4_000
+    config.llm.context_window = 4_800
     config.llm.context_headroom = 400
     config.llm.context_keep_recent = 4
     config.llm.max_tool_iterations = 1

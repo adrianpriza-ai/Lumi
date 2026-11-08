@@ -10,11 +10,14 @@ Freshness: Exa supports filtering on the publish date directly. A recency
 window is sent as ``start_published_date``, so year-old pages stop outranking
 this week's news on time-sensitive queries.
 
-Like Firecrawl, Exa has no keyless tier: an unset ``EXA_API_KEY`` makes the
-provider unavailable, which the web tool surfaces honestly and falls through
-from. Several keys are supported. A comma-separated list is a rotation pool —
-the same shape ``OPENAI_API_KEY`` already uses — and a failed key is parked for a
-minute before it is retried, so a 429 that clears itself recovers without a
+Like Firecrawl, Exa's own API has no keyless tier: an unset ``EXA_API_KEY``
+makes the provider unavailable there, which the web tool surfaces honestly
+and falls through from. A ``base_url`` pointed anywhere else, though, is the
+owner's endpoint — a proxy, a compatible re-implementation — and runs
+keyless: one credential-free client, one attempt per call. Several keys are
+supported. A comma-separated list is a rotation pool — the same shape
+``OPENAI_API_KEY`` already uses — and a failed key is parked for a minute
+before it is retried, so a 429 that clears itself recovers without a
 restart. The rotation lives in :class:`lumi.llm.keypool.KeyPool`; this module
 just describes which keys are ``available`` and which client to build per key.
 """
@@ -53,11 +56,15 @@ class ExaProvider(WebProvider):
         self._pool = KeyPool(config.api_keys(), config.key_strategy_of())
         #: one ``AsyncExa`` client per key, so a parked key keeps its own session
         self._clients: dict[str, Any] = {}
+        #: one credential-free client, for an owner-run endpoint
+        self._keyless: Any = None
 
     def available(self) -> tuple[bool, str]:
         if not self.config.enabled:
             return False, "disabled in config"
-        if not self.config.api_key():
+        # Exa's own API bills per call, so it needs a key; an overridden
+        # base_url is the owner's endpoint and may take no auth at all.
+        if not self.config.api_key() and self.config.needs_key():
             return False, f"{self.config.api_key_env} is not set"
         try:
             import exa_py  # noqa: F401
@@ -76,6 +83,15 @@ class ExaProvider(WebProvider):
             log.debug("exa client created for %s", mask(key))
         return client
 
+    def _keyless_client(self) -> Any:
+        """One cached client with no credentials, for an owner-run endpoint."""
+        if self._keyless is None:
+            from exa_py import AsyncExa
+
+            self._keyless = AsyncExa(api_key="", api_base=self.config.base_url)
+            log.debug("exa keyless client created for %s", self.config.base_url)
+        return self._keyless
+
     # -- public surface ---------------------------------------------------- #
 
     async def search(
@@ -83,13 +99,28 @@ class ExaProvider(WebProvider):
     ) -> SearchResult:
         """Search via Exa, retrying the pool on failure.
 
-        No keyless tier: ``available()`` guarantees at least one key exists,
-        but stay defensive about an empty pool — a single-attempt failure is
-        friendlier than a None-crash.
+        Keyless mode (owner-run endpoint) makes a single attempt, the same
+        shape Tavily's keyless tier takes. Keyed mode still guards an empty
+        pool defensively — a single-attempt failure is friendlier than a
+        None-crash.
         """
         result = SearchResult(query=query, provider=self.name)
         if not self._pool:
-            result.error = f"{self.config.api_key_env} is not set"
+            try:
+                raw = await self._keyless_client().search(
+                    query,
+                    num_results=max_results,
+                    type=self.config.search_type,
+                    category=self.config.category or None,
+                    contents={"text": True},
+                    start_published_date=recent_cutoff(days) if days else None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("keyless exa search failed: %s", exc)
+                result.error = f"{type(exc).__name__}: {exc}"
+                return result
+            self._populate(raw, result)
+            log.info("keyless exa returned %d result(s) for %r", len(result.hits), query)
             return result
 
         tried: list[str] = []
@@ -123,7 +154,13 @@ class ExaProvider(WebProvider):
     async def fetch(self, url: str) -> Page:
         """Read one page as text via ``get_contents``, retrying the pool."""
         if not self._pool:
-            return Page(url=url, markdown=f"{self.config.api_key_env} is not set")
+            # Keyless mode: single attempt, no rotation.
+            try:
+                raw = await self._keyless_client().get_contents([url], text=True)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("keyless exa fetch failed for %s: %s", url, exc)
+                return Page(url=url, markdown=f"fetch failed: {type(exc).__name__}: {exc}")
+            return self._page_from(raw, url)
 
         tried: list[str] = []
         last_error = ""

@@ -199,15 +199,28 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
         checks.append(Check("ocr", FAIL, problem))
     elif ocr_cfg.provider_of():
         ocr_key = ocr_cfg.api_key()
-        checks.append(
-            Check(
-                "ocr",
-                OK if ocr_key else WARN,
-                f"{ocr_cfg.model} via {ocr_cfg.base_url} ({ocr_cfg.api_key_env})"
-                if ocr_key
-                else f"{ocr_cfg.api_key_env} unset; the ocr tool is unavailable (no automatic fallback)",
+        if ocr_key:
+            detail = f"{ocr_cfg.model} via {ocr_cfg.base_url} ({ocr_cfg.api_key_env})"
+            checks.append(Check("ocr", OK, detail))
+        elif ocr_cfg.needs_key():
+            checks.append(
+                Check(
+                    "ocr",
+                    WARN,
+                    f"{ocr_cfg.api_key_env} unset; the ocr tool is unavailable (no automatic fallback)",
+                )
             )
-        )
+        else:
+            # A keyless custom endpoint is a real configuration: self-hosted,
+            # on the LAN, no auth. Running, not misconfigured.
+            checks.append(
+                Check(
+                    "ocr",
+                    OK,
+                    f"{ocr_cfg.model} via {ocr_cfg.base_url} (keyless; set "
+                    f"{ocr_cfg.api_key_env} if the endpoint needs a key)",
+                )
+            )
     elif config.tools.is_enabled("ocr"):
         checks.append(
             Check(
@@ -215,6 +228,31 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
                 OK,
                 f"local path (embedded text + {config.llm.ocr_model_of()} for scans); "
                 'set [tools.ocr] provider = "mistral" for a dedicated OCR API',
+            )
+        )
+
+    img_cfg = config.tools.image_gen
+    if not config.tools.is_enabled("image_gen") or not img_cfg.enabled:
+        checks.append(Check("image_gen", WARN, "disabled in config"))
+    elif problem := img_cfg.endpoint_problem():
+        checks.append(Check("image_gen", FAIL, problem))
+    elif img_cfg.api_key():
+        checks.append(Check("image_gen", OK, f"{img_cfg.model} via {img_cfg.base_url} ({img_cfg.api_key_env})"))
+    elif img_cfg.needs_key():
+        checks.append(
+            Check(
+                "image_gen",
+                WARN,
+                f"{img_cfg.api_key_env} unset; the image_gen tool is unavailable",
+            )
+        )
+    else:
+        checks.append(
+            Check(
+                "image_gen",
+                OK,
+                f"{img_cfg.model} via {img_cfg.base_url} (keyless; set "
+                f"{img_cfg.api_key_env} if the endpoint needs a key)",
             )
         )
 
@@ -234,14 +272,18 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
     )
 
     # -- web providers ----------------------------------------------------- #
-    # Tavily and You.com have keyless tiers (they stay available without a
-    # key); Firecrawl and Exa do not — an unset key means the provider is
-    # skipped. Each provider also takes a key pool, so the doctor reports the
-    # strategy when more than one key is configured.
+    # Every provider config answers needs_key(): False for the keyless tiers
+    # (Tavily free, You.com free) and for a base_url overridden away from the
+    # hosted default (self-hosted Firecrawl, an Exa or Context.dev proxy) —
+    # those run fine without a key. The hosted endpoints bill per call, so an
+    # unset key means that provider is skipped. Each provider also takes a
+    # key pool, so the doctor reports the strategy when more than one key is
+    # configured.
     for provider_name, cfg in (
         ("tavily", config.tools.web.tavily),
         ("firecrawl", config.tools.web.firecrawl),
         ("exa", config.tools.web.exa),
+        ("contextdev", config.tools.web.contextdev),
         ("you", config.tools.web.you),
     ):
         if not cfg.enabled:
@@ -250,12 +292,12 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
 
         keys = cfg.api_keys()
         if not keys:
-            if provider_name in {"tavily", "you"}:
+            if not cfg.needs_key():
                 checks.append(
                     Check(
                         cfg.api_key_env,
                         OK,
-                        f"unset — using {provider_name}'s keyless tier (free, low rate limit)",
+                        f"unset — {provider_name} runs keyless",
                     )
                 )
             else:

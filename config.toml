@@ -78,7 +78,7 @@ show_reasoning = true
 
 [tools]
 # Remove a tool from this list to disable it everywhere.
-enabled = ["shell", "files", "read_file", "list_files", "grep", "memory", "more_context", "web", "mcp", "context7", "ocr", "send", "skills"]
+enabled = ["shell", "files", "read_file", "list_files", "grep", "memory", "more_context", "web", "mcp", "context7", "ocr", "image_gen", "send", "skills"]
 
 [tools.shell]
 enabled = true
@@ -116,7 +116,7 @@ auto_remember = true
 [tools.web]
 enabled = true
 # Providers tried in order; the first available one answers.
-provider_order = ["firecrawl", "exa", "tavily", "you", "mcp"]
+provider_order = ["firecrawl", "exa", "tavily", "contextdev", "you", "mcp"]
 # Hits per search. 0 = whatever the model asks for.
 max_results = 10
 # Top up from the next provider below this many hits.
@@ -140,22 +140,42 @@ key_strategy = "fallback"
 [tools.web.providers.firecrawl]
 enabled = true
 api_key_env = "FIRECRAWL_API_KEY"
+# The hosted API needs a key. Point base_url at a self-hosted instance and
+# it runs keyless (Firecrawl is open source).
 base_url = "https://api.firecrawl.dev"
 only_main_content = true
 # Scrape this many hits when results lack body text.
 auto_scrape_top_n = 3
-# fallback | round_robin | random. No keyless tier.
+# fallback | round_robin | random.
 key_strategy = "fallback"
 
 [tools.web.providers.exa]
 enabled = true
 api_key_env = "EXA_API_KEY"
+# The hosted API needs a key. An overridden base_url (your own endpoint or
+# proxy) runs keyless.
 base_url = "https://api.exa.ai"
 # auto | neural | keyword
 search_type = "auto"
 # Optional category filter, e.g. news, github, paper.
 category = ""
-# fallback | round_robin | random. No keyless tier.
+# fallback | round_robin | random.
+key_strategy = "fallback"
+
+[tools.web.providers.contextdev]
+enabled = true
+# Search built for AI agents: relevance-ranked hits with highlight passages.
+# The hosted API has a free tier (1,000 credits/month) but needs a key;
+# an overridden base_url (your own endpoint) runs keyless.
+api_key_env = "CONTEXT_DEV_API_KEY"
+base_url = "https://api.context.dev/v1"
+# Query-relevant passages per hit (+1 credit per 10 results).
+highlights = true
+# Full-page markdown per hit (+1 credit per page). Off: the firecrawl
+# top-up covers thin hits more cheaply.
+include_markdown = false
+timeout_seconds = 90
+# fallback | round_robin | random.
 key_strategy = "fallback"
 
 [tools.web.providers.you]
@@ -187,6 +207,23 @@ base_url = "https://context7.com/api/v2"
 timeout_seconds = 30
 # fallback | round_robin | random
 key_strategy = "fallback"
+
+[tools.image_gen]
+# Text-to-image over the OpenAI Images wire format (POST /images/generations).
+# With provider = "openai" the tool hides itself from the model until
+# OPENAI_API_KEY is set. provider = "custom" may run keyless (self-hosted).
+enabled = true
+# "openai" (hosted) or "custom" (any compatible endpoint, needs base_url).
+provider = "openai"
+base_url = "https://api.openai.com/v1"
+model = "gpt-image-1"
+api_key_env = "OPENAI_API_KEY"
+# Default image size, WIDTHxHEIGHT. Empty or "auto" = provider default.
+size = "1024x1024"
+# Where generated images land, relative to the project root.
+output_dir = "workspace/images"
+# Image generation is slow; minutes on some providers.
+timeout_seconds = 300
 
 [logging]
 level = "INFO"

@@ -12,6 +12,7 @@
 | `memory` | Remember and recall, scoped to the chat it is used in; forgetting is human-only by design |
 | `more_context` | Up to 10 messages of room chatter the bot never answered (`offset` ≤ 9, ~30k-token cap), dropped media included with its saved path |
 | `ocr` | Extract text from PDFs, scans, and document images |
+| `image_gen` | Generate an image from a text prompt (OpenAI Images wire format); the file lands in `workspace/images/` and is sent to the chat |
 | `web` | Search and fetch, across three interchangeable providers |
 | `mcp` | Call any tool an MCP server exposes (`.mcp.json`) — Linear, GitHub, Hugging Face: `list` the servers, `call` a tool, owner approval before each call |
 | `context7` | Up-to-date library docs from https://context7.com; auto-enables on `CONTEXT7_API_KEY` |
@@ -127,6 +128,40 @@ The committed configuration enables the tool. Remove `"ocr"` from
 `tools.ocr.provider = "mistral"` for the
 dedicated API path. With no provider, local PDF extraction needs `pypdfium2`
 and only scanned pages use the configured model.
+
+## Image generation (`image_gen`)
+
+The `image_gen` tool turns a text prompt into an image over the OpenAI Images
+wire format (`POST /images/generations`). Like `ocr`, the client is not the
+chat model: a prompt goes in, image bytes come back, and any compatible
+endpoint works by pointing `tools.image_gen.base_url` at it.
+
+- the image is saved under `tools.image_gen.output_dir`
+  (`workspace/images/` by default) — a normal project file the model can
+  read, rename or process afterwards;
+- it is delivered to the chat as an artifact, the same file-delivery path
+  `files` uploads use;
+- `provider = "openai"` uses OpenAI's hosted API; `provider = "custom"` needs
+  its own `base_url` (validate refuses a custom provider still pointing at
+  the OpenAI default — that is a typo);
+- both `data[0].b64_json` and `data[0].url` answers are accepted, so models
+  that host the result (dall-e-3's default) work unchanged;
+- availability follows the endpoint, not just the key: the hosted provider
+  bills per call, so with `api_key_env` unset the tool registers but
+  `available()` reports false and the model never sees it; a `custom`
+  endpoint may be self-hosted and take no auth, in which case the tool runs
+  keyless and sends no `Authorization` header at all.
+
+```toml
+[tools.image_gen]
+provider = "openai"          # or "custom" + base_url = "https://…/v1"
+model = "gpt-image-1"
+api_key_env = "OPENAI_API_KEY"
+size = "1024x1024"           # default size; "auto" = provider default
+```
+
+The committed configuration enables the tool. Remove `"image_gen"` from
+`tools.enabled` or set `tools.image_gen.enabled = false` to disable it.
 
 ## Editing files
 
@@ -329,9 +364,10 @@ the guardrails assume about the machine they run on is written down in
 provider_order = ["firecrawl", "exa", "tavily", "you", "mcp"]
 ```
 
-- **firecrawl** — best for reading a specific page. Renders JavaScript, returns clean markdown. No keyless tier — a `FIRECRAWL_API_KEY` is required, but a comma-separated pool with the same three strategies (`tools.web.firecrawl.key_strategy`) keeps the bot up when one key is rate-limited.
-- **exa** — neural search built for agents: natural-language queries in, semantically ranked pages out, with highlights or full text per hit. Needs an `EXA_API_KEY` (no keyless tier); same rotation rules as the others (`tools.web.exa.key_strategy`). Optional `search_type` (`auto` / `neural` / `keyword`) and `category` (`news`, `github`, `paper`, `pdf`, ...) knobs in `[tools.web.providers.exa]`.
+- **firecrawl** — best for reading a specific page. Renders JavaScript, returns clean markdown. The hosted API needs a `FIRECRAWL_API_KEY`; point `base_url` at a self-hosted instance (Firecrawl is open source) and it runs keyless. A comma-separated key pool with the same three strategies (`tools.web.firecrawl.key_strategy`) keeps the bot up when one key is rate-limited.
+- **exa** — neural search built for agents: natural-language queries in, semantically ranked pages out, with highlights or full text per hit. The hosted API needs an `EXA_API_KEY`; an overridden `base_url` (your own endpoint or proxy) runs keyless. Same rotation rules as the others (`tools.web.exa.key_strategy`). Optional `search_type` (`auto` / `neural` / `keyword`) and `category` (`news`, `github`, `paper`, `pdf`, ...) knobs in `[tools.web.providers.exa]`.
 - **tavily** — best for agentic search. LLM-ready snippets, optional bundled answer. **Works without an API key** — the SDK runs in its free tier (low rate limit; `search` and `extract` only) when `TAVILY_API_KEY` is unset. With one or more keys, a failed key is parked for a minute and the next one answers; `tools.web.tavily.key_strategy` picks `fallback` / `round_robin` / `random`.
+- **contextdev** — [Context.dev](https://context.dev) search built for AI agents: relevance-ranked hits with query-relevant highlight passages (`highlights = true`, +1 credit per 10 results) and optional per-hit page markdown (`include_markdown`, +1 credit per page). The hosted API has a free tier (1,000 credits/month) but needs a `CONTEXT_DEV_API_KEY`; an overridden `base_url` runs keyless. Speaks the REST API directly over httpx — no SDK dependency. Same rotation rules as the others (`tools.web.contextdev.key_strategy`).
 - **you** — You.com's hosted MCP endpoint, `https://api.you.com/mcp?profile=free`. **Keyless by design**: no account and no API key, so a fresh clone still has a working search (low rate limit). A `YOU_API_KEY`, when set, is sent as an `X-API-Key` header. Disable it with `enabled = false` in `[tools.web.providers.you]`.
 - **mcp** — reads `.mcp.json` from the project root and `~/.agents/mcp.json` (for servers configured once for every project; the project file wins on a duplicate server name, and `tools.web.providers.mcp.user_config_file = ""` turns the user file off), expands `${VAR}` from the environment, and speaks MCP over streamable HTTP or stdio. It discovers each server's tools and reads their input schemas, so it works with a server whose parameter is called `q` instead of `query`. It only ever calls a tool that looks like a search or a page read — the server's *other* tools belong to the [`mcp` tool](#mcp-action-surface) below. A project-file entry connects only after the owner approved it (see [MCP (action surface)](#mcp-action-surface)); unapproved servers are skipped, so a search never dials one.
 

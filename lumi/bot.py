@@ -1204,6 +1204,8 @@ STEP_LABELS = {
     "memory": "📌 Memory",
     "more_context": "🕒 More Context",
     "context7": "📚 Context7",
+    "ocr": "📄 OCR",
+    "image_gen": "🎨 Image Gen",
     "send": "✉️ Send",
     "skills": "🧩 Skills",
 }

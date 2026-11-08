@@ -195,6 +195,7 @@ def test_defaults_apply_with_no_config_file(project) -> None:
         "mcp",
         "context7",
         "ocr",
+        "image_gen",
         "send",
         "skills",
     ]

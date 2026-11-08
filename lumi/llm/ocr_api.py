@@ -100,16 +100,22 @@ class OCRDocumentClient:
             raise LLMError("no document to OCR")
 
         key = self.config.api_key()
-        if not key:
+        # A key is mandatory only where the config says the endpoint cannot
+        # work without one (the hosted API). A keyless custom endpoint is a
+        # real configuration — a LAN server, a local queue — so no header
+        # rather than a refusal; if that endpoint does want auth, its own 401
+        # names the problem better than a guess here.
+        if not key and self.config.needs_key():
             raise LLMError(
                 f"{self.config.api_key_env} is not set — the OCR endpoint needs it in .env."
             )
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
 
         payload = {"model": self.config.model, "document": document}
         try:
             async with httpx.AsyncClient(
                 timeout=self.config.timeout_seconds,
-                headers={"Authorization": f"Bearer {key}"},
+                headers=headers,
             ) as http:
                 response = await http.post(endpoint, json=payload)
         except httpx.HTTPError as exc:

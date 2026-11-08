@@ -400,6 +400,49 @@ async def test_the_tool_is_unavailable_without_the_provider_key(config, monkeypa
     assert "MISTRAL_API_KEY" in reason
 
 
+async def test_a_custom_endpoint_without_key_is_available(config, monkeypatch) -> None:
+    """A self-hosted endpoint may take no auth; keyless is a real configuration."""
+    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    config.tools.ocr.provider = "custom"
+    config.tools.ocr.base_url = "http://localhost:8787/v1"
+    assert OCRTool(config).available() == (True, "")
+
+
+async def test_a_keyless_custom_endpoint_sends_no_auth_header(config, monkeypatch) -> None:
+    captured: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = "{}"
+
+        def json(self):
+            return {"pages": [{"page_number": 1, "markdown": "# Hi"}]}
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            captured["headers"] = kwargs.get("headers")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, *, json):
+            return FakeResponse()
+
+    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+    client = OCRDocumentClient(
+        OCRConfig(provider="custom", base_url="http://localhost:8787/v1")
+    )
+
+    pages = await client.ocr(document_b64="JVBERg==")
+
+    assert pages == [(1, "# Hi")]
+    assert "Authorization" not in (captured["headers"] or {})
+
+
 def test_the_ocr_enabled_flag_is_honoured(config) -> None:
     config.tools.ocr.enabled = False
     ok, reason = OCRTool(config).available()

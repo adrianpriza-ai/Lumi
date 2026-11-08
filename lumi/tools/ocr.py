@@ -128,7 +128,9 @@ class OCRTool(Tool):
             return False, "disabled by tools.ocr.enabled"
         if problem := ocr.endpoint_problem():
             return False, problem
-        if ocr.provider_of() and not ocr.api_key():
+        # The hosted API bills per call, so it needs a key; a custom endpoint
+        # may be self-hosted and keyless, and that is a usable configuration.
+        if ocr.needs_key() and not ocr.api_key():
             return False, f"{ocr.api_key_env} is unset (needed by tools.ocr.provider)"
         return True, ""
 

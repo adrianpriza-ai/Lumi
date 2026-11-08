@@ -8,8 +8,10 @@ provider tops up the top hits with a scrape when the snippets come back empty.
 Several keys are supported. A comma-separated list is a rotation pool — the
 same shape ``OPENAI_API_KEY`` already uses — and a failed key is parked for a
 minute before it is retried, so a 429 that clears itself recovers without a
-restart. Firecrawl does not offer a keyless tier; an unset env var makes the
-provider unavailable, which the web tool surfaces honestly to the model.
+restart. Firecrawl's hosted API has no keyless tier, so an unset env var makes
+the provider unavailable there — but the service is open source and
+self-hostable, so a ``base_url`` pointed anywhere else runs keyless: one
+client with no credentials, one attempt per call.
 """
 
 from __future__ import annotations
@@ -48,11 +50,15 @@ class FirecrawlProvider(WebProvider):
         self._pool = KeyPool(config.api_keys(), config.key_strategy_of())
         #: one ``AsyncFirecrawl`` client per key, so a parked key keeps its own session
         self._clients: dict[str, Any] = {}
+        #: one credential-free client, for a self-hosted endpoint
+        self._keyless: Any = None
 
     def available(self) -> tuple[bool, str]:
         if not self.config.enabled:
             return False, "disabled in config"
-        if not self.config.api_key():
+        # The hosted API bills per call, so it needs a key; an overridden
+        # base_url is the owner's endpoint and may take no auth at all.
+        if not self.config.api_key() and self.config.needs_key():
             return False, f"{self.config.api_key_env} is not set"
         try:
             import firecrawl  # noqa: F401
@@ -71,6 +77,15 @@ class FirecrawlProvider(WebProvider):
             log.debug("firecrawl client created for %s", mask(key))
         return client
 
+    def _keyless_client(self) -> Any:
+        """One cached client with no credentials, for a self-hosted endpoint."""
+        if self._keyless is None:
+            from firecrawl import AsyncFirecrawl
+
+            self._keyless = AsyncFirecrawl(api_key="", api_url=self.config.base_url)
+            log.debug("firecrawl keyless client created for %s", self.config.base_url)
+        return self._keyless
+
     # -- public surface ---------------------------------------------------- #
 
     async def search(
@@ -78,13 +93,26 @@ class FirecrawlProvider(WebProvider):
     ) -> SearchResult:
         """Search via Firecrawl, retrying the pool on failure.
 
-        Unlike Tavily there is no keyless tier: the ``available()`` check
-        guarantees at least one key exists. Still defensive about it — an
-        empty pool is a single-attempt call rather than a None-crash.
+        Keyless mode (self-hosted endpoint) makes a single attempt, the same
+        shape Tavily's keyless tier takes. Keyed mode still guards an empty
+        pool defensively — a single-attempt call rather than a None-crash.
         """
         result = SearchResult(query=query, provider=self.name)
         if not self._pool:
-            result.error = f"{self.config.api_key_env} is not set"
+            try:
+                raw = await self._keyless_client().search(
+                    query,
+                    limit=max_results,
+                    tbs=_tbs(days),
+                    scrape_options={"formats": ["markdown"]},
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("keyless firecrawl search failed: %s", exc)
+                result.error = f"{type(exc).__name__}: {exc}"
+                return result
+            self._populate_search(raw, result)
+            await self._top_up(result)
+            log.info("keyless firecrawl returned %d result(s) for %r", len(result.hits), query)
             return result
 
         tried: list[str] = []
@@ -127,7 +155,15 @@ class FirecrawlProvider(WebProvider):
     async def fetch(self, url: str) -> Page:
         """Scrape one page as markdown, retrying the pool on failure."""
         if not self._pool:
-            return Page(url=url, markdown=f"{self.config.api_key_env} is not set")
+            # Keyless mode: single attempt, no rotation.
+            try:
+                doc = await self._keyless_client().scrape(
+                    url, formats=["markdown"], only_main_content=self.config.only_main_content
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.warning("keyless firecrawl scrape failed for %s: %s", url, exc)
+                return Page(url=url, markdown=f"scrape failed: {type(exc).__name__}: {exc}")
+            return self._scrape_page(doc, url)
 
         tried: list[str] = []
         last_error = ""
@@ -145,24 +181,28 @@ class FirecrawlProvider(WebProvider):
                 continue
 
             self._pool.report(key, ok=True)
-            data = _as_dict(doc)
-            metadata = _as_dict(data.get("metadata"))
-            return Page(
-                # Firecrawl followed the redirects wherever they went; its
-                # metadata names the page it actually landed on, which is what
-                # the tool layer re-checks against the private-host rules
-                # (finding E).
-                url=final_url(
-                    metadata.get("url"), metadata.get("sourceURL"), metadata.get("pageUrl"),
-                    requested=url,
-                ),
-                title=str(metadata.get("title") or metadata.get("ogTitle") or ""),
-                markdown=str(data.get("markdown") or "(no content)"),
-            )
+            return self._scrape_page(doc, url)
 
         return Page(url=url, markdown=last_error or "every firecrawl key failed")
 
     # -- per-key helpers --------------------------------------------------- #
+
+    def _scrape_page(self, doc: Any, url: str) -> Page:
+        """Shape one ``scrape`` response, from either the keyed or keyless path."""
+        data = _as_dict(doc)
+        metadata = _as_dict(data.get("metadata"))
+        return Page(
+            # Firecrawl followed the redirects wherever they went; its
+            # metadata names the page it actually landed on, which is what
+            # the tool layer re-checks against the private-host rules
+            # (finding E).
+            url=final_url(
+                metadata.get("url"), metadata.get("sourceURL"), metadata.get("pageUrl"),
+                requested=url,
+            ),
+            title=str(metadata.get("title") or metadata.get("ogTitle") or ""),
+            markdown=str(data.get("markdown") or "(no content)"),
+        )
 
     def _scrape_client(self, url: str) -> Any:
         """Pick any healthy client for the top-up scrape (no rotation)."""
@@ -173,8 +213,8 @@ class FirecrawlProvider(WebProvider):
             key = self._pool.pick()
             if key is not None:
                 return self._get_client(key)
-        # Fall back to the primary key (or whatever the SDK accepts).
-        return self._get_client(self.config.api_key() or "")
+        # Keyless endpoint: the credential-free client.
+        return self._keyless_client()
 
     def _populate_search(self, raw: Any, result: SearchResult) -> None:
         data = _as_dict(raw)

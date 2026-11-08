@@ -3135,7 +3135,7 @@ async def test_config_shows_the_resolved_settings(config) -> None:
     bot, _ = await send(config, [], "/config")
     body = texts(bot)
     assert "test-model" in body
-    assert "firecrawl → exa → tavily → you → mcp" in body
+    assert "firecrawl → exa → tavily → contextdev → you → mcp" in body
     assert "group mode: mention" in body
     assert "workspace" in body
 

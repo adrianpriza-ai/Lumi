@@ -19,6 +19,7 @@ from .base import NeedsApproval, Tool, ToolContext, ToolError, ToolResult
 from .context7 import Context7Tool
 from .explore import GrepTool, ListFilesTool, ReadFileTool
 from .files import FilesTool
+from .imagegen import ImageGenTool
 from .mcp_tool import MCPTool
 from .memory_tool import MemoryTool
 from .more_context import MoreContextTool
@@ -55,6 +56,7 @@ def build_registry(config: Config, memory: MemoryStore) -> ToolRegistry:
         "mcp": lambda: MCPTool(config),
         "context7": lambda: Context7Tool(config),
         "ocr": lambda: OCRTool(config),
+        "image_gen": lambda: ImageGenTool(config),
         "send": lambda: SendTool(config),
         "skills": lambda: SkillsTool(config),
     }
@@ -95,6 +97,7 @@ __all__ = [
     "MCPTool",
     "Context7Tool",
     "OCRTool",
+    "ImageGenTool",
     "SendTool",
     "SkillsTool",
     "build_registry",

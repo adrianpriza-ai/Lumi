@@ -17,6 +17,7 @@ from ...util.net import validate_fetch_url
 from ...util.text import fence_untrusted, truncate
 from ..base import Tool, ToolContext, ToolError, ToolResult
 from .providers.base import Page, SearchResult, WebProvider
+from .providers.contextdev_provider import ContextDevProvider
 from .providers.exa_provider import ExaProvider
 from .providers.firecrawl_provider import FirecrawlProvider
 from .providers.mcp_provider import MCPProvider
@@ -45,6 +46,8 @@ def build_providers(config: Config) -> dict[str, WebProvider]:
                 built[name] = FirecrawlProvider(web.firecrawl)
             elif name == "exa":
                 built[name] = ExaProvider(web.exa)
+            elif name == "contextdev":
+                built[name] = ContextDevProvider(web.contextdev)
             elif name == "you":
                 built[name] = YouProvider(web.you, config.root)
             elif name == "mcp":
