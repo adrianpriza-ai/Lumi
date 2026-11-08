@@ -706,9 +706,12 @@ def _is_addressed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
             snippet = _entity_text(text, entity).lower().lstrip("@")
             if snippet == bot_username:
                 return True
-        elif entity.type == MessageEntity.TEXT_MENTION and entity.user is not None:
-            if (entity.user.username or "").lower() == bot_username:
-                return True
+        elif (
+            entity.type == MessageEntity.TEXT_MENTION
+            and entity.user is not None
+            and (entity.user.username or "").lower() == bot_username
+        ):
+            return True
 
     return False
 
