@@ -125,6 +125,12 @@ class ImageGenTool(Tool):
                 False,
                 f"{self._settings.api_key_env} is unset (needed by tools.image_gen.provider)",
             )
+        # The wire client imports httpx inside the request, so without this
+        # check a missing module surfaced only as a failure on every prompt.
+        try:
+            import httpx  # noqa: F401
+        except ImportError:
+            return False, "httpx is not installed; tools.image_gen needs it"
         return True, ""
 
     # -- dispatch ---------------------------------------------------------- #

@@ -1785,7 +1785,7 @@ def build_handlers(config: Config) -> list[Any]:
             f"tools: {escape_html(', '.join(agent.registry.names())) or 'none'}",
         ]
         for tool in agent.registry.all():
-            ok, reason = tool.available()
+            ok, reason = agent.registry.availability(tool)
             if not ok:
                 lines.append(f"- <code>{tool.name}</code>: {escape_html(reason)}")
         await reply(update, "\n".join(lines))

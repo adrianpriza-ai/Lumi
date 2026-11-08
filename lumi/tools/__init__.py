@@ -45,7 +45,7 @@ def build_registry(config: Config, memory: MemoryStore) -> ToolRegistry:
     """
     registry = ToolRegistry()
     candidates = {
-        "shell": lambda: ShellTool(config),
+        "run_shell": lambda: ShellTool(config),
         "files": lambda: FilesTool(config),
         "read_file": lambda: ReadFileTool(config),
         "list_files": lambda: ListFilesTool(config),
@@ -67,13 +67,17 @@ def build_registry(config: Config, memory: MemoryStore) -> ToolRegistry:
             continue
         try:
             tool = factory()
+            # Registration validates the definition (a name, a description),
+            # and that validation is as fallible as construction: an invalid
+            # third-party tool must be skipped, not take the registry — and
+            # with it the bot — down at startup.
+            registry.register(tool)
         except Exception as exc:  # noqa: BLE001 - one bad tool must not stop the bot
             log.exception("could not build tool %r: %s", name, exc)
             continue
-        ok, reason = tool.available()
+        ok, reason = registry.availability(tool)
         if not ok:
             log.warning("tool %r registered but unavailable: %s", name, reason)
-        registry.register(tool)
 
     log.info("registry ready with %d tool(s): %s", len(registry), ", ".join(registry.names()))
     return registry

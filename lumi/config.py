@@ -1065,11 +1065,22 @@ class WebConfig:
     mcp: MCPConfig = field(default_factory=MCPConfig)
 
 
+#: ``tools.enabled`` spellings that still mean a registered tool. ``shell``
+#: was the key before the tool was reachable as ``run_shell``; a config written
+#: against either name keeps working.
+TOOL_ALIASES = {"shell": "run_shell"}
+
+
+def canonical_tool_name(name: str) -> str:
+    """The registered tool a ``tools.enabled`` entry refers to."""
+    return TOOL_ALIASES.get(name, name)
+
+
 @dataclass(slots=True)
 class ToolsConfig:
     enabled: list[str] = field(
         default_factory=lambda: [
-            "shell",
+            "run_shell",
             "files",
             "read_file",
             "list_files",
@@ -1094,7 +1105,8 @@ class ToolsConfig:
     image_gen: ImageGenConfig = field(default_factory=ImageGenConfig)
 
     def is_enabled(self, name: str) -> bool:
-        return name in self.enabled
+        wanted = canonical_tool_name(name)
+        return any(canonical_tool_name(entry) == wanted for entry in self.enabled)
 
 
 @dataclass(slots=True)
@@ -1550,8 +1562,8 @@ def validate(config: Config) -> list[str]:
     # one-time seed, reported by `lumi doctor` at most.
 
     for name in config.tools.enabled:
-        if name not in {
-            "shell",
+        if canonical_tool_name(name) not in {
+            "run_shell",
             "files",
             "read_file",
             "list_files",

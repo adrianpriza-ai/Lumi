@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import importlib
 import platform
-import shutil
 import sys
 from dataclasses import dataclass
 
@@ -18,6 +17,7 @@ from .config import Config
 from .paths import relative_to_root, ui_binary
 from .tools import safety
 from .tools.registry import ToolRegistry
+from .tools.shell import shell_binary
 from .util.log import get_logger
 from .util.text import format_error
 
@@ -270,10 +270,14 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
         )
 
     # -- shell ------------------------------------------------------------- #
-    shell_ok = shutil.which("bash") or shutil.which("sh")
+    # The same value the run_shell tool gates on: when this is missing, the
+    # tool is deactivated rather than offered and failing per call.
+    shell_ok = shell_binary()
     checks.append(
         Check(
-            "shell", OK if shell_ok else WARN, shell_ok or "no bash/sh on PATH; commands may fail"
+            "shell",
+            OK if shell_ok else WARN,
+            shell_ok or "no bash/sh on PATH; the run_shell tool is unavailable",
         )
     )
     checks.append(Check("shell policy", OK, safety.describe_policy()))
@@ -378,7 +382,7 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
     # -- tools ------------------------------------------------------------- #
     if registry is not None:
         for tool in registry.all():
-            ok, reason = tool.available()
+            ok, reason = registry.availability(tool)
             checks.append(
                 Check(f"tool {tool.name}", OK if ok else WARN, reason or tool.summary_line())
             )
@@ -389,7 +393,7 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
 
             built = build_registry(config, config.build_memory_store())
             for tool in built.all():
-                ok, reason = tool.available()
+                ok, reason = built.availability(tool)
                 checks.append(
                     Check(f"tool {tool.name}", OK if ok else WARN, reason or tool.summary_line())
                 )

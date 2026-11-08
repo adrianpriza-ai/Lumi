@@ -1009,6 +1009,34 @@ def test_contextdev_overridden_base_url_is_available_without_a_key(monkeypatch) 
     assert provider.available() == (True, "")
 
 
+def test_contextdev_imports_httpx_lazily() -> None:
+    """This provider is in the web tool's fixed import graph: a module-level
+    httpx import would turn a missing package into a startup crash for the
+    whole bot instead of one provider switching itself off."""
+    from lumi.tools.web.providers import contextdev_provider as provider_module
+
+    assert "httpx" not in vars(provider_module)
+
+
+def test_contextdev_is_unavailable_without_httpx(monkeypatch) -> None:
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_httpx(name, *args, **kwargs):
+        if name == "httpx":
+            raise ImportError("No module named 'httpx'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setenv("CONTEXT_DEV_API_KEY", "cd-91")
+    monkeypatch.setattr(builtins, "__import__", no_httpx)
+
+    ok, reason = ContextDevProvider(ContextDevConfig()).available()
+
+    assert not ok
+    assert "httpx" in reason
+
+
 async def test_contextdev_search_maps_results(monkeypatch) -> None:
     monkeypatch.setenv("CONTEXT_DEV_API_KEY", "cd-91")
     bodies = install_http(

@@ -78,7 +78,7 @@ show_reasoning = true
 
 [tools]
 # Remove a tool from this list to disable it everywhere.
-enabled = ["shell", "files", "read_file", "list_files", "grep", "memory", "more_context", "web", "mcp", "context7", "ocr", "image_gen", "send", "skills"]
+enabled = ["run_shell", "files", "read_file", "list_files", "grep", "memory", "more_context", "web", "mcp", "context7", "ocr", "image_gen", "send", "skills"]
 
 [tools.shell]
 enabled = true

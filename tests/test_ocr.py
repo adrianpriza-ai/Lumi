@@ -416,6 +416,73 @@ async def test_a_custom_endpoint_without_key_is_available(config, monkeypatch) -
     assert OCRTool(config).available() == (True, "")
 
 
+def test_the_provider_route_is_unavailable_without_httpx(config, monkeypatch) -> None:
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_httpx(name, *args, **kwargs):
+        if name == "httpx":
+            raise ImportError("No module named 'httpx'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setenv("MISTRAL_API_KEY", "mk-1")
+    monkeypatch.setattr(builtins, "__import__", no_httpx)
+    config.tools.ocr.provider = "mistral"
+
+    ok, reason = OCRTool(config).available()
+
+    assert not ok
+    assert "httpx" in reason
+
+
+@pytest.mark.parametrize(
+    ("blocked", "package"),
+    [("pypdfium2", "pypdfium2"), ("PIL", "Pillow")],
+)
+def test_the_local_path_is_unavailable_without_its_libraries(
+    config, monkeypatch, blocked: str, package: str
+) -> None:
+    """A partial install must not be offered: reading a PDF needs both."""
+    import builtins
+    import sys
+
+    real_import = builtins.__import__
+
+    def no_module(name, *args, **kwargs):
+        if name == blocked:
+            raise ImportError(f"No module named {blocked!r}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.delitem(sys.modules, blocked, raising=False)
+    monkeypatch.setattr(builtins, "__import__", no_module)
+    config.tools.ocr.enabled = True
+    config.tools.ocr.provider = ""
+
+    ok, reason = OCRTool(config).available()
+
+    assert not ok
+    assert package in reason
+
+
+def test_a_missing_httpx_does_not_disable_the_local_path(config, monkeypatch) -> None:
+    """pypdfium2 and the vision model need no httpx; only the provider route does."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_httpx(name, *args, **kwargs):
+        if name == "httpx":
+            raise ImportError("No module named 'httpx'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_httpx)
+    config.tools.ocr.enabled = True
+    config.tools.ocr.provider = ""
+
+    assert OCRTool(config).available() == (True, "")
+
+
 async def test_a_keyless_custom_endpoint_sends_no_auth_header(config, monkeypatch) -> None:
     captured: dict = {}
 

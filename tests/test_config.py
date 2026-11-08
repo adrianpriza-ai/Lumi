@@ -184,7 +184,7 @@ def test_defaults_apply_with_no_config_file(project) -> None:
     assert isinstance(config, Config)
     assert config.llm.provider == "openai"
     assert config.tools.enabled == [
-        "shell",
+        "run_shell",
         "files",
         "read_file",
         "list_files",
@@ -260,6 +260,15 @@ def test_validate_flags_unknown_tools(config) -> None:
 def test_validate_flags_unknown_providers(config) -> None:
     config.tools.web.provider_order = ["tavily", "askjeeves"]
     assert any("askjeeves" in p for p in validate(config))
+
+
+def test_validate_accepts_the_old_shell_name(config) -> None:
+    """`shell` predates the `run_shell` tool; a config using it still validates."""
+    config.tools.enabled = ["shell", "run_shell", "telepathy"]
+    problems = validate(config)
+    assert config.tools.is_enabled("run_shell")
+    assert not [p for p in problems if "'shell'" in p]
+    assert any("telepathy" in p for p in problems)
 
 
 def test_validate_accepts_context7_in_tools_enabled(config) -> None:

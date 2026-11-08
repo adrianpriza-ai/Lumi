@@ -62,6 +62,27 @@ def test_available_with_key(key: None, tmp_path: Path) -> None:
     assert make_tool(tmp_path).available() == (True, "")
 
 
+def test_unavailable_without_httpx(
+    key: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The client imports httpx per request; say so instead of failing on every prompt."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_httpx(name, *args, **kwargs):
+        if name == "httpx":
+            raise ImportError("No module named 'httpx'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_httpx)
+
+    ok, reason = make_tool(tmp_path).available()
+
+    assert not ok
+    assert "httpx" in reason
+
+
 def test_custom_endpoint_without_key_is_available(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

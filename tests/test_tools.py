@@ -48,6 +48,21 @@ def shell(config) -> ShellTool:
     return ShellTool(config)
 
 
+def test_unavailable_when_the_host_has_no_shell(shell: ShellTool, monkeypatch) -> None:
+    """With no sh or bash, every call would fail — so the tool must not be offered."""
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+
+    ok, reason = shell.available()
+
+    assert not ok
+    assert "shell" in reason
+
+
+def test_available_when_a_shell_is_on_path(shell: ShellTool, monkeypatch) -> None:
+    monkeypatch.setattr("shutil.which", lambda name: "/bin/sh" if name == "sh" else None)
+    assert shell.available() == (True, "")
+
+
 async def test_runs_a_simple_command(shell: ShellTool) -> None:
     result = await shell.invoke({"command": "echo hello"}, ctx(source="cli"))
     assert result.ok
@@ -1023,6 +1038,77 @@ async def test_step_detail_falls_back_to_the_tool_name(config) -> None:
     assert registry.step_detail("grumpy", {}) == "grumpy"
     assert registry.step_detail("missing", {}) == "missing"
     assert registry.step_detail("grep") == "grep"  # no arguments at all
+
+
+# --------------------------------------------------------------------------- #
+# availability (auto-deactivation)
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_broken_availability_check_deactivates_the_tool() -> None:
+    """A tool whose check raises is off, with a reason — not an exception that
+    escapes into the specs the model is offered and kills the turn."""
+
+    class Explodes(Tool):
+        name = "explodes"
+        description = "Its availability check raises."
+
+        def available(self) -> tuple[bool, str]:
+            raise RuntimeError("no environment")
+
+        async def invoke(self, arguments, ctx) -> ToolResult:
+            return ToolResult(text="should never run")
+
+    registry = ToolRegistry()
+    registry.register(Explodes())
+
+    ok, reason = registry.availability(registry.get("explodes"))  # type: ignore[arg-type]
+    assert not ok
+    assert "no environment" in reason
+
+    assert registry.specs() == []  # never offered to the model
+    assert "explodes" not in registry.describe(available_only=True)
+    assert "explodes" in registry.describe()  # /tools still names it and why
+
+    result = await registry.invoke("explodes", {}, ctx())
+    assert not result.ok
+    assert "not available" in result.text
+
+
+def test_build_registry_skips_a_tool_that_fails_validation(config, monkeypatch) -> None:
+    """An invalid definition (here: no description) is dropped at startup, the
+    way a broken factory already is — it must not take the whole bot down."""
+    import lumi.tools as tools_module
+    from lumi.tools import build_registry
+
+    class Nameless(Tool):
+        name = "nameless"
+        description = "   "
+
+        async def invoke(self, arguments, ctx) -> ToolResult:
+            return ToolResult(text="")
+
+    monkeypatch.setattr(tools_module, "SkillsTool", lambda config: Nameless())
+
+    registry = build_registry(config, config.build_memory_store())
+
+    assert "nameless" not in registry.names()
+    assert "skills" not in registry.names()
+    assert "grep" in registry.names()  # the rest of the registry still built
+
+
+def test_run_shell_is_the_name_tools_enabled_switches(config) -> None:
+    """The entry matches the tool name, and the pre-rename "shell" still works."""
+    from lumi.tools import build_registry
+
+    config.tools.enabled = ["run_shell"]
+    assert "run_shell" in build_registry(config, config.build_memory_store()).names()
+
+    config.tools.enabled = ["shell"]
+    assert "run_shell" in build_registry(config, config.build_memory_store()).names()
+
+    config.tools.enabled = []
+    assert "run_shell" not in build_registry(config, config.build_memory_store()).names()
 
 
 # --------------------------------------------------------------------------- #

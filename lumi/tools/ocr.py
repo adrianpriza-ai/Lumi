@@ -39,6 +39,25 @@ from .docread import (
 )
 
 
+def _missing_local_library() -> tuple[str, str] | None:
+    """``(package, pip name)`` of a missing local-PDF library, or ``None``.
+
+    The local route opens every PDF with pypdfium2 and renders scanned pages
+    with Pillow. Both are declared dependencies, so this only fires in a
+    partial install — where the honest answer is "unavailable", not a promise
+    of a transcription the call cannot deliver.
+    """
+    try:
+        import pypdfium2  # noqa: F401 - the PDF reader
+    except ImportError:
+        return "pypdfium2", "pypdfium2"
+    try:
+        import PIL  # noqa: F401 - renders scanned pages
+    except ImportError:
+        return "Pillow", "Pillow"
+    return None
+
+
 def _result(pages: list[tuple[int, str]], *, source: str) -> ToolResult:
     """Assemble ``(page_number, markdown)`` pairs into one tool result."""
     if not pages:
@@ -132,6 +151,21 @@ class OCRTool(Tool):
         # may be self-hosted and keyless, and that is a usable configuration.
         if ocr.needs_key() and not ocr.api_key():
             return False, f"{ocr.api_key_env} is unset (needed by tools.ocr.provider)"
+        # Only the dedicated API is an httpx client. The local path uses
+        # pypdfium2 and the vision model, so a missing httpx must not switch
+        # off PDF and image reading that would still work.
+        if ocr.provider_of():
+            try:
+                import httpx  # noqa: F401
+            except ImportError:
+                return False, "httpx is not installed; tools.ocr.provider needs it"
+            return True, ""
+        if missing := _missing_local_library():
+            package, install = missing
+            return False, (
+                f"{package} is not installed; the local PDF path needs it "
+                f"(pip install {install}), or set [tools.ocr] provider"
+            )
         return True, ""
 
     # -- dispatch ---------------------------------------------------------- #

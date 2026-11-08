@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import shutil
 import signal
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,20 @@ log = get_logger(__name__)
 
 #: Hard ceiling regardless of config, so a bad config cannot wedge the bot.
 MAX_TIMEOUT_SECONDS = 600
+
+
+def shell_binary() -> str | None:
+    """The shell a command would run under, or ``None`` when the host has none.
+
+    ``create_subprocess_shell`` execs ``/bin/sh`` on POSIX and ``COMSPEC`` on
+    Windows, so that is what has to exist; ``bash`` is the accepted fallback
+    because it is what ``/bin/sh`` is on every system Lumi targets. The doctor
+    reports this same value, so "the shell works" means one thing in both
+    places.
+    """
+    if os.name == "nt":
+        return os.environ.get("COMSPEC") or shutil.which("cmd")
+    return shutil.which("bash") or shutil.which("sh")
 
 
 class ShellTool(Tool):
@@ -134,6 +149,10 @@ Rules:
     def available(self) -> tuple[bool, str]:
         if not self.shell_config.enabled:
             return False, "disabled in config (tools.shell.enabled = false)"
+        # Offering a tool that cannot run a single command is worse than not
+        # offering it: the model plans around it and every call fails.
+        if shell_binary() is None:
+            return False, "no bash or sh on PATH — there is no shell to run commands in"
         return True, ""
 
     def _resolve_cwd(self, requested: str | None) -> Path:

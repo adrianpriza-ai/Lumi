@@ -41,10 +41,30 @@ class ToolRegistry:
     def all(self) -> list[Tool]:
         return [self._tools[name] for name in self.names()]
 
+    # -- availability ------------------------------------------------------ #
+
+    def availability(self, tool: Tool) -> tuple[bool, str]:
+        """``tool.available()``, with a broken check counted as unavailable.
+
+        Deactivation must not depend on the check itself behaving. A tool's
+        ``available()`` reads config, env vars and optional imports, any of
+        which can fail on a machine the tool was not written for; a raise (or
+        a malformed return) means "off, with the reason", never an exception
+        that escapes into :meth:`specs` and takes down every turn. The same
+        rule the dispatch path applies to ``invoke``, applied to the check
+        that decides whether dispatch is offered at all.
+        """
+        try:
+            ok, reason = tool.available()
+        except Exception as exc:  # noqa: BLE001 - a broken check deactivates the tool
+            log.exception("tool %s availability check failed", tool.name)
+            return False, f"availability check failed: {format_error(exc)}"
+        return bool(ok), str(reason or "")
+
     # -- LLM surface ------------------------------------------------------- #
 
     def specs(self) -> list[dict[str, Any]]:
-        return [tool.spec() for tool in self.all() if tool.available()[0]]
+        return [tool.spec() for tool in self.all() if self.availability(tool)[0]]
 
     def describe(self, available_only: bool = False, *, html: bool = False) -> str:
         """A human-readable summary of every registered tool.
@@ -67,7 +87,7 @@ class ToolRegistry:
 
             lines = []
             for tool in self.all():
-                ok, reason = tool.available()
+                ok, reason = self.availability(tool)
                 if available_only and not ok:
                     continue
                 mark = "" if ok else f" <i>(unavailable: {escape_html(reason)})</i>"
@@ -76,7 +96,7 @@ class ToolRegistry:
             return "\n".join(lines)
         lines = []
         for tool in self.all():
-            ok, reason = tool.available()
+            ok, reason = self.availability(tool)
             if available_only and not ok:
                 continue
             mark = "" if ok else f" _(unavailable: {reason})_"
@@ -129,7 +149,7 @@ class ToolRegistry:
                 f"Unknown tool {name!r}. Available tools: {', '.join(self.names()) or 'none'}."
             )
 
-        ok, reason = tool.available()
+        ok, reason = self.availability(tool)
         if not ok:
             return ToolResult.failure(f"Tool {name!r} is not available right now: {reason}")
 

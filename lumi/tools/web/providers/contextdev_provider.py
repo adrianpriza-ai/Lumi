@@ -30,15 +30,16 @@ a restart. The rotation lives in :class:`lumi.llm.keypool.KeyPool`.
 
 from __future__ import annotations
 
-from typing import Any
-
-import httpx
+from typing import TYPE_CHECKING, Any
 
 from ....config import ContextDevConfig
 from ....llm.keypool import KeyPool
 from ....util.log import get_logger
 from ....util.text import format_error, truncate
 from .base import Page, SearchHit, SearchResult, WebProvider, final_url
+
+if TYPE_CHECKING:  # pragma: no cover - annotation only, imported lazily at call time
+    import httpx
 
 log = get_logger(__name__)
 
@@ -87,6 +88,14 @@ class ContextDevProvider(WebProvider):
         # base_url is the owner's endpoint and may take no auth at all.
         if not self.config.api_key() and self.config.needs_key():
             return False, f"{self.config.api_key_env} is not set"
+        # Imported here, not at module scope: this provider is part of the web
+        # tool's fixed import graph, so a module-level import made a missing
+        # httpx a startup crash for the whole bot instead of one provider
+        # deactivating. Same rule the other raw-httpx clients already follow.
+        try:
+            import httpx  # noqa: F401
+        except ImportError:
+            return False, "httpx is not installed; the context.dev provider needs it"
         return True, ""
 
     # -- HTTP --------------------------------------------------------------- #
@@ -103,6 +112,12 @@ class ContextDevProvider(WebProvider):
         (``USAGE_EXCEEDED``, ``RATE_LIMITED``) and the model needs the exact
         words, not a guess.
         """
+        try:
+            import httpx
+        except ImportError as exc:  # pragma: no cover - available() catches it first
+            raise RuntimeError(
+                "httpx is not installed; the context.dev provider needs it (pip install httpx)"
+            ) from exc
         url = self.config.base_url.strip().rstrip("/") + path
         try:
             async with httpx.AsyncClient(
