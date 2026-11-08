@@ -31,7 +31,9 @@ class NeedsApproval(Exception):
     to re-run the call for real.
     """
 
-    def __init__(self, tool: str, arguments: dict[str, Any], reason: str, preview: str = "") -> None:
+    def __init__(
+        self, tool: str, arguments: dict[str, Any], reason: str, preview: str = ""
+    ) -> None:
         super().__init__(reason)
         self.tool = tool
         self.arguments = arguments
@@ -122,6 +124,7 @@ class Tool(abc.ABC):
     description: str = ""
     #: JSON Schema object (with "properties" and "required").
     parameters: dict[str, Any] = {}
+
     def available(self) -> tuple[bool, str]:
         """Whether this tool can run right now, plus a reason for the log."""
         return True, ""

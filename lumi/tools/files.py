@@ -228,7 +228,9 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         # /usr/lib/os-release, and the read-only whitelist is written in terms of
         # the paths a human would actually type.
         requested = str(candidate)
-        resolved = candidate.resolve() if candidate.is_absolute() else (self.root / candidate).resolve()
+        resolved = (
+            candidate.resolve() if candidate.is_absolute() else (self.root / candidate).resolve()
+        )
 
         if for_write:
             if not any(is_within(resolved, root) for root in self.writable_roots):
@@ -304,7 +306,9 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         except OSError:
             return True
 
-    def _require_owner(self, path: Path, ctx: ToolContext, arguments: dict[str, Any], preview: str) -> None:
+    def _require_owner(
+        self, path: Path, ctx: ToolContext, arguments: dict[str, Any], preview: str
+    ) -> None:
         """Raise :class:`NeedsApproval` unless *path* is already cleared."""
         if ctx.confirmed or not self._session_authored(path):
             return
@@ -720,7 +724,9 @@ it validates the path, caps the size, and shows a diff before it overwrites.
 
 def _ignored(path: Path) -> bool:
     parts = set(path.parts)
-    return bool(parts & {".git", "__pycache__", ".venv", "node_modules", ".pytest_cache", ".ruff_cache"})
+    return bool(
+        parts & {".git", "__pycache__", ".venv", "node_modules", ".pytest_cache", ".ruff_cache"}
+    )
 
 
 def _short_diff(previous: str, current: str, context: int = 2, limit: int = 40) -> str:

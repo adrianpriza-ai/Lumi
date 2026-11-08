@@ -160,7 +160,7 @@ future conversation in this chat, so trivia crowds out signal. One fact per call
                     "not saved: that reads like an instruction, not a fact. Memories "
                     "are read back as data in future prompts, so instruction-shaped "
                     "text is refused — phrase it as a short statement about the "
-                    "owner or this chat, e.g. \"prefers dark mode\"."
+                    'owner or this chat, e.g. "prefers dark mode".'
                 )
             if looks_like_secret(fact):
                 return ToolResult.failure(
@@ -170,7 +170,9 @@ future conversation in this chat, so trivia crowds out signal. One fact per call
                     "where the credential lives, not the credential."
                 )
             message = memory.remember(fact, source=ctx.source, by="model")
-            return ToolResult(text=message, data={"fact": fact}, summary=truncate(message, 100, "…"))
+            return ToolResult(
+                text=message, data={"fact": fact}, summary=truncate(message, 100, "…")
+            )
 
         if action == "recall":
             query = str(arguments.get("query") or "").strip()

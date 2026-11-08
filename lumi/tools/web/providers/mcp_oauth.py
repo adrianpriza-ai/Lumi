@@ -139,7 +139,9 @@ class FileTokenStorage:
         try:
             return OAuthClientInformationFull.model_validate(raw)
         except Exception:  # noqa: BLE001 - a stale registration re-registers
-            log.warning("stored oauth registration for %r is unreadable; re-registering", self.server)
+            log.warning(
+                "stored oauth registration for %r is unreadable; re-registering", self.server
+            )
             return None
 
     async def set_client_info(self, client_info: Any) -> None:
@@ -247,7 +249,11 @@ class CallbackServer:
                     )
                 elif "code" in query:
                     server._deliver(
-                        {"code": query["code"], "state": query.get("state", ""), "iss": query.get("iss", "")}
+                        {
+                            "code": query["code"],
+                            "state": query.get("state", ""),
+                            "iss": query.get("iss", ""),
+                        }
                     )
                 else:
                     server._deliver({"code": "", "error": "no code in the redirect"})
@@ -401,7 +407,8 @@ async def authorize_server(
             raise
         log.warning(
             "the callback port %d from %r's stored oauth registration is taken; re-registering",
-            _stored_redirect_port(client_info), spec.name,
+            _stored_redirect_port(client_info),
+            spec.name,
         )
         storage.forget()
         had_registration = False

@@ -365,7 +365,8 @@ class ContextWindow:
         self._calibrated = True
         log.debug(
             "context estimate recalibrated: %.2f chars/token (provider counted %d tokens)",
-            self._chars_per_token, reported,
+            self._chars_per_token,
+            reported,
         )
 
     # -- transcript replay -------------------------------------------------- #
@@ -407,7 +408,10 @@ class ContextWindow:
         self._give_back(conv, first)
         log.info(
             "replayed %d message(s) for chat %s (~%d of %d tokens)%s",
-            len(replayed.messages), conv.chat_id, self.estimate(conv.messages), self.effective_budget,
+            len(replayed.messages),
+            conv.chat_id,
+            self.estimate(conv.messages),
+            self.effective_budget,
             " after a condensed record" if replayed.summary else "",
         )
 
@@ -431,7 +435,11 @@ class ContextWindow:
     def _install_summary(self, conv: Any, summary: str, *, remember: bool) -> None:
         """Put the condensed record into the prompt, and optionally on disk."""
         conv.summary = summary.strip()
-        note = {"role": "user", "content": SUMMARY_NOTE.format(body=conv.summary), SUMMARY_FLAG: True}
+        note = {
+            "role": "user",
+            "content": SUMMARY_NOTE.format(body=conv.summary),
+            SUMMARY_FLAG: True,
+        }
         # Directly after the system prompt, and only ever one of them: a second
         # note would mean the first outlived its own summary.
         messages = conv.messages
@@ -490,7 +498,9 @@ class ContextWindow:
         before = len(conv.messages)
         log.info(
             "context full for chat %s: ~%d tokens over a %d budget; condensing",
-            conv.chat_id, estimated, effective_budget,
+            conv.chat_id,
+            estimated,
+            effective_budget,
         )
         self._elide_tool_output(conv, max(0, trim_over, hard_over))
         effective_budget = trim_budget()
@@ -505,8 +515,12 @@ class ContextWindow:
         self._refresh_note(conv)
         log.info(
             "context for chat %s: %d -> %d messages, ~%d of %d tokens, record is %d chars",
-            conv.chat_id, before, len(conv.messages), self.estimate(conv.messages),
-            effective_budget, len(conv.summary),
+            conv.chat_id,
+            before,
+            len(conv.messages),
+            self.estimate(conv.messages),
+            effective_budget,
+            len(conv.summary),
         )
 
     def _tail_start(self, groups: list[list[dict[str, Any]]]) -> int:
@@ -573,8 +587,7 @@ class ContextWindow:
                 # than treating the message as untouchable and letting one
                 # attached screenshot hold the window open forever.
                 images = [
-                    part for part in content
-                    if isinstance(part, dict) and "image_url" in part
+                    part for part in content if isinstance(part, dict) and "image_url" in part
                 ]
                 if not images:
                     continue
@@ -583,7 +596,11 @@ class ContextWindow:
                     for part in images
                 )
                 message["content"] = [
-                    *(part for part in content if not (isinstance(part, dict) and "image_url" in part)),
+                    *(
+                        part
+                        for part in content
+                        if not (isinstance(part, dict) and "image_url" in part)
+                    ),
                     {
                         "type": "text",
                         "text": "[attached image(s) dropped to fit the context window — "
@@ -595,7 +612,8 @@ class ContextWindow:
                 if saved_total >= over:
                     log.info(
                         "elided %d tool result(s) for chat %s to fit the window",
-                        conv.elided, conv.chat_id,
+                        conv.elided,
+                        conv.chat_id,
                     )
                     return
                 continue
@@ -608,7 +626,8 @@ class ContextWindow:
             if saved_total >= over:
                 log.info(
                     "elided %d tool result(s) for chat %s to fit the window",
-                    conv.elided, conv.chat_id,
+                    conv.elided,
+                    conv.chat_id,
                 )
                 return
 
@@ -663,7 +682,9 @@ class ContextWindow:
         )
         log.info(
             "condensed %d message(s) for chat %s into a %d-char record",
-            removed, conv.chat_id, len(conv.summary),
+            removed,
+            conv.chat_id,
+            len(conv.summary),
         )
 
     async def _summarise(self, transcript: str, conv: Any, *, prior: str = "") -> str:
@@ -702,7 +723,9 @@ class ContextWindow:
             return ""
         summary = (getattr(reply, "text", "") or "").strip()
         if not summary:
-            log.info("the model returned no record for chat %s; keeping the turns verbatim", conv.chat_id)
+            log.info(
+                "the model returned no record for chat %s; keeping the turns verbatim", conv.chat_id
+            )
             return ""
         return truncate(summary, SUMMARY_MAX_CHARS, marker="\n… [record cut]")
 
@@ -776,7 +799,10 @@ class ContextWindow:
                 "system prompt and the newest turn alone exceed it. Raise "
                 "llm.context_window (currently %d) or lower llm.context_keep_recent "
                 "(currently %d).",
-                conv.chat_id, self.estimate(conv.messages), self.budget, self.window,
+                conv.chat_id,
+                self.estimate(conv.messages),
+                self.budget,
+                self.window,
                 int(self.config.llm.context_keep_recent),
             )
             conv.truncated = True
@@ -817,7 +843,9 @@ def _as_transcript(messages: list[dict[str, Any]]) -> str:
         if role == "tool":
             name = message.get("name") or "tool"
             body = message.get("content")
-            lines.append(f"tool ({name}): {truncate(body if isinstance(body, str) else '', 1_200, marker='…')}")
+            lines.append(
+                f"tool ({name}): {truncate(body if isinstance(body, str) else '', 1_200, marker='…')}"
+            )
             continue
         if role == "assistant" and message.get("tool_calls"):
             names = ", ".join(

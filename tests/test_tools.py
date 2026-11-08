@@ -56,9 +56,7 @@ async def test_runs_a_simple_command(shell: ShellTool) -> None:
 
 
 async def test_runs_a_multiline_command(shell: ShellTool) -> None:
-    result = await shell.invoke(
-        {"command": "echo one\necho two\necho three"}, ctx(source="cli")
-    )
+    result = await shell.invoke({"command": "echo one\necho two\necho three"}, ctx(source="cli"))
     assert result.ok
     for word in ("one", "two", "three"):
         assert word in result.text
@@ -137,9 +135,7 @@ async def test_timeout_kills_the_process_group(shell: ShellTool, config) -> None
     assert "TIMED OUT" in result.text
 
 
-async def test_timeout_message_names_the_budget_that_was_used(
-    shell: ShellTool, config
-) -> None:
+async def test_timeout_message_names_the_budget_that_was_used(shell: ShellTool, config) -> None:
     """A per-call timeout must be reported, not the configured default."""
     config.tools.shell.timeout_seconds = 30
     result = await shell.invoke(
@@ -211,9 +207,7 @@ async def test_shell_refuses_another_chats_uploads(shell: ShellTool, config) -> 
     # The same file named *inside* a flag is refused too: `_operands` drops
     # every dash-word, so ``xargs -a…`` used to reach the shell with no read
     # guard having seen the path that follows it.
-    glued = await shell.invoke(
-        {"command": "xargs -auploads/42/notes.md echo"}, ctx(chat_id=43)
-    )
+    glued = await shell.invoke({"command": "xargs -auploads/42/notes.md echo"}, ctx(chat_id=43))
     assert not glued.ok
     assert "Refused" in glued.text
     assert "chat 42 only" not in glued.text
@@ -241,9 +235,7 @@ async def test_nonexistent_cwd_is_an_error(shell: ShellTool) -> None:
 
 
 async def test_timeout_override_is_clamped(shell: ShellTool) -> None:
-    result = await shell.invoke(
-        {"command": "echo ok", "timeout_seconds": 99999}, ctx(source="cli")
-    )
+    result = await shell.invoke({"command": "echo ok", "timeout_seconds": 99999}, ctx(source="cli"))
     assert result.ok
 
 
@@ -372,7 +364,12 @@ async def test_overwrite_flag_skips_approval(files: FilesTool, config) -> None:
     target.write_text("original", encoding="utf-8")
     backdate(target)  # a file from before this session: only the overwrite rule applies
     result = await files.invoke(
-        {"action": "write", "path": "workspace/exists.md", "content": "replaced", "overwrite": True},
+        {
+            "action": "write",
+            "path": "workspace/exists.md",
+            "content": "replaced",
+            "overwrite": True,
+        },
         ctx(),
     )
     assert result.ok
@@ -478,8 +475,12 @@ async def test_append(files: FilesTool, config) -> None:
 
 
 async def test_append_needs_no_approval_even_when_the_file_exists(files: FilesTool) -> None:
-    await files.invoke({"action": "write", "path": "workspace/a.md", "content": "x"}, ctx(confirmed=True))
-    result = await files.invoke({"action": "append", "path": "workspace/a.md", "content": "y"}, ctx())
+    await files.invoke(
+        {"action": "write", "path": "workspace/a.md", "content": "x"}, ctx(confirmed=True)
+    )
+    result = await files.invoke(
+        {"action": "append", "path": "workspace/a.md", "content": "y"}, ctx()
+    )
     assert result.ok
 
 
@@ -630,7 +631,9 @@ async def test_unknown_action(files: FilesTool) -> None:
 async def test_write_size_limit(files: FilesTool, config) -> None:
     config.tools.files.max_write_chars = 100
     with pytest.raises(ToolError, match="over the"):
-        await files.invoke({"action": "write", "path": "workspace/big.md", "content": "x" * 200}, ctx())
+        await files.invoke(
+            {"action": "write", "path": "workspace/big.md", "content": "x" * 200}, ctx()
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -658,9 +661,7 @@ async def test_edit_replaces_exact_text(files: FilesTool, config) -> None:
     assert "before" in result.text and "after" in result.text  # a diff is shown
 
 
-async def test_edit_needs_no_approval_even_on_an_existing_file(
-    files: FilesTool, config
-) -> None:
+async def test_edit_needs_no_approval_even_on_an_existing_file(files: FilesTool, config) -> None:
     """An anchored edit cannot clobber what it does not name, so no tap.
 
     The whole-file `write` to the same non-empty file must still ask — the
@@ -930,7 +931,7 @@ async def test_only_instruction_shaped_text_is_refused(
 
 
 async def test_remember_refuses_facts_carrying_a_credential(memory_tool: MemoryTool) -> None:
-    """"Do not save secrets" is an instruction to a component the attacker may
+    """ "Do not save secrets" is an instruction to a component the attacker may
     control, so the rule is enforced instead of asked for. A memory is replayed
     into every future prompt in the chat, and it outlives the conversation."""
     for fact in (
@@ -1191,9 +1192,7 @@ async def test_read_file_names_the_line_it_cannot_read(config) -> None:
 async def test_read_file_says_how_to_stop_before_an_over_long_line(config) -> None:
     """The lines before it were fine, so the tool says where to stop."""
     _write(config.root, "wide.js", "var small = 1;\n" + "x" * 300_000 + "\n")
-    result = await ReadFileTool(config).invoke(
-        {"path": "wide.js", "offset": 1, "limit": 10}, ctx()
-    )
+    result = await ReadFileTool(config).invoke({"path": "wide.js", "offset": 1, "limit": 10}, ctx())
     assert not result.ok
     assert "limit=1" in result.text
     assert "run_shell" in result.text
@@ -1306,9 +1305,7 @@ async def test_list_files_says_truncated_only_when_it_actually_is(config, monkey
     assert result.data["truncated"] is False
 
 
-async def test_list_files_skips_symlinks_that_leave_the_project(
-    config, tmp_path: Path
-) -> None:
+async def test_list_files_skips_symlinks_that_leave_the_project(config, tmp_path: Path) -> None:
     """The listing shows what is inside the project — a link out of it is not
     ours to count, let alone to name the entry count of."""
     outside = tmp_path.parent / f"{tmp_path.name}-outside_dir"
@@ -1350,9 +1347,7 @@ async def test_grep_is_case_insensitive_by_default(config) -> None:
 
 async def test_grep_case_sensitive_flag(config) -> None:
     _write(config.root, "x.txt", "Hello world\n")
-    result = await GrepTool(config).invoke(
-        {"query": "hello", "case_sensitive": True}, ctx()
-    )
+    result = await GrepTool(config).invoke({"query": "hello", "case_sensitive": True}, ctx())
     assert "no matches" in result.text
 
 
@@ -1406,9 +1401,7 @@ async def test_grep_clamps_max_results_to_the_ceiling(config) -> None:
     assert result.data["truncated"] is True
 
 
-async def test_grep_reports_when_the_runaway_guard_stops_the_scan(
-    config, monkeypatch
-) -> None:
+async def test_grep_reports_when_the_runaway_guard_stops_the_scan(config, monkeypatch) -> None:
     """A scan cut short by the file-count guard used to stop silently, so the
     answer looked complete when it was not."""
     monkeypatch.setattr("lumi.tools.explore.MAX_GREP_SCAN_FILES", 2)
@@ -1426,7 +1419,7 @@ async def test_grep_reports_when_the_runaway_guard_stops_the_scan(
 async def test_grep_says_so_when_an_empty_result_came_from_an_early_stop(
     config, monkeypatch
 ) -> None:
-    """"No matches" after a give-up is not "no matches" — the model has to be
+    """ "No matches" after a give-up is not "no matches" — the model has to be
     able to tell the difference before it concludes anything."""
     monkeypatch.setattr("lumi.tools.explore.MAX_GREP_SCAN_FILES", 2)
     for i in range(5):
@@ -1611,9 +1604,7 @@ async def test_more_context_returns_the_newest_ten_oldest_first(config) -> None:
 
 async def test_more_context_offset_skips_the_newest(config) -> None:
     log = room("m1", "m2", "m3", "m4", "m5", "m6", "m7")
-    result = await MoreContextTool(config, log=log).invoke(
-        {"offset": 2}, ctx(chat_id=CHAT_ID)
-    )
+    result = await MoreContextTool(config, log=log).invoke({"offset": 2}, ctx(chat_id=CHAT_ID))
     assert result.ok
     assert "m1" in result.text and "m5" in result.text
     assert "m6" not in result.text and "m7" not in result.text

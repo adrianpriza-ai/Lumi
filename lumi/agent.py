@@ -477,7 +477,8 @@ class Agent:
                 "conversations; other chats have their own memories that you cannot "
                 "see. Anything marked as elided below is still on disk, just too old "
                 "to send — say so rather than pretending you were never told.\n\n"
-                if "[older remembered fact" in memory_block or "[older memory elided]" in memory_block
+                if "[older remembered fact" in memory_block
+                or "[older memory elided]" in memory_block
                 else "This is the long-term memory for this chat. It persists across "
                 "conversations; other chats have their own memories that you cannot see.\n\n"
             )
@@ -535,7 +536,8 @@ class Agent:
         self._expire_approvals()
         while len(self._conversations) > self._max_conversations:
             candidates = [
-                conv for chat_id, conv in self._conversations.items()
+                conv
+                for chat_id, conv in self._conversations.items()
                 if chat_id != keep and not conv.pending
             ]
             if not candidates:
@@ -545,7 +547,8 @@ class Agent:
             log.info(
                 "evicted the conversation for chat %s from memory (%d held); "
                 "it replays from its transcript on the next message",
-                quietest.chat_id, len(self._conversations),
+                quietest.chat_id,
+                len(self._conversations),
             )
 
     def _expire_approvals(self) -> None:
@@ -568,7 +571,8 @@ class Agent:
                 self._note_approval_expired(conv, action)
             log.info(
                 "cancelled %d unanswered approval(s) for chat %s",
-                len(stale), conv.chat_id,
+                len(stale),
+                conv.chat_id,
             )
 
     def _note_approval_expired(self, conv: Conversation, action: PendingAction) -> None:
@@ -603,11 +607,7 @@ class Agent:
             return 0
         messages = conv.messages
         idx = next(
-            (
-                i
-                for i in range(len(messages) - 1, -1, -1)
-                if messages[i].get("tool_calls")
-            ),
+            (i for i in range(len(messages) - 1, -1, -1) if messages[i].get("tool_calls")),
             None,
         )
         if idx is None:
@@ -617,9 +617,7 @@ class Agent:
             for message in messages[idx + 1 :]
             if message.get("role") == "tool"
         }
-        missing = [
-            call for call in messages[idx]["tool_calls"] if call.get("id") not in answered
-        ]
+        missing = [call for call in messages[idx]["tool_calls"] if call.get("id") not in answered]
         for call in missing:
             messages.append(
                 {
@@ -630,9 +628,7 @@ class Agent:
                 }
             )
         if missing:
-            log.info(
-                "sealed %d dangling tool call(s) for chat %s", len(missing), chat_id
-            )
+            log.info("sealed %d dangling tool call(s) for chat %s", len(missing), chat_id)
         return len(missing)
 
     def context_report(self, chat_id: int | str) -> ContextReport:
@@ -692,7 +688,10 @@ class Agent:
         if image_b64:
             content = [
                 {"type": "text", "text": text},
-                {"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{image_b64}"}},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{image_mime};base64,{image_b64}"},
+                },
             ]
         else:
             content = text
@@ -796,7 +795,9 @@ class Agent:
                     self.history.append(conv.chat_id, "assistant", reply.text, session=conv.session)
                     log.info(
                         "turn done: %d iteration(s), %d tool call(s), %.1fs",
-                        iteration, len(tools), result.elapsed,
+                        iteration,
+                        len(tools),
+                        result.elapsed,
                     )
                 return result
 
@@ -894,12 +895,17 @@ class Agent:
             result.artifacts.extend(tool_result.artifacts)
             log.info(
                 "turn collected %d artifact(s) from %s: %s",
-                len(tool_result.artifacts), call.name,
+                len(tool_result.artifacts),
+                call.name,
                 ", ".join(a.path for a in tool_result.artifacts),
             )
         tools_used.append(call.name)
         self.history.append(
-            conv.chat_id, "tool", f"{call.name}: {tool_result.summary}", session=conv.session, tool=call.name
+            conv.chat_id,
+            "tool",
+            f"{call.name}: {tool_result.summary}",
+            session=conv.session,
+            tool=call.name,
         )
         return False
 
@@ -909,7 +915,7 @@ class Agent:
         """Announce a progress step (a model call, a tool call) to the chat.
 
         Best effort by construction: a presentation channel that fails must
-        not fail the turn. """
+        not fail the turn."""
         if hooks is None or hooks.on_step is None:
             return
         try:
@@ -968,17 +974,25 @@ class Agent:
             conv.pending = [p for p in conv.pending if p.id != action_id]
             self._note_approval_expired(conv, action)
             log.info("approval %s expired before it was answered (chat %s)", action_id, chat_id)
-            return TurnResult(error="That request expired before it was answered, so it was cancelled.")
+            return TurnResult(
+                error="That request expired before it was answered, so it was cancelled."
+            )
 
         if approved:
             log.info("owner approved %s: %s", action.tool, action.preview[:120])
-            await self._step(hooks, "tool", self.registry.step_detail(action.tool, action.arguments))
+            await self._step(
+                hooks, "tool", self.registry.step_detail(action.tool, action.arguments)
+            )
             tool_result = await self.registry.invoke_approved(action, ctx)
-            outcome = f"[Approved by the owner. {action.tool} ran and returned:]\n{tool_result.text}"
+            outcome = (
+                f"[Approved by the owner. {action.tool} ran and returned:]\n{tool_result.text}"
+            )
             used = [action.tool]
         else:
             log.info("owner declined %s: %s", action.tool, action.preview[:120])
-            outcome = "[The owner declined this one. Do not run it, and do not retry it in another form.]"
+            outcome = (
+                "[The owner declined this one. Do not run it, and do not retry it in another form.]"
+            )
             used = []
 
         conv.pending = [p for p in conv.pending if p.id != action_id]
@@ -1028,7 +1042,9 @@ class Agent:
                 preview=exc.preview,
             )
             conv.pending.append(pending)
-            self.history.append(conv.chat_id, "tool", f"{tool}: needs approval", session=conv.session, tool=tool)
+            self.history.append(
+                conv.chat_id, "tool", f"{tool}: needs approval", session=conv.session, tool=tool
+            )
             return TurnResult(pending=[pending], text=f"{exc.reason.capitalize()} — confirm below.")
 
         self.history.append(

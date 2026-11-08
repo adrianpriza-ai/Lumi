@@ -331,7 +331,8 @@ def _render_config(config: Config, memory_limit: int) -> str:
             f"- agent: {llm.max_tool_iterations} tool iterations"
             f" · history: {'as much as fits' if not llm.history_turns else f'at least {llm.history_turns} turns'}"
             f" · memory {memory_cap}",
-            "",            f"<b>web</b> — {'enabled' if web.enabled else 'DISABLED'}",
+            "",
+            f"<b>web</b> — {'enabled' if web.enabled else 'DISABLED'}",
             f"- order: {' → '.join(escape_html(p) for p in web.provider_order)}",
             f"- results: {web.max_results or 'unlimited'} per search · floor {web.min_results}",
             f"- firecrawl: scrape top {web.firecrawl.auto_scrape_top_n} · {escape_html(web.firecrawl.key_strategy_of())}",
@@ -344,11 +345,7 @@ def _render_config(config: Config, memory_limit: int) -> str:
                 or "none"
             )
             + f" · timeout {web.mcp.timeout_seconds}s"
-            + (
-                " · asks before each call"
-                if web.mcp.ask_before_call
-                else " · no approval prompt"
-            ),
+            + (" · asks before each call" if web.mcp.ask_before_call else " · no approval prompt"),
             f"- call timeout {web.timeout_seconds}s · page content {web_content}",
             "",
             f"<b>shell</b> — cwd {escape_html(str(shell.cwd))} · timeout {shell.timeout_seconds}s"
@@ -415,12 +412,7 @@ def _redact_word(word: str) -> str:
     key, sep, value = word.partition("=")
     if sep and _secret_name(key):
         return f"{key}={_mask(value)}"
-    if (
-        not sep
-        and not word.startswith("-")
-        and len(word) >= 12
-        and _secret_name(word)
-    ):
+    if not sep and not word.startswith("-") and len(word) >= 12 and _secret_name(word):
         return _mask(word)
     return word
 
@@ -503,9 +495,13 @@ def _render_mcp_list(tool: Any) -> str:
         if endpoint := _mcp_endpoint(spec):
             lines.append(f"  {endpoint}")
         if missing := spec.unresolved():
-            lines.append(f"  <i>needs <code>${{{escape_html(missing)}}}</code> set in the environment</i>")
+            lines.append(
+                f"  <i>needs <code>${{{escape_html(missing)}}}</code> set in the environment</i>"
+            )
         if tool.provider._trust_refusal(spec):
-            lines.append(f"  <i>not approved to connect — <code>/mcp approve {escape_html(spec.name)}</code></i>")
+            lines.append(
+                f"  <i>not approved to connect — <code>/mcp approve {escape_html(spec.name)}</code></i>"
+            )
     lines += [
         "",
         "<code>/mcp check &lt;name&gt;</code> connects to one and reports"
@@ -539,7 +535,10 @@ def _render_mcp_check(outcome: CheckOutcome, spec: Any) -> str:
     if len(outcome.trail) > 1:
         lines += ["", f"<pre>{escape_html(chr(10).join(outcome.trail))}</pre>"]
     if outcome.attempts and not outcome.ok:
-        lines += ["", "<i>it retried on its own; if it still fails, the server or its config is the place to look.</i>"]
+        lines += [
+            "",
+            "<i>it retried on its own; if it still fails, the server or its config is the place to look.</i>",
+        ]
     return "\n".join(lines)
 
 
@@ -803,11 +802,7 @@ def _quoted_prefix(message: Any, media: dict[int, str] | None = None) -> str:
             # "(a photo with no text)" + the note would say the same nothing
             # twice; the note is the real content, so it replaces the
             # placeholder rather than stacking onto it.
-            body = (
-                note
-                if body.startswith("(") and body.endswith(")")
-                else f"{body}\n{note}"
-            )
+            body = note if body.startswith("(") and body.endswith(")") else f"{body}\n{note}"
         return body
 
     if len(chain) == 1:
@@ -959,7 +954,11 @@ async def _chain_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> di
             if getattr(link, "photo", None):
                 kind, name, file_id = "photo", f"photo-{mid}.jpg", link.photo[-1].file_id
             elif getattr(link, "document", None):
-                kind, name, file_id = "document", link.document.file_name or "upload.bin", link.document.file_id
+                kind, name, file_id = (
+                    "document",
+                    link.document.file_name or "upload.bin",
+                    link.document.file_id,
+                )
             else:
                 continue
             processed += 1
@@ -1025,7 +1024,9 @@ async def reply(update: Update, text: str, *, strict: bool = False, **kwargs: An
 
     if message is None and chat is None:
         if strict:
-            raise TelegramError("cannot deliver reply: effective_message and effective_chat are None")
+            raise TelegramError(
+                "cannot deliver reply: effective_message and effective_chat are None"
+            )
         return
 
     async def _send_chunk(chunk: str, *, formatted: bool) -> None:
@@ -1501,7 +1502,9 @@ def build_handlers(config: Config) -> list[Any]:
         if user is not None and _is_allowed(user, config, update.effective_chat):
             return True
         await reply(update, NOT_AUTHORISED)
-        log.warning("rejected %s from user %s", update.effective_message and "message", user and user.id)
+        log.warning(
+            "rejected %s from user %s", update.effective_message and "message", user and user.id
+        )
         return False
 
     def gated(handler):
@@ -1703,7 +1706,7 @@ def build_handlers(config: Config) -> list[Any]:
         if not await authorised(update):
             return
         llm = config.llm
-        argument = (context.args[0].strip().lower() if context.args else "")
+        argument = context.args[0].strip().lower() if context.args else ""
 
         if argument in ("on", "off"):
             llm.show_reasoning = argument == "on"
@@ -1771,9 +1774,7 @@ def build_handlers(config: Config) -> list[Any]:
         ]
         vision = config.llm.vision_model_of()
         if vision:
-            lines.append(
-                f"vision model: <code>{escape_html(vision)}</code> (for photos)"
-            )
+            lines.append(f"vision model: <code>{escape_html(vision)}</code> (for photos)")
         lines += [
             f"endpoint: {escape_html(config.llm.base_url_of())} (from {escape_html(config.llm.where_from())})",
             f"reasoning: {'on' if config.llm.reasoning else 'off'}"
@@ -1790,7 +1791,9 @@ def build_handlers(config: Config) -> list[Any]:
         if not await authorised(update):
             return
         checks = run_checks(config, agent_of(context).registry)
-        await reply(update, "<b>doctor</b>\n" + sanitize_html("\n".join(check.render() for check in checks)))
+        await reply(
+            update, "<b>doctor</b>\n" + sanitize_html("\n".join(check.render() for check in checks))
+        )
 
     async def mcp_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """``/mcp help`` · ``/mcp list`` · ``/mcp check <server>`` · ``/mcp auth <server>``
@@ -2073,7 +2076,10 @@ def build_handlers(config: Config) -> list[Any]:
         agent.reset(chat_of(update))
         history: History = context.application.bot_data["history"]
         if history.clear(chat_of(update)):
-            await reply(update, "cleared this conversation and its transcript. long-term memory is untouched.")
+            await reply(
+                update,
+                "cleared this conversation and its transcript. long-term memory is untouched.",
+            )
         else:
             await reply(update, "cleared this conversation. long-term memory is untouched.")
 
@@ -2161,9 +2167,13 @@ def build_handlers(config: Config) -> list[Any]:
         if remove_id in config.bot.whitelisted_users:
             config.bot.whitelisted_users.remove(remove_id)
             _save_whitelist(config)
-            await reply(update, f"removed <code>{escape_html(remove_id)}</code> from the user whitelist.")
+            await reply(
+                update, f"removed <code>{escape_html(remove_id)}</code> from the user whitelist."
+            )
         else:
-            await reply(update, f"<code>{escape_html(remove_id)}</code> is not in the user whitelist.")
+            await reply(
+                update, f"<code>{escape_html(remove_id)}</code> is not in the user whitelist."
+            )
 
     async def whitelist_add_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await authorised(update):
@@ -2202,9 +2212,13 @@ def build_handlers(config: Config) -> list[Any]:
         if remove_id in config.bot.whitelisted_groups:
             config.bot.whitelisted_groups.remove(remove_id)
             _save_whitelist(config)
-            await reply(update, f"removed <code>{escape_html(remove_id)}</code> from the group whitelist.")
+            await reply(
+                update, f"removed <code>{escape_html(remove_id)}</code> from the group whitelist."
+            )
         else:
-            await reply(update, f"<code>{escape_html(remove_id)}</code> is not in the group whitelist.")
+            await reply(
+                update, f"<code>{escape_html(remove_id)}</code> is not in the group whitelist."
+            )
 
     async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         query = update.callback_query
@@ -2301,7 +2315,9 @@ def build_handlers(config: Config) -> list[Any]:
             return
 
         log.info("document %s (%d bytes) stored for chat %s", artifact.path, artifact.size, chat_id)
-        await reply(update, f"📎 saved <code>{escape_html(artifact.path)}</code> ({artifact.size:,} bytes)")
+        await reply(
+            update, f"📎 saved <code>{escape_html(artifact.path)}</code> ({artifact.size:,} bytes)"
+        )
 
         caption = (message.caption or "").strip()
         prompt = (
@@ -2360,7 +2376,10 @@ def build_handlers(config: Config) -> list[Any]:
         # context.args is None when a command was sent with no arguments, so the
         # name has to come from the text itself.
         command = text.split(maxsplit=1)[0] if text.strip() else "that"
-        await reply(update, f"i don't know <code>{escape_html(command)}</code>. try /start for what i can do.")
+        await reply(
+            update,
+            f"i don't know <code>{escape_html(command)}</code>. try /start for what i can do.",
+        )
 
     async def on_stranger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Anyone who is not allowed gets one clear sentence and nothing else.
@@ -2383,7 +2402,10 @@ def build_handlers(config: Config) -> list[Any]:
                 update.effective_user and update.effective_user.id,
             )
             return
-        log.warning("rejected a message from non-owner %s", update.effective_user and update.effective_user.id)
+        log.warning(
+            "rejected a message from non-owner %s",
+            update.effective_user and update.effective_user.id,
+        )
         await reply(update, NOT_AUTHORISED)
 
     async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2459,9 +2481,7 @@ def build_handlers(config: Config) -> list[Any]:
         verb = "running" if approved else "cancelling"
         if update.callback_query is not None:
             with contextlib.suppress(BadRequest, TelegramError):
-                await update.callback_query.edit_message_text(
-                    f"{verb}…", parse_mode=ParseMode.HTML
-                )
+                await update.callback_query.edit_message_text(f"{verb}…", parse_mode=ParseMode.HTML)
 
         async with _Typing(context.bot, chat_id):
             try:
@@ -2567,9 +2587,13 @@ def build_handlers(config: Config) -> list[Any]:
         # Whitelist management — owner only (checked inside each handler).
         CommandHandler("whitelist", gated(whitelist_command), filters=allowed_filter),
         CommandHandler("whitelist_add_user", gated(whitelist_add_user), filters=allowed_filter),
-        CommandHandler("whitelist_remove_user", gated(whitelist_remove_user), filters=allowed_filter),
+        CommandHandler(
+            "whitelist_remove_user", gated(whitelist_remove_user), filters=allowed_filter
+        ),
         CommandHandler("whitelist_add_group", gated(whitelist_add_group), filters=allowed_filter),
-        CommandHandler("whitelist_remove_group", gated(whitelist_remove_group), filters=allowed_filter),
+        CommandHandler(
+            "whitelist_remove_group", gated(whitelist_remove_group), filters=allowed_filter
+        ),
         # Inline buttons: the approval Confirm/Cancel pair. Taps are never
         # messages in a group, so the mention rule does not apply, and
         # ``button`` checks the sender itself.
@@ -2581,16 +2605,12 @@ def build_handlers(config: Config) -> list[Any]:
         ChatMemberHandler(on_my_chat_member),
         # Keyword arguments on purpose: MessageHandler's parameter order changed
         # between python-telegram-bot v20 and v22, and the keyword form is stable.
-        MessageHandler(
-            callback=on_text, filters=filters.TEXT & ~filters.COMMAND & allowed_filter
-        ),
+        MessageHandler(callback=on_text, filters=filters.TEXT & ~filters.COMMAND & allowed_filter),
         MessageHandler(
             callback=on_non_text, filters=~filters.TEXT & ~filters.COMMAND & allowed_filter
         ),
         # An unrecognised command from the owner still deserves an answer.
-        MessageHandler(
-            callback=on_unknown_command, filters=filters.COMMAND & allowed_filter
-        ),
+        MessageHandler(callback=on_unknown_command, filters=filters.COMMAND & allowed_filter),
         # Everyone else. Last, so an owner's message is never caught here.
         MessageHandler(callback=on_stranger, filters=~allowed_filter),
     ]
@@ -2620,7 +2640,9 @@ def _apply_network_settings(builder: ApplicationBuilder, config: Config) -> None
     builder.get_updates_connection_pool_size(GET_UPDATES_POOL_SIZE)
 
 
-def build_application(config: Config, agent: Agent | None = None, *, bot: Any = None) -> Application:
+def build_application(
+    config: Config, agent: Agent | None = None, *, bot: Any = None
+) -> Application:
     """Assemble the python-telegram-bot Application.
 
     *bot* is an injection point for tests: pass a Bot subclass that records what

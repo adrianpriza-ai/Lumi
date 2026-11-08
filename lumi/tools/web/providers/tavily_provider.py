@@ -111,9 +111,7 @@ class TavilyProvider(WebProvider):
                 return result
             last_error = result.error
             self._pool.report(key, ok=False, retryable=True)
-        return SearchResult(
-            query=query, provider=self.name, error=last_error or "every key failed"
-        )
+        return SearchResult(query=query, provider=self.name, error=last_error or "every key failed")
 
     async def fetch(self, url: str) -> Page:
         if not self._pool:

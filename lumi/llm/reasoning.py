@@ -41,12 +41,8 @@ TRACE_FIELDS = ("reasoning_content", "reasoning", "thinking")
 #: thinking instead of using a separate field.
 _THINK_TAGS = ("think", "thinking", "reasoning")
 
-_CLOSED_THINK_RE = re.compile(
-    rf"</({'|'.join(_THINK_TAGS)})\s*>", re.IGNORECASE
-)
-_OPEN_THINK_RE = re.compile(
-    rf"<({'|'.join(_THINK_TAGS)})(\s[^>]*)?>", re.IGNORECASE
-)
+_CLOSED_THINK_RE = re.compile(rf"</({'|'.join(_THINK_TAGS)})\s*>", re.IGNORECASE)
+_OPEN_THINK_RE = re.compile(rf"<({'|'.join(_THINK_TAGS)})(\s[^>]*)?>", re.IGNORECASE)
 
 #: Phrasings that mean "I have never heard of that field", as opposed to "that
 #: field holds a bad value". Only the first kind is worth retrying without the
@@ -97,11 +93,11 @@ def split_think(text: str) -> tuple[str, str]:
         if closing is None:
             # Unclosed: everything from the tag onwards was thinking, and the
             # model never got to an answer.
-            traces.append(remainder[opening.end():])
+            traces.append(remainder[opening.end() :])
             remainder = remainder[: opening.start()]
             break
         traces.append(remainder[opening.end() : closing.start()])
-        remainder = remainder[: opening.start()] + remainder[closing.end():]
+        remainder = remainder[: opening.start()] + remainder[closing.end() :]
 
     if not traces:
         return text, ""

@@ -30,7 +30,7 @@ def test_splits_on_paragraphs() -> None:
     chunks = split_message(text, 200)
     assert len(chunks) > 1
     assert all(len(c) <= 200 for c in chunks)
-    assert "".join(chunks).replace("\n", "") .startswith("word")
+    assert "".join(chunks).replace("\n", "").startswith("word")
 
 
 def test_every_chunk_respects_the_limit() -> None:
@@ -176,7 +176,7 @@ def test_escape_leaves_ordinary_text_alone() -> None:
 
 
 def test_escape_html_handles_the_three_reserved_characters() -> None:
-    assert escape_html('a < b & c > "d"') == "a &lt; b &amp; c &gt; \"d\""
+    assert escape_html('a < b & c > "d"') == 'a &lt; b &amp; c &gt; "d"'
     assert escape_html("underscores_and_asterisks*stay*") == "underscores_and_asterisks*stay*"
 
 
@@ -288,10 +288,7 @@ def test_markdown_table_becomes_an_aligned_pre_block() -> None:
     text = "Here you go:\n| Name | Age |\n|---|---|\n| Alice | 30 |\n| Bo | 7 |\ndone"
     out = markdown_table_to_html(text)
     assert out == (
-        "Here you go:\n<pre>Name  | Age\n"
-        "------+----\n"
-        "Alice | 30 \n"
-        "Bo    | 7  </pre>\ndone"
+        "Here you go:\n<pre>Name  | Age\n------+----\nAlice | 30 \nBo    | 7  </pre>\ndone"
     )
 
 

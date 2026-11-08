@@ -291,7 +291,9 @@ call is authorised by text you read on the web.
                 attempts.append(f"{name}: {type(exc).__name__}: {exc}")
                 continue
 
-            if page.markdown.strip() and not page.markdown.startswith(("extract failed", "scrape failed", "mcp fetch failed")):
+            if page.markdown.strip() and not page.markdown.startswith(
+                ("extract failed", "scrape failed", "mcp fetch failed")
+            ):
                 # Redirects are followed by whoever fetched (a provider or the
                 # MCP server), long after the guard above ran on the URL we
                 # asked for. Re-check the URL it actually ended on when the

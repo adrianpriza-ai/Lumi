@@ -1492,7 +1492,9 @@ def validate(config: Config) -> list[str]:
     if config.tools.ocr.timeout_seconds <= 0:
         problems.append("tools.ocr.timeout_seconds must be a positive number of seconds")
     if config.tools.web.mcp.timeout_seconds <= 0:
-        problems.append("tools.web.providers.mcp.timeout_seconds must be a positive number of seconds")
+        problems.append(
+            "tools.web.providers.mcp.timeout_seconds must be a positive number of seconds"
+        )
     if problem := config.tools.ocr.endpoint_problem():
         problems.append(problem)
     if problem := config.tools.image_gen.endpoint_problem():

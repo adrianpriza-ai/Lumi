@@ -59,7 +59,8 @@ def test_scopes_reach_the_spec_from_either_dict_spelling(config) -> None:
         "a", {"url": "https://a.test", "auth": {"type": "oauth", "scopes": "read offline_access"}}
     )
     as_list = ServerSpec.from_json(
-        "b", {"url": "https://b.test", "auth": {"type": "oauth", "scopes": ["read", "offline_access"]}}
+        "b",
+        {"url": "https://b.test", "auth": {"type": "oauth", "scopes": ["read", "offline_access"]}},
     )
 
     assert as_string.oauth and as_string.oauth_scope == "read offline_access"
@@ -94,7 +95,10 @@ def test_with_scope_makes_the_configured_request_win() -> None:
     # The SDK dropped the parameter entirely (server advertised no scopes):
     # the configured one is added back.
     plain = "http://as.test/authorize?state=s2&code_challenge=c"
-    assert _with_scope(plain, "read") == "http://as.test/authorize?state=s2&code_challenge=c&scope=read"
+    assert (
+        _with_scope(plain, "read")
+        == "http://as.test/authorize?state=s2&code_challenge=c&scope=read"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -111,7 +115,9 @@ async def test_tokens_round_trip_and_isolation(tmp_path) -> None:
 
     await first.set_tokens(tokens)
     client = {"client_id": "cid", "redirect_uris": ["http://localhost:1/callback"]}
-    await first.set_client_info(type("Info", (), {"model_dump": staticmethod(lambda mode="": client)})())
+    await first.set_client_info(
+        type("Info", (), {"model_dump": staticmethod(lambda mode="": client)})()
+    )
 
     got = await first.get_tokens()
     assert got is not None and got.access_token == "at" and got.refresh_token == "rt"
@@ -304,7 +310,11 @@ class FakeOAuthServer:
                     self._json({**body, "client_id": "fake-client-1", "client_id_issued_at": 1})
                 elif self.path == "/token":
                     grant = body.get("grant_type")
-                    if grant == "authorization_code" and body.get("code") == "ac-1" and body.get("code_verifier"):
+                    if (
+                        grant == "authorization_code"
+                        and body.get("code") == "ac-1"
+                        and body.get("code_verifier")
+                    ):
                         self._json(
                             {
                                 "access_token": "test-access-token",
@@ -351,9 +361,11 @@ async def test_a_full_login_through_the_installed_sdk(tmp_path) -> None:
             # RFC 9207's authorization-response issuer — 2.x validates it.
             query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
             state = query["state"][0]
-            origin = urllib.parse.urlparse(url)._replace(
-                path="", params="", query="", fragment=""
-            ).geturl()
+            origin = (
+                urllib.parse.urlparse(url)
+                ._replace(path="", params="", query="", fragment="")
+                .geturl()
+            )
             redirect = fake.registered_redirect
             assert redirect, "the SDK must register before redirecting"
             landing = (
@@ -392,9 +404,11 @@ async def test_the_authorization_request_carries_the_configured_scopes(tmp_path)
         async def on_redirect(url: str) -> None:
             seen.append(url)
             query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
-            origin = urllib.parse.urlparse(url)._replace(
-                path="", params="", query="", fragment=""
-            ).geturl()
+            origin = (
+                urllib.parse.urlparse(url)
+                ._replace(path="", params="", query="", fragment="")
+                .geturl()
+            )
             landing = (
                 f"{fake.registered_redirect}?code=ac-1&state={query['state'][0]}"
                 f"&iss={urllib.parse.quote(origin)}"
@@ -414,11 +428,14 @@ async def test_the_authorization_request_carries_the_configured_scopes(tmp_path)
 async def test_a_second_login_reuses_the_registration(tmp_path) -> None:
     fake = FakeOAuthServer().start()
     try:
+
         async def on_redirect(url: str) -> None:
             query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
-            origin = urllib.parse.urlparse(url)._replace(
-                path="", params="", query="", fragment=""
-            ).geturl()
+            origin = (
+                urllib.parse.urlparse(url)
+                ._replace(path="", params="", query="", fragment="")
+                .geturl()
+            )
             landing = (
                 f"{fake.registered_redirect}?code=ac-1&state={query['state'][0]}"
                 f"&iss={urllib.parse.quote(origin)}"

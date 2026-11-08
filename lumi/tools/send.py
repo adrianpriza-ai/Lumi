@@ -27,8 +27,8 @@ class SendTool(Tool):
     name = "send"
     description = (
         "Send a message to the owner right now, mid-turn, and keep working. "
-        "Use for progress updates during long work (\"done with phase 1, "
-        "starting phase 2\") or to deliver the answer in parts across several "
+        'Use for progress updates during long work ("done with phase 1, '
+        'starting phase 2") or to deliver the answer in parts across several '
         "messages. One call sends one message. Do NOT use it for your final "
         "answer — that is your normal reply text — and keep it to a handful "
         "of messages per turn."

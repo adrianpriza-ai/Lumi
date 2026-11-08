@@ -352,12 +352,16 @@ class MemoryFile:
             return body
         kept = [line for i, line in enumerate(lines) if i not in tagged]
         facts = [lines[i] for i in sorted(tagged)]
-        out = "\n".join(kept).rstrip("\n") + "\n\n" + "\n".join(
-            [MODEL_NOTES_START, *facts, MODEL_NOTES_END]
+        out = (
+            "\n".join(kept).rstrip("\n")
+            + "\n\n"
+            + "\n".join([MODEL_NOTES_START, *facts, MODEL_NOTES_END])
         )
         # The fence size was reserved before elision, so this should never
         # fire — but the budget is the whole reason this method exists.
-        return truncate(out, budget, marker=_ELIDED_TAIL) if budget > 0 and len(out) > budget else out
+        return (
+            truncate(out, budget, marker=_ELIDED_TAIL) if budget > 0 and len(out) > budget else out
+        )
 
     def _elide(self, body: str, budget: int) -> str:
         """*body* cut to *budget*, keeping the structure and the newest facts.
@@ -424,7 +428,8 @@ class MemoryFile:
     def stats(self) -> dict[str, Any]:
         self.ensure_loaded()
         managed = self.managed()
-        return {            "path": str(self.path),
+        return {
+            "path": str(self.path),
             "chars": len(self.text),
             "managed_count": len(managed),
             "bullet_count": sum(1 for ln in self.text.splitlines() if _BULLET_RE.match(ln)),
@@ -458,6 +463,7 @@ class MemoryFile:
 # --------------------------------------------------------------------------- #
 # Scoped memory: one MEMORY.md per chat
 # --------------------------------------------------------------------------- #
+
 
 def scope_slug(scope: int | str) -> str:
     """Return a filesystem-safe, collision-free directory name for a scope id.
@@ -630,9 +636,7 @@ class History:
         tool: str = "",
     ) -> Turn:
         self.directory.mkdir(parents=True, exist_ok=True)
-        turn = Turn(
-            ts=_now(), role=role, content=content, session=session, name=name, tool=tool
-        )
+        turn = Turn(ts=_now(), role=role, content=content, session=session, name=name, tool=tool)
         try:
             with self.path_for(chat_id).open("a", encoding="utf-8") as handle:
                 handle.write(turn.to_json() + "\n")

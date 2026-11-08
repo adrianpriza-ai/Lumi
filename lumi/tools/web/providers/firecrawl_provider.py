@@ -39,7 +39,11 @@ def _as_dict(value: Any) -> dict[str, Any]:
                 return method()
             except TypeError:  # pragma: no cover - defensive
                 continue
-    return {k: v for k, v in vars(value).items() if not k.startswith("_")} if hasattr(value, "__dict__") else {}
+    return (
+        {k: v for k, v in vars(value).items() if not k.startswith("_")}
+        if hasattr(value, "__dict__")
+        else {}
+    )
 
 
 class FirecrawlProvider(WebProvider):
@@ -88,9 +92,7 @@ class FirecrawlProvider(WebProvider):
 
     # -- public surface ---------------------------------------------------- #
 
-    async def search(
-        self, query: str, max_results: int, days: int | None = None
-    ) -> SearchResult:
+    async def search(self, query: str, max_results: int, days: int | None = None) -> SearchResult:
         """Search via Firecrawl, retrying the pool on failure.
 
         Keyless mode (self-hosted endpoint) makes a single attempt, the same
@@ -197,7 +199,9 @@ class FirecrawlProvider(WebProvider):
             # the tool layer re-checks against the private-host rules
             # (finding E).
             url=final_url(
-                metadata.get("url"), metadata.get("sourceURL"), metadata.get("pageUrl"),
+                metadata.get("url"),
+                metadata.get("sourceURL"),
+                metadata.get("pageUrl"),
                 requested=url,
             ),
             title=str(metadata.get("title") or metadata.get("ogTitle") or ""),
@@ -249,7 +253,9 @@ class FirecrawlProvider(WebProvider):
 
     async def _top_up(self, result: SearchResult) -> None:
         """Fill in missing bodies for the top hits with a real scrape."""
-        thin = [hit for hit in result.hits if not hit.content.strip()][: self.config.auto_scrape_top_n]
+        thin = [hit for hit in result.hits if not hit.content.strip()][
+            : self.config.auto_scrape_top_n
+        ]
         # Search results are someone else's index: a hit whose URL the tool
         # itself would refuse to fetch is not scraped behind its back either
         # (finding K).

@@ -512,7 +512,7 @@ def test_duplicate_keys_collapse(config, monkeypatch) -> None:
 
 
 def test_quotes_around_a_key_are_stripped(config, monkeypatch) -> None:
-    monkeypatch.setenv("OPENAI_API_KEY", '"sk-90", \'sk-91\'')
+    monkeypatch.setenv("OPENAI_API_KEY", "\"sk-90\", 'sk-91'")
     assert config.llm.api_keys() == ["sk-90", "sk-91"]
 
 
@@ -710,8 +710,8 @@ def test_a_vision_route_merges_only_what_it_states(config, monkeypatch) -> None:
 
     route = config.llm.vision_route_of()
     assert route is not None
-    assert route.provider == "openrouter"          # from the route
-    assert route.api_key() == "sk-or"              # its own key
+    assert route.provider == "openrouter"  # from the route
+    assert route.api_key() == "sk-or"  # its own key
     assert route.vision_model_of() == "google/gemini-2.0-flash-001"
     assert route.model_of() == config.llm.model_of()  # text model inherited
     assert route.base_url_of() == config.llm.base_url_of()
@@ -723,7 +723,7 @@ def test_the_ocr_route_stays_on_the_default_even_with_a_vision_route(config) -> 
     config.llm.vision.provider = "openrouter"
     config.llm.vision.model = "google/gemini-2.0-flash-001"
     ocr = config.llm.ocr_route_of()
-    assert ocr.provider == config.llm.provider      # default endpoint, not vision's
+    assert ocr.provider == config.llm.provider  # default endpoint, not vision's
     assert ocr.base_url_of() == config.llm.base_url_of()
     assert config.llm.ocr_model_of() == config.llm.model_of()
 

@@ -53,7 +53,11 @@ async def test_read_file_reads_a_text_pdf_without_the_model(config, project: Pat
 async def test_read_file_pages_a_pdf_in_pages(config, project: Path) -> None:
     path = project / "workspace" / "long.pdf"
     path.write_bytes(
-        make_pdf("page one with plenty of words", "page two with plenty of words", "page three with plenty of words")
+        make_pdf(
+            "page one with plenty of words",
+            "page two with plenty of words",
+            "page three with plenty of words",
+        )
     )
     tool = ReadFileTool(config)
 
@@ -353,7 +357,9 @@ class FakeMessage:
 
 
 def test_media_entry_renders_with_its_path() -> None:
-    entry = media_entry_from(FakeMessage(caption="see attached"), "document", "workspace/uploads/1/notes.txt")
+    entry = media_entry_from(
+        FakeMessage(caption="see attached"), "document", "workspace/uploads/1/notes.txt"
+    )
 
     assert entry.kind == "document"
     assert "see attached" in entry.render(1)
@@ -373,8 +379,14 @@ async def test_more_context_lists_attachment_paths(config) -> None:
     log = ChatLog()
     log.record(
         "chat",
-        LogEntry(message_id=1, author="Owner", text="see attached", clock="10:00",
-                 kind="document", path="workspace/uploads/chat/notes.txt"),
+        LogEntry(
+            message_id=1,
+            author="Owner",
+            text="see attached",
+            clock="10:00",
+            kind="document",
+            path="workspace/uploads/chat/notes.txt",
+        ),
     )
     log.record("chat", LogEntry(message_id=2, author="Dana", text="thanks!", clock="10:01"))
 
@@ -395,8 +407,13 @@ def _message(message_id: int, text: str = "") -> Any:
     return type(
         "M",
         (),
-        {"message_id": message_id, "text": text, "caption": "", "from_user": None,
-         "reply_to_message": None},
+        {
+            "message_id": message_id,
+            "text": text,
+            "caption": "",
+            "from_user": None,
+            "reply_to_message": None,
+        },
     )()
 
 
@@ -406,7 +423,9 @@ def test_quoted_prefix_single_link_carries_a_media_note() -> None:
     photo.photo = [{"file_id": "x"}]
     reply.reply_to_message = photo
 
-    prefix = _quoted_prefix(reply, {1: "[this is a photo, saved as workspace/uploads/1/photo-1.jpg]"})
+    prefix = _quoted_prefix(
+        reply, {1: "[this is a photo, saved as workspace/uploads/1/photo-1.jpg]"}
+    )
 
     assert "saved as workspace/uploads/1/photo-1.jpg" in prefix
     assert "(a photo with no text)" not in prefix
@@ -420,7 +439,9 @@ def test_quoted_prefix_chain_media_note_lands_in_its_own_block() -> None:
     newest.reply_to_message = middle
     middle.reply_to_message = oldest
 
-    prefix = _quoted_prefix(newest, {1: "[this is a document, saved as workspace/uploads/1/spec.pdf]"})
+    prefix = _quoted_prefix(
+        newest, {1: "[this is a document, saved as workspace/uploads/1/spec.pdf]"}
+    )
 
     assert "saved as workspace/uploads/1/spec.pdf" in prefix
     # oldest first: the note is in the first block, not the last

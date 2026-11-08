@@ -149,9 +149,7 @@ class ToolRegistry:
             log.info("tool %s -> %s", name, result.summary[:160])
         return result
 
-    async def invoke_approved(
-        self, pending: NeedsApproval, ctx: ToolContext
-    ) -> ToolResult:
+    async def invoke_approved(self, pending: NeedsApproval, ctx: ToolContext) -> ToolResult:
         """Re-run a previously blocked call, this time flagged as approved."""
         return await self.invoke(pending.tool, pending.arguments, ctx.approve())
 

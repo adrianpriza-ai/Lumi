@@ -496,13 +496,15 @@ def test_chat_reasoning_command_in_repl(config, capsys, monkeypatch) -> None:
     )
     monkeypatch.setattr(cli, "_build_agent", lambda cfg: agent)
 
-    scripted = iter([
-        "/reasoning",
-        "/reasoning off",
-        "/reasoning on",
-        "/reasoning invalid",
-        "/quit",
-    ])
+    scripted = iter(
+        [
+            "/reasoning",
+            "/reasoning off",
+            "/reasoning on",
+            "/reasoning invalid",
+            "/quit",
+        ]
+    )
 
     async def fake_prompt(message: str) -> str:
         return next(scripted)

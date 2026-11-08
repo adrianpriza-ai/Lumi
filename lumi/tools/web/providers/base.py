@@ -136,8 +136,7 @@ class WebProvider(abc.ABC):
         """Search *query*, optionally limited to pages from the last *days*."""
 
     @abc.abstractmethod
-    async def fetch(self, url: str) -> Page:
-        ...
+    async def fetch(self, url: str) -> Page: ...
 
     def summary_line(self) -> str:
         ok, reason = self.available()

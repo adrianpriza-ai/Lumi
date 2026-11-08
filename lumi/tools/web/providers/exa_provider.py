@@ -45,7 +45,11 @@ def _as_dict(value: Any) -> dict[str, Any]:
                 return method()
             except TypeError:  # pragma: no cover - defensive
                 continue
-    return {k: v for k, v in vars(value).items() if not k.startswith("_")} if hasattr(value, "__dict__") else {}
+    return (
+        {k: v for k, v in vars(value).items() if not k.startswith("_")}
+        if hasattr(value, "__dict__")
+        else {}
+    )
 
 
 class ExaProvider(WebProvider):
@@ -94,9 +98,7 @@ class ExaProvider(WebProvider):
 
     # -- public surface ---------------------------------------------------- #
 
-    async def search(
-        self, query: str, max_results: int, days: int | None = None
-    ) -> SearchResult:
+    async def search(self, query: str, max_results: int, days: int | None = None) -> SearchResult:
         """Search via Exa, retrying the pool on failure.
 
         Keyless mode (owner-run endpoint) makes a single attempt, the same
@@ -177,7 +179,9 @@ class ExaProvider(WebProvider):
 
             self._pool.report(key, ok=True)
             page = self._page_from(raw, url)
-            if page.markdown.strip() and not page.markdown.startswith(("extraction failed", "no content")):
+            if page.markdown.strip() and not page.markdown.startswith(
+                ("extraction failed", "no content")
+            ):
                 return page
             # The API call itself succeeded, so the miss is the URL's fault,
             # not the key's: leave the key in rotation and move on.

@@ -102,8 +102,7 @@ Use it when the owner asks for something that lives in an external service: crea
             "server": {
                 "type": "string",
                 "description": (
-                    "Server name from list. Required for call; an optional "
-                    "filter for list."
+                    "Server name from list. Required for call; an optional filter for list."
                 ),
             },
             "tool": {
@@ -193,14 +192,10 @@ Use it when the owner asks for something that lives in an external service: crea
         if refusal := self.provider._trust_refusal(spec):
             # Same logic: retrying cannot approve an entry, and connecting is
             # exactly the thing the owner has not agreed to yet.
-            return CheckOutcome(
-                name=spec.name, ok=False, detail=refusal, attempts=0, seconds=0.0
-            )
+            return CheckOutcome(name=spec.name, ok=False, detail=refusal, attempts=0, seconds=0.0)
         ok, reason = self.available()
         if not ok:
-            return CheckOutcome(
-                name=spec.name, ok=False, detail=reason, attempts=0, seconds=0.0
-            )
+            return CheckOutcome(name=spec.name, ok=False, detail=reason, attempts=0, seconds=0.0)
 
         budget = min(float(self.settings.timeout_seconds), CHECK_ATTEMPT_SECONDS)
         trail: list[str] = []
@@ -316,9 +311,7 @@ Use it when the owner asks for something that lives in an external service: crea
             configured = ", ".join(s.name for s in servers) or "none"
             raise ToolError(f"no server named {server!r}; configured: {configured}")
         if missing := spec.unresolved():
-            raise ToolError(
-                f"server {server!r} needs ${{{missing}}} set in the environment"
-            )
+            raise ToolError(f"server {server!r} needs ${{{missing}}} set in the environment")
         if refusal := self.provider._trust_refusal(spec):
             # Fail before connecting, and before the per-call approval prompt:
             # the owner confirming one call is not them approving an entry
@@ -333,9 +326,7 @@ Use it when the owner asks for something that lives in an external service: crea
             # The exception can carry the server's response body, so it is
             # fenced like any other server-authored text.
             return ToolResult.failure(
-                fence_untrusted(
-                    f"server {server!r} is unreachable: {type(exc).__name__}: {exc}"
-                )
+                fence_untrusted(f"server {server!r} is unreachable: {type(exc).__name__}: {exc}")
             )
 
         tool = next((t for t in tools if t.name == tool_name), None)
@@ -381,9 +372,7 @@ Use it when the owner asks for something that lives in an external service: crea
             raise  # a timeout reads as "did not answer within Ns", not "failed: ToolError"
         except Exception as exc:  # noqa: BLE001
             return ToolResult.failure(
-                fence_untrusted(
-                    f"{server}.{tool_name} failed: {type(exc).__name__}: {exc}"
-                )
+                fence_untrusted(f"{server}.{tool_name} failed: {type(exc).__name__}: {exc}")
             )
 
         text = truncate(_flatten(result) or "(the server returned nothing)", CALL_MAX_CHARS)

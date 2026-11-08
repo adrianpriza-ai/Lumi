@@ -121,7 +121,10 @@ class ImageGenTool(Tool):
         # The hosted API bills per call, so it needs a key; a custom endpoint
         # may be self-hosted and keyless, and that is a usable configuration.
         if self._settings.needs_key() and not self._settings.api_key():
-            return False, f"{self._settings.api_key_env} is unset (needed by tools.image_gen.provider)"
+            return (
+                False,
+                f"{self._settings.api_key_env} is unset (needed by tools.image_gen.provider)",
+            )
         return True, ""
 
     # -- dispatch ---------------------------------------------------------- #

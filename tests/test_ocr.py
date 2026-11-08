@@ -120,7 +120,9 @@ def ctx() -> ToolContext:
 
 async def test_a_text_pdf_never_touches_the_model(config, project: Path) -> None:
     path = project / "workspace" / "text.pdf"
-    path.write_bytes(make_pdf("Hello Lumi OCR, the quick brown fox", "second page text with more words"))
+    path.write_bytes(
+        make_pdf("Hello Lumi OCR, the quick brown fox", "second page text with more words")
+    )
     tool = OCRTool(config)
     tool._llm = StubLLM([])  # any call raises
 
@@ -154,7 +156,13 @@ async def test_a_scanned_page_falls_back_to_the_vision_model(config, project: Pa
 
 async def test_max_pages_limits_the_work_and_names_the_rest(config, project: Path) -> None:
     path = project / "workspace" / "long.pdf"
-    path.write_bytes(make_pdf("page one with plenty of words", "page two with plenty of words", "page three with plenty of words"))
+    path.write_bytes(
+        make_pdf(
+            "page one with plenty of words",
+            "page two with plenty of words",
+            "page three with plenty of words",
+        )
+    )
     tool = OCRTool(config)
     tool._llm = StubLLM([])
 
@@ -433,9 +441,7 @@ async def test_a_keyless_custom_endpoint_sends_no_auth_header(config, monkeypatc
 
     monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
     monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
-    client = OCRDocumentClient(
-        OCRConfig(provider="custom", base_url="http://localhost:8787/v1")
-    )
+    client = OCRDocumentClient(OCRConfig(provider="custom", base_url="http://localhost:8787/v1"))
 
     pages = await client.ocr(document_b64="JVBERg==")
 
@@ -451,7 +457,9 @@ def test_the_ocr_enabled_flag_is_honoured(config) -> None:
 
 
 @pytest.mark.parametrize("base_url", ["", "https://api.mistral.ai/v1/", "not-a-url"])
-async def test_invalid_custom_endpoint_is_blocked_before_http(config, monkeypatch, base_url) -> None:
+async def test_invalid_custom_endpoint_is_blocked_before_http(
+    config, monkeypatch, base_url
+) -> None:
     config.tools.ocr.provider = "custom"
     config.tools.ocr.base_url = base_url
     monkeypatch.setenv("MISTRAL_API_KEY", "test-ocr-key")
@@ -566,7 +574,8 @@ async def test_local_pdf_upload_uses_a_document_data_uri(monkeypatch, provider) 
 
     client_class = httpx.AsyncClient
     monkeypatch.setattr(
-        httpx, "AsyncClient",
+        httpx,
+        "AsyncClient",
         lambda **kwargs: client_class(transport=httpx.MockTransport(respond), **kwargs),
     )
     monkeypatch.setenv("MISTRAL_API_KEY", "test-ocr-key")

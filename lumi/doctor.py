@@ -98,12 +98,17 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
         Check(
             "config",
             OK if config.config_path else WARN,
-            str(config.config_path) if config.config_path else "no config.toml; using built-in defaults",
+            str(config.config_path)
+            if config.config_path
+            else "no config.toml; using built-in defaults",
         )
     )
     checks.append(
-        Check("PERSONALITY.md", OK if config.personality_file.is_file() else FAIL,
-              relative_to_root(config.personality_file))
+        Check(
+            "PERSONALITY.md",
+            OK if config.personality_file.is_file() else FAIL,
+            relative_to_root(config.personality_file),
+        )
     )
 
     for label, path in (
@@ -114,7 +119,11 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
     ):
         exists = path.is_dir()
         status = OK if exists else WARN
-        detail = relative_to_root(path) if exists else f"{relative_to_root(path)} (will be created on demand)"
+        detail = (
+            relative_to_root(path)
+            if exists
+            else f"{relative_to_root(path)} (will be created on demand)"
+        )
         checks.append(Check(label, status, detail))
 
     # -- terminal UI ------------------------------------------------------- #
@@ -149,7 +158,9 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
         Check(
             "TELEGRAM_OWNER_ID",
             OK if owner else FAIL,
-            f"{owner} (only this id gets the shell and file tools)" if owner else "missing — see .env.example",
+            f"{owner} (only this id gets the shell and file tools)"
+            if owner
+            else "missing — see .env.example",
         )
     )
     if config.bot.proxy_url:
@@ -172,9 +183,7 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
     keys = config.llm.api_keys()
     if keys:
         detail = (
-            f"{len(keys)} key(s), {config.llm.strategy_of()} strategy"
-            if len(keys) > 1
-            else "set"
+            f"{len(keys)} key(s), {config.llm.strategy_of()} strategy" if len(keys) > 1 else "set"
         )
     else:
         detail = "missing — the bot cannot answer anything"
@@ -237,7 +246,11 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
     elif problem := img_cfg.endpoint_problem():
         checks.append(Check("image_gen", FAIL, problem))
     elif img_cfg.api_key():
-        checks.append(Check("image_gen", OK, f"{img_cfg.model} via {img_cfg.base_url} ({img_cfg.api_key_env})"))
+        checks.append(
+            Check(
+                "image_gen", OK, f"{img_cfg.model} via {img_cfg.base_url} ({img_cfg.api_key_env})"
+            )
+        )
     elif img_cfg.needs_key():
         checks.append(
             Check(
@@ -259,7 +272,9 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
     # -- shell ------------------------------------------------------------- #
     shell_ok = shutil.which("bash") or shutil.which("sh")
     checks.append(
-        Check("shell", OK if shell_ok else WARN, shell_ok or "no bash/sh on PATH; commands may fail")
+        Check(
+            "shell", OK if shell_ok else WARN, shell_ok or "no bash/sh on PATH; commands may fail"
+        )
     )
     checks.append(Check("shell policy", OK, safety.describe_policy()))
     checks.append(
@@ -350,13 +365,13 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
             unresolved = [f"{s.name} (needs {s.unresolved()})" for s in servers if s.unresolved()]
             detail = f"{len(servers)} server(s): {', '.join(s.name for s in servers) or 'none'}"
             if unresolved:
-                checks.append(Check("mcp servers", WARN, f"{detail}; unset: {', '.join(unresolved)}"))
+                checks.append(
+                    Check("mcp servers", WARN, f"{detail}; unset: {', '.join(unresolved)}")
+                )
             else:
                 checks.append(Check("mcp servers", OK, detail))
         else:
-            checks.append(
-                Check("mcp servers", WARN, f"no {' or '.join(mcp.sources)} found")
-            )
+            checks.append(Check("mcp servers", WARN, f"no {' or '.join(mcp.sources)} found"))
     except Exception as exc:  # noqa: BLE001
         checks.append(Check("mcp servers", FAIL, format_error(exc)))
 
@@ -375,7 +390,9 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
             built = build_registry(config, config.build_memory_store())
             for tool in built.all():
                 ok, reason = tool.available()
-                checks.append(Check(f"tool {tool.name}", OK if ok else WARN, reason or tool.summary_line()))
+                checks.append(
+                    Check(f"tool {tool.name}", OK if ok else WARN, reason or tool.summary_line())
+                )
         except Exception as exc:  # noqa: BLE001
             checks.append(Check("tools", FAIL, format_error(exc)))
 

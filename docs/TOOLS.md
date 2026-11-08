@@ -478,6 +478,7 @@ setting `tools.context7.enabled = false`.
 # lumi/tools/weather.py
 from .base import Tool, ToolContext, ToolResult
 
+
 class WeatherTool(Tool):
     name = "weather"
     description = "Look up the current weather for a city. Use when asked about weather."

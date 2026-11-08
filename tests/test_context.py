@@ -79,12 +79,14 @@ def test_a_multimodal_turn_counts_its_text_not_its_image(config) -> None:
 
 def test_tool_call_arguments_count_towards_the_estimate(config) -> None:
     window = make_window(config)
-    small = {"role": "assistant", "tool_calls": [
-        {"function": {"name": "files", "arguments": "{}"}}
-    ]}
-    large = {"role": "assistant", "tool_calls": [
-        {"function": {"name": "files", "arguments": "x" * 20_000}}
-    ]}
+    small = {
+        "role": "assistant",
+        "tool_calls": [{"function": {"name": "files", "arguments": "{}"}}],
+    }
+    large = {
+        "role": "assistant",
+        "tool_calls": [{"function": {"name": "files", "arguments": "x" * 20_000}}],
+    }
     assert window.estimate([large]) - window.estimate([small]) > 5_000
 
 
@@ -377,7 +379,9 @@ def test_replay_of_an_unknown_chat_is_empty(config) -> None:
 def test_the_whole_memory_file_reaches_the_prompt(config) -> None:
     """A memory file that gets cut is a memory the model cannot use."""
     path = Path(config.memory_file)
-    path.write_text("# Memory\n\n" + "\n".join(f"- fact {i}" for i in range(1_000)), encoding="utf-8")
+    path.write_text(
+        "# Memory\n\n" + "\n".join(f"- fact {i}" for i in range(1_000)), encoding="utf-8"
+    )
     memory = MemoryFile(path, 0)
     memory.load()
     assert memory.for_prompt() == memory.text.strip()
@@ -587,7 +591,10 @@ async def test_an_unreachable_target_is_clamped_to_the_protected_tail(config, ca
 
     used = window.estimate(conv.messages)
     assert window.target < used <= window.budget
-    assert any("context target" in record.message and "unreachable" in record.message for record in caplog.records)
+    assert any(
+        "context target" in record.message and "unreachable" in record.message
+        for record in caplog.records
+    )
 
 
 def test_the_report_names_the_target_when_one_is_set(config) -> None:

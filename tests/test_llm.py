@@ -80,9 +80,7 @@ def reply(
     untyped extra field — and is the thing :mod:`lumi.llm.reasoning` probes.
     """
     function_calls = [
-        SimpleNamespace(
-            id=cid, function=SimpleNamespace(name=name, arguments=arguments)
-        )
+        SimpleNamespace(id=cid, function=SimpleNamespace(name=name, arguments=arguments))
         for cid, name, arguments in (tool_calls or [])
     ]
     message = SimpleNamespace(content=text, tool_calls=function_calls or None)
@@ -244,9 +242,7 @@ async def test_multiple_tool_calls_are_all_kept(config) -> None:
 
 
 async def test_text_alongside_tool_calls_is_kept(config) -> None:
-    completions = StubCompletions(
-        reply("let me look", [("c1", "run_shell", '{"command":"ls"}')])
-    )
+    completions = StubCompletions(reply("let me look", [("c1", "run_shell", '{"command":"ls"}')]))
     result = await client_with(config, completions).complete([{"role": "user", "content": "q"}])
     assert result.text == "let me look"
     assert result.wants_tools is True
@@ -258,7 +254,9 @@ async def test_missing_usage_is_tolerated(config) -> None:
     assert result.usage == {}
 
 
-async def test_an_empty_completion_is_retried_before_it_reaches_the_agent(config, monkeypatch) -> None:
+async def test_an_empty_completion_is_retried_before_it_reaches_the_agent(
+    config, monkeypatch
+) -> None:
     async def no_wait(_seconds: float) -> None:
         return None
 
@@ -663,7 +661,9 @@ async def test_the_ladder_keeps_going_until_nothing_is_left_to_drop(config) -> N
 async def test_a_value_error_is_not_retried(config) -> None:
     """Retrying a 400 about a bad value would only bury the message."""
     reasoning_config(config, reasoning_effort="high")
-    completions = StubCompletions(error=status_error(400, "temperature is only supported when set to 1"))
+    completions = StubCompletions(
+        error=status_error(400, "temperature is only supported when set to 1")
+    )
     with pytest.raises(LLMError):
         await client_with(config, completions).complete([{"role": "user", "content": "q"}])
     assert len(completions.requests) == 1
@@ -715,7 +715,9 @@ async def test_the_ladder_does_not_apply_without_reasoning_mode(config) -> None:
 
 async def test_a_reasoning_model_failure_names_the_config_fix(config, monkeypatch) -> None:
     monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
-    completions = StubCompletions(error=status_error(400, "temperature is only supported when set to 1"))
+    completions = StubCompletions(
+        error=status_error(400, "temperature is only supported when set to 1")
+    )
     with pytest.raises(LLMError) as caught:
         await client_with(config, completions).complete([{"role": "user", "content": "q"}])
 
@@ -727,7 +729,9 @@ async def test_a_reasoning_model_failure_names_the_config_fix(config, monkeypatc
 async def test_no_reasoning_hint_when_already_in_reasoning_mode(config, monkeypatch) -> None:
     monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:11434/v1")
     reasoning_config(config)
-    completions = StubCompletions(error=status_error(400, "temperature is only supported when set to 1"))
+    completions = StubCompletions(
+        error=status_error(400, "temperature is only supported when set to 1")
+    )
     with pytest.raises(LLMError) as caught:
         await client_with(config, completions).complete([{"role": "user", "content": "q"}])
     assert "reasoning = true" not in str(caught.value)
@@ -766,9 +770,7 @@ async def test_inline_think_tags_never_reach_the_answer(config) -> None:
 
 
 async def test_a_trace_field_wins_over_inline_tags(config) -> None:
-    completions = StubCompletions(
-        reply("<think>tags</think>answer", reasoning="from the field")
-    )
+    completions = StubCompletions(reply("<think>tags</think>answer", reasoning="from the field"))
     result = await client_with(config, completions).complete([{"role": "user", "content": "q"}])
     assert result.reasoning == "from the field"
     assert result.text == "answer"
@@ -915,7 +917,7 @@ async def test_image_turns_go_to_the_vision_client(config) -> None:
     vision_completions = StubCompletions(reply("from vision"))
     vision = OpenAICompatClient(config.llm.vision_route_of())
     vision_used: list[str] = []
-    vision._client_for = lambda key: (vision_used.append(key) or StubClient(vision_completions))  # type: ignore[method-assign]
+    vision._client_for = lambda key: vision_used.append(key) or StubClient(vision_completions)  # type: ignore[method-assign]
     main.vision = vision
 
     text_only = [{"role": "user", "content": "plain question"}]
@@ -1129,9 +1131,7 @@ async def test_an_empty_retry_never_replays_the_thinking(config, monkeypatch) ->
 async def test_a_stream_that_dies_after_text_does_not_retry(config) -> None:
     """The first token commits the call: replaying would show the answer
     twice, so the failure is terminal — and the key is not parked for it."""
-    stream = StreamCompletions(
-        DyingStream([chunk(content="partial")], status_error(503))
-    )
+    stream = StreamCompletions(DyingStream([chunk(content="partial")], status_error(503)))
     seen: list[tuple[str, str]] = []
 
     with pytest.raises(LLMError, match="while the answer was streaming") as caught:

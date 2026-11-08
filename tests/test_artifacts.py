@@ -141,8 +141,9 @@ def test_recent_lists_a_re_registered_file_once(store: ArtifactStore, config) ->
 
 def test_caption_is_human_readable(store: ArtifactStore, config) -> None:
     (config.root / "workspace" / "tiny.txt").write_text("hi", encoding="utf-8")
-    artifact = store.send(config.root / "workspace" / "tiny.txt", origin="files",
-                          project_root=config.root)
+    artifact = store.send(
+        config.root / "workspace" / "tiny.txt", origin="files", project_root=config.root
+    )
     caption = artifact.caption()
     assert "workspace/tiny.txt" in caption
     assert "2 B" in caption
@@ -275,9 +276,7 @@ async def test_upload_of_a_missing_file_fails_cleanly(files: FilesTool) -> None:
     assert result.artifacts == []
 
 
-async def test_upload_of_a_disallowed_file_degrades_to_a_note(
-    files: FilesTool, config
-) -> None:
+async def test_upload_of_a_disallowed_file_degrades_to_a_note(files: FilesTool, config) -> None:
     (config.root / "workspace" / "binary.exe").write_bytes(b"MZ")
     result = await files.invoke({"action": "upload", "path": "workspace/binary.exe"}, ctx())
     assert not result.ok

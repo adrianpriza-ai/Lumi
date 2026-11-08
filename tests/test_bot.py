@@ -146,9 +146,7 @@ class StaleToastBot(FakeBot):
     async def answer_callback_query(self, *args: Any, **kwargs: Any) -> bool:
         from telegram.error import BadRequest
 
-        raise BadRequest(
-            "Query is too old and response timeout expired or query id is invalid"
-        )
+        raise BadRequest("Query is too old and response timeout expired or query id is invalid")
 
 
 class FlakySendBot(FakeBot):
@@ -181,11 +179,18 @@ class DeadBot(FakeBot):
         raise TelegramError("chat is gone")
 
 
-def make_update(bot: Bot, text: str | None = None, *, chat_id: int = CHAT, user_id: int = OWNER,
-                message_id: int = 1, chat_type: str = "private",
-                chat_username: str = "lab_group",
-                entities: list[dict[str, Any]] | None = None,
-                reply_to_message: dict[str, Any] | None = None) -> Update:
+def make_update(
+    bot: Bot,
+    text: str | None = None,
+    *,
+    chat_id: int = CHAT,
+    user_id: int = OWNER,
+    message_id: int = 1,
+    chat_type: str = "private",
+    chat_username: str = "lab_group",
+    entities: list[dict[str, Any]] | None = None,
+    reply_to_message: dict[str, Any] | None = None,
+) -> Update:
     message: dict[str, Any] = {
         "message_id": message_id,
         "date": int(time.time()),
@@ -199,9 +204,7 @@ def make_update(bot: Bot, text: str | None = None, *, chat_id: int = CHAT, user_
         # it every command would fall through to the catch-all text handler.
         if text.startswith("/") and entities is None:
             command = text.split(maxsplit=1)[0]
-            message["entities"] = [
-                {"type": "bot_command", "offset": 0, "length": len(command)}
-            ]
+            message["entities"] = [{"type": "bot_command", "offset": 0, "length": len(command)}]
         if entities is not None:
             message["entities"] = entities
     if reply_to_message is not None:
@@ -209,10 +212,16 @@ def make_update(bot: Bot, text: str | None = None, *, chat_id: int = CHAT, user_
     return Update.de_json({"update_id": message_id, "message": message}, bot)
 
 
-def make_document_update(bot: Bot, *, caption: str | None = None, chat_id: int = CHAT,
-                         chat_type: str = "private", user_id: int = OWNER,
-                         file_name: str = "notes.txt",
-                         file_size: int = 11) -> Update:
+def make_document_update(
+    bot: Bot,
+    *,
+    caption: str | None = None,
+    chat_id: int = CHAT,
+    chat_type: str = "private",
+    user_id: int = OWNER,
+    file_name: str = "notes.txt",
+    file_size: int = 11,
+) -> Update:
     """An update carrying a document message (with or without a caption)."""
     message: dict[str, Any] = {
         "message_id": 5,
@@ -232,8 +241,9 @@ def make_document_update(bot: Bot, *, caption: str | None = None, chat_id: int =
     return Update.de_json({"update_id": 5, "message": message}, bot)
 
 
-def make_callback(bot: Bot, data: str, *, chat_id: int = CHAT, user_id: int = OWNER,
-                  chat_type: str = "private") -> Update:
+def make_callback(
+    bot: Bot, data: str, *, chat_id: int = CHAT, user_id: int = OWNER, chat_type: str = "private"
+) -> Update:
     """An update for a tapped inline button.
 
     ``chat_type`` matters for authorisation: ``_is_allowed`` admits *any* member
@@ -349,11 +359,13 @@ def test_the_handler_gate_is_a_live_view_of_the_whitelist(config) -> None:
 
     handlers = build_handlers(config)
     text_gate = next(
-        h for h in handlers
+        h
+        for h in handlers
         if isinstance(h, MessageHandler) and getattr(h.callback, "__name__", "") == "on_text"
     )
     stranger_gate = next(
-        h for h in handlers
+        h
+        for h in handlers
         if isinstance(h, MessageHandler) and getattr(h.callback, "__name__", "") == "on_stranger"
     )
     bot = FakeBot()
@@ -609,16 +621,22 @@ async def test_a_group_member_cannot_tap_run_it(config) -> None:
     try:
         await application.process_update(
             make_update(
-                bot, "clean up the workspace",
-                chat_id=WHITELISTED_GROUP, chat_type="supergroup", user_id=STRANGER,
+                bot,
+                "clean up the workspace",
+                chat_id=WHITELISTED_GROUP,
+                chat_type="supergroup",
+                user_id=STRANGER,
             )
         )
         keyboard = next(m["reply_markup"] for m in bot.sent if m.get("reply_markup"))
         approve = keyboard.inline_keyboard[0][0]
         await application.process_update(
             make_callback(
-                bot, approve.callback_data,
-                chat_id=WHITELISTED_GROUP, chat_type="supergroup", user_id=STRANGER,
+                bot,
+                approve.callback_data,
+                chat_id=WHITELISTED_GROUP,
+                chat_type="supergroup",
+                user_id=STRANGER,
             )
         )
     finally:
@@ -627,9 +645,7 @@ async def test_a_group_member_cannot_tap_run_it(config) -> None:
     assert agent.conversation(WHITELISTED_GROUP).pending, "the tap must not resolve the action"
     assert "should never narrate an approval" not in texts(bot)
     # PTB forwards the toast text as a keyword, not a positional arg.
-    toast = " ".join(
-        str(t["args"][0]) if t["args"] else str(t.get("text", "")) for t in bot.toasts
-    )
+    toast = " ".join(str(t["args"][0]) if t["args"] else str(t.get("text", "")) for t in bot.toasts)
     assert "only the owner" in toast
 
 
@@ -643,14 +659,16 @@ async def test_a_whitelisted_user_cannot_tap_run_it_in_their_own_chat(config) ->
     await application.initialize()
     try:
         await application.process_update(
-            make_update(bot, "clean up the workspace", chat_id=WHITELISTED_USER,
-                        user_id=WHITELISTED_USER)
+            make_update(
+                bot, "clean up the workspace", chat_id=WHITELISTED_USER, user_id=WHITELISTED_USER
+            )
         )
         keyboard = next(m["reply_markup"] for m in bot.sent if m.get("reply_markup"))
         approve = keyboard.inline_keyboard[0][0]
         await application.process_update(
-            make_callback(bot, approve.callback_data,
-                          chat_id=WHITELISTED_USER, user_id=WHITELISTED_USER)
+            make_callback(
+                bot, approve.callback_data, chat_id=WHITELISTED_USER, user_id=WHITELISTED_USER
+            )
         )
     finally:
         await application.shutdown()
@@ -671,15 +689,22 @@ async def test_a_group_member_cannot_approve_or_deny_by_command(config) -> None:
     try:
         await application.process_update(
             make_update(
-                bot, "clean up the workspace",
-                chat_id=WHITELISTED_GROUP, chat_type="supergroup", user_id=STRANGER,
+                bot,
+                "clean up the workspace",
+                chat_id=WHITELISTED_GROUP,
+                chat_type="supergroup",
+                user_id=STRANGER,
             )
         )
         for command, message_id in (("/approve", 8), ("/deny", 9)):
             await application.process_update(
                 make_update(
-                    bot, command, message_id=message_id,
-                    chat_id=WHITELISTED_GROUP, chat_type="supergroup", user_id=STRANGER,
+                    bot,
+                    command,
+                    message_id=message_id,
+                    chat_id=WHITELISTED_GROUP,
+                    chat_type="supergroup",
+                    user_id=STRANGER,
                 )
             )
     finally:
@@ -707,16 +732,22 @@ async def test_the_owner_still_approves_a_pending_action_in_the_group(config) ->
     try:
         await application.process_update(
             make_update(
-                bot, "clean up the workspace",
-                chat_id=WHITELISTED_GROUP, chat_type="supergroup", user_id=STRANGER,
+                bot,
+                "clean up the workspace",
+                chat_id=WHITELISTED_GROUP,
+                chat_type="supergroup",
+                user_id=STRANGER,
             )
         )
         keyboard = next(m["reply_markup"] for m in bot.sent if m.get("reply_markup"))
         approve = keyboard.inline_keyboard[0][0]
         await application.process_update(
             make_callback(
-                bot, approve.callback_data,
-                chat_id=WHITELISTED_GROUP, chat_type="supergroup", user_id=OWNER,
+                bot,
+                approve.callback_data,
+                chat_id=WHITELISTED_GROUP,
+                chat_type="supergroup",
+                user_id=OWNER,
             )
         )
     finally:
@@ -848,7 +879,9 @@ async def test_context_shows_the_record_once_there_is_one(config) -> None:
     history = History(config.history_dir)
     history.append(CHAT, "user", "how do we deploy?")
     history.append(CHAT, "assistant", "through the release script")
-    history.append(CHAT, "summary", "they work on a service called lumi and deploy it with a script")
+    history.append(
+        CHAT, "summary", "they work on a service called lumi and deploy it with a script"
+    )
     bot, _ = await send(config, [], "/context")
     body = texts(bot)
     assert "condensed record" in body
@@ -1002,7 +1035,11 @@ async def test_mcp_list_shows_a_stdio_server_without_connecting(config) -> None:
     every server is down, which is what /mcp check is for."""
     (config.root / ".mcp.json").write_text(
         json.dumps(
-            {"mcpServers": {"local-tools": {"type": "stdio", "command": "npx", "args": ["-y", "pkg"]}}}
+            {
+                "mcpServers": {
+                    "local-tools": {"type": "stdio", "command": "npx", "args": ["-y", "pkg"]}
+                }
+            }
         ),
         encoding="utf-8",
     )
@@ -1016,7 +1053,14 @@ async def test_mcp_list_shows_a_stdio_server_without_connecting(config) -> None:
 async def test_mcp_list_masks_a_token_in_the_url(config) -> None:
     (config.root / ".mcp.json").write_text(
         json.dumps(
-            {"mcpServers": {"tavily": {"type": "remote", "url": "https://x.test/mcp/?tavilyApiKey=super-secret-value"}}}
+            {
+                "mcpServers": {
+                    "tavily": {
+                        "type": "remote",
+                        "url": "https://x.test/mcp/?tavilyApiKey=super-secret-value",
+                    }
+                }
+            }
         ),
         encoding="utf-8",
     )
@@ -1150,8 +1194,12 @@ async def test_unsupported_media_is_explained(config) -> None:
                 "chat": {"id": CHAT, "type": "private"},
                 "from": {"id": OWNER, "is_bot": False, "first_name": "Owner"},
                 "sticker": {
-                    "file_id": "abc", "file_unique_id": "u1",
-                    "width": 1, "height": 1, "type": "regular", "is_animated": False,
+                    "file_id": "abc",
+                    "file_unique_id": "u1",
+                    "width": 1,
+                    "height": 1,
+                    "type": "regular",
+                    "is_animated": False,
                     "is_video": False,
                 },
             },
@@ -1207,7 +1255,8 @@ def test_the_gate_filter_admits_allowed_principals_not_just_the_owner(config) ->
     config.bot.whitelisted_groups = [str(WHITELISTED_GROUP)]
     handlers = build_handlers(config)
     text_gate = next(
-        h for h in handlers
+        h
+        for h in handlers
         if isinstance(h, MessageHandler) and getattr(h.callback, "__name__", "") == "on_text"
     )
     bot = FakeBot()
@@ -1216,9 +1265,7 @@ def test_the_gate_filter_admits_allowed_principals_not_just_the_owner(config) ->
     assert text_gate.filters.check_update(make_update(bot, "hi", user_id=OWNER))
     # A member of a whitelisted group passes, in that group.
     assert text_gate.filters.check_update(
-        make_update(
-            bot, "hi", chat_id=WHITELISTED_GROUP, chat_type="supergroup", user_id=STRANGER
-        )
+        make_update(bot, "hi", chat_id=WHITELISTED_GROUP, chat_type="supergroup", user_id=STRANGER)
     )
     # The same stranger in a private chat does not.
     assert not text_gate.filters.check_update(make_update(bot, "hi", user_id=STRANGER))
@@ -1554,9 +1601,7 @@ async def test_an_unaddressed_group_message_is_kept_for_the_model(config) -> Non
     )
     assert bot.sent == []
     assert agent.llm.calls == []
-    assert [entry.text for entry in CHATLOG.entries(GROUP_CHAT)] == [
-        "the deploy is broken again"
-    ]
+    assert [entry.text for entry in CHATLOG.entries(GROUP_CHAT)] == ["the deploy is broken again"]
 
 
 async def test_a_dropped_group_document_is_logged_with_its_saved_path(config) -> None:
@@ -1767,7 +1812,9 @@ async def test_a_stranger_replying_to_another_stranger_is_ignored(config) -> Non
 
 async def test_group_chat_slash_command_targeting_the_bot(config) -> None:
     """/start@lumi_test_bot in a group runs the command — it names the bot."""
-    bot, _ = await send(config, [], "/start@lumi_test_bot", chat_id=GROUP_CHAT, chat_type="supergroup")
+    bot, _ = await send(
+        config, [], "/start@lumi_test_bot", chat_id=GROUP_CHAT, chat_type="supergroup"
+    )
     assert "confirmation" in texts(bot).lower()
 
 
@@ -1779,7 +1826,9 @@ async def test_group_chat_plain_slash_command_is_silent(config) -> None:
 
 async def test_group_chat_slash_command_targeting_another_bot_is_silent(config) -> None:
     """/start@some_other_bot must not fire this bot's handlers."""
-    bot, _ = await send(config, [], "/start@some_other_bot", chat_id=GROUP_CHAT, chat_type="supergroup")
+    bot, _ = await send(
+        config, [], "/start@some_other_bot", chat_id=GROUP_CHAT, chat_type="supergroup"
+    )
     assert bot.sent == []
 
 
@@ -2223,9 +2272,7 @@ async def test_saving_the_whitelist_leaves_config_local_toml_alone(config) -> No
 
     assert "added" in texts(bot).lower()
     assert local.read_bytes() == before, "config.local.toml must be left alone"
-    saved = json.loads(
-        (config.root / "data" / "whitelist.json").read_text(encoding="utf-8")
-    )
+    saved = json.loads((config.root / "data" / "whitelist.json").read_text(encoding="utf-8"))
     assert "777" in saved["whitelisted_users"]
     # The file still parses — a ConfigError here means boot is broken.
     assert load_config(config.root).llm.context_window == 128_000
@@ -2234,6 +2281,7 @@ async def test_saving_the_whitelist_leaves_config_local_toml_alone(config) -> No
 # --------------------------------------------------------------------------- #
 # vision support
 # --------------------------------------------------------------------------- #
+
 
 class _FakeFile:
     """A minimal file object that supports download_as_bytearray."""
@@ -2256,9 +2304,15 @@ class FakePhotoBot(FakeBot):
         return _FakeFile(self._image_bytes)
 
 
-def _make_photo_update(bot: Bot, *, caption: str | None = None, chat_id: int = CHAT,
-                       chat_type: str = "private",
-                       user_id: int = OWNER, message_id: int = 1) -> Update:
+def _make_photo_update(
+    bot: Bot,
+    *,
+    caption: str | None = None,
+    chat_id: int = CHAT,
+    chat_type: str = "private",
+    user_id: int = OWNER,
+    message_id: int = 1,
+) -> Update:
     message: dict[str, Any] = {
         "message_id": message_id,
         "date": int(time.time()),
@@ -2275,9 +2329,7 @@ def _make_photo_update(bot: Bot, *, caption: str | None = None, chat_id: int = C
         # caption; group routing keys off the entity, not the raw text.
         if caption.startswith("@"):
             handle = caption.split(maxsplit=1)[0]
-            message["caption_entities"] = [
-                {"type": "mention", "offset": 0, "length": len(handle)}
-            ]
+            message["caption_entities"] = [{"type": "mention", "offset": 0, "length": len(handle)}]
     return Update.de_json({"update_id": message_id, "message": message}, bot)
 
 
@@ -2376,9 +2428,7 @@ async def test_photo_caption_reaches_the_model(config) -> None:
     user_messages = [m for m in agent.llm.calls[0] if m.get("role") == "user"]
     content = user_messages[-1]["content"]
     text_part = next(p for p in content if p["type"] == "text")
-    assert "what does this error mean?" in text_part["text"], (
-        "caption never reached the model"
-    )
+    assert "what does this error mean?" in text_part["text"], "caption never reached the model"
     assert "what's in this image?" not in text_part["text"]
 
 
@@ -2388,6 +2438,7 @@ async def test_photo_download_failure_gracefully(config) -> None:
     class FailingPhotoBot(FakePhotoBot):
         async def get_file(self, file_id: str, **kwargs: Any) -> Any:
             from telegram.error import TelegramError
+
             raise TelegramError("file unavailable")
 
     bot = FailingPhotoBot()
@@ -2428,8 +2479,12 @@ async def test_photo_in_group_with_mention_replies(config) -> None:
     await application.initialize()
     try:
         await application.process_update(
-            _make_photo_update(bot, caption="@lumi_test_bot what is this?",
-                             chat_id=GROUP_CHAT, chat_type="supergroup")
+            _make_photo_update(
+                bot,
+                caption="@lumi_test_bot what is this?",
+                chat_id=GROUP_CHAT,
+                chat_type="supergroup",
+            )
         )
     finally:
         await application.shutdown()
@@ -2454,8 +2509,9 @@ async def test_photo_in_group_without_mention_is_silent(config) -> None:
     await application.initialize()
     try:
         await application.process_update(
-            _make_photo_update(bot, caption="what is this?",
-                               chat_id=GROUP_CHAT, chat_type="supergroup")
+            _make_photo_update(
+                bot, caption="what is this?", chat_id=GROUP_CHAT, chat_type="supergroup"
+            )
         )
     finally:
         await application.shutdown()
@@ -2516,7 +2572,9 @@ async def test_an_upload_action_result_is_delivered(config) -> None:
     application, bot, agent = build(
         config,
         [
-            make_reply("", [("c1", "files", {"action": "upload", "path": "workspace/shell-made.csv"})]),
+            make_reply(
+                "", [("c1", "files", {"action": "upload", "path": "workspace/shell-made.csv"})]
+            ),
             make_reply("sent it"),
         ],
     )
@@ -2575,7 +2633,9 @@ async def test_a_failed_delivery_degrades_to_a_path(config, monkeypatch) -> None
         registry=build_registry(config, memory),
         llm=FakeLLM(
             [
-                make_reply("", [("c1", "files", {"action": "upload", "path": "workspace/doomed.md"})]),
+                make_reply(
+                    "", [("c1", "files", {"action": "upload", "path": "workspace/doomed.md"})]
+                ),
                 make_reply("here you go"),
             ]
         ),
@@ -2670,9 +2730,7 @@ async def test_a_disallowed_document_is_refused_politely(config) -> None:
     application, bot, agent = build(config, [make_reply("never")])
     await application.initialize()
     try:
-        await application.process_update(
-            make_document_update(bot, file_name="program.exe")
-        )
+        await application.process_update(make_document_update(bot, file_name="program.exe"))
     finally:
         await application.shutdown()
 
@@ -2686,6 +2744,7 @@ async def test_a_document_download_failure_explains_itself(config) -> None:
     application, bot, agent = build(config, [make_reply("never")])
     await application.initialize()
     try:
+
         async def fail_get_file(self, file_id: str, **kwargs: Any) -> Any:
             raise TelegramError("file gone")
 
@@ -2721,9 +2780,7 @@ async def test_document_intake_respects_the_whitelist(config) -> None:
     application, bot, agent = build(config, [make_reply("never")])
     await application.initialize()
     try:
-        await application.process_update(
-            make_document_update(bot, user_id=STRANGER)
-        )
+        await application.process_update(make_document_update(bot, user_id=STRANGER))
     finally:
         await application.shutdown()
 

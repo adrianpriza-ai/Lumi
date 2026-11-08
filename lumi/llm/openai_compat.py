@@ -348,7 +348,9 @@ class OpenAICompatClient(LLMClient):
                 if rejects_param(exc) and index + 1 < len(variants):
                     log.warning(
                         "%s rejected this request: %s. Retrying without %s",
-                        self.config.base_url_of(), format_error(exc), _dropped(params),
+                        self.config.base_url_of(),
+                        format_error(exc),
+                        _dropped(params),
                     )
                     continue
                 return None, exc, is_retryable(exc)
@@ -571,8 +573,7 @@ class OpenAICompatClient(LLMClient):
 
                 if empty:
                     failure = LLMError(
-                        "the model returned an empty response after "
-                        f"{retry_number + 1} attempts"
+                        f"the model returned an empty response after {retry_number + 1} attempts"
                     )
                     # An empty completion is not evidence that the credential is
                     # bad, so do not park the key or rotate a pool for it.
@@ -583,14 +584,14 @@ class OpenAICompatClient(LLMClient):
                 self._pool.report(key, ok=False, retryable=retryable)
                 log.error(
                     "llm call to %s failed on key %s: %s",
-                    self.config.base_url_of(), mask(key), format_error(error),
+                    self.config.base_url_of(),
+                    mask(key),
+                    format_error(error),
                 )
                 if not retryable:
                     stop_after_key = True
                     break
-                log.warning(
-                    "retrying on the next key (%d/%d tried)", len(tried), len(self._pool)
-                )
+                log.warning("retrying on the next key (%d/%d tried)", len(tried), len(self._pool))
                 break
             if stop_after_key:
                 break
@@ -712,13 +713,17 @@ class OpenAICompatClient(LLMClient):
             name = getattr(function, "name", "") or ""
             raw_args = getattr(function, "arguments", "") or "{}"
             try:
-                arguments = json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args or {})
+                arguments = (
+                    json.loads(raw_args) if isinstance(raw_args, str) else dict(raw_args or {})
+                )
             except json.JSONDecodeError:
                 log.warning("tool call %s had unparseable arguments: %r", name, raw_args)
                 arguments = {}
             if not isinstance(arguments, dict):
                 arguments = {}
-            calls.append(ToolCall(id=getattr(raw, "id", "") or name, name=name, arguments=arguments))
+            calls.append(
+                ToolCall(id=getattr(raw, "id", "") or name, name=name, arguments=arguments)
+            )
 
         usage = {}
         if getattr(completion, "usage", None):
@@ -748,7 +753,9 @@ class OpenAICompatClient(LLMClient):
 
 def _dropped(params: dict[str, Any]) -> str:
     """A short description of a variant, for the log line about stepping down."""
-    optional = [k for k in ("reasoning_effort", "temperature", "max_completion_tokens") if k in params]
+    optional = [
+        k for k in ("reasoning_effort", "temperature", "max_completion_tokens") if k in params
+    ]
     return ", ".join(optional) or "the optional parameters"
 
 

@@ -124,7 +124,7 @@ Rules:
             # than a line in a config file nobody reads.
             log.warning(
                 "tools.shell.home = inherit: shell commands run with HOME=%s, so they "
-                "can read the owner's home directory. The default \"project\" keeps "
+                'can read the owner\'s home directory. The default "project" keeps '
                 "them inside the project.",
                 Path.home(),
             )

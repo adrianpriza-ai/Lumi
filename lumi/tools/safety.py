@@ -459,9 +459,7 @@ SECRET_FILE_SUFFIXES: tuple[str, ...] = (".pem", ".key", ".p12", ".pfx", ".keyst
 #: Private-key stems: a rotated or backed-up key keeps the name with a
 #: suffix — ``id_rsa.old``, ``id_ed25519.bak`` (R19). The public half ends
 #: in ``.pub`` and stays readable; it is published by definition.
-PRIVATE_KEY_STEMS: frozenset[str] = frozenset(
-    {"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"}
-)
+PRIVATE_KEY_STEMS: frozenset[str] = frozenset({"id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"})
 
 #: System files that hold credentials under names that look ordinary. A
 #: read-only command may read a system path — ``cat /etc/passwd`` is fine —
@@ -729,9 +727,7 @@ INTERPRETER_VALUE_FLAGS: dict[str, frozenset[str]] = {
     "python": frozenset({"-c", "-m", "-W", "-X", "-Q"}),
     "python2": frozenset({"-c", "-m", "-W", "-X"}),
     "python3": frozenset({"-c", "-m", "-W", "-X"}),
-    "node": frozenset(
-        {"-e", "-p", "-r", "--eval", "--print", "--require", "--import", "--loader"}
-    ),
+    "node": frozenset({"-e", "-p", "-r", "--eval", "--print", "--require", "--import", "--loader"}),
     "deno": frozenset({"-e", "--eval"}),
     "bun": frozenset({"-e", "--eval", "--require"}),
     "perl": frozenset({"-e", "-E", "-M", "-m", "-I"}),
@@ -971,9 +967,7 @@ def tokenize(command: str) -> list[str]:
 #: and a delimiter that is not an identifier (``$((x << 2))`` arithmetic, a
 #: variable ``<<$EOF``) stays in the line untouched - its "body" then shows up
 #: as commands, which errs strict, never loose.
-_HEREDOC_START = re.compile(
-    r"<<(-?)[ \t]*(?:'([^']+)'|\"([^\"]+)\"|([A-Za-z_][A-Za-z0-9_]*))"
-)
+_HEREDOC_START = re.compile(r"<<(-?)[ \t]*(?:'([^']+)'|\"([^\"]+)\"|([A-Za-z_][A-Za-z0-9_]*))")
 
 
 class _Heredoc(NamedTuple):
@@ -1566,8 +1560,10 @@ def _interpreter_index(tokens: list[str]) -> int | None:
                         digit_positional = False
                         index += 1
                         continue
-                if word.startswith("-") or word.isdigit() or (
-                    "=" in word and not word.startswith(("/", "~", "./", "../"))
+                if (
+                    word.startswith("-")
+                    or word.isdigit()
+                    or ("=" in word and not word.startswith(("/", "~", "./", "../")))
                 ):
                     index += 1
                     continue
@@ -1640,9 +1636,7 @@ def _inline_script_value(tokens: list[str]) -> tuple[int, str] | None:
     code_flags = code_flags or frozenset()
     flag_chars = {flag[1] for flag in code_flags if len(flag) == 2}
     other_value_chars = {
-        flag[1]
-        for flag in INTERPRETER_VALUE_FLAGS.get(program, frozenset())
-        if len(flag) == 2
+        flag[1] for flag in INTERPRETER_VALUE_FLAGS.get(program, frozenset()) if len(flag) == 2
     } - flag_chars
     for position in range(index + 1, len(tokens)):
         token = tokens[position]
@@ -1884,8 +1878,10 @@ def _wrapper_script_value(tokens: list[str]) -> tuple[int, str] | None:
                 if word in value_flags:
                     index += 2
                     continue
-                if word.startswith("-") or word.isdigit() or (
-                    "=" in word and not word.startswith(("/", "~", "./", "../"))
+                if (
+                    word.startswith("-")
+                    or word.isdigit()
+                    or ("=" in word and not word.startswith(("/", "~", "./", "../")))
                 ):
                     index += 1
                     continue
@@ -1956,7 +1952,11 @@ def script_paths(tokens: list[str], cwd: Path, home: Path | None) -> list[Path]:
                 return [_absolute(word.split("=", 1)[1], cwd, home)]
             if word.startswith("-") and len(word) > 2 and not word.startswith("--"):
                 glued = next(
-                    (flag for flag in file_flags if not flag.startswith("--") and word.startswith(flag)),
+                    (
+                        flag
+                        for flag in file_flags
+                        if not flag.startswith("--") and word.startswith(flag)
+                    ),
                     None,
                 )
                 if glued:
@@ -2499,15 +2499,15 @@ def explain(
     #    there is nothing to flatten the two copies are the same text and the
     #    tables run once.
     rewritten, heredocs = _normalize_multiline(command)
-    bodies = ";".join(
-        heredoc.body.replace("\n", ";") for heredoc in heredocs if heredoc.body
-    )
+    bodies = ";".join(heredoc.body.replace("\n", ";") for heredoc in heredocs if heredoc.body)
     flattened = f"{rewritten};{bodies}" if bodies else rewritten
     for text in dict.fromkeys((command, flattened)):
         for pattern in extra_deny:
             try:
                 if re.search(pattern, text):
-                    verdicts.append(Verdict(Tier.DENY, f"matches extra_deny {pattern!r}", "extra_deny"))
+                    verdicts.append(
+                        Verdict(Tier.DENY, f"matches extra_deny {pattern!r}", "extra_deny")
+                    )
             except re.error:
                 log.warning("extra_deny is not a valid regex, ignoring: %r", pattern)
         for pattern in extra_confirm:
@@ -2677,9 +2677,7 @@ def explain(
             continue
         destination = tokens[index + 1] if index + 1 < len(tokens) else ""
         if not destination:
-            verdicts.append(
-                Verdict(Tier.CONFIRM, "redirect with no destination", "redirect-write")
-            )
+            verdicts.append(Verdict(Tier.CONFIRM, "redirect with no destination", "redirect-write"))
             continue
         target_path = _absolute(destination, base, home)
         if _is_dev_sink(target_path):

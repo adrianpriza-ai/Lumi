@@ -107,7 +107,9 @@ async def _ask_once(config: Config, question: str, chat_id: str = "cli") -> int:
     # captures nothing but the answer. In a terminal there is no button to
     # collapse it behind, and a terminal is where you go to look at this.
     if result.has_reasoning and config.llm.show_reasoning:
-        print(f"--- thinking ({result.thinking_seconds or result.elapsed:.1f}s) ---", file=sys.stderr)
+        print(
+            f"--- thinking ({result.thinking_seconds or result.elapsed:.1f}s) ---", file=sys.stderr
+        )
         print(result.reasoning, file=sys.stderr)
         print("---", file=sys.stderr)
     if result.error:
@@ -225,7 +227,9 @@ async def _repl(agent: Any, config: Config) -> int:
                     if llm.max_tokens > 0
                     else "none — no output ceiling is sent, the provider decides"
                 )
-                temp = "omitted" if llm.reasoning and llm.temperature is not None else llm.temperature
+                temp = (
+                    "omitted" if llm.reasoning and llm.temperature is not None else llm.temperature
+                )
                 print(
                     "reasoning:\n"
                     f"  model mode: {'on' if llm.reasoning else 'off'}\n"
@@ -250,9 +254,7 @@ async def _repl(agent: Any, config: Config) -> int:
             for action in list(result.pending):
                 approved = answer in {"y", "yes"}
                 print("  working…", flush=True)
-                result = await agent.resolve(
-                    "cli", action.id, approved, source="cli", hooks=hooks
-                )
+                result = await agent.resolve("cli", action.id, approved, source="cli", hooks=hooks)
         for message in result.messages:
             print(message)
         if result.text:

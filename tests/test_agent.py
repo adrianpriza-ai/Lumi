@@ -38,7 +38,9 @@ class CondensingLLM(FakeLLM):
         first = str((messages[0] if messages else {}).get("content", ""))
         if "condensing the earlier part" in first:
             self.condensed += 1
-            return make_reply(f"record {self.condensed}: questions up to {self.condensed} were settled")
+            return make_reply(
+                f"record {self.condensed}: questions up to {self.condensed} were settled"
+            )
         return make_reply(self.answer)
 
 
@@ -317,8 +319,14 @@ async def test_llm_error_is_reported_not_raised(config) -> None:
             raise LLMError("upstream is on fire")
 
     memory = make_store(config)
-    agent = Agent(config, Personality.load(config.personality_file), memory,
-                  History(config.history_dir), build_registry(config, memory), Broken([]))
+    agent = Agent(
+        config,
+        Personality.load(config.personality_file),
+        memory,
+        History(config.history_dir),
+        build_registry(config, memory),
+        Broken([]),
+    )
     result = await agent.handle(CHAT, "hi")
 
     assert not result.ok
@@ -338,8 +346,7 @@ async def test_empty_llm_reply_is_reported_not_silently_dropped(config) -> None:
     assert result.error == "the model returned an empty response"
     dialogue = History(config.history_dir).recent_dialogue(CHAT)
     assert not any(
-        message["role"] == "assistant" and not message["content"]
-        for message in dialogue.messages
+        message["role"] == "assistant" and not message["content"] for message in dialogue.messages
     )
 
 
@@ -391,7 +398,9 @@ async def test_traces_accumulate_across_iterations(config) -> None:
     agent = make_agent(
         config,
         [
-            make_reply("", [("c1", "run_shell", {"command": "echo hi"})], reasoning="need to run it"),
+            make_reply(
+                "", [("c1", "run_shell", {"command": "echo hi"})], reasoning="need to run it"
+            ),
             make_reply("it said hi", reasoning="it worked"),
         ],
     )
@@ -476,10 +485,13 @@ async def test_every_tool_call_gets_exactly_one_tool_message(config) -> None:
     agent = make_agent(
         config,
         [
-            make_reply("", [
-                ("c1", "run_shell", {"command": "echo one"}),
-                ("c2", "run_shell", {"command": "echo two"}),
-            ]),
+            make_reply(
+                "",
+                [
+                    ("c1", "run_shell", {"command": "echo one"}),
+                    ("c2", "run_shell", {"command": "echo two"}),
+                ],
+            ),
             make_reply("both done"),
         ],
     )
@@ -547,9 +559,7 @@ async def test_iteration_cap_stops_a_runaway_loop(config) -> None:
         for call in (message.get("tool_calls") or [])
     }
     answered = {
-        message.get("tool_call_id")
-        for message in messages
-        if message.get("role") == "tool"
+        message.get("tool_call_id") for message in messages if message.get("role") == "tool"
     }
     assert asked == answered
 
@@ -608,11 +618,14 @@ async def test_approval_in_a_parallel_set_answers_every_tool_call(config) -> Non
     agent = make_agent(
         config,
         [
-            make_reply("", [
-                ("c1", "run_shell", {"command": "rm x.txt"}),
-                ("c2", "run_shell", {"command": "ls"}),
-                ("c3", "run_shell", {"command": "echo hi"}),
-            ]),
+            make_reply(
+                "",
+                [
+                    ("c1", "run_shell", {"command": "rm x.txt"}),
+                    ("c2", "run_shell", {"command": "ls"}),
+                    ("c3", "run_shell", {"command": "echo hi"}),
+                ],
+            ),
             make_reply("done"),
         ],
     )
@@ -626,8 +639,7 @@ async def test_approval_in_a_parallel_set_answers_every_tool_call(config) -> Non
     asked = [c["id"] for c in assistant["tool_calls"]]
     answered = [m["tool_call_id"] for m in messages if m["role"] == "tool"]
     assert sorted(answered) == sorted(asked), (
-        f"assistant asked for {asked}, only {answered} were answered — "
-        "the next request would 400"
+        f"assistant asked for {asked}, only {answered} were answered — the next request would 400"
     )
 
     # The sibling calls that needed no approval still ran and reported back.
@@ -1184,7 +1196,9 @@ async def test_direct_tool_invocation_preserves_artifacts(config) -> None:
     from lumi.tools.base import ToolResult
 
     agent = make_agent(config, [make_reply("uploaded file")])
-    artifact = Artifact(path="doc.pdf", absolute=Path("/tmp/doc.pdf"), size=1234, mime="application/pdf")
+    artifact = Artifact(
+        path="doc.pdf", absolute=Path("/tmp/doc.pdf"), size=1234, mime="application/pdf"
+    )
 
     async def fake_invoke(name, args, ctx):
         return ToolResult(text="uploaded", summary="uploaded doc", artifacts=[artifact])
@@ -1212,9 +1226,7 @@ async def test_an_approved_action_announces_its_step(config) -> None:
     async def on_step(kind: str, detail: str) -> None:
         steps.append((kind, detail))
 
-    resumed = await agent.resolve(
-        CHAT, action.id, approved=True, hooks=TurnHooks(on_step=on_step)
-    )
+    resumed = await agent.resolve(CHAT, action.id, approved=True, hooks=TurnHooks(on_step=on_step))
     assert resumed.text == "gone"
     assert steps[0] == ("tool", "run_shell")
 

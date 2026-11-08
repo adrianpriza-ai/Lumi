@@ -234,7 +234,9 @@ class Context7Client:
                 self._pool.report(key, ok=False, retryable=retryable)
                 log.warning(
                     "context7 call to %s failed on key %s: %s",
-                    path, mask(key), type(exc).__name__,
+                    path,
+                    mask(key),
+                    type(exc).__name__,
                 )
                 if not retryable:
                     break
@@ -245,24 +247,25 @@ class Context7Client:
                 try:
                     data = response.json()
                 except (ValueError, json.JSONDecodeError) as exc:
-                    raise ToolError(
-                        f"context7 returned non-JSON for {path}: {exc}"
-                    ) from exc
+                    raise ToolError(f"context7 returned non-JSON for {path}: {exc}") from exc
                 if not isinstance(data, dict):
                     raise ToolError(
-                        f"context7 returned an unexpected shape for {path}: "
-                        f"{type(data).__name__}"
+                        f"context7 returned an unexpected shape for {path}: {type(data).__name__}"
                     )
                 return data
 
             # HTTP error path. 404 / 422 are request-shaped, not key-shaped,
             # so they short-circuit out of the pool — same reasoning as the
             # LLM client's retryable detection.
-            retryable = response.status_code in {401, 403, 408, 409, 429} or response.status_code >= 500
+            retryable = (
+                response.status_code in {401, 403, 408, 409, 429} or response.status_code >= 500
+            )
             self._pool.report(key, ok=False, retryable=retryable)
             log.warning(
                 "context7 %s on key %s -> HTTP %d",
-                path, mask(key), response.status_code,
+                path,
+                mask(key),
+                response.status_code,
             )
             if not retryable:
                 raise ToolError(
@@ -494,10 +497,7 @@ def _render_library_matches(library_name: str, matches: list[LibraryMatch]) -> s
             lines.append(truncate(match.description, 240, "…"))
     lines.append("")
     lines.append(f"Use `library_id` (e.g. '{matches[0].id}') with action='query_docs'.")
-    return (
-        f"context7 matches for {library_name!r}:\n"
-        + fence_untrusted("\n".join(lines).strip())
-    )
+    return f"context7 matches for {library_name!r}:\n" + fence_untrusted("\n".join(lines).strip())
 
 
 def _render_snippets(

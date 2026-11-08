@@ -71,8 +71,14 @@ def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     # that exercise the user-level file re-enable it against a throwaway HOME.
     monkeypatch.setenv("LUMI__TOOLS__WEB__PROVIDERS__MCP__USER_CONFIG_FILE", "")
     for leaked in (
-        "TAVILY_API_KEY", "FIRECRAWL_API_KEY", "EXA_API_KEY", "LUMI_MCP_URL",
-        "OPENAI_MODEL", "OPENAI_BASE_URL", "OPENAI_API_BASE", "OPENAI_VISION_MODEL",
+        "TAVILY_API_KEY",
+        "FIRECRAWL_API_KEY",
+        "EXA_API_KEY",
+        "LUMI_MCP_URL",
+        "OPENAI_MODEL",
+        "OPENAI_BASE_URL",
+        "OPENAI_API_BASE",
+        "OPENAI_VISION_MODEL",
     ):
         monkeypatch.delenv(leaked, raising=False)
     return tmp_path
@@ -109,9 +115,7 @@ class FakeLLM:
     def __init__(self, replies: list, *, stream: bool = False) -> None:
         from lumi.llm.base import LLMReply
 
-        self.replies = [
-            r if isinstance(r, LLMReply) else LLMReply(**r) for r in replies
-        ]
+        self.replies = [r if isinstance(r, LLMReply) else LLMReply(**r) for r in replies]
         self.calls: list[list[dict]] = []
         self.index = 0
         self.stream = stream
@@ -119,7 +123,9 @@ class FakeLLM:
     async def complete(self, messages, *, tools=None, on_delta=None):
         self.calls.append([dict(m) for m in messages])
         if self.index >= len(self.replies):
-            raise AssertionError(f"LLM called {self.index + 1} times, only {len(self.replies)} scripted")
+            raise AssertionError(
+                f"LLM called {self.index + 1} times, only {len(self.replies)} scripted"
+            )
         reply = self.replies[self.index]
         self.index += 1
         if self.stream and on_delta is not None:
@@ -147,9 +153,7 @@ def make_reply(
     """Build an LLMReply with tool calls given as (id, name, arguments) tuples."""
     from lumi.llm.base import LLMReply, ToolCall
 
-    calls = [
-        ToolCall(id=cid, name=name, arguments=args) for cid, name, args in (tool_calls or [])
-    ]
+    calls = [ToolCall(id=cid, name=name, arguments=args) for cid, name, args in (tool_calls or [])]
     return LLMReply(
         text=text,
         reasoning=reasoning,

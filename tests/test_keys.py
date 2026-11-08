@@ -34,7 +34,7 @@ def test_duplicate_keys_collapse() -> None:
 
 
 def test_quotes_around_a_key_are_stripped() -> None:
-    assert parse_key_list('"ctx7sk-90", \'ctx7sk-91\'') == ["ctx7sk-90", "ctx7sk-91"]
+    assert parse_key_list("\"ctx7sk-90\", 'ctx7sk-91'") == ["ctx7sk-90", "ctx7sk-91"]
 
 
 def test_an_empty_variable_has_no_keys(monkeypatch) -> None:

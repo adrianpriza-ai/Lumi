@@ -58,7 +58,7 @@ def fake_result(text: str, error: bool = False) -> SimpleNamespace:
 #: started in instead of inferring it from whether the spawn happened to work.
 #: Raw on purpose: the ``"\n"`` it writes has to reach the child file as those
 #: two characters, not as a newline that would split its own string literal.
-STDIO_CWD_SERVER = r'''
+STDIO_CWD_SERVER = r"""
 import json, os, sys
 
 def send(obj):
@@ -97,14 +97,14 @@ for line in sys.stdin:
         }})
     else:
         send({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
-'''
+"""
 
 
 #: The same shape, but the tool *acts* and then dies without replying — the
 #: exact fixture the F3 validation plan calls for. What the client receives
 #: is the SDK's CONNECTION_CLOSED tombstone; the marker file records what the
 #: server actually executed, so a re-sent write would show up as a second line.
-DIE_AFTER_WRITE_SERVER = r'''
+DIE_AFTER_WRITE_SERVER = r"""
 import json, os, sys
 
 def send(obj):
@@ -137,7 +137,7 @@ for line in sys.stdin:
         os._exit(0)  # the write landed; die before any reply can go out
     else:
         send({"jsonrpc": "2.0", "id": msg["id"], "result": {}})
-'''
+"""
 
 
 # --------------------------------------------------------------------------- #
@@ -357,7 +357,11 @@ async def test_a_stdio_server_runs_in_the_project_directory(config) -> None:
     (config.root / "server.py").write_text(STDIO_CWD_SERVER, encoding="utf-8")
     (config.root / ".mcp.json").write_text(
         json.dumps(
-            {"mcpServers": {"probe": {"type": "stdio", "command": sys.executable, "args": ["server.py"]}}}
+            {
+                "mcpServers": {
+                    "probe": {"type": "stdio", "command": sys.executable, "args": ["server.py"]}
+                }
+            }
         ),
         encoding="utf-8",
     )
@@ -408,7 +412,11 @@ async def test_a_call_reaches_the_real_sdk_end_to_end(config) -> None:
     (config.root / "server.py").write_text(STDIO_CWD_SERVER, encoding="utf-8")
     (config.root / ".mcp.json").write_text(
         json.dumps(
-            {"mcpServers": {"probe": {"type": "stdio", "command": sys.executable, "args": ["server.py"]}}}
+            {
+                "mcpServers": {
+                    "probe": {"type": "stdio", "command": sys.executable, "args": ["server.py"]}
+                }
+            }
         ),
         encoding="utf-8",
     )
@@ -1024,7 +1032,9 @@ async def test_an_unapproved_project_server_never_spawns(config) -> None:
     """Before approval, a list must refuse without running the entry's
     command — the marker file the command would write stays absent."""
     marker = config.root / "spawned.marker"
-    (config.root / ".mcp.json").write_text(json.dumps(hostile_config(config.root, marker)), encoding="utf-8")
+    (config.root / ".mcp.json").write_text(
+        json.dumps(hostile_config(config.root, marker)), encoding="utf-8"
+    )
     tool = MCPTool(config)
 
     result = await tool.invoke({"action": "list"}, ToolContext())
@@ -1040,7 +1050,9 @@ async def test_an_approved_project_server_spawns(config) -> None:
     The command is one-shot on purpose: it writes and exits, so discovery may
     fail on the closed connection; the spawn itself is what this pins."""
     marker = config.root / "spawned.marker"
-    (config.root / ".mcp.json").write_text(json.dumps(hostile_config(config.root, marker)), encoding="utf-8")
+    (config.root / ".mcp.json").write_text(
+        json.dumps(hostile_config(config.root, marker)), encoding="utf-8"
+    )
     tool = MCPTool(config)
     tool.provider.trust.approve("hostile", spec_of(tool).digest)
 
@@ -1098,9 +1110,7 @@ async def test_rotating_a_variable_does_not_ask_again(config, monkeypatch) -> No
     itself would not."""
     monkeypatch.setenv("LUMI_TEST_ROTATING_KEY", "one")
     (config.root / ".mcp.json").write_text(
-        json.dumps(
-            {"mcpServers": {"srv": {"url": "https://x.test/k=${LUMI_TEST_ROTATING_KEY}"}}}
-        ),
+        json.dumps({"mcpServers": {"srv": {"url": "https://x.test/k=${LUMI_TEST_ROTATING_KEY}"}}}),
         encoding="utf-8",
     )
     tool = MCPTool(config)
@@ -1149,7 +1159,9 @@ async def test_a_call_refuses_an_untrusted_server_before_connecting(config) -> N
     """`call` fails before the spawn, the HTTP request — and before its own
     approval prompt: confirming one call is not approving an entry."""
     marker = config.root / "spawned.marker"
-    (config.root / ".mcp.json").write_text(json.dumps(hostile_config(config.root, marker)), encoding="utf-8")
+    (config.root / ".mcp.json").write_text(
+        json.dumps(hostile_config(config.root, marker)), encoding="utf-8"
+    )
     tool = MCPTool(config)
 
     async def _never(spec):
@@ -1260,9 +1272,7 @@ async def test_the_registry_renders_a_usage_error_as_a_failure(config) -> None:
     )
     registry = build_registry(config, make_store(config))
 
-    result = await registry.invoke(
-        "mcp", {"action": "call", "tool": "create_issue"}, ToolContext()
-    )
+    result = await registry.invoke("mcp", {"action": "call", "tool": "create_issue"}, ToolContext())
 
     assert not result.ok
     assert "server is required" in result.text

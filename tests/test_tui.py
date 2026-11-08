@@ -289,7 +289,7 @@ async def test_a_malformed_line_is_reported_and_the_loop_survives(config) -> Non
         errors = await fe.wait_for("error")
         assert "malformed" in errors[0]["text"]
 
-        fe.push_raw('[1, 2, 3]\n')
+        fe.push_raw("[1, 2, 3]\n")
         await fe.wait_for("error", count=2)
 
         fe.push({"hello": "world"})
@@ -366,9 +366,7 @@ async def test_cancel_stops_the_turn_and_seals_dangling_tool_calls(config) -> No
 
 async def test_quit_cancels_the_running_turn_instead_of_waiting(config) -> None:
     """Leaving mid-turn must not hang the TUI until the turn finishes."""
-    agent = make_agent(
-        config, [make_reply("", [("c1", "run_shell", {"command": "echo hi"})])]
-    )
+    agent = make_agent(config, [make_reply("", [("c1", "run_shell", {"command": "echo hi"})])])
     gate = asyncio.Event()
     original = agent.registry.invoke
 

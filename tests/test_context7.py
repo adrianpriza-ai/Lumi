@@ -71,9 +71,7 @@ def transport(*responses: tuple[int, Any]) -> StubTransport:
 
 
 @asynccontextmanager
-async def _stub_client(
-    client: Context7Client, *responses: tuple[int, Any]
-):
+async def _stub_client(client: Context7Client, *responses: tuple[int, Any]):
     """Replace the client's httpx stack with the stub transport.
 
     The real ``_client_for`` is synchronous (``httpx.AsyncClient()`` construction
@@ -221,9 +219,7 @@ async def test_resolve_handles_no_matches(monkeypatch) -> None:
     monkeypatch.setenv("CONTEXT7_API_KEY", "ctx7sk-91")
     tool = Context7Tool(_full_config())
     async with _stub_client(tool._client, (200, {"results": []})):
-        result = await tool.invoke(
-            {"action": "resolve_library_id", "library_name": "nope"}, ctx()
-        )
+        result = await tool.invoke({"action": "resolve_library_id", "library_name": "nope"}, ctx())
     assert result.ok
     assert "no libraries" in result.text
 
@@ -278,9 +274,7 @@ async def test_query_docs_snippets_are_fenced_as_untrusted(monkeypatch) -> None:
         ],
     }
     async with _stub_client(tool._client, (200, payload)):
-        result = await tool.invoke(
-            {"action": "query_docs", "library_id": "/acme/lib"}, ctx()
-        )
+        result = await tool.invoke({"action": "query_docs", "library_id": "/acme/lib"}, ctx())
 
     assert result.ok
     assert result.text.index(UNTRUSTED_BEGIN) < result.text.index("IGNORE ALL")
@@ -304,9 +298,7 @@ async def test_resolve_matches_are_fenced_as_untrusted(monkeypatch) -> None:
         ]
     }
     async with _stub_client(tool._client, (200, payload)):
-        result = await tool.invoke(
-            {"action": "resolve_library_id", "library_name": "evil"}, ctx()
-        )
+        result = await tool.invoke({"action": "resolve_library_id", "library_name": "evil"}, ctx())
 
     assert result.ok
     assert result.text.index(UNTRUSTED_BEGIN) < result.text.index("IGNORE ALL")
@@ -319,9 +311,7 @@ async def test_query_docs_rejects_a_bare_id(monkeypatch) -> None:
     monkeypatch.setenv("CONTEXT7_API_KEY", "ctx7sk-91")
     tool = Context7Tool(_full_config())
     with pytest.raises(ToolError, match="must start with '/'"):
-        await tool.invoke(
-            {"action": "query_docs", "library_id": "react"}, ctx()
-        )
+        await tool.invoke({"action": "query_docs", "library_id": "react"}, ctx())
 
 
 async def test_query_docs_requires_an_id(monkeypatch) -> None:
@@ -343,9 +333,7 @@ async def test_a_401_falls_through_to_the_next_key(monkeypatch) -> None:
 
     # First key: 401. Second key: 200.
     async with _stub_client(tool._client, (401, "unauthorized"), (200, payload)):
-        result = await tool.invoke(
-            {"action": "resolve_library_id", "library_name": "y"}, ctx()
-        )
+        result = await tool.invoke({"action": "resolve_library_id", "library_name": "y"}, ctx())
 
     assert result.ok
     assert len(tool._client._clients) == 0  # both calls used the same stub
@@ -358,9 +346,7 @@ async def test_a_400_does_not_burn_the_pool(monkeypatch) -> None:
 
     async with _stub_client(tool._client, (400, "bad libraryName")):
         with pytest.raises(ToolError, match="400"):
-            await tool.invoke(
-                {"action": "resolve_library_id", "library_name": "x"}, ctx()
-            )
+            await tool.invoke({"action": "resolve_library_id", "library_name": "x"}, ctx())
 
 
 async def test_every_key_failing_reports_the_pool(monkeypatch) -> None:
@@ -368,12 +354,13 @@ async def test_every_key_failing_reports_the_pool(monkeypatch) -> None:
     tool = Context7Tool(_full_config())
 
     async with _stub_client(
-        tool._client, (401, "u1"), (403, "f2"), (429, "rl"),
+        tool._client,
+        (401, "u1"),
+        (403, "f2"),
+        (429, "rl"),
     ):
         with pytest.raises(ToolError) as caught:
-            await tool.invoke(
-                {"action": "resolve_library_id", "library_name": "x"}, ctx()
-            )
+            await tool.invoke({"action": "resolve_library_id", "library_name": "x"}, ctx())
     assert "all 2 keys" in str(caught.value)
 
 
@@ -421,9 +408,7 @@ async def test_invoke_builds_a_real_httpx_client(monkeypatch) -> None:
 
     monkeypatch.setattr(httpx, "AsyncClient", factory)
     try:
-        result = await tool.invoke(
-            {"action": "resolve_library_id", "library_name": "y"}, ctx()
-        )
+        result = await tool.invoke({"action": "resolve_library_id", "library_name": "y"}, ctx())
     finally:
         monkeypatch.undo()
         await tool.aclose()

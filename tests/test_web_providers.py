@@ -206,9 +206,7 @@ def test_tavily_strategy_round_robin(monkeypatch) -> None:
     provider = TavilyProvider(TavilyConfig(key_strategy="round_robin"))
 
     replies = {"results": [{"url": "u", "title": "t"}]}
-    clients = {
-        k: FakeTavilyClient(search_reply=replies) for k in ("tvly-91", "tvly-92", "tvly-93")
-    }
+    clients = {k: FakeTavilyClient(search_reply=replies) for k in ("tvly-91", "tvly-92", "tvly-93")}
     provider._auth_clients = clients
 
     import asyncio
@@ -285,9 +283,7 @@ async def test_firecrawl_keyless_search_makes_one_attempt(monkeypatch) -> None:
 async def test_firecrawl_keyless_fetch_shapes_the_page(monkeypatch) -> None:
     monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
     provider = FirecrawlProvider(FirecrawlConfig(base_url="http://localhost:9/"))
-    good = FakeFirecrawlClient(
-        scrape_reply={"metadata": {"title": "Hello"}, "markdown": "# body"}
-    )
+    good = FakeFirecrawlClient(scrape_reply={"metadata": {"title": "Hello"}, "markdown": "# body"})
     provider._keyless = good
 
     page = await provider.fetch("https://example.com")
@@ -530,7 +526,9 @@ def test_exa_fetch_rotates(monkeypatch) -> None:
     provider = ExaProvider(ExaConfig())
 
     bad = FakeExaClient(contents_error=RuntimeError("boom"))
-    good = FakeExaClient(contents_reply={"results": [{"url": "https://x", "title": "T", "text": "body"}]})
+    good = FakeExaClient(
+        contents_reply={"results": [{"url": "https://x", "title": "T", "text": "body"}]}
+    )
     provider._clients = {"exa-91": bad, "exa-92": good}
 
     import asyncio
@@ -620,7 +618,10 @@ def test_firecrawl_top_up_skips_urls_the_tool_would_refuse(monkeypatch) -> None:
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-91")
     provider = FirecrawlProvider(FirecrawlConfig())
 
-    search_reply = {"web": [{"url": "http://169.254.169.254/latest/meta-data", "title": "meta"}], "news": []}
+    search_reply = {
+        "web": [{"url": "http://169.254.169.254/latest/meta-data", "title": "meta"}],
+        "news": [],
+    }
     scrape_reply = {"metadata": {"title": "meta"}, "markdown": "instance secret"}
     fake = FakeFirecrawlClient(search_reply=search_reply, scrape_reply=scrape_reply)
     provider._clients = {"fc-91": fake}
@@ -783,6 +784,7 @@ def test_exa_parses_published_date(monkeypatch) -> None:
     result = asyncio.run(provider.search("hi", 5))
     assert result.hits[0].published == "2026-04-02"
 
+
 # --------------------------------------------------------------------------- #
 # Redirect URL propagation (finding E / R3)
 # --------------------------------------------------------------------------- #
@@ -882,7 +884,9 @@ def test_tavily_extract_propagates_the_final_url(monkeypatch) -> None:
     provider = TavilyProvider(TavilyConfig())
     provider._auth_clients = {
         "tvly-91": FakeTavilyClient(
-            extract_reply={"results": [{"url": "http://169.254.169.254/latest", "raw_content": "s"}]}
+            extract_reply={
+                "results": [{"url": "http://169.254.169.254/latest", "raw_content": "s"}]
+            }
         )
     }
 
@@ -1022,7 +1026,11 @@ async def test_contextdev_search_maps_results(monkeypatch) -> None:
 
     assert result.ok
     first, second = result.hits
-    assert (first.url, first.title, first.snippet) == ("https://a.example/1", "title of https://a.example/1", "a hit")
+    assert (first.url, first.title, first.snippet) == (
+        "https://a.example/1",
+        "title of https://a.example/1",
+        "a hit",
+    )
     assert first.content == "passage one\n\npassage two"
     assert first.score == 1.0
     assert second.content == ""  # no highlights, markdown not requested

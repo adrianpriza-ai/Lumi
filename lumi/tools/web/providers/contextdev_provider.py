@@ -121,9 +121,7 @@ class ContextDevProvider(WebProvider):
 
     # -- public surface ----------------------------------------------------- #
 
-    async def search(
-        self, query: str, max_results: int, days: int | None = None
-    ) -> SearchResult:
+    async def search(self, query: str, max_results: int, days: int | None = None) -> SearchResult:
         """Search via Context.dev, retrying the pool on failure.
 
         Keyless mode (owner-run endpoint) makes a single attempt, the same
@@ -234,7 +232,9 @@ class ContextDevProvider(WebProvider):
         metadata = body.get("metadata") or {}
         title = str(metadata.get("title") or "") if isinstance(metadata, dict) else ""
         return Page(
-            url=final_url(metadata.get("url") if isinstance(metadata, dict) else None, requested=url),
+            url=final_url(
+                metadata.get("url") if isinstance(metadata, dict) else None, requested=url
+            ),
             title=title,
             markdown=text or "(no content)",
         )

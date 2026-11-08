@@ -545,9 +545,12 @@ to contain every word, so a distinctive multi-word phrase works as well."""
             raise ToolError("query is required for a search")
         case_sensitive = bool(arguments.get("case_sensitive"))
         needles = list(words) if case_sensitive else [w.casefold() for w in words]
-        max_results = _positive_int(
-            arguments.get("max_results"), default=GREP_DEFAULT_RESULTS, name="max_results"
-        ) or GREP_DEFAULT_RESULTS
+        max_results = (
+            _positive_int(
+                arguments.get("max_results"), default=GREP_DEFAULT_RESULTS, name="max_results"
+            )
+            or GREP_DEFAULT_RESULTS
+        )
         max_results = min(max_results, GREP_MAX_RESULTS)
 
         start = _resolve_read(self.root, arguments.get("path") or ".", ctx.chat_id)
@@ -588,11 +591,7 @@ to contain every word, so a distinctive multi-word phrase works as well."""
                         shown = text.strip()
                         if len(shown) > GREP_LINE_CHARS:
                             shown = shown[:GREP_LINE_CHARS] + " …"
-                        rel = (
-                            file.relative_to(self.root)
-                            if is_within(file, self.root)
-                            else file
-                        )
+                        rel = file.relative_to(self.root) if is_within(file, self.root) else file
                         matches.append(f"{rel}:{lineno}: {shown}")
                         if len(matches) >= max_results:
                             truncated = True
@@ -673,9 +672,7 @@ to contain every word, so a distinctive multi-word phrase works as well."""
             return
         for dirpath, dirnames, filenames in os.walk(start):
             dirnames[:] = sorted(
-                d
-                for d in dirnames
-                if d not in NOISE_DIRS and not (Path(dirpath) / d).is_symlink()
+                d for d in dirnames if d not in NOISE_DIRS and not (Path(dirpath) / d).is_symlink()
             )
             for name in sorted(filenames):
                 file = Path(dirpath) / name

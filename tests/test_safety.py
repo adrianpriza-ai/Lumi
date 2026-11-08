@@ -228,9 +228,7 @@ def test_arrow_is_not_a_redirect(tmp_path: Path) -> None:
     def rules(command: str) -> set[str]:
         return {
             v.rule
-            for v in safety.explain(
-                command, cwd=root / "workspace", project_root=root, home=home
-            )
+            for v in safety.explain(command, cwd=root / "workspace", project_root=root, home=home)
         }
 
     assert "redirect-write" not in rules("ls -> f")
@@ -824,7 +822,9 @@ def test_a_glued_payload_into_another_chats_state_is_denied(tmp_path: Path) -> N
     # R2's wrappers reach the same state: flock's -c value and parallel's
     # -S-hosted command are inline code, and the thin wrappers peel off.
     assert _verdict("flock /tmp/lk -c 'cat ../data/memory/-1002/MEMORY.md'", root, home).blocked
-    assert _verdict("parallel -S host bash -c 'cat ../data/memory/-1002/MEMORY.md'", root, home).blocked
+    assert _verdict(
+        "parallel -S host bash -c 'cat ../data/memory/-1002/MEMORY.md'", root, home
+    ).blocked
     assert _verdict("nice bash -c 'cat ../data/memory/-1002/MEMORY.md'", root, home).blocked
 
 
@@ -907,13 +907,9 @@ def test_inline_interpreter_code_is_not_an_authored_script(tmp_path: Path) -> No
     root, workspace, home = _session_project(tmp_path)
 
     assert (
-        _session_verdict('python3 -c "print(1)"', root, workspace, home).tier
-        is safety.Tier.ALLOW
+        _session_verdict('python3 -c "print(1)"', root, workspace, home).tier is safety.Tier.ALLOW
     )
-    assert (
-        _session_verdict("python3 -m pytest", root, workspace, home).tier
-        is safety.Tier.ALLOW
-    )
+    assert _session_verdict("python3 -m pytest", root, workspace, home).tier is safety.Tier.ALLOW
 
 
 def test_a_script_edited_this_session_asks_before_running(tmp_path: Path) -> None:
@@ -928,7 +924,9 @@ def test_a_script_edited_this_session_asks_before_running(tmp_path: Path) -> Non
 
     session_start = time.time()
     assert (
-        _session_verdict("python3 existing.py", root, workspace, home, session_start=session_start).tier
+        _session_verdict(
+            "python3 existing.py", root, workspace, home, session_start=session_start
+        ).tier
         is safety.Tier.ALLOW
     )
 
@@ -991,15 +989,26 @@ def test_thin_wrappers_do_not_stop_the_peel() -> None:
     # on the wrapper itself with the script behind it never tokenised.
     # `command` and `builtin` are worse: they sit on the read-only list, so
     # even the mutating branch was skipped for what they ran.
-    for wrapper in ("nice", "ionice -c 2", "ionice -c2", "setsid", "taskset -c 0,1",
-                    "taskset --cpu-list 0-3", "time", "strace -f", "chrt -f 10",
-                    "numactl -C 0-3", "command", "builtin"):
+    for wrapper in (
+        "nice",
+        "ionice -c 2",
+        "ionice -c2",
+        "setsid",
+        "taskset -c 0,1",
+        "taskset --cpu-list 0-3",
+        "time",
+        "strace -f",
+        "chrt -f 10",
+        "numactl -C 0-3",
+        "command",
+        "builtin",
+    ):
         assert verdict(f"{wrapper} cp NOTES.md /etc/X").blocked, wrapper
     assert verdict("nice -n 10 bash -c 'cp NOTES.md /etc/X'").blocked
     assert verdict("nice -n10 bash -c 'cp NOTES.md /etc/X'").blocked
     assert verdict("nice -n -5 bash -c 'cp NOTES.md /etc/X'").blocked
     assert verdict("nice bash -c 'cp NOTES.md /etc/X'").blocked
-    assert verdict("nice bash -c \"$(cat fresh.sh)\"").tier is not safety.Tier.ALLOW
+    assert verdict('nice bash -c "$(cat fresh.sh)"').tier is not safety.Tier.ALLOW
     assert verdict("command bash -c 'cp NOTES.md /etc/X'").blocked
     # Benign wrapped reads stay reads.
     assert verdict("nice ls").tier is safety.Tier.ALLOW
@@ -1026,7 +1035,7 @@ def test_trailing_punctuation_does_not_blind_the_inner_zoning() -> None:
     assert verdict("python3 -c \"os.system('cp NOTES.md /etc/X');\"").blocked
     assert verdict("php -r 'system(\"cp NOTES.md /etc/X\");'").blocked
     assert verdict("php -r'system(\"cp NOTES.md /etc/X\");'").blocked
-    assert verdict("node -e 'require(\"child_process\").exec(\"cp NOTES.md /etc/X\");'").blocked
+    assert verdict('node -e \'require("child_process").exec("cp NOTES.md /etc/X");\'').blocked
     # The operators that are legitimately multi-character stay whole.
     assert verdict("echo hi >> NOTES.md").tier is safety.Tier.ALLOW
     assert verdict("grep -rn TODO . && ls").tier is safety.Tier.ALLOW
@@ -1058,9 +1067,7 @@ def test_double_wrapping_does_not_bypass_the_zone_checks() -> None:
     def check(command: str) -> safety.Verdict:
         # Run from the project root, the way the audit harness did: that is
         # where config.toml and data/whitelist.json are the real state files.
-        return safety.classify(
-            command, cwd=ROOT, project_root=ROOT, home=HOME, write_root=ROOT
-        )
+        return safety.classify(command, cwd=ROOT, project_root=ROOT, home=HOME, write_root=ROOT)
 
     denied = [
         "timeout 5 env cp notes.md /etc/lumi-audit-probe",
@@ -1705,7 +1712,10 @@ def test_a_path_carried_inside_a_flag_is_read_guarded_too(tmp_path: Path) -> Non
     assert _verdict("grep -rn chat .", root, home, chat_id=43).tier is safety.Tier.CONFIRM
     assert _verdict("grep -rn chat uploads", root, home, chat_id=43).tier is safety.Tier.CONFIRM
     assert _verdict("grep -rn chat uploads/42", root, home, chat_id=43).tier is safety.Tier.DENY
-    assert _verdict("grep -rn chat uploads/42/notes.md", root, home, chat_id=43).tier is safety.Tier.DENY
+    assert (
+        _verdict("grep -rn chat uploads/42/notes.md", root, home, chat_id=43).tier
+        is safety.Tier.DENY
+    )
     assert _verdict("grep -rn chat .", root, home, chat_id=42).tier is safety.Tier.CONFIRM
     assert _verdict("grep -rn chat .", root, home).tier is safety.Tier.ALLOW
     assert _verdict("sort -oleak.txt NOTES.md", root, home, chat_id=43).tier is safety.Tier.ALLOW

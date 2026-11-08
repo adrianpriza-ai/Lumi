@@ -97,7 +97,17 @@ def is_retryable(exc: BaseException) -> bool:
     name = type(exc).__name__
     if any(marker in name for marker in ("BadRequest", "NotFound", "Unprocessable", "Conflict")):
         return False
-    if any(marker in name for marker in ("Connection", "Timeout", "RateLimit", "Authentication", "Permission", "Server")):
+    if any(
+        marker in name
+        for marker in (
+            "Connection",
+            "Timeout",
+            "RateLimit",
+            "Authentication",
+            "Permission",
+            "Server",
+        )
+    ):
         return True
 
     message = str(exc).lower()
@@ -145,7 +155,9 @@ class KeyPool:
         if self.strategy != wanted:
             log.warning(
                 "unknown llm.key_strategy %r; using %r. Known: %s",
-                strategy, self.strategy, ", ".join(STRATEGIES),
+                strategy,
+                self.strategy,
+                ", ".join(STRATEGIES),
             )
         self.cooldown = cooldown
         self._clock = clock
@@ -192,9 +204,7 @@ class KeyPool:
         """Record the outcome of a call made with *key*."""
         if not ok and retryable:
             self._parked_at[key] = self._clock()
-            log.warning(
-                "key %s failed; parked for %.0fs", mask(key), self.cooldown
-            )
+            log.warning("key %s failed; parked for %.0fs", mask(key), self.cooldown)
         elif ok:
             # A success clears the cooldown, so a key that was rate-limited
             # gets back into rotation the moment it works again.

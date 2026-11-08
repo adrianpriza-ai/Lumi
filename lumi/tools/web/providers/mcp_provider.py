@@ -165,9 +165,9 @@ def _sdk_timeout_is_timedelta() -> bool:
     try:
         from mcp import ClientSession
 
-        annotation = inspect.signature(ClientSession.call_tool).parameters[
-            "read_timeout_seconds"
-        ].annotation
+        annotation = (
+            inspect.signature(ClientSession.call_tool).parameters["read_timeout_seconds"].annotation
+        )
     except Exception:  # noqa: BLE001 - mcp absent or unreadable: 1.x shape it is
         return True
     return "timedelta" in str(annotation)
@@ -245,7 +245,12 @@ class ServerSpec:
 
     def unresolved(self) -> str | None:
         """Return the first variable this server needs but the environment lacks."""
-        for candidate in self.raw or [self.url, *self.args, *self.env.values(), *self.headers.values()]:
+        for candidate in self.raw or [
+            self.url,
+            *self.args,
+            *self.env.values(),
+            *self.headers.values(),
+        ]:
             match = _ENV_PATTERN.search(str(candidate))
             if match and match.group(2) is None and not os.environ.get(match.group(1)):
                 return match.group(1)
@@ -489,9 +494,7 @@ class MCPProvider(WebProvider):
     def sources(self) -> list[str]:
         """The configured file names as written, for human-facing messages."""
         return list(
-            dict.fromkeys(
-                c for c in (self.config.user_config_file, self.config.config_file) if c
-            )
+            dict.fromkeys(c for c in (self.config.user_config_file, self.config.config_file) if c)
         )
 
     def _read_servers(self, path: Path, origin: str = "user") -> dict[str, ServerSpec]:
@@ -779,7 +782,8 @@ class MCPProvider(WebProvider):
                     if cursor in seen:
                         log.warning(
                             "mcp server %r repeated the tools cursor %r; stopping",
-                            spec.name, cursor,
+                            spec.name,
+                            cursor,
                         )
                         return found
                     seen.add(cursor)
@@ -790,7 +794,9 @@ class MCPProvider(WebProvider):
                     return found
             log.warning(
                 "mcp server %r still paginating after %d page(s); using %d tool(s) so far",
-                spec.name, LIST_PAGES_MAX, len(found),
+                spec.name,
+                LIST_PAGES_MAX,
+                len(found),
             )
             return found
 
@@ -800,11 +806,7 @@ class MCPProvider(WebProvider):
 
         tools = []
         for tool in raw_tools:
-            schema = (
-                getattr(tool, "input_schema", None)
-                or getattr(tool, "inputSchema", None)
-                or {}
-            )
+            schema = getattr(tool, "input_schema", None) or getattr(tool, "inputSchema", None) or {}
             properties = schema.get("properties", {}) if isinstance(schema, dict) else {}
             required = schema.get("required") if isinstance(schema, dict) else None
             tools.append(
@@ -816,7 +818,12 @@ class MCPProvider(WebProvider):
                 )
             )
         self._tool_cache[spec.name] = (now, tools)
-        log.info("mcp server %r advertises %d tool(s): %s", spec.name, len(tools), [t.name for t in tools])
+        log.info(
+            "mcp server %r advertises %d tool(s): %s",
+            spec.name,
+            len(tools),
+            [t.name for t in tools],
+        )
         return tools
 
     async def _pick(
@@ -864,13 +871,9 @@ class MCPProvider(WebProvider):
 
     # -- WebProvider ------------------------------------------------------- #
 
-    async def search(
-        self, query: str, max_results: int, days: int | None = None
-    ) -> SearchResult:
+    async def search(self, query: str, max_results: int, days: int | None = None) -> SearchResult:
         result = SearchResult(query=query, provider=self.name)
-        chosen = await self._pick(
-            self.config.search_tools, lambda name: "search" in name
-        )
+        chosen = await self._pick(self.config.search_tools, lambda name: "search" in name)
         if chosen is None:
             result.error = (
                 f"no search tool found in {', '.join(self.sources)} "
@@ -911,7 +914,8 @@ class MCPProvider(WebProvider):
 
     async def fetch(self, url: str) -> Page:
         chosen = await self._pick(
-            self.config.fetch_tools, lambda name: any(k in name for k in ("scrape", "extract", "fetch"))
+            self.config.fetch_tools,
+            lambda name: any(k in name for k in ("scrape", "extract", "fetch")),
         )
         if chosen is None:
             return Page(
@@ -1035,7 +1039,9 @@ def _takes_cursor_kwarg(session: Any) -> bool:
 
 def _page_tools(response: Any) -> list[Any]:
     """The tools on one ``ListToolsResult`` page, in object or dict shape."""
-    tools = response.get("tools") if isinstance(response, dict) else getattr(response, "tools", None)
+    tools = (
+        response.get("tools") if isinstance(response, dict) else getattr(response, "tools", None)
+    )
     return list(tools) if isinstance(tools, list) else []
 
 
@@ -1050,9 +1056,7 @@ def _next_cursor(response: Any) -> str | None:
     if isinstance(response, dict):
         cursor = response.get("nextCursor") or response.get("next_cursor")
     else:
-        cursor = getattr(response, "nextCursor", None) or getattr(
-            response, "next_cursor", None
-        )
+        cursor = getattr(response, "nextCursor", None) or getattr(response, "next_cursor", None)
     return str(cursor) if cursor else None
 
 
@@ -1090,7 +1094,9 @@ def _flatten(result: Any) -> str:
                 text = block.get("text")
             if text is None:
                 # Resource or image blocks: describe rather than ignore.
-                kind = getattr(block, "type", None) or (block.get("type") if isinstance(block, dict) else None)
+                kind = getattr(block, "type", None) or (
+                    block.get("type") if isinstance(block, dict) else None
+                )
                 parts.append(f"[{kind} content omitted]")
             else:
                 parts.append(str(text))
@@ -1146,12 +1152,7 @@ def _parse_search_payload(text: str, result: SearchResult) -> None:
         # Grouped by source rather than a flat list — You.com answers with
         # ``{"results": {"web": [...]}}`` — so flatten the groups first.
         if isinstance(items, dict):
-            items = [
-                item
-                for group in items.values()
-                if isinstance(group, list)
-                for item in group
-            ]
+            items = [item for group in items.values() if isinstance(group, list) for item in group]
         elif not isinstance(items, list):
             items = []
         for item in items:
@@ -1174,7 +1175,9 @@ def _parse_search_payload(text: str, result: SearchResult) -> None:
                 SearchHit(
                     title=str(item.get("title") or ""),
                     url=url,
-                    snippet=str(item.get("content") or item.get("description") or item.get("snippet") or ""),
+                    snippet=str(
+                        item.get("content") or item.get("description") or item.get("snippet") or ""
+                    ),
                     content=body,
                     score=item.get("score"),
                     published=str(
