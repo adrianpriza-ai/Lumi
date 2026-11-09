@@ -241,3 +241,6 @@ __marimo__/
 
 # OAuth tokens for MCP servers — bearer credentials for the owner accounts
 .mcp-tokens/
+
+# ZCode local agent state (plans, session config).
+.zcode/
