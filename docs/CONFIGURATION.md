@@ -288,8 +288,16 @@ one small message above the answer that grows while the turn runs:
 > 🌐 Web Search
 
 A turn that never touches a tool posts no step message at all — it just
-answers, as it always did. On a long turn the list keeps the last ten lines
-and collapses the rest under "… earlier".
+answers, as it always did. Up to three steps read as plain lines, exactly as
+above; past that the list folds into one summary line with every step kept
+inside a quote Telegram collapses and opens on tap:
+
+> ▸ 7 steps
+
+The header is only the count; the steps themselves are one line each inside
+the quote, so open it to see them and nothing is repeated twice. Nothing is
+dropped to make that fit — the old "… earlier" tail hid the oldest steps of a
+long turn, which read as the message being cut off.
 
 `/reasoning` reports the current setup; `/reasoning off` (or `on`) hides the
 step list for the running process. `lumi ask` prints the raw trace to

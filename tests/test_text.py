@@ -185,6 +185,15 @@ def test_sanitize_html_passes_telegram_tags_through() -> None:
     assert sanitize_html(text) == text
 
 
+def test_sanitize_html_keeps_the_expandable_quote() -> None:
+    """The step feed's fold is a native Telegram quote, not a button; the one
+    attribute Telegram adds to the whitelist survives, nothing else does."""
+    text = "<blockquote expandable>one\ntwo</blockquote>"
+    assert sanitize_html(text) == text
+    assert sanitize_html("<blockquote collapsed>one</blockquote>").startswith("&lt;blockquote")
+    assert sanitize_html("<blockquote>plain</blockquote>") == "<blockquote>plain</blockquote>"
+
+
 def test_sanitize_html_escapes_stray_angle_brackets() -> None:
     assert "&lt;script&gt;" in sanitize_html("<script>alert(1)</script>")
     assert "2 &lt; 3" in sanitize_html("if 2 < 3 then ok")

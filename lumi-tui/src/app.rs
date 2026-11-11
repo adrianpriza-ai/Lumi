@@ -4,7 +4,7 @@
 use crate::backend::{self, AgentEvent};
 use crate::markdown::{render, Role};
 use crate::theme;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -19,12 +19,21 @@ pub struct Approval {
     pub reason: String,
 }
 
+/// One entry inside a trace: a chunk of reasoning, or a tool call.
+#[derive(Debug, Clone)]
+pub enum TraceItem {
+    Thinking(String),
+    Tool { name: String, detail: String, done: Option<(String, bool)> },
+}
+
 /// One transcript entry, kept raw so it can be re-wrapped on resize.
 #[derive(Debug, Clone)]
 pub enum Block {
     Message { role: Role, text: String },
-    Thinking { text: String, live: bool },
-    Tool { name: String, detail: String, done: Option<(String, bool)> },
+    /// A run of reasoning and tool calls between two messages. The whole run
+    /// is one line by default — a long turn should read as `3 steps ·
+    /// thinking, web_search`, not as a wall of italic. `ctrl+t` opens it.
+    Trace { items: Vec<TraceItem>, live: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -315,6 +324,9 @@ pub struct App {
     pub search_status: String,
     pub turns: usize,
     pub quit: bool,
+    /// Draw every trace in full; toggled by `ctrl+t`. Off by default so the
+    /// reasoning stays out of the way while a turn runs.
+    pub show_trace: bool,
 }
 
 impl App {
@@ -335,6 +347,17 @@ impl App {
             search_status,
             turns: 0,
             quit: false,
+            show_trace: false,
+        }
+    }
+
+    /// Expand or collapse every trace (`ctrl+t`).
+    pub fn toggle_trace(&mut self) {
+        self.show_trace = !self.show_trace;
+        for i in 0..self.blocks.len() {
+            if matches!(&self.blocks[i], Block::Trace { .. }) {
+                self.rerender_block(i);
+            }
         }
     }
 
@@ -352,41 +375,7 @@ impl App {
     fn rerender_block(&mut self, index: usize) {
         let lines = match &self.blocks[index] {
             Block::Message { role, text } => render(text, *role, self.render_width),
-            Block::Thinking { text, live } => {
-                let mut lines = render(text, Role::Thinking, self.render_width);
-                if *live {
-                    if let Some(last) = lines.last_mut() {
-                        last.spans
-                            .push(Span::styled(" ▍", Style::default().fg(theme::MUTED)));
-                    }
-                }
-                lines
-            }
-            Block::Tool { name, detail, done } => {
-                // Codex's exec lines: the mark carries the only colour, the
-                // detail sits in gray, the summary stays dim.
-                let (mark, mark_style) = match done {
-                    Some((_, true)) => ("✓", Style::default().fg(theme::SUCCESS)),
-                    Some((_, false)) => ("✗", Style::default().fg(theme::FAILURE)),
-                    None => ("✳", Style::default().fg(theme::SECONDARY)),
-                };
-                let detail_short =
-                    backend::truncate(detail.replace('\n', " ").trim(), 72);
-                let rest = if detail_short.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{name}({detail_short})")
-                };
-                let suffix = match done {
-                    Some((summary, _)) => format!(" · {summary}"),
-                    None => " …".to_string(),
-                };
-                vec![Line::from(vec![
-                    Span::styled(format!("{mark} "), mark_style),
-                    Span::styled(rest, Style::default().fg(theme::SECONDARY)),
-                    Span::styled(suffix, Style::default().fg(theme::MUTED)),
-                ])]
-            }
+            Block::Trace { items, live } => self.render_trace(items, *live),
         };
         if self.rendered.len() <= index {
             self.rendered.resize(index + 1, Vec::new());
@@ -394,11 +383,162 @@ impl App {
         self.rendered[index] = lines;
     }
 
+    /// Codex's exec line: the mark carries the only colour, the detail sits
+    /// in gray, the summary stays dim.
+    fn tool_line(name: &str, detail: &str, done: &Option<(String, bool)>) -> Line<'static> {
+        let (mark, mark_style) = match done {
+            Some((_, true)) => ("✓", Style::default().fg(theme::SUCCESS)),
+            Some((_, false)) => ("✗", Style::default().fg(theme::FAILURE)),
+            None => ("✳", Style::default().fg(theme::SECONDARY)),
+        };
+        let detail_short = backend::truncate(detail.replace('\n', " ").trim(), 72);
+        let rest = if detail_short.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name}({detail_short})")
+        };
+        let suffix = match done {
+            Some((summary, _)) => format!(" · {summary}"),
+            None => " …".to_string(),
+        };
+        Line::from(vec![
+            Span::styled(format!("{mark} "), mark_style),
+            Span::styled(rest, Style::default().fg(theme::SECONDARY)),
+            Span::styled(suffix, Style::default().fg(theme::MUTED)),
+        ])
+    }
+
+    /// A trace renders as one summary line, plus the reasoning and tool lines
+    /// when `show_trace` is on. A lone tool call has nothing to summarise, so
+    /// it keeps its plain exec line.
+    fn render_trace(&self, items: &[TraceItem], live: bool) -> Vec<Line<'static>> {
+        if let [TraceItem::Tool { name, detail, done }] = items {
+            return vec![Self::tool_line(name, detail, done)];
+        }
+        if items.is_empty() {
+            return Vec::new();
+        }
+
+        // `3 steps · thinking×2, web_search` — repeats collapse into a count
+        // in first-seen order, so a search-heavy turn still fits on one line.
+        let mut names: Vec<(String, usize)> = Vec::new();
+        for item in items {
+            let name = match item {
+                TraceItem::Thinking(_) => "thinking",
+                TraceItem::Tool { name, .. } => name.as_str(),
+            };
+            match names.iter_mut().find(|(seen, _)| seen == name) {
+                Some((_, count)) => *count += 1,
+                None => names.push((name.to_string(), 1)),
+            }
+        }
+        let joined = names
+            .iter()
+            .map(|(name, count)| {
+                if *count > 1 {
+                    format!("{name}×{count}")
+                } else {
+                    name.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        // The transcript clips rather than wraps, so keep the summary short
+        // enough that the live tail after it still fits on one line.
+        let joined = backend::truncate(
+            &joined,
+            (self.render_width as usize).saturating_sub(26).max(16),
+        );
+        let steps = if items.len() == 1 {
+            "1 step".to_string()
+        } else {
+            format!("{} steps", items.len())
+        };
+        let failed = items
+            .iter()
+            .any(|item| matches!(item, TraceItem::Tool { done: Some((_, false)), .. }));
+
+        let (mark, mark_style) = if live {
+            ("✳", Style::default().fg(theme::SECONDARY))
+        } else if self.show_trace {
+            ("▾", Style::default().fg(theme::MUTED))
+        } else if failed {
+            ("✗", Style::default().fg(theme::FAILURE))
+        } else {
+            ("▸", Style::default().fg(theme::MUTED))
+        };
+        let mut header = vec![
+            Span::styled(format!("{mark} "), mark_style),
+            Span::styled(steps, Style::default().fg(theme::SECONDARY)),
+            Span::styled(format!(" · {joined}"), Style::default().fg(theme::MUTED)),
+        ];
+        if !self.show_trace {
+            // While collapsed, the newest thought is still worth a glance —
+            // dimmed onto the same line rather than streamed line by line.
+            if let Some(tail) = items.iter().rev().find_map(|item| match item {
+                TraceItem::Thinking(text) => text.lines().rev().find(|l| !l.trim().is_empty()),
+                _ => None,
+            }) {
+                let room = (self.render_width as usize).saturating_sub(48).max(12);
+                header.push(Span::styled(
+                    format!(" · {}", backend::truncate(tail.trim(), room)),
+                    Style::default().fg(theme::MUTED).add_modifier(Modifier::ITALIC),
+                ));
+            }
+        }
+        let mut lines = vec![Line::from(header)];
+        if !self.show_trace {
+            return lines;
+        }
+
+        let thinking_style = theme::role_style(Role::Thinking);
+        for item in items {
+            match item {
+                TraceItem::Thinking(text) => {
+                    for raw in text.trim_end().lines() {
+                        if raw.trim().is_empty() {
+                            continue;
+                        }
+                        lines.extend(crate::markdown::span_line(
+                            &format!("  {}", raw.trim_end()),
+                            thinking_style,
+                            self.render_width as usize,
+                        ));
+                    }
+                }
+                TraceItem::Tool { name, detail, done } => {
+                    lines.push(Self::tool_line(name, detail, done));
+                }
+            }
+        }
+        if live {
+            if let Some(last) = lines.last_mut() {
+                last.spans
+                    .push(Span::styled(" ▍", Style::default().fg(theme::MUTED)));
+            }
+        }
+        lines
+    }
+
     /// Append a fresh block (already rendered) to the transcript.
     fn push_block(&mut self, block: Block) {
         self.blocks.push(block);
         let i = self.blocks.len() - 1;
         self.rerender_block(i);
+    }
+
+    /// Stop the live cursor on every open trace. Called when real output
+    /// starts, wherever the trace sits in the transcript.
+    fn close_live_traces(&mut self) {
+        let open: Vec<usize> = (0..self.blocks.len())
+            .filter(|i| matches!(&self.blocks[*i], Block::Trace { live: true, .. }))
+            .collect();
+        for i in open {
+            if let Block::Trace { live, .. } = &mut self.blocks[i] {
+                *live = false;
+            }
+            self.rerender_block(i);
+        }
     }
 
     fn last_message_block(&self, role: Role) -> Option<usize> {
@@ -412,18 +552,9 @@ impl App {
         match event {
             AgentEvent::Delta(text) => {
                 // Any text delta stops the live thinking cursor — wherever the
-                // thinking block sits, since a tool step may have been pushed
-                // after it opened.
-                if let Some(i) = self
-                    .blocks
-                    .iter()
-                    .rposition(|b| matches!(b, Block::Thinking { live: true, .. }))
-                {
-                    if let Block::Thinking { live, .. } = &mut self.blocks[i] {
-                        *live = false;
-                    }
-                    self.rerender_block(i);
-                }
+                // trace sits, since a tool step may have been pushed after it
+                // opened.
+                self.close_live_traces();
                 let idx = match self.last_message_block(Role::Assistant) {
                     Some(i) => i,
                     None => {
@@ -441,44 +572,57 @@ impl App {
             }
             AgentEvent::ThinkingDelta(text) => {
                 let idx = match self.blocks.last() {
-                    Some(Block::Thinking { .. }) => self.blocks.len() - 1,
+                    Some(Block::Trace { .. }) => self.blocks.len() - 1,
                     _ => {
-                        self.blocks
-                            .push(Block::Thinking { text: String::new(), live: true });
+                        self.push_block(Block::Trace { items: Vec::new(), live: true });
                         self.blocks.len() - 1
                     }
                 };
-                if let Block::Thinking { text: t, .. } = &mut self.blocks[idx] {
-                    t.push_str(&text);
+                if let Block::Trace { items, live } = &mut self.blocks[idx] {
+                    *live = true;
+                    // One thinking item per uninterrupted stream; a tool call
+                    // in between starts a new one.
+                    match items.last_mut() {
+                        Some(TraceItem::Thinking(t)) => t.push_str(&text),
+                        _ => items.push(TraceItem::Thinking(text)),
+                    }
                 }
                 self.rerender_block(idx);
             }
             AgentEvent::AssistantDone => {
-                // Close the newest *live* trace, not just the last block: the
-                // answer or an error may already sit on top of it.
-                if let Some(i) = self
-                    .blocks
-                    .iter()
-                    .rposition(|b| matches!(b, Block::Thinking { live: true, .. }))
-                {
-                    if let Block::Thinking { live, .. } = &mut self.blocks[i] {
-                        *live = false;
-                    }
-                    self.rerender_block(i);
-                }
+                self.close_live_traces();
             }
             AgentEvent::ToolStart { name, detail } => {
-                self.push_block(Block::Tool { name, detail, done: None });
+                let idx = match self.blocks.last() {
+                    Some(Block::Trace { .. }) => self.blocks.len() - 1,
+                    _ => {
+                        self.push_block(Block::Trace { items: Vec::new(), live: false });
+                        self.blocks.len() - 1
+                    }
+                };
+                if let Block::Trace { items, .. } = &mut self.blocks[idx] {
+                    items.push(TraceItem::Tool { name, detail, done: None });
+                }
+                self.rerender_block(idx);
             }
             AgentEvent::ToolEnd { summary, ok } => {
-                if let Some(i) = self
-                    .blocks
-                    .iter()
-                    .rposition(|b| matches!(b, Block::Tool { done: None, .. }))
-                {
-                    if let Block::Tool { done, .. } = &mut self.blocks[i] {
-                        *done = Some((summary, ok));
+                // Close the newest tool still running, walking back through the
+                // traces: an answer may already sit on top of it.
+                let mut hit = None;
+                'outer: for i in (0..self.blocks.len()).rev() {
+                    if let Block::Trace { items, .. } = &mut self.blocks[i] {
+                        for item in items.iter_mut().rev() {
+                            if let TraceItem::Tool { done, .. } = item {
+                                if done.is_none() {
+                                    *done = Some((summary.clone(), ok));
+                                    hit = Some(i);
+                                    break 'outer;
+                                }
+                            }
+                        }
                     }
+                }
+                if let Some(i) = hit {
                     self.rerender_block(i);
                 }
             }
@@ -649,6 +793,93 @@ mod tests {
         // Unknown Ctrl combos must not leak letters into the composer.
         c.handle_key(key(KeyCode::Char('x'), KeyModifiers::CONTROL));
         assert_eq!(c.text(), "");
+    }
+
+    fn text_of(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A thinking chunk, a search, more thinking, then the answer: one turn
+    /// with three trace steps folds into a single line.
+    fn run_a_turn(app: &mut App) {
+        app.handle_agent_event(AgentEvent::ThinkingDelta("look up the docs".into()));
+        app.handle_agent_event(AgentEvent::ToolStart {
+            name: "web_search".into(),
+            detail: "ratatui block".into(),
+        });
+        app.handle_agent_event(AgentEvent::ToolEnd {
+            summary: "5 results".into(),
+            ok: true,
+        });
+        app.handle_agent_event(AgentEvent::ThinkingDelta("now answer".into()));
+        app.handle_agent_event(AgentEvent::AssistantDone);
+        app.handle_agent_event(AgentEvent::Delta("here you go".into()));
+    }
+
+    #[test]
+    fn thinking_and_tools_fold_into_one_collapsed_line() {
+        let mut app = App::new(String::new(), String::new(), String::new());
+        run_a_turn(&mut app);
+
+        assert_eq!(app.blocks.len(), 2, "trace + answer: {:?}", app.blocks);
+        let trace = text_of(&app.rendered[0]);
+        assert_eq!(app.rendered[0].len(), 1, "collapsed trace is one line: {trace}");
+        assert!(trace.starts_with("▸ 3 steps · thinking×2, web_search"), "{trace}");
+        assert!(!trace.contains("look up the docs"), "reasoning hidden: {trace}");
+
+        // The live cursor closed when the answer started streaming.
+        assert!(matches!(&app.blocks[0], Block::Trace { live: false, .. }));
+    }
+
+    #[test]
+    fn ctrl_t_expands_the_trace_in_place() {
+        let mut app = App::new(String::new(), String::new(), String::new());
+        run_a_turn(&mut app);
+        app.toggle_trace();
+
+        let trace = text_of(&app.rendered[0]);
+        assert!(trace.starts_with("▾ 3 steps · thinking×2, web_search"), "{trace}");
+        assert!(trace.contains("look up the docs"), "reasoning shown: {trace}");
+        assert!(trace.contains("✓ web_search(ratatui block) · 5 results"), "{trace}");
+
+        app.toggle_trace();
+        assert_eq!(app.rendered[0].len(), 1, "collapses back to one line");
+    }
+
+    #[test]
+    fn a_single_tool_call_keeps_its_own_exec_line() {
+        let mut app = App::new(String::new(), String::new(), String::new());
+        app.handle_agent_event(AgentEvent::ToolStart {
+            name: "shell".into(),
+            detail: "cargo test".into(),
+        });
+        app.handle_agent_event(AgentEvent::ToolEnd {
+            summary: "14 passed".into(),
+            ok: true,
+        });
+
+        let trace = text_of(&app.rendered[0]);
+        assert_eq!(trace, "✓ shell(cargo test) · 14 passed");
+    }
+
+    #[test]
+    fn a_new_message_starts_a_fresh_trace() {
+        let mut app = App::new(String::new(), String::new(), String::new());
+        run_a_turn(&mut app);
+        app.push_user("and again");
+        app.handle_agent_event(AgentEvent::ThinkingDelta("second look".into()));
+        app.handle_agent_event(AgentEvent::AssistantDone);
+
+        let traces = app
+            .blocks
+            .iter()
+            .filter(|b| matches!(b, Block::Trace { .. }))
+            .count();
+        assert_eq!(traces, 2, "one trace per run of activity: {:?}", app.blocks);
     }
 
     #[test]

@@ -248,13 +248,32 @@ async def _repl(agent: Any, config: Config) -> int:
             print(f"\ni broke: {format_error(exc)}\n")
             continue
 
-        if result.pending:
-            print("\n".join(f"  needs approval — {a.reason}: {a.preview}" for a in result.pending))
-            answer = (await _prompt("  run it? [y/N] ")).strip().lower()
-            for action in list(result.pending):
-                approved = answer in {"y", "yes"}
-                print("  working…", flush=True)
-                result = await agent.resolve("cli", action.id, approved, source="cli", hooks=hooks)
+        # One question per card, not per action: two commands that need a yes
+        # are one decision, and answering it settles both before the model is
+        # asked anything. A resumed turn can raise a fresh approval, so this
+        # loops — otherwise the new one would sit in the queue unasked.
+        while result.pending:
+            for action in result.pending:
+                print(f"  needs approval — {action.reason}: {action.preview}")
+            prompt = "  run it? [y/N] " if len(result.pending) == 1 else "  run all? [y/N] "
+            try:
+                answer = (await _prompt(prompt)).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                # Ctrl-D at a safety prompt means "stop", like every other
+                # prompt: leaving the actions unanswered is the same as walking
+                # away from the card, and is a far better end than a traceback.
+                answer = "/quit"
+            if answer in {"/quit", "/exit", ":q"}:
+                print("bye")
+                return 0
+            print("  working…", flush=True)
+            result = await agent.resolve_all(
+                "cli",
+                [action.id for action in result.pending],
+                answer in {"y", "yes"},
+                source="cli",
+                hooks=hooks,
+            )
         for message in result.messages:
             print(message)
         if result.text:

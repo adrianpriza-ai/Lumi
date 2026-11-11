@@ -52,6 +52,7 @@ from .tools.web.providers.mcp_oauth import authorize_server as mcp_authorize_ser
 from .util.env import SECRET_PATTERN
 from .util.log import get_logger
 from .util.text import (
+    TELEGRAM_LIMIT,
     escape_html,
     format_error,
     markdown_bold_to_html,
@@ -67,6 +68,9 @@ log = get_logger(__name__)
 #: Callback data prefix; keeps our buttons from colliding with anything else.
 CB_OK = "lumi:ok:"
 CB_NO = "lumi:no:"
+#: The pseudo action id behind ``run all`` / ``cancel all``. Action ids are
+#: uuids, so this can never name a real pending action.
+CB_ALL = "all"
 
 TYPING_INTERVAL = 4.0
 
@@ -76,10 +80,15 @@ TYPING_INTERVAL = 4.0
 #: proxies"). One extra connection is harmless without a proxy.
 GET_UPDATES_POOL_SIZE = 2
 
-#: How many step lines the live progress message keeps visible before it
-#: starts collapsing the oldest under an "… earlier" marker. A long turn can
-#: call twenty tools; the list is a glance at what is happening, not a log.
-STEP_MAX_LINES = 10
+#: Step lines shown plainly before the feed folds. Past this the lines move
+#: into an ``<blockquote expandable>`` under a one-line summary — Telegram shows
+#: the first three and opens the rest on tap — so a twenty-call turn stays one
+#: line in the chat instead of a wall the message limit would eventually cut.
+STEP_COLLAPSE_AFTER = 3
+
+#: The last line of a feed whose turn stopped on an approval prompt. Not a tool
+#: label: nothing ran, and the prompt below is what happens next.
+PAUSED_LABEL = "⏸ Waiting for your approval"
 
 # All bot-authored strings are Telegram HTML: <b>…</b> for headers, <code>…</code>
 # around commands and paths, <i>…</i> for asides. HTML only reserves < > & —
@@ -118,6 +127,7 @@ they live in <code>/own_help</code> with the rest of the owner commands.
 #: so a whitelisted user in a shared group never sees the backend inventory.
 OWNER_HELP_TEXT = """\
 <b>owner commands</b>
+<code>/approve</code> / <code>/deny</code> — answer a waiting action from the keyboard, for a client where the buttons do not reach (<code>/yes</code>, <code>/y</code>, <code>/no</code>, <code>/n</code> work too)
 <code>/config</code> — the resolved configuration this process runs on
 <code>/env</code> — which credentials are set, values masked
 <code>/forget [n]</code> — drop the newest n saved facts (erasing memory is a human decision, and yours)
@@ -1162,24 +1172,83 @@ class _Typing:
 # --------------------------------------------------------------------------- #
 
 
-def approval_keyboard(action: PendingAction) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+#: Room for one action's preview when every pending action shares one card.
+#: A card that has to be split is not one question any more, so the budget is
+#: divided across the actions rather than truncating one of them harder.
+APPROVAL_PREVIEW_CHARS = 1200
+
+
+def _approval_tool_label(tool: str) -> str:
+    """The owner-facing name of a tool: ``Run Bash``, not ``run_shell``."""
+    label = STEP_LABELS.get(tool)
+    return label.split(" ", 1)[-1] if label else tool
+
+
+def _approval_preview_budget(count: int) -> int:
+    """Characters of preview each action gets so the whole card fits one message."""
+    room = TELEGRAM_LIMIT - 900 - 90 * count
+    return max(60, min(APPROVAL_PREVIEW_CHARS, room // count))
+
+
+def render_approvals(actions: list[PendingAction]) -> str:
+    """Every action waiting on the owner, as one card.
+
+    A turn can stop on more than one action (an assistant reply carrying two
+    calls, or an action still waiting from an earlier turn), and each used to
+    get a message of its own — three "needs your approval" blocks for what is
+    really one question. They are numbered under a single header instead, and
+    stay one Telegram message: a long preview is shortened, never split.
+    """
+    budget = _approval_preview_budget(len(actions))
+
+    def _preview(action: PendingAction) -> str:
+        detail = truncate(action.preview, budget, marker="\n…")
+        return f"<pre>{escape_html(detail)}</pre>"
+
+    if len(actions) == 1:
+        action = actions[0]
+        return (
+            "🔐 <b>needs your approval</b>\n"
+            f"<b>{escape_html(_approval_tool_label(action.tool))}</b> — "
+            f"{escape_html(action.reason)}\n\n"
+            f"{_preview(action)}"
+        )
+    lines = [f"🔐 <b>{len(actions)} actions need your approval</b>"]
+    for index, action in enumerate(actions, 1):
+        lines.append(
+            f"\n<b>{index}.</b> {escape_html(_approval_tool_label(action.tool))} — "
+            f"{escape_html(action.reason)}\n{_preview(action)}"
+        )
+    return "\n".join(lines)
+
+
+def approval_keyboard(actions: list[PendingAction]) -> InlineKeyboardMarkup:
+    """A run/cancel row per action, plus one answer for the whole card.
+
+    The bulk row exists only when there is more than one action: on a single
+    prompt ``run it`` already is ``run all``, and two rows saying so would be
+    the clutter the card is trying to avoid.
+    """
+    numbered = len(actions) > 1
+    rows = [
         [
-            [
-                InlineKeyboardButton("run it", callback_data=CB_OK + action.id),
-                InlineKeyboardButton("cancel", callback_data=CB_NO + action.id),
-            ]
+            InlineKeyboardButton(
+                f"run {index}" if numbered else "run it", callback_data=CB_OK + action.id
+            ),
+            InlineKeyboardButton(
+                f"cancel {index}" if numbered else "cancel", callback_data=CB_NO + action.id
+            ),
         ]
-    )
-
-
-def render_approval(action: PendingAction) -> str:
-    detail = truncate(action.preview, 1200, marker="\n…")
-    return (
-        f"<b>needs your approval</b>\n"
-        f"<code>{escape_html(action.tool)}</code> — {escape_html(action.reason)}\n\n"
-        f"<pre>{escape_html(detail)}</pre>"
-    )
+        for index, action in enumerate(actions, 1)
+    ]
+    if numbered:
+        rows.append(
+            [
+                InlineKeyboardButton("run all", callback_data=CB_OK + CB_ALL),
+                InlineKeyboardButton("cancel all", callback_data=CB_NO + CB_ALL),
+            ]
+        )
+    return InlineKeyboardMarkup(rows)
 
 
 # --------------------------------------------------------------------------- #
@@ -1229,11 +1298,15 @@ class StepFeed:
 
     This replaces the old collapsed-thinking button. The thinking trace itself
     stays internal — never shown, not behind a button — and what the chat sees
-    is the steps the turn actually took:
+    is the steps the turn actually took. Up to three of them read as plain
+    lines (`🧠 Thinking`, `💻 Run Bash`, …, which is what a normal turn looks
+    like); past that the list folds under a one-line count, with the steps
+    themselves inside a quote Telegram collapses and opens on tap:
 
-        🧠 Thinking
-        💻 Run Bash
-        🌐 Web Search
+        ▸ 7 steps
+        > 🧠 Thinking
+        > 💻 Run Bash
+        > 🌐 Web Search
 
     Sent on the first step and edited after that, so a turn reads as one
     growing note above the answer. Every failure degrades the same way: if the
@@ -1264,11 +1337,41 @@ class StepFeed:
         self._steps.append(label)
         await self._render()
 
+    async def paused(self) -> None:
+        """Close the note: the turn stopped on a safety prompt, not mid-step.
+
+        Without this the list just stops at the tool that needed approval and
+        reads as though it were cut off — the prompt below explains it, but the
+        note has to agree. A turn with no steps posts nothing, as always.
+        """
+        if not self._steps or self._steps[-1] == PAUSED_LABEL:
+            return
+        self._steps.append(PAUSED_LABEL)
+        await self._render()
+
+    def summary(self) -> str:
+        """How much happened, and nothing else: `▸ 7 steps`.
+
+        The kinds live in the quote, one line each, where they can be opened;
+        repeating them in the header is the same noise in a shorter box. The
+        pause marker is not a step, so it does not inflate the count.
+        """
+        steps = sum(1 for line in self._steps if line != PAUSED_LABEL)
+        return f"▸ {steps} steps"
+
     def _body(self) -> str:
-        if len(self._steps) <= STEP_MAX_LINES:
+        """Plain lines while the run is short, summary + expandable quote after.
+
+        The quote holds every step, not the tail of them: the old "… (+2
+        earlier)" marker hid exactly the steps someone scrolling back wants to
+        see, which is how a paused-for-approval turn looked cut off. Telegram's
+        collapsed quote shows the first three lines and keeps the rest one tap
+        away, so the cap is the message limit alone.
+        """
+        if len(self._steps) <= STEP_COLLAPSE_AFTER:
             return "\n".join(self._steps)
-        hidden = len(self._steps) - (STEP_MAX_LINES - 1)
-        return f"… (+{hidden} earlier)\n" + "\n".join(self._steps[-(STEP_MAX_LINES - 1) :])
+        lines = truncate("\n".join(self._steps), TELEGRAM_LIMIT - 400, marker="\n…")
+        return f"{self.summary()}\n<blockquote expandable>{lines}</blockquote>"
 
     async def _render(self) -> None:
         text = sanitize_html(self._body())
@@ -1298,6 +1401,16 @@ class StepFeed:
             return None
 
 
+async def _note_paused(feed: StepFeed | None, result: TurnResult) -> None:
+    """Mark the step note when *result* stopped on an approval prompt.
+
+    Called after every turn, so a turn that finished on its own leaves the note
+    exactly as it was.
+    """
+    if feed is not None and result.pending:
+        await feed.paused()
+
+
 async def _toast(query: Any, text: str = "", **kwargs: Any) -> None:
     """Answer a callback query, suppressing errors from stale queries.
 
@@ -1308,6 +1421,31 @@ async def _toast(query: Any, text: str = "", **kwargs: Any) -> None:
     """
     with contextlib.suppress(BadRequest, TelegramError):
         await query.answer(text, **kwargs)
+
+
+async def _refresh_approvals(
+    query: Any, agent: Agent, chat_id: int | str, result: TurnResult
+) -> None:
+    """Redraw a tapped approval card with the actions still waiting.
+
+    The tap first rewrites the card to ``running…``, which is right for a card
+    holding one action and wrong for one holding several: it would erase the
+    buttons of every action the tap did not resolve. What is left is drawn back
+    onto the same message, so the owner answers the rest where they already are.
+    When the resumed turn asked something new, ``deliver`` posts the whole queue
+    as a fresh card and this message stays the status line instead.
+    """
+    if result.pending:
+        return
+    remaining = agent.conversation(chat_id).pending
+    if not remaining:
+        return
+    with contextlib.suppress(BadRequest, TelegramError):
+        await query.edit_message_text(
+            render_approvals(remaining),
+            parse_mode=ParseMode.HTML,
+            reply_markup=approval_keyboard(remaining),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -1375,8 +1513,14 @@ async def deliver(update: Update, result: TurnResult, config: Config) -> None:
     for artifact in result.artifacts:
         await send_artifact(update, artifact)
 
-    for action in result.pending:
-        await reply_html(update, render_approval(action), reply_markup=approval_keyboard(action))
+    if result.pending:
+        # One card, one question: several waiting actions used to arrive as
+        # several separate prompts, each with its own buttons.
+        await reply_html(
+            update,
+            render_approvals(result.pending),
+            reply_markup=approval_keyboard(result.pending),
+        )
 
     if result.error and result.text:
         note = f"<i>note: {escape_html(result.error)}</i>"
@@ -1548,14 +1692,20 @@ def build_handlers(config: Config) -> list[Any]:
         cfg: Config = context.application.bot_data.get("config", config)
         return store.get(cfg.memory_scope_of(chat_of(update) or None))
 
-    def hooks_for(update: Update, context: ContextTypes.DEFAULT_TYPE) -> TurnHooks:
+    def hooks_for(
+        update: Update, context: ContextTypes.DEFAULT_TYPE, *, feed: StepFeed | None = None
+    ) -> TurnHooks:
         """Wire one turn to the chat: mid-turn messages reply live, and the
         step feed (unless the owner turned traces off) grows above the answer.
 
         Built per turn because both close over *update* — the reply target —
         and because a turn that never touches a tool never creates a message.
+        *feed* is passed back by a caller that also wants to close the note off
+        when the turn pauses for approval (`run_agent` and `_resolve` do); a
+        caller with no use for it lets this build one.
         """
-        feed = StepFeed(context.bot, chat_of(update)) if config.llm.show_reasoning else None
+        if feed is None and config.llm.show_reasoning:
+            feed = StepFeed(context.bot, chat_of(update))
 
         async def _on_message(text: str) -> None:
             await reply(update, text, strict=True)
@@ -2442,7 +2592,8 @@ def build_handlers(config: Config) -> list[Any]:
     ) -> None:
         agent = agent_of(context)
         chat_id = chat_of(update)
-        hooks = hooks_for(update, context)
+        feed = StepFeed(context.bot, chat_id) if config.llm.show_reasoning else None
+        hooks = hooks_for(update, context, feed=feed)
         # If this message is a reply, the message it quotes goes in front of
         # the text — see _quoted_prefix: it is the only place that quote can
         # still be recovered, and without it "try this" has no referent. Media
@@ -2463,6 +2614,7 @@ def build_handlers(config: Config) -> list[Any]:
                 log.exception("agent turn failed")
                 await reply(update, f"i broke on that: {format_error(exc)}")
                 return
+        await _note_paused(feed, result)
         await deliver(update, result, config)
 
     async def _resolve(
@@ -2474,27 +2626,37 @@ def build_handlers(config: Config) -> list[Any]:
     ) -> None:
         agent = agent_of(context)
         chat_id = chat_of(update)
-        if action_id is None:
+        # ``None`` is /approve (the oldest question); CB_ALL is the card's bulk
+        # row, which answers everything still on it.
+        if action_id is None or action_id == CB_ALL:
             pending = agent.conversation(chat_id).pending
             if not pending:
                 await reply(update, "nothing is waiting for approval.")
                 return
-            action_id = pending[0].id
+            action_ids = (
+                [action.id for action in pending] if action_id == CB_ALL else [pending[0].id]
+            )
+        else:
+            action_ids = [action_id]
 
         verb = "running" if approved else "cancelling"
         if update.callback_query is not None:
             with contextlib.suppress(BadRequest, TelegramError):
                 await update.callback_query.edit_message_text(f"{verb}…", parse_mode=ParseMode.HTML)
 
+        feed = StepFeed(context.bot, chat_id) if config.llm.show_reasoning else None
         async with _Typing(context.bot, chat_id):
             try:
-                result = await agent.resolve(
-                    chat_id, action_id, approved, hooks=hooks_for(update, context)
+                result = await agent.resolve_all(
+                    chat_id, action_ids, approved, hooks=hooks_for(update, context, feed=feed)
                 )
             except Exception as exc:  # noqa: BLE001
                 log.exception("resolving approval failed")
                 await reply(update, f"i broke on that: {format_error(exc)}")
                 return
+        await _note_paused(feed, result)
+        if update.callback_query is not None:
+            await _refresh_approvals(update.callback_query, agent, chat_id, result)
         await deliver(update, result, config)
 
     # -- whitelist persistence --------------------------------------------- #

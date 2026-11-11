@@ -35,6 +35,7 @@ pub fn help_text() -> String {
 - `/help` — this list
 - `/search <query>` — run a web search now, through the backend
 - `/reasoning on|off` — show the model's thinking steps live
+- `/trace` — same as `ctrl+t`: open or close every step trace
 - `/tools` — the tools the backend has loaded
 - `/context` — the context window: tokens in use, compactions
 - `/memory` — this chat's long-term memory as it enters the prompt
@@ -43,6 +44,7 @@ pub fn help_text() -> String {
 
 ## Keys
 - `enter` send · `shift+enter` (or `ctrl+j`, `alt+enter`) new line
+- `ctrl+t` expand/collapse the thinking + tool traces
 - `↑/↓` input history and multi-line cursor · `pgup/pgdn`, wheel scrollback
 - `y`/`n` answer the approval modal · `esc` cancel the running turn · `ctrl+c` cancel, then quit on empty input"
         .to_string()
@@ -237,6 +239,10 @@ fn handle_key(
             app.composer.clear();
             return false;
         }
+        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.toggle_trace();
+            return false;
+        }
         KeyCode::PageUp => {
             scroll(app, -20);
             return false;
@@ -261,6 +267,10 @@ fn handle_key(
             let lowered = text.trim().to_ascii_lowercase();
             if lowered == "/quit" || lowered == "/exit" || lowered == "/q" || lowered == ":q" {
                 return true;
+            }
+            if lowered == "/trace" {
+                app.toggle_trace();
+                return false;
             }
             app.push_user(&text);
             app.scroll_top = None;

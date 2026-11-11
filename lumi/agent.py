@@ -961,50 +961,103 @@ class Agent:
         hooks: TurnHooks | None = None,
     ) -> TurnResult:
         """Run a pending action for real, or record the refusal, then continue."""
+        return await self.resolve_all(chat_id, [action_id], approved, source=source, hooks=hooks)
+
+    async def resolve_all(
+        self,
+        chat_id: int | str,
+        action_ids: list[str],
+        approved: bool,
+        *,
+        source: str = "chat",
+        hooks: TurnHooks | None = None,
+    ) -> TurnResult:
+        """Answer several pending actions with one decision, then continue.
+
+        ``run all`` / ``cancel all`` on a grouped approval card land here. Every
+        action is settled before the model is asked anything, so approving three
+        commands costs one turn and reads as one answer, and a batch refusal is
+        one instruction rather than the same "do not retry" note three times.
+        """
         conv = self.conversation(chat_id, source=source)
         ctx = self._context(source, chat_id, hooks)
 
-        action = next((p for p in conv.pending if p.id == action_id), None)
-        if action is None:
-            log.info("approval %s is no longer pending for chat %s", action_id, chat_id)
+        wanted = set(action_ids)
+        actions = [p for p in conv.pending if p.id in wanted]
+        if not actions:
+            log.info("approvals %s are no longer pending for chat %s", action_ids, chat_id)
             return TurnResult(error="That request has already been handled or cancelled.")
 
-        if action.expired():
-            # A tap on a day-old button must not run the day-old command.
-            conv.pending = [p for p in conv.pending if p.id != action_id]
+        # A tap on a day-old button must not run the day-old command. Expired
+        # actions are dropped first; the rest of the batch still goes through.
+        expired = [action for action in actions if action.expired()]
+        for action in expired:
+            conv.pending = [p for p in conv.pending if p.id != action.id]
             self._note_approval_expired(conv, action)
-            log.info("approval %s expired before it was answered (chat %s)", action_id, chat_id)
+            log.info("approval %s expired before it was answered (chat %s)", action.id, chat_id)
+        actions = [action for action in actions if action not in expired]
+        if not actions:
             return TurnResult(
                 error="That request expired before it was answered, so it was cancelled."
             )
 
+        used: list[str] = []
+        artifacts: list[Artifact] = []
+        outcomes: list[tuple[PendingAction, str]] = []
+        for action in actions:
+            if approved:
+                log.info("owner approved %s: %s", action.tool, action.preview[:120])
+                await self._step(
+                    hooks, "tool", self.registry.step_detail(action.tool, action.arguments)
+                )
+                tool_result = await self.registry.invoke_approved(action, ctx)
+                outcomes.append(
+                    (
+                        action,
+                        f"[Approved by the owner. {action.tool} ran and returned:]\n"
+                        f"{tool_result.text}",
+                    )
+                )
+                used.append(action.tool)
+                artifacts.extend(tool_result.artifacts)
+            else:
+                log.info("owner declined %s: %s", action.tool, action.preview[:120])
+
+        for action in actions:
+            conv.pending = [p for p in conv.pending if p.id != action.id]
         if approved:
-            log.info("owner approved %s: %s", action.tool, action.preview[:120])
-            await self._step(
-                hooks, "tool", self.registry.step_detail(action.tool, action.arguments)
-            )
-            tool_result = await self.registry.invoke_approved(action, ctx)
-            outcome = (
-                f"[Approved by the owner. {action.tool} ran and returned:]\n{tool_result.text}"
-            )
-            used = [action.tool]
+            for action, outcome in outcomes:
+                conv.messages.append({"role": "user", "content": outcome})
+                self.history.append(
+                    conv.chat_id, "user", outcome, session=conv.session, tool=action.tool
+                )
         else:
-            log.info("owner declined %s: %s", action.tool, action.preview[:120])
+            # One note for the whole refusal: repeating it per action would let
+            # a batch decline read as several separate decisions.
             outcome = (
                 "[The owner declined this one. Do not run it, and do not retry it in another form.]"
+                if len(actions) == 1
+                else (
+                    f"[The owner declined all {len(actions)} of these. "
+                    "Do not run them, and do not retry them in another form.]"
+                )
             )
-            used = []
+            conv.messages.append({"role": "user", "content": outcome})
+            self.history.append(
+                conv.chat_id,
+                "user",
+                outcome,
+                session=conv.session,
+                tool=", ".join(dict.fromkeys(action.tool for action in actions)),
+            )
 
-        conv.pending = [p for p in conv.pending if p.id != action_id]
-        conv.messages.append({"role": "user", "content": outcome})
-        self.history.append(conv.chat_id, "user", outcome, session=conv.session, tool=action.tool)
         resumed = await self._loop(conv, ctx, tools_used=used, hooks=hooks)
-        if approved and tool_result.artifacts:
+        if artifacts:
             # An approved write can carry artifacts too (files written with
             # upload: true that needed an overwrite confirmation). _loop only
             # collects artifacts from model-driven tool calls, so merge these
             # in before handing the turn back to the presentation layer.
-            resumed.artifacts.extend(tool_result.artifacts)
+            resumed.artifacts.extend(artifacts)
         return resumed
 
     # -- direct invocation (one tool outside the model loop) ---------------- #

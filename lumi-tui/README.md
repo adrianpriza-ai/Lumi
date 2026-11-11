@@ -92,10 +92,15 @@ is the protocol and nothing else.
   bottom until you scroll up.
 - **Editing** — input history on `↑/↓` at the first line, bracketed paste,
   emacs-ish `home`/`end`, multi-line cursor movement.
+- **Step traces** — thinking and tool calls between two messages fold into
+  one line (`▸ 3 steps · thinking×2, web_search`), with the newest thought
+  dimmed alongside it while collapsed. `ctrl+t` (or `/trace`) opens every
+  trace in place and closes it again; a lone tool call keeps its own exec
+  line, since there is nothing to fold.
 - **Slash commands** — `/help`, `/search <query>`, `/reasoning on|off`,
-  `/tools`, `/context`, `/memory`, `/reset`, `/quit`. `/model` is not a
-  frontend switch: it points you at `config.toml`, because the backend would
-  contradict a local override on the next command.
+  `/trace`, `/tools`, `/context`, `/memory`, `/reset`, `/quit`. `/model` is
+  not a frontend switch: it points you at `config.toml`, because the backend
+  would contradict a local override on the next command.
 
 No token streaming yet: a turn emits live *steps* (thinking, each tool start)
 and then the whole answer. That is the same behaviour as `lumi chat`; streaming
@@ -109,6 +114,7 @@ is a planned follow-up on the Python LLM client.
 | `shift+enter` / `ctrl+j` / `alt+enter` | new line |
 | `↑` / `↓` | cursor between lines; history at the edge |
 | `pgup` / `pgdn` / wheel | scrollback |
+| `ctrl+t` | expand / collapse the thinking + tool traces |
 | `y` / `n` | answer the approval modal |
 | `esc` | decline approval / cancel turn / clear composer |
 | `ctrl+c` | cancel turn, then quit when idle and empty |

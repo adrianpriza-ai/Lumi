@@ -140,7 +140,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         ])
     } else {
         Line::from(Span::styled(
-            " enter send · shift+enter newline · ↑ history · /help commands",
+            " enter send · shift+enter newline · ctrl+t trace · /help commands",
             Style::default().fg(theme::MUTED),
         ))
     };
@@ -335,10 +335,13 @@ mod tests {
     fn the_frame_shows_the_codex_layout() {
         let mut app = App::new("test-model".into(), "local".into(), "off".into());
         app.push_user("fix the tests");
-        app.blocks.push(Block::Tool {
-            name: "shell".into(),
-            detail: "cargo test".into(),
-            done: Some(("14 passed".into(), true)),
+        app.blocks.push(Block::Trace {
+            items: vec![crate::app::TraceItem::Tool {
+                name: "shell".into(),
+                detail: "cargo test".into(),
+                done: Some(("14 passed".into(), true)),
+            }],
+            live: false,
         });
         let screen = render_screen(&mut app, 80, 24);
         let flat = screen.join("\n");
@@ -348,6 +351,7 @@ mod tests {
         assert!(flat.contains("✓ shell(cargo test) · 14 passed"), "tool step: {flat}");
         assert!(flat.contains("ask lumi…"), "composer placeholder: {flat}");
         assert!(flat.contains("enter send · shift+enter newline"), "idle hints: {flat}");
+        assert!(flat.contains("ctrl+t trace"), "trace hint: {flat}");
     }
 
     #[test]
@@ -385,4 +389,3 @@ mod tests {
         assert!(total > 24, "label line should span the pane width, got {total}");
     }
 }
-

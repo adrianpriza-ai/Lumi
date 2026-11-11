@@ -274,6 +274,149 @@ def test_chat_prints_the_answer_after_an_approval(config, capsys, monkeypatch) -
     assert "done" in capsys.readouterr().out
 
 
+def _chat_agent(config, replies):
+    """An agent wired with scripted replies, ready for ``_chat`` to drive."""
+    from conftest import FakeLLM
+
+    from lumi.agent import Agent
+    from lumi.memory import History
+    from lumi.personality import Personality
+    from lumi.tools import build_registry
+
+    memory = config.build_memory_store()
+    return Agent(
+        config=config,
+        personality=Personality.load(config.personality_file),
+        memory=memory,
+        history=History(config.history_dir),
+        registry=build_registry(config, memory),
+        llm=FakeLLM(replies),
+    )
+
+
+def test_chat_answers_a_whole_approval_card_with_one_yes(config, capsys, monkeypatch) -> None:
+    """Two waiting commands are one question, settled in one model turn."""
+    import asyncio
+
+    from conftest import make_reply
+
+    from lumi import __main__ as cli
+
+    first = config.shell_cwd / "one.txt"
+    second = config.shell_cwd / "two.txt"
+    first.write_text("x", encoding="utf-8")
+    second.write_text("y", encoding="utf-8")
+    agent = _chat_agent(
+        config,
+        [
+            make_reply(
+                tool_calls=[
+                    ("c1", "run_shell", {"command": f"rm {first}"}),
+                    ("c2", "run_shell", {"command": f"rm {second}"}),
+                ]
+            ),
+            make_reply("both gone"),
+        ],
+    )
+    monkeypatch.setattr(cli, "_build_agent", lambda cfg: agent)
+    prompts: list[str] = []
+    scripted = iter(["tidy up", "y", "/quit"])
+
+    async def fake_prompt(message: str) -> str:
+        prompts.append(message)
+        return next(scripted)
+
+    monkeypatch.setattr(cli, "_prompt", fake_prompt)
+    assert asyncio.run(cli._chat(config)) == 0
+
+    assert "both gone" in capsys.readouterr().out
+    assert not first.exists() and not second.exists()
+    assert prompts.count("  run all? [y/N] ") == 1
+    assert "  run it? [y/N] " not in prompts, "one card asks one question"
+
+
+def test_chat_asks_again_when_the_resumed_turn_needs_approval(config, monkeypatch) -> None:
+    """An approval raised by the answer must be asked about, not left queued."""
+    import asyncio
+
+    from conftest import make_reply
+
+    from lumi import __main__ as cli
+
+    first = config.shell_cwd / "one.txt"
+    second = config.shell_cwd / "two.txt"
+    first.write_text("x", encoding="utf-8")
+    second.write_text("y", encoding="utf-8")
+    agent = _chat_agent(
+        config,
+        [
+            make_reply(tool_calls=[("c1", "run_shell", {"command": f"rm {first}"})]),
+            make_reply(tool_calls=[("c2", "run_shell", {"command": f"rm {second}"})]),
+            make_reply("both gone"),
+        ],
+    )
+    monkeypatch.setattr(cli, "_build_agent", lambda cfg: agent)
+    prompts: list[str] = []
+    scripted = iter(["tidy up", "y", "y", "/quit"])
+
+    async def fake_prompt(message: str) -> str:
+        prompts.append(message)
+        return next(scripted)
+
+    monkeypatch.setattr(cli, "_prompt", fake_prompt)
+    assert asyncio.run(cli._chat(config)) == 0
+
+    assert prompts.count("  run it? [y/N] ") == 2, "the second approval was offered"
+    assert not first.exists() and not second.exists()
+    assert agent.conversation("cli").pending == []
+
+
+def test_the_version_matches_the_project_metadata() -> None:
+    """``lumi --version`` reads the package; ``pip`` ships the pyproject one.
+
+    They are bumped by hand, and once they drifted: the CLI and ``/doctor``
+    reported 0.4.1 while the project metadata said 0.4.2.
+    """
+    import tomllib
+    from pathlib import Path
+
+    from lumi import __version__
+
+    root = Path(__file__).resolve().parent.parent
+    metadata = tomllib.loads(root.joinpath("pyproject.toml").read_text(encoding="utf-8"))
+    assert __version__ == metadata["project"]["version"]
+
+
+def test_chat_exits_cleanly_when_the_approval_prompt_hits_eof(config, capsys, monkeypatch) -> None:
+    """Ctrl-D at a safety prompt means exit, and used to be a traceback."""
+    import asyncio
+
+    from conftest import make_reply
+
+    from lumi import __main__ as cli
+
+    doomed = config.shell_cwd / "one.txt"
+    doomed.write_text("x", encoding="utf-8")
+    agent = _chat_agent(
+        config,
+        [make_reply(tool_calls=[("c1", "run_shell", {"command": f"rm {doomed}"})])],
+    )
+    monkeypatch.setattr(cli, "_build_agent", lambda cfg: agent)
+    scripted = iter(["tidy up"])
+
+    async def fake_prompt(message: str) -> str:
+        try:
+            return next(scripted)
+        except StopIteration:
+            raise EOFError from None
+
+    monkeypatch.setattr(cli, "_prompt", fake_prompt)
+    assert asyncio.run(cli._chat(config)) == 0
+
+    assert "bye" in capsys.readouterr().out
+    assert doomed.exists(), "nothing ran on the way out"
+
+
 def test_chat_memory_shares_the_window_with_the_prompt(config, capsys, monkeypatch) -> None:
     """``/memory`` in the REPL must apply the same cap the system prompt uses.
 

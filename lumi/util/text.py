@@ -26,8 +26,10 @@ def _preferred_cut(window: str, limit: int) -> int:
 #: every formatting tag except anchors (an ``<a>`` cannot be reopened across a
 #: chunk without its ``href``, so links are simply not balanced). The pattern
 #: matches the exact attribute-free shapes that survive :func:`sanitize_html` —
-#: a ``<b onclick=…>`` is escaped into visible text and must not count here.
-_BALANCE_TAG = r"(?:b|strong|i|em|u|ins|s|strike|del|code|pre|blockquote)"
+#: a ``<b onclick=…>`` is escaped into visible text and must not count here —
+#: plus ``<blockquote expandable>``, whose one attribute has to be part of the
+#: match so a chunk boundary can reopen the block still collapsible.
+_BALANCE_TAG = r"(?:b|strong|i|em|u|ins|s|strike|del|code|pre|blockquote(?:\s+expandable)?)"
 _BALANCE_TAG_RE = re.compile(rf"<(/?)({_BALANCE_TAG})\s*(/?)>", re.IGNORECASE)
 
 
@@ -43,12 +45,15 @@ def _open_tags(text: str) -> list[str]:
     stack: list[str] = []
     for match in _BALANCE_TAG_RE.finditer(text):
         closing, tag, selfclose = match.groups()
+        # A closing tag never carries the attribute, so it matches an opener by
+        # its bare name: ``</blockquote>`` closes ``blockquote expandable``.
         tag = tag.lower()
+        name = tag.split(" ", 1)[0]
         if closing:
-            if tag in stack:
-                stack.reverse()
-                stack.remove(tag)
-                stack.reverse()
+            for index in range(len(stack) - 1, -1, -1):
+                if stack[index].split(" ", 1)[0] == name:
+                    del stack[index]
+                    break
         elif not selfclose:
             stack.append(tag)
     return stack
@@ -100,7 +105,7 @@ def split_message(text: str, limit: int = TELEGRAM_LIMIT - _HEADROOM) -> list[st
         # even the floor leaves no room (deeply nested markup), balancing is
         # skipped and the sender's fallback degrades that chunk to plain text.
         def _closes(tags: list[str]) -> str:
-            return "".join(f"</{tag}>" for tag in reversed(tags))
+            return "".join(f"</{tag.split(' ', 1)[0]}>" for tag in reversed(tags))
 
         def _reopens(tags: list[str]) -> str:
             return "".join(f"<{tag}>" for tag in tags)
@@ -194,7 +199,7 @@ def escape_markdown(text: str) -> str:
 #: into literal text.
 _HTML_TAG_RE = re.compile(
     r"(</?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|tg-spoiler)\s*/?>"
-    r"|<blockquote\s*/?>|</blockquote>"
+    r"|<blockquote(?:\s+expandable)?\s*/?>|</blockquote>"
     r"|<a\s+href=\"[^\"<>]*\"\s*/?>"
     r"|</a>)",
     re.IGNORECASE,

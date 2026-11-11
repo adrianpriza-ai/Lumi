@@ -502,6 +502,170 @@ async def test_approval_button_data_is_well_formed(config) -> None:
     assert len(cancel.callback_data) <= 64
 
 
+async def test_several_approvals_share_one_card(config) -> None:
+    """Two risky calls in one reply are one question, not two prompts.
+
+    Each pending action used to get its own message — two "needs your
+    approval" blocks, two keyboards, reading like two unrelated requests.
+    """
+    bot, _ = await send(
+        config,
+        [
+            make_reply(
+                "",
+                [
+                    ("c1", "run_shell", {"command": "rm -rf workspace/tmp"}),
+                    ("c2", "run_shell", {"command": "chmod -R 700 workspace/out"}),
+                ],
+            )
+        ],
+        "clean up and lock down",
+    )
+
+    cards = [m for m in bot.sent if m.get("reply_markup")]
+    assert len(cards) == 1, "both actions belong on one card"
+    body = cards[0]["text"]
+    assert "2 actions need your approval" in body
+    assert "1." in body and "2." in body
+    assert "rm -rf workspace/tmp" in body and "chmod -R 700 workspace/out" in body
+
+    rows = cards[0]["reply_markup"].inline_keyboard
+    assert [[button.text for button in row] for row in rows] == [
+        ["run 1", "cancel 1"],
+        ["run 2", "cancel 2"],
+        ["run all", "cancel all"],
+    ]
+
+
+async def test_run_all_approves_the_whole_card_in_one_turn(config) -> None:
+    """``run all`` answers every action first, then asks the model once."""
+    first = config.shell_cwd / "one.txt"
+    second = config.shell_cwd / "two.txt"
+    first.write_text("x", encoding="utf-8")
+    second.write_text("y", encoding="utf-8")
+
+    application, bot, agent = build(
+        config,
+        [
+            make_reply(
+                "",
+                [
+                    ("c1", "run_shell", {"command": f"rm {first}"}),
+                    ("c2", "run_shell", {"command": f"rm {second}"}),
+                ],
+            ),
+            make_reply("both gone"),
+        ],
+    )
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "clean both up"))
+        card = next(m for m in bot.sent if m.get("reply_markup"))
+        run_all = card["reply_markup"].inline_keyboard[-1][0]
+        assert run_all.text == "run all"
+        await application.process_update(make_callback(bot, run_all.callback_data))
+    finally:
+        await application.shutdown()
+
+    assert not agent.conversation(CHAT).pending, "the whole card was answered"
+    assert not first.exists() and not second.exists()
+    assert "both gone" in texts(bot)
+
+
+async def test_cancel_all_declines_the_whole_card_at_once(config) -> None:
+    """One refusal note, not the same note once per action."""
+    first = config.shell_cwd / "one.txt"
+    second = config.shell_cwd / "two.txt"
+    first.write_text("x", encoding="utf-8")
+    second.write_text("y", encoding="utf-8")
+
+    application, bot, agent = build(
+        config,
+        [
+            make_reply(
+                "",
+                [
+                    ("c1", "run_shell", {"command": f"rm {first}"}),
+                    ("c2", "run_shell", {"command": f"rm {second}"}),
+                ],
+            ),
+            make_reply("left both alone"),
+        ],
+    )
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "clean both up"))
+        card = next(m for m in bot.sent if m.get("reply_markup"))
+        cancel_all = card["reply_markup"].inline_keyboard[-1][1]
+        assert cancel_all.text == "cancel all"
+        await application.process_update(make_callback(bot, cancel_all.callback_data))
+    finally:
+        await application.shutdown()
+
+    assert not agent.conversation(CHAT).pending
+    assert first.exists() and second.exists(), "a declined action must not run"
+    notes = [
+        message["content"]
+        for message in agent.conversation(CHAT).messages
+        if message["role"] == "user" and "declined" in message["content"]
+    ]
+    assert len(notes) == 1, "one card, one refusal note"
+    assert "declined all 2" in notes[0]
+
+
+async def test_tapping_one_action_keeps_the_other_tappable(config) -> None:
+    """Answering one of several actions must not erase the rest of the card.
+
+    The tap rewrites the card to ``running…`` while the tool runs; the actions
+    still waiting are drawn back onto that same message afterwards.
+    """
+    application, bot, agent = build(
+        config,
+        [
+            make_reply(
+                "",
+                [
+                    ("c1", "run_shell", {"command": "rm -rf workspace/tmp"}),
+                    ("c2", "run_shell", {"command": "chmod -R 700 workspace/out"}),
+                ],
+            ),
+            make_reply("one down"),
+        ],
+    )
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "clean up and lock down"))
+        card = next(m for m in bot.sent if m.get("reply_markup"))
+        run_first = card["reply_markup"].inline_keyboard[0][0]
+        await application.process_update(make_callback(bot, run_first.callback_data))
+    finally:
+        await application.shutdown()
+
+    assert len(agent.conversation(CHAT).pending) == 1
+    redrawn = [edit for edit in bot.edits if "needs your approval" in edit["text"]]
+    assert redrawn, "the untouched action must stay on screen with its buttons"
+    assert "chmod -R 700 workspace/out" in redrawn[-1]["text"]
+    assert "rm -rf workspace/tmp" not in redrawn[-1]["text"]
+    assert len(redrawn[-1]["reply_markup"].inline_keyboard) == 1
+
+
+async def test_a_very_long_preview_still_fits_one_card(config) -> None:
+    """The card is shortened, never split: a message without its buttons asks
+    nothing. Ten actions with long previews still land in one Telegram message."""
+    calls = [
+        (f"c{index}", "run_shell", {"command": "rm -rf workspace/" + "a" * 900})
+        for index in range(10)
+    ]
+    bot, _ = await send(config, [make_reply("", calls)], "clean everything")
+
+    cards = [m for m in bot.sent if m.get("reply_markup")]
+    assert len(cards) == 1
+    assert len(cards[0]["text"]) <= 4096
+    rows = cards[0]["reply_markup"].inline_keyboard
+    assert len(rows) == 11, "ten actions plus the bulk row"
+    assert [button.text for button in rows[-1]] == ["run all", "cancel all"]
+
+
 async def test_tapping_run_it_actually_runs_the_command(config) -> None:
     """The whole approval flow, through the button rather than plain prose.
 
@@ -2882,19 +3046,68 @@ async def test_steps_can_be_turned_off(config) -> None:
     assert "it said hi" in texts(bot)
 
 
-async def test_step_feed_caps_rendered_body_at_ten_lines() -> None:
+async def test_a_long_step_run_folds_into_a_summary_and_one_tap() -> None:
+    """Past three steps the feed is one line plus a collapsed quote that still
+    carries every step — no "… earlier" marker, so nothing is cut off."""
     bot = FakeBot()
     feed = StepFeed(bot, CHAT)
 
-    for index in range(11):
-        await feed.step("tool", f"tool-{index}")
+    for _ in range(4):
+        await feed.step("thinking")
+        await feed.step("tool", "read_file")
 
     rendered = bot.edits[-1]["text"]
-    assert rendered.splitlines() == [
-        "… (+2 earlier)",
-        *(f"🔧 tool-{index}" for index in range(2, 11)),
+    assert rendered.startswith("▸ 8 steps\n<blockquote expandable>")
+    assert rendered.endswith("</blockquote>")
+    assert rendered.count("🧠 Thinking") == 4  # the steps themselves, no recap
+    assert "earlier" not in rendered
+
+    # A pause closes the note without pretending the wait was a step.
+    await feed.paused()
+    folded = bot.edits[-1]["text"]
+    assert folded.splitlines()[0] == "▸ 8 steps"
+    assert folded.splitlines()[-1] == "⏸ Waiting for your approval</blockquote>"
+
+
+async def test_every_step_kind_folds_the_same_way() -> None:
+    """Not only thinking/bash/read: web search and fetch, MCP, grep and a tool
+    the feed has never heard of all count into the same one-line fold, and the
+    fold carries the labels and nothing else."""
+    bot = FakeBot()
+    feed = StepFeed(bot, CHAT)
+
+    labels = [
+        ("thinking", ""),
+        ("tool", "web.search"),
+        ("tool", "web.fetch"),
+        ("tool", "mcp.call"),
+        ("tool", "grep"),
+        ("tool", "brand_new_tool"),
     ]
-    assert len(rendered.splitlines()) == 10
+    for kind, detail in labels:
+        await feed.step(kind, detail)
+
+    rendered = bot.edits[-1]["text"]
+    summary, quoted = rendered.split("\n", 1)
+    assert summary == "▸ 6 steps"
+    assert quoted == (
+        "<blockquote expandable>🧠 Thinking\n🌐 Web Search\n🌐 Web Fetch\n"
+        "🔌 MCP Call\n🔍 Search\n🔧 brand_new_tool</blockquote>"
+    )
+
+
+async def test_a_short_step_run_stays_plain_unfolded_lines() -> None:
+    """A normal turn looks exactly as it did: the label per step, no chrome."""
+    bot = FakeBot()
+    feed = StepFeed(bot, CHAT)
+
+    await feed.step("thinking")
+    await feed.step("tool", "run_shell")
+    await feed.step("tool", "read_file")
+
+    rendered = bot.edits[-1]["text"]
+    assert rendered.splitlines() == ["🧠 Thinking", "💻 Run Bash", "📖 Read File"]
+    assert "<blockquote" not in rendered and "steps ·" not in rendered
 
 
 def test_step_labels_read_the_way_the_owner_sees_them() -> None:
@@ -2928,9 +3141,25 @@ async def test_a_turn_paused_for_approval_keeps_its_step_list(config) -> None:
     )
     assert "needs your approval" in texts(bot)
     assert "🧠 Thinking" in texts(bot)
+    # The note says why it stopped. Without the line it just ends at the tool
+    # that needed approval, which reads as the step list being cut off.
+    assert bot.edits[-1]["text"].splitlines()[-1] == "⏸ Waiting for your approval"
     # Exactly one keyboard on the turn: the Confirm/Cancel pair, not a
     # second button riding on the step message.
     assert len([m for m in bot.sent if m.get("reply_markup")]) == 1
+
+
+async def test_a_finished_turn_never_claims_to_be_waiting(config) -> None:
+    bot, _ = await send(
+        config,
+        [
+            make_reply("", [("c1", "run_shell", {"command": "echo hi"})]),
+            make_reply("it said hi"),
+        ],
+        "run echo hi",
+    )
+    rendered = texts(bot) + "\n" + "\n".join(edit["text"] for edit in bot.edits)
+    assert "Waiting for your approval" not in rendered
 
 
 async def test_the_send_tool_delivers_before_the_final_answer(config) -> None:
@@ -3278,6 +3507,10 @@ async def test_own_help_lists_the_owner_introspection_commands(config) -> None:
     assert "/forget" in body
     assert "/reload" in body
     assert "/reset" in body
+    # The keyboard answer to a card: registered commands, so they are listed
+    # with the rest of the owner's rather than left for the buttons alone.
+    assert "/approve" in body
+    assert "/deny" in body
 
 
 async def test_own_help_accepts_the_hyphen_spelling(config) -> None:
