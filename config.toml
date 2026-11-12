@@ -20,6 +20,8 @@ connect_timeout = 15.0
 bootstrap_retries = -1
 # Max document size sent to chat (MB). Telegram's own limit is 50.
 max_upload_mb = 20
+# Retention for uploaded files in group and channel chats in days (0 = disabled).
+group_upload_retention_days = 7
 
 [llm]
 # Any OpenAI-compatible endpoint (OpenAI, Ollama, LM Studio, vLLM, Groq, ...).

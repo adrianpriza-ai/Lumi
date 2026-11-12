@@ -23,6 +23,7 @@ it came from the writable roots.
 
 from __future__ import annotations
 
+import contextlib
 import shutil
 import time
 import uuid
@@ -38,6 +39,25 @@ log = get_logger(__name__)
 #: limit is 50 MB; a 20 MB default keeps the outbox useful without letting one
 #: runaway export fill the disk. Overridable per store.
 DEFAULT_MAX_BYTES = 20 * 1024 * 1024
+
+#: Default retention period for group and channel uploads, in days.
+#: Uploaded files in group/channel folders older than this are automatically deleted.
+DEFAULT_GROUP_RETENTION_DAYS = 7
+
+
+def is_group_or_channel_chat_id(chat_id: int | str | None) -> bool:
+    """Whether *chat_id* represents a group, supergroup, or channel.
+
+    In Telegram Bot API, private 1:1 user chats have positive integer IDs,
+    while groups, supergroups, and channels all have negative IDs
+    (starting with ``-`` or ``-100``).
+    """
+    if chat_id is None:
+        return False
+    try:
+        return int(chat_id) < 0
+    except (ValueError, TypeError):
+        return str(chat_id).startswith("-")
 
 #: File kinds we are willing to store. Anything else is refused — the point of
 #: the harness is files the model produces on purpose, not whatever a tool
@@ -193,9 +213,16 @@ class ArtifactStore:
     delivering nothing at all.
     """
 
-    def __init__(self, root: Path, *, max_bytes: int = DEFAULT_MAX_BYTES) -> None:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        max_bytes: int = DEFAULT_MAX_BYTES,
+        group_retention_days: int = DEFAULT_GROUP_RETENTION_DAYS,
+    ) -> None:
         self.root = root
         self.max_bytes = max_bytes
+        self.group_retention_days = group_retention_days
         self._recent: dict[str, Artifact] = {}
         # Bounded: a long-lived process should not grow this without limit.
         self._recent_order: list[str] = []
@@ -317,6 +344,13 @@ class ArtifactStore:
         except OSError as exc:
             raise ArtifactError(f"could not store {safe}: {exc}") from exc
 
+        # Auto-delete expired group/channel uploads on ingestion.
+        if self.group_retention_days > 0:
+            try:
+                self.cleanup_old_group_uploads(project_root, max_age_days=self.group_retention_days)
+            except Exception as exc:  # noqa: BLE001 - cleanup failure must never fail ingestion
+                log.warning("could not run upload cleanup on ingest: %s", exc)
+
         return Artifact(
             path=relative_to_root(target),
             absolute=target,
@@ -325,6 +359,73 @@ class ArtifactStore:
             origin="telegram upload",
             created=time.time(),
         )
+
+    def cleanup_old_group_uploads(
+        self,
+        project_root: Path | None = None,
+        *,
+        max_age_days: int | None = None,
+        now: float | None = None,
+    ) -> list[Path]:
+        """Auto-delete uploaded files for groups/channels older than *max_age_days*.
+
+        Only files under ``workspace/uploads/<chat>/`` where the chat is a group or
+        channel (negative chat ID) are pruned. Private chat uploads are never touched.
+        Empty directories are removed after their files are deleted.
+        """
+        days = self.group_retention_days if max_age_days is None else max_age_days
+        if days <= 0:
+            return []
+
+        root = project_root if project_root is not None else self.root
+        uploads_dir = root / "workspace" / "uploads"
+        if not uploads_dir.is_dir():
+            return []
+
+        current_time = time.time() if now is None else now
+        cutoff = current_time - (days * 86400)
+        deleted: list[Path] = []
+
+        try:
+            entries = list(uploads_dir.iterdir())
+        except OSError as exc:
+            log.warning("could not read uploads directory %s: %s", uploads_dir, exc)
+            return []
+
+        for chat_dir in entries:
+            if not chat_dir.is_dir() or not is_group_or_channel_chat_id(chat_dir.name):
+                continue
+
+            try:
+                files = list(chat_dir.iterdir())
+            except OSError as exc:
+                log.warning("could not list files in %s: %s", chat_dir, exc)
+                continue
+
+            for file_path in files:
+                if not file_path.is_file() and not file_path.is_symlink():
+                    continue
+                try:
+                    stat = file_path.stat()
+                    if stat.st_mtime < cutoff:
+                        file_path.unlink(missing_ok=True)
+                        deleted.append(file_path)
+                        key = file_path.as_posix()
+                        self._recent.pop(key, None)
+                        if key in self._recent_order:
+                            self._recent_order.remove(key)
+                        log.info(
+                            "auto-deleted expired group/channel upload (%d days old): %s",
+                            days,
+                            file_path,
+                        )
+                except OSError as exc:
+                    log.warning("could not delete expired upload %s: %s", file_path, exc)
+
+            with contextlib.suppress(OSError):
+                chat_dir.rmdir()
+
+        return deleted
 
     @staticmethod
     def _unique_path(target: Path) -> Path:
@@ -373,4 +474,6 @@ __all__ = [
     "ArtifactError",
     "ALLOWED_SUFFIXES",
     "DEFAULT_MAX_BYTES",
+    "DEFAULT_GROUP_RETENTION_DAYS",
+    "is_group_or_channel_chat_id",
 ]

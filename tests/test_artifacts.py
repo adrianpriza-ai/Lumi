@@ -10,7 +10,12 @@ from __future__ import annotations
 import pytest
 from conftest import FakeLLM, backdate, make_reply
 
-from lumi.artifacts import DEFAULT_MAX_BYTES, ArtifactError, ArtifactStore
+from lumi.artifacts import (
+    DEFAULT_MAX_BYTES,
+    ArtifactError,
+    ArtifactStore,
+    is_group_or_channel_chat_id,
+)
 from lumi.tools.base import ToolContext, ToolError
 from lumi.tools.files import FilesTool
 
@@ -400,3 +405,128 @@ async def test_a_turn_without_uploads_collects_no_artifacts(config) -> None:
     )
     result = await agent.handle(42, "hi")
     assert result.artifacts == []
+
+
+# --------------------------------------------------------------------------- #
+# group & channel upload retention & cleanup
+# --------------------------------------------------------------------------- #
+
+
+def test_is_group_or_channel_chat_id() -> None:
+    assert is_group_or_channel_chat_id(-1001234567890) is True
+    assert is_group_or_channel_chat_id("-1001234567890") is True
+    assert is_group_or_channel_chat_id(-42) is True
+    assert is_group_or_channel_chat_id("-42") is True
+    assert is_group_or_channel_chat_id(42) is False
+    assert is_group_or_channel_chat_id("42") is False
+    assert is_group_or_channel_chat_id(0) is False
+    assert is_group_or_channel_chat_id(None) is False
+    assert is_group_or_channel_chat_id("user_abc") is False
+
+
+async def test_cleanup_old_group_uploads_deletes_files_older_than_7_days(
+    store: ArtifactStore, config
+) -> None:
+    import os
+    import time
+
+    now = time.time()
+    group_dir = config.root / "workspace" / "uploads" / "-1001234567890"
+    group_dir.mkdir(parents=True, exist_ok=True)
+
+    old_file = group_dir / "old_doc.pdf"
+    old_file.write_bytes(b"old content")
+    os.utime(old_file, (now - 8 * 86400, now - 8 * 86400))
+
+    new_file = group_dir / "new_doc.pdf"
+    new_file.write_bytes(b"new content")
+    os.utime(new_file, (now - 2 * 86400, now - 2 * 86400))
+
+    deleted = store.cleanup_old_group_uploads(config.root, max_age_days=7, now=now)
+
+    assert old_file in deleted
+    assert not old_file.exists()
+    assert new_file.exists()
+    assert group_dir.exists()
+
+
+async def test_cleanup_old_group_uploads_removes_empty_group_directory(
+    store: ArtifactStore, config
+) -> None:
+    import os
+    import time
+
+    now = time.time()
+    group_dir = config.root / "workspace" / "uploads" / "-98765"
+    group_dir.mkdir(parents=True, exist_ok=True)
+
+    old_file = group_dir / "file.txt"
+    old_file.write_text("old", encoding="utf-8")
+    os.utime(old_file, (now - 10 * 86400, now - 10 * 86400))
+
+    deleted = store.cleanup_old_group_uploads(config.root, max_age_days=7, now=now)
+
+    assert old_file in deleted
+    assert not old_file.exists()
+    assert not group_dir.exists()
+
+
+async def test_cleanup_old_group_uploads_preserves_private_chat_files(
+    store: ArtifactStore, config
+) -> None:
+    import os
+    import time
+
+    now = time.time()
+    private_dir = config.root / "workspace" / "uploads" / "12345678"
+    private_dir.mkdir(parents=True, exist_ok=True)
+
+    old_private_file = private_dir / "my_secret_file.pdf"
+    old_private_file.write_bytes(b"private content")
+    os.utime(old_private_file, (now - 30 * 86400, now - 30 * 86400))
+
+    deleted = store.cleanup_old_group_uploads(config.root, max_age_days=7, now=now)
+
+    assert deleted == []
+    assert old_private_file.exists()
+    assert private_dir.exists()
+
+
+async def test_cleanup_disabled_when_zero_or_negative(
+    store: ArtifactStore, config
+) -> None:
+    import os
+    import time
+
+    now = time.time()
+    group_dir = config.root / "workspace" / "uploads" / "-100123"
+    group_dir.mkdir(parents=True, exist_ok=True)
+
+    old_file = group_dir / "kept.pdf"
+    old_file.write_bytes(b"keep me")
+    os.utime(old_file, (now - 20 * 86400, now - 20 * 86400))
+
+    deleted = store.cleanup_old_group_uploads(config.root, max_age_days=0, now=now)
+    assert deleted == []
+    assert old_file.exists()
+
+
+async def test_ingest_triggers_cleanup_of_old_group_files(
+    store: ArtifactStore, config
+) -> None:
+    import os
+    import time
+
+    now = time.time()
+    group_dir = config.root / "workspace" / "uploads" / "-100999"
+    group_dir.mkdir(parents=True, exist_ok=True)
+
+    old_file = group_dir / "stale.txt"
+    old_file.write_text("stale", encoding="utf-8")
+    os.utime(old_file, (now - 14 * 86400, now - 14 * 86400))
+
+    artifact = store.ingest(b"fresh data", "new.txt", -100999, config.root)
+
+    assert not old_file.exists()
+    assert artifact.absolute.exists()
+    assert artifact.absolute.read_text(encoding="utf-8") == "fresh data"

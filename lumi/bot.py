@@ -73,6 +73,7 @@ CB_NO = "lumi:no:"
 CB_ALL = "all"
 
 TYPING_INTERVAL = 4.0
+UPLOAD_CLEANUP_INTERVAL = 3600.0
 
 #: Pool size for the getUpdates request object. PTB sizes it at 1 connection;
 #: that is fine except with a non-empty bot.proxy_url, where httpx with
@@ -373,6 +374,7 @@ def _render_config(config: Config, memory_limit: int) -> str:
             f" · groups: {len(bot.whitelisted_groups)}"
             f" · always-reply chats: {len(bot.always_reply_chats)}",
             f"- file delivery: documents up to {bot.max_upload_mb} MB"
+            f" · group upload retention: {bot.group_upload_retention_days}d"
             f" · files tool: {'uploads on' if files.uploads else 'uploads off'}",
             f"- logging: {escape_html(config.logging.level)} → {escape_html(str(config.logging.file))}",
             f"- config file: {escape_html(str(config.config_path)) if config.config_path else 'none (built-in defaults)'}",
@@ -1305,7 +1307,7 @@ class StepFeed:
 
         ▸ 7 steps
         > 🧠 Thinking
-        > 💻 Run Bash
+        > 💻 Run Bash (approved)
         > 🌐 Web Search
 
     Sent on the first step and edited after that, so a turn reads as one
@@ -1313,6 +1315,11 @@ class StepFeed:
     message cannot be edited (or a test's Bot stub returns nothing to edit),
     each step falls back to a fresh message carrying the list so far — noisy
     but never wrong, and never an exception into the turn.
+
+    When a tool needs approval the turn pauses. The feed is stored per-chat so
+    ``_resolve`` can retrieve it, annotate the pending step line with
+    ``(approved)`` or ``(canceled)``, and continue adding steps to the same
+    message rather than opening a fresh one.
     """
 
     def __init__(self, bot: Any, chat_id: int | str) -> None:
@@ -1335,6 +1342,27 @@ class StepFeed:
             # identical lines.
             return
         self._steps.append(label)
+        await self._render()
+
+    async def mark_outcome(self, suffix: str) -> None:
+        """Annotate the last non-paused step with *(approved)* or *(canceled)*.
+
+        Called by ``_resolve`` before the continuation runs so the step line
+        that triggered the approval prompt reflects the owner's decision inline.
+        The paused marker (if present) is replaced — the outcome label is the
+        closure, not the pause. Nothing is posted if the feed has no steps yet.
+        """
+        if not self._steps:
+            return
+        # Drop the paused marker — the outcome replaces it.
+        if self._steps and self._steps[-1] == PAUSED_LABEL:
+            self._steps.pop()
+        if not self._steps:
+            return
+        last = self._steps[-1]
+        # Avoid double-annotating if mark_outcome is called twice.
+        if not last.endswith((" (approved)", " (canceled)")):
+            self._steps[-1] = f"{last} {suffix}"
         await self._render()
 
     async def paused(self) -> None:
@@ -2615,6 +2643,12 @@ def build_handlers(config: Config) -> list[Any]:
                 await reply(update, f"i broke on that: {format_error(exc)}")
                 return
         await _note_paused(feed, result)
+        # Stash the feed so _resolve can annotate the pending step in-place
+        # instead of opening a fresh step message for the continuation.
+        if result.pending and feed is not None:
+            context.bot_data.setdefault("pending_feed", {})[chat_id] = feed
+        elif feed is not None:
+            context.bot_data.setdefault("pending_feed", {}).pop(chat_id, None)
         await deliver(update, result, config)
 
     async def _resolve(
@@ -2639,12 +2673,30 @@ def build_handlers(config: Config) -> list[Any]:
         else:
             action_ids = [action_id]
 
-        verb = "running" if approved else "cancelling"
+        outcome_suffix = "(approved)" if approved else "(canceled)"
+
+        # Retrieve the step feed from the paused turn so we can annotate the
+        # pending step line in-place and continue adding steps to that same
+        # message rather than opening a fresh one.
+        pending_feeds: dict[Any, StepFeed] = context.bot_data.get("pending_feed", {})
+        feed: StepFeed | None = pending_feeds.pop(chat_id, None)
+
+        if feed is not None and config.llm.show_reasoning:
+            # Annotate the last step (the one that triggered the prompt) with
+            # the owner's decision, then keep using the same message below.
+            await feed.mark_outcome(outcome_suffix)
+        elif config.llm.show_reasoning:
+            # No stashed feed (e.g. /approve typed without a prior inline turn):
+            # start a fresh step message for the continuation.
+            feed = StepFeed(context.bot, chat_id)
+
+        # Remove the buttons from the approval card and replace it with a
+        # one-line status so it is clear the decision was recorded.
         if update.callback_query is not None:
             with contextlib.suppress(BadRequest, TelegramError):
-                await update.callback_query.edit_message_text(f"{verb}…", parse_mode=ParseMode.HTML)
+                label = "✅ approved" if approved else "❌ canceled"
+                await update.callback_query.edit_message_text(label, parse_mode=ParseMode.HTML)
 
-        feed = StepFeed(context.bot, chat_id) if config.llm.show_reasoning else None
         async with _Typing(context.bot, chat_id):
             try:
                 result = await agent.resolve_all(
@@ -2655,6 +2707,10 @@ def build_handlers(config: Config) -> list[Any]:
                 await reply(update, f"i broke on that: {format_error(exc)}")
                 return
         await _note_paused(feed, result)
+        # If the continuation itself paused again, stash the feed for the next
+        # _resolve call.
+        if result.pending and feed is not None:
+            context.bot_data.setdefault("pending_feed", {})[chat_id] = feed
         if update.callback_query is not None:
             await _refresh_approvals(update.callback_query, agent, chat_id, result)
         await deliver(update, result, config)
@@ -2839,7 +2895,9 @@ def build_application(
     application.bot_data["personality"] = personality
     application.bot_data["history"] = history
     application.bot_data["artifacts"] = ArtifactStore(
-        config.root, max_bytes=max(1, config.bot.max_upload_mb) * 1024 * 1024
+        config.root,
+        max_bytes=max(1, config.bot.max_upload_mb) * 1024 * 1024,
+        group_retention_days=config.bot.group_upload_retention_days,
     )
     application.bot_data["agent"] = agent or Agent(config, personality, store, history)
 
@@ -2905,6 +2963,28 @@ def _install_stop_handlers(application: Application) -> None:
         log.debug("no signal handler support on this loop; using PTB's default stop handling")
 
 
+async def _periodic_upload_cleanup(application: Application) -> None:
+    """Periodically purge uploads in group/channel folders older than retention limit."""
+    while True:
+        try:
+            await asyncio.sleep(UPLOAD_CLEANUP_INTERVAL)
+            config: Config = application.bot_data.get("config")
+            store: ArtifactStore = application.bot_data.get("artifacts")
+            if config and store and config.bot.group_upload_retention_days > 0:
+                deleted = store.cleanup_old_group_uploads(
+                    config.root, max_age_days=config.bot.group_upload_retention_days
+                )
+                if deleted:
+                    log.info(
+                        "periodic cleanup: auto-deleted %d expired group/channel upload(s)",
+                        len(deleted),
+                    )
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:  # noqa: BLE001
+            log.warning("error during periodic group upload cleanup: %s", exc)
+
+
 async def _post_init(application: Application) -> None:
     config: Config = application.bot_data["config"]
     agent: Agent = application.bot_data["agent"]
@@ -2923,8 +3003,26 @@ async def _post_init(application: Application) -> None:
         except (TelegramError, ValueError) as exc:
             log.warning("could not send the startup ping: %s", exc)
 
+    # Prune expired group/channel uploads on startup and start periodic cleanup.
+    store: ArtifactStore = application.bot_data["artifacts"]
+    deleted = store.cleanup_old_group_uploads(
+        config.root, max_age_days=config.bot.group_upload_retention_days
+    )
+    if deleted:
+        log.info("startup cleanup: auto-deleted %d expired group/channel upload(s)", len(deleted))
+
+    if config.bot.group_upload_retention_days > 0:
+        application.bot_data["upload_cleanup_task"] = asyncio.create_task(
+            _periodic_upload_cleanup(application)
+        )
+
 
 async def _post_shutdown(application: Application) -> None:
+    cleanup_task: asyncio.Task[None] | None = application.bot_data.get("upload_cleanup_task")
+    if cleanup_task is not None:
+        cleanup_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await cleanup_task
     agent: Agent | None = application.bot_data.get("agent")
     if agent is not None:
         # Cached HTTP clients (context7) close here rather than being left to

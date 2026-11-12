@@ -53,6 +53,10 @@ class BotConfig:
     #: the outbox from filling with one runaway export. The artifact harness
     #: refuses anything larger with a model-readable reason.
     max_upload_mb: int = 20
+    #: Retention for uploaded files in group and channel chats, in days.
+    #: Files under ``workspace/uploads/<chat>/`` for groups and channels older
+    #: than this are automatically deleted. 0 or negative disables cleanup.
+    group_upload_retention_days: int = 7
     #: How the bot behaves in group chats. ``"mention"`` (default) only replies
     #: when the bot is mentioned, replied to, or sent a slash command targeting
     #: it specifically (e.g. ``/start@Lumi_a_bot``). ``"always"`` replies to every

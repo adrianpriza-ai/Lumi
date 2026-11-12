@@ -3295,8 +3295,9 @@ async def test_reply_falls_back_to_bot_send_message_when_message_reply_raises_ba
 
 
 async def test_an_approved_run_shows_up_in_the_step_list(config) -> None:
-    """The tap on "run it" runs the tool after the turn ended — its step
-    belongs to the resolve turn's feed, not the vanished one."""
+    """The tap on "run it" runs the tool — the step feed from the paused turn
+    is reused and annotated with (approved) in-place via edits, so the step
+    label shows in bot.edits rather than bot.sent after the clear."""
     application, bot, agent = build(
         config,
         [
@@ -3309,19 +3310,23 @@ async def test_an_approved_run_shows_up_in_the_step_list(config) -> None:
         await application.process_update(make_update(bot, "clean up the workspace"))
         keyboard = next(m["reply_markup"] for m in bot.sent if m.get("reply_markup"))
         approve = keyboard.inline_keyboard[0][0]
-        bot._sent.clear()  # only the resolve turn's feed is under test
+        bot._sent.clear()
+        bot._edits.clear()
         await application.process_update(make_callback(bot, approve.callback_data))
     finally:
         await application.shutdown()
 
-    body = texts(bot)
-    assert "💻 Run Bash" in body
-    assert "it is gone" in body
+    # The step feed is reused from the paused turn: mark_outcome edits the
+    # existing message in-place, so "💻 Run Bash (approved)" shows up in
+    # bot.edits.  The final answer arrives as a fresh send.
+    edited_body = "\n".join(e.get("text", "") for e in bot.edits)
+    assert "💻 Run Bash" in edited_body
+    assert "it is gone" in texts(bot)
 
 
 async def test_slash_approve_command_shows_up_in_the_step_list(config) -> None:
     """Approving via `/approve` text command executes the pending action and
-    renders the step feed."""
+    annotates the existing step feed via edits rather than a fresh message."""
     application, bot, agent = build(
         config,
         [
@@ -3333,13 +3338,14 @@ async def test_slash_approve_command_shows_up_in_the_step_list(config) -> None:
     try:
         await application.process_update(make_update(bot, "clean up the workspace"))
         bot._sent.clear()
+        bot._edits.clear()
         await application.process_update(make_update(bot, "/approve"))
     finally:
         await application.shutdown()
 
-    body = texts(bot)
-    assert "💻 Run Bash" in body
-    assert "cleaned up" in body
+    edited_body = "\n".join(e.get("text", "") for e in bot.edits)
+    assert "💻 Run Bash" in edited_body
+    assert "cleaned up" in texts(bot)
 
 
 async def test_double_asterisk_bold_renders_as_bold(config) -> None:
@@ -3423,6 +3429,7 @@ async def test_config_shows_the_resolved_settings(config) -> None:
     assert "test-model" in body
     assert "firecrawl → exa → tavily → contextdev → you → mcp" in body
     assert "group mode: mention" in body
+    assert "group upload retention: 7d" in body
     assert "workspace" in body
 
 
@@ -3651,3 +3658,27 @@ def test_install_stop_handlers_wires_a_real_signal() -> None:
         assert app.stopped
 
     asyncio.run(scenario())
+
+
+async def test_startup_cleans_expired_group_uploads(config) -> None:
+    """When the bot boots, expired uploads for groups and channels are pruned."""
+    import os
+    import time
+    from lumi.bot import _post_init, _post_shutdown
+
+    now = time.time()
+    group_dir = config.root / "workspace" / "uploads" / "-100777"
+    group_dir.mkdir(parents=True, exist_ok=True)
+    old_file = group_dir / "old.png"
+    old_file.write_bytes(b"content")
+    os.utime(old_file, (now - 10 * 86400, now - 10 * 86400))
+
+    application, bot, agent = build(config, [make_reply("hello")])
+    await application.initialize()
+    try:
+        await _post_init(application)
+        assert not old_file.exists()
+        assert not group_dir.exists()
+    finally:
+        await _post_shutdown(application)
+        await application.shutdown()
