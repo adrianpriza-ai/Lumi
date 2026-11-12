@@ -374,7 +374,7 @@ def _render_config(config: Config, memory_limit: int) -> str:
             f" · groups: {len(bot.whitelisted_groups)}"
             f" · always-reply chats: {len(bot.always_reply_chats)}",
             f"- file delivery: documents up to {bot.max_upload_mb} MB"
-            f" · group upload retention: {bot.group_upload_retention_days}d"
+            f" · upload retention: {bot.group_upload_retention_days}d groups / {bot.personal_upload_retention_days}d personal"
             f" · files tool: {'uploads on' if files.uploads else 'uploads off'}",
             f"- logging: {escape_html(config.logging.level)} → {escape_html(str(config.logging.file))}",
             f"- config file: {escape_html(str(config.config_path)) if config.config_path else 'none (built-in defaults)'}",
@@ -2898,6 +2898,7 @@ def build_application(
         config.root,
         max_bytes=max(1, config.bot.max_upload_mb) * 1024 * 1024,
         group_retention_days=config.bot.group_upload_retention_days,
+        personal_retention_days=config.bot.personal_upload_retention_days,
     )
     application.bot_data["agent"] = agent or Agent(config, personality, store, history)
 
@@ -2964,25 +2965,34 @@ def _install_stop_handlers(application: Application) -> None:
 
 
 async def _periodic_upload_cleanup(application: Application) -> None:
-    """Periodically purge uploads in group/channel folders older than retention limit."""
+    """Periodically purge uploads in group/channel and personal folders older than retention limits."""
     while True:
         try:
             await asyncio.sleep(UPLOAD_CLEANUP_INTERVAL)
             config: Config = application.bot_data.get("config")
             store: ArtifactStore = application.bot_data.get("artifacts")
-            if config and store and config.bot.group_upload_retention_days > 0:
-                deleted = store.cleanup_old_group_uploads(
-                    config.root, max_age_days=config.bot.group_upload_retention_days
+            if (
+                config
+                and store
+                and (
+                    config.bot.group_upload_retention_days > 0
+                    or config.bot.personal_upload_retention_days > 0
+                )
+            ):
+                deleted = store.cleanup_old_uploads(
+                    config.root,
+                    group_days=config.bot.group_upload_retention_days,
+                    personal_days=config.bot.personal_upload_retention_days,
                 )
                 if deleted:
                     log.info(
-                        "periodic cleanup: auto-deleted %d expired group/channel upload(s)",
+                        "periodic cleanup: auto-deleted %d expired upload(s)",
                         len(deleted),
                     )
         except asyncio.CancelledError:
             break
         except Exception as exc:  # noqa: BLE001
-            log.warning("error during periodic group upload cleanup: %s", exc)
+            log.warning("error during periodic upload cleanup: %s", exc)
 
 
 async def _post_init(application: Application) -> None:
@@ -3003,15 +3013,17 @@ async def _post_init(application: Application) -> None:
         except (TelegramError, ValueError) as exc:
             log.warning("could not send the startup ping: %s", exc)
 
-    # Prune expired group/channel uploads on startup and start periodic cleanup.
+    # Prune expired group/channel and personal uploads on startup and start periodic cleanup.
     store: ArtifactStore = application.bot_data["artifacts"]
-    deleted = store.cleanup_old_group_uploads(
-        config.root, max_age_days=config.bot.group_upload_retention_days
+    deleted = store.cleanup_old_uploads(
+        config.root,
+        group_days=config.bot.group_upload_retention_days,
+        personal_days=config.bot.personal_upload_retention_days,
     )
     if deleted:
-        log.info("startup cleanup: auto-deleted %d expired group/channel upload(s)", len(deleted))
+        log.info("startup cleanup: auto-deleted %d expired upload(s)", len(deleted))
 
-    if config.bot.group_upload_retention_days > 0:
+    if config.bot.group_upload_retention_days > 0 or config.bot.personal_upload_retention_days > 0:
         application.bot_data["upload_cleanup_task"] = asyncio.create_task(
             _periodic_upload_cleanup(application)
         )

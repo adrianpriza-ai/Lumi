@@ -57,6 +57,10 @@ class BotConfig:
     #: Files under ``workspace/uploads/<chat>/`` for groups and channels older
     #: than this are automatically deleted. 0 or negative disables cleanup.
     group_upload_retention_days: int = 7
+    #: Retention for uploaded files in personal (direct) chats, in days.
+    #: Files under ``workspace/uploads/<chat>/`` for personal chats older
+    #: than this are automatically deleted. 0 or negative disables cleanup.
+    personal_upload_retention_days: int = 30
     #: How the bot behaves in group chats. ``"mention"`` (default) only replies
     #: when the bot is mentioned, replied to, or sent a slash command targeting
     #: it specifically (e.g. ``/start@Lumi_a_bot``). ``"always"`` replies to every

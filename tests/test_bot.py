@@ -3429,7 +3429,7 @@ async def test_config_shows_the_resolved_settings(config) -> None:
     assert "test-model" in body
     assert "firecrawl → exa → tavily → contextdev → you → mcp" in body
     assert "group mode: mention" in body
-    assert "group upload retention: 7d" in body
+    assert "upload retention: 7d groups / 30d personal" in body
     assert "workspace" in body
 
 
@@ -3664,6 +3664,7 @@ async def test_startup_cleans_expired_group_uploads(config) -> None:
     """When the bot boots, expired uploads for groups and channels are pruned."""
     import os
     import time
+
     from lumi.bot import _post_init, _post_shutdown
 
     now = time.time()
@@ -3679,6 +3680,36 @@ async def test_startup_cleans_expired_group_uploads(config) -> None:
         await _post_init(application)
         assert not old_file.exists()
         assert not group_dir.exists()
+    finally:
+        await _post_shutdown(application)
+        await application.shutdown()
+
+
+async def test_startup_cleans_expired_personal_uploads(config) -> None:
+    """When the bot boots, personal uploads older than 30 days are pruned."""
+    import os
+    import time
+
+    from lumi.bot import _post_init, _post_shutdown
+
+    now = time.time()
+    personal_dir = config.root / "workspace" / "uploads" / "123456"
+    personal_dir.mkdir(parents=True, exist_ok=True)
+    old_file = personal_dir / "old_personal.png"
+    old_file.write_bytes(b"content")
+    os.utime(old_file, (now - 31 * 86400, now - 31 * 86400))
+
+    new_file = personal_dir / "recent_personal.png"
+    new_file.write_bytes(b"content")
+    os.utime(new_file, (now - 10 * 86400, now - 10 * 86400))
+
+    application, bot, agent = build(config, [make_reply("hello")])
+    await application.initialize()
+    try:
+        await _post_init(application)
+        assert not old_file.exists()
+        assert new_file.exists()
+        assert personal_dir.exists()
     finally:
         await _post_shutdown(application)
         await application.shutdown()

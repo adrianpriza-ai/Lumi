@@ -492,9 +492,7 @@ async def test_cleanup_old_group_uploads_preserves_private_chat_files(
     assert private_dir.exists()
 
 
-async def test_cleanup_disabled_when_zero_or_negative(
-    store: ArtifactStore, config
-) -> None:
+async def test_cleanup_disabled_when_zero_or_negative(store: ArtifactStore, config) -> None:
     import os
     import time
 
@@ -511,9 +509,7 @@ async def test_cleanup_disabled_when_zero_or_negative(
     assert old_file.exists()
 
 
-async def test_ingest_triggers_cleanup_of_old_group_files(
-    store: ArtifactStore, config
-) -> None:
+async def test_ingest_triggers_cleanup_of_old_group_files(store: ArtifactStore, config) -> None:
     import os
     import time
 
@@ -530,3 +526,29 @@ async def test_ingest_triggers_cleanup_of_old_group_files(
     assert not old_file.exists()
     assert artifact.absolute.exists()
     assert artifact.absolute.read_text(encoding="utf-8") == "fresh data"
+
+
+async def test_cleanup_old_uploads_prunes_personal_files_older_than_30_days(
+    store: ArtifactStore, config
+) -> None:
+    import os
+    import time
+
+    now = time.time()
+    personal_dir = config.root / "workspace" / "uploads" / "42"
+    personal_dir.mkdir(parents=True, exist_ok=True)
+
+    old_file = personal_dir / "old_receipt.pdf"
+    old_file.write_bytes(b"old")
+    os.utime(old_file, (now - 35 * 86400, now - 35 * 86400))
+
+    recent_file = personal_dir / "recent_note.txt"
+    recent_file.write_text("recent", encoding="utf-8")
+    os.utime(recent_file, (now - 10 * 86400, now - 10 * 86400))
+
+    deleted = store.cleanup_old_uploads(config.root, group_days=7, personal_days=30, now=now)
+
+    assert old_file in deleted
+    assert not old_file.exists()
+    assert recent_file.exists()
+    assert personal_dir.exists()

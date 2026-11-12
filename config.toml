@@ -22,6 +22,8 @@ bootstrap_retries = -1
 max_upload_mb = 20
 # Retention for uploaded files in group and channel chats in days (0 = disabled).
 group_upload_retention_days = 7
+# Retention for uploaded files in personal chats in days (0 = disabled).
+personal_upload_retention_days = 30
 
 [llm]
 # Any OpenAI-compatible endpoint (OpenAI, Ollama, LM Studio, vLLM, Groq, ...).

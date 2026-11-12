@@ -44,6 +44,10 @@ DEFAULT_MAX_BYTES = 20 * 1024 * 1024
 #: Uploaded files in group/channel folders older than this are automatically deleted.
 DEFAULT_GROUP_RETENTION_DAYS = 7
 
+#: Default retention period for personal (1:1) uploads, in days.
+#: Uploaded files in personal chat folders older than this are automatically deleted.
+DEFAULT_PERSONAL_RETENTION_DAYS = 30
+
 
 def is_group_or_channel_chat_id(chat_id: int | str | None) -> bool:
     """Whether *chat_id* represents a group, supergroup, or channel.
@@ -58,6 +62,7 @@ def is_group_or_channel_chat_id(chat_id: int | str | None) -> bool:
         return int(chat_id) < 0
     except (ValueError, TypeError):
         return str(chat_id).startswith("-")
+
 
 #: File kinds we are willing to store. Anything else is refused — the point of
 #: the harness is files the model produces on purpose, not whatever a tool
@@ -219,10 +224,12 @@ class ArtifactStore:
         *,
         max_bytes: int = DEFAULT_MAX_BYTES,
         group_retention_days: int = DEFAULT_GROUP_RETENTION_DAYS,
+        personal_retention_days: int = DEFAULT_PERSONAL_RETENTION_DAYS,
     ) -> None:
         self.root = root
         self.max_bytes = max_bytes
         self.group_retention_days = group_retention_days
+        self.personal_retention_days = personal_retention_days
         self._recent: dict[str, Artifact] = {}
         # Bounded: a long-lived process should not grow this without limit.
         self._recent_order: list[str] = []
@@ -344,10 +351,14 @@ class ArtifactStore:
         except OSError as exc:
             raise ArtifactError(f"could not store {safe}: {exc}") from exc
 
-        # Auto-delete expired group/channel uploads on ingestion.
-        if self.group_retention_days > 0:
+        # Auto-delete expired uploads on ingestion.
+        if self.group_retention_days > 0 or self.personal_retention_days > 0:
             try:
-                self.cleanup_old_group_uploads(project_root, max_age_days=self.group_retention_days)
+                self.cleanup_old_uploads(
+                    project_root,
+                    group_days=self.group_retention_days,
+                    personal_days=self.personal_retention_days,
+                )
             except Exception as exc:  # noqa: BLE001 - cleanup failure must never fail ingestion
                 log.warning("could not run upload cleanup on ingest: %s", exc)
 
@@ -360,21 +371,27 @@ class ArtifactStore:
             created=time.time(),
         )
 
-    def cleanup_old_group_uploads(
+    def cleanup_old_uploads(
         self,
         project_root: Path | None = None,
         *,
-        max_age_days: int | None = None,
+        group_days: int | None = None,
+        personal_days: int | None = None,
         now: float | None = None,
     ) -> list[Path]:
-        """Auto-delete uploaded files for groups/channels older than *max_age_days*.
+        """Auto-delete uploaded files older than the retention threshold.
 
-        Only files under ``workspace/uploads/<chat>/`` where the chat is a group or
-        channel (negative chat ID) are pruned. Private chat uploads are never touched.
+        Group/channel uploads (negative chat IDs) are pruned when older than
+        *group_days* (default: self.group_retention_days, 7 days).
+        Personal uploads (positive chat IDs) are pruned when older than
+        *personal_days* (default: self.personal_retention_days, 30 days).
+        0 or negative disables cleanup for that chat type.
         Empty directories are removed after their files are deleted.
         """
-        days = self.group_retention_days if max_age_days is None else max_age_days
-        if days <= 0:
+        g_days = self.group_retention_days if group_days is None else group_days
+        p_days = self.personal_retention_days if personal_days is None else personal_days
+
+        if g_days <= 0 and p_days <= 0:
             return []
 
         root = project_root if project_root is not None else self.root
@@ -383,7 +400,6 @@ class ArtifactStore:
             return []
 
         current_time = time.time() if now is None else now
-        cutoff = current_time - (days * 86400)
         deleted: list[Path] = []
 
         try:
@@ -393,8 +409,15 @@ class ArtifactStore:
             return []
 
         for chat_dir in entries:
-            if not chat_dir.is_dir() or not is_group_or_channel_chat_id(chat_dir.name):
+            if not chat_dir.is_dir():
                 continue
+
+            is_group = is_group_or_channel_chat_id(chat_dir.name)
+            days = g_days if is_group else p_days
+            if days <= 0:
+                continue
+
+            cutoff = current_time - (days * 86400)
 
             try:
                 files = list(chat_dir.iterdir())
@@ -415,7 +438,8 @@ class ArtifactStore:
                         if key in self._recent_order:
                             self._recent_order.remove(key)
                         log.info(
-                            "auto-deleted expired group/channel upload (%d days old): %s",
+                            "auto-deleted expired %s upload (%d days old): %s",
+                            "group/channel" if is_group else "personal",
                             days,
                             file_path,
                         )
@@ -426,6 +450,21 @@ class ArtifactStore:
                 chat_dir.rmdir()
 
         return deleted
+
+    def cleanup_old_group_uploads(
+        self,
+        project_root: Path | None = None,
+        *,
+        max_age_days: int | None = None,
+        now: float | None = None,
+    ) -> list[Path]:
+        """Auto-delete uploaded files for groups/channels older than *max_age_days*."""
+        return self.cleanup_old_uploads(
+            project_root,
+            group_days=max_age_days,
+            personal_days=0,
+            now=now,
+        )
 
     @staticmethod
     def _unique_path(target: Path) -> Path:
@@ -475,5 +514,6 @@ __all__ = [
     "ALLOWED_SUFFIXES",
     "DEFAULT_MAX_BYTES",
     "DEFAULT_GROUP_RETENTION_DAYS",
+    "DEFAULT_PERSONAL_RETENTION_DAYS",
     "is_group_or_channel_chat_id",
 ]
