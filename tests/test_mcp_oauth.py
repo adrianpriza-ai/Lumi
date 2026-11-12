@@ -24,6 +24,7 @@ from mcp.client.auth import OAuthClientProvider
 from lumi.tools.web.providers.mcp_oauth import (
     CallbackServer,
     FileTokenStorage,
+    MCPOAuthLoginRequired,
     authorize_server,
     oauth_provider_for,
     tokens_dir,
@@ -168,9 +169,9 @@ async def test_session_auth_never_opens_a_browser(tmp_path) -> None:
     assert isinstance(provider, OAuthClientProvider)
     metadata = provider.context.client_metadata
     assert metadata.grant_types == ["authorization_code", "refresh_token"]
-    with pytest.raises(RuntimeError, match="/mcp auth fake"):
+    with pytest.raises(MCPOAuthLoginRequired, match="/mcp auth fake"):
         await provider.context.redirect_handler("https://auth.test/authorize")
-    with pytest.raises(RuntimeError, match="/mcp auth fake"):
+    with pytest.raises(MCPOAuthLoginRequired, match="/mcp auth fake"):
         await provider.context.callback_handler()
 
 

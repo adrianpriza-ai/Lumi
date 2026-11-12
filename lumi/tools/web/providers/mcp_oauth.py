@@ -64,6 +64,19 @@ CALLBACK_PAGE = (
 )
 
 
+class MCPOAuthLoginRequired(RuntimeError):
+    """The stored OAuth credentials cannot be used without a fresh login.
+
+    Raised by the non-interactive session handler when a *login* — not a
+    refresh — would be needed, and by :func:`authorize_server` when a login
+    finished without producing a token. The remedy is always the owner's
+    ``/mcp auth <name>``; the distinct class lets the provider keep the
+    session alive (the transport is healthy, the credentials are not) and
+    lets tests and callers tell "needs a human" apart from any transport
+    failure.
+    """
+
+
 def tokens_dir(root: Path) -> Path:
     """The directory token files live under, one file per server."""
     return Path(root) / ".mcp-tokens"
@@ -439,7 +452,7 @@ async def authorize_server(
 
     tokens = await storage.get_tokens()
     if tokens is None:
-        raise RuntimeError(
+        raise MCPOAuthLoginRequired(
             f"the login for {spec.name!r} did not produce a token; try /mcp auth again"
         )
     return {
@@ -466,7 +479,7 @@ def oauth_provider_for(spec: Any, root: Path) -> Any:
     async def demand_login(*_args: Any) -> None:
         # The redirect handler is called with the URL, the callback handler
         # with nothing — either shape means the same thing here.
-        raise RuntimeError(
+        raise MCPOAuthLoginRequired(
             f"the oauth login for {spec.name!r} has expired; the owner runs "
             f"/mcp auth {spec.name} to authorize again"
         )
@@ -497,6 +510,7 @@ __all__ = [
     "AUTHORIZE_TIMEOUT",
     "CallbackServer",
     "FileTokenStorage",
+    "MCPOAuthLoginRequired",
     "authorize_server",
     "oauth_provider_for",
     "oauth_supported",

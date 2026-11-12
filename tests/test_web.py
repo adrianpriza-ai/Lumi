@@ -1226,6 +1226,50 @@ async def test_fetch_reports_when_no_tool_matches(config) -> None:
     assert page.markdown.startswith("mcp fetch failed: no fetch tool found")
 
 
+async def test_search_failure_names_why_each_server_was_skipped(config) -> None:
+    """A bare "no search tool found" hides whether the server was down,
+    unapproved, or simply had no matching tool — the model and the owner
+    need the per-server reason to know what to fix."""
+    (config.root / ".mcp.json").write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "down": {"url": "https://down.test"},
+                    "empty": {"url": "https://empty.test"},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    provider = MCPProvider(config.tools.web.mcp, config.root)
+
+    async def list_tools(spec):
+        if spec.name == "down":
+            raise RuntimeError("connection refused")
+        return []
+
+    provider._list_tools = list_tools  # type: ignore[method-assign]
+
+    result = await provider.search("q", 5)
+
+    assert not result.ok
+    assert "down: unreachable (connection refused)" in result.error
+    assert "empty: no tool matching" in result.error
+
+
+async def test_fetch_failure_names_why_each_server_was_skipped(config) -> None:
+    (config.root / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {"down": {"url": "https://down.test"}}}), encoding="utf-8"
+    )
+    provider = MCPProvider(config.tools.web.mcp, config.root)
+    provider._list_tools = lambda spec: _raise(RuntimeError("connection refused"))  # type: ignore[assignment]
+
+    page = await provider.fetch("https://x.test")
+
+    assert page.markdown.startswith("mcp fetch failed: no fetch tool found")
+    assert "down: unreachable (connection refused)" in page.markdown
+
+
 async def _raise(exc: Exception):
     raise exc
 
@@ -1404,6 +1448,39 @@ async def test_a_dead_transport_during_a_call_is_not_re_sent(config) -> None:
     result = await provider.search("q", 5)
     assert result.ok
     assert len(opened) == 2
+    await provider.aclose()
+
+
+async def test_a_dead_session_during_discovery_is_retried_once_after_a_pause(
+    config, monkeypatch
+) -> None:
+    """Discovery re-runs safely, so a server that died between queries earns
+    one re-send on a fresh session — after a short pause, the way the
+    /mcp check probe backs off, because a just-crashed stdio server is
+    often mid-teardown when the respawn lands."""
+    import lumi.tools.web.providers.mcp_provider as mcp_provider_module
+
+    monkeypatch.setattr(mcp_provider_module, "DISCOVERY_RETRY_SECONDS", 0)
+    payload = _mcp_project(config)
+    provider = MCPProvider(config.tools.web.mcp, config.root)
+    opened: list[str] = []
+
+    class OnceDead(FakeSession):
+        async def list_tools(self, cursor=None):
+            if len(opened) == 1:
+                raise RuntimeError("connection lost")
+            return await super().list_tools(cursor)
+
+    async def fake_open(stack, spec):
+        opened.append(spec.name)
+        return OnceDead(payload)
+
+    provider._open = fake_open  # type: ignore[method-assign]
+
+    result = await provider.search("q", 5)
+
+    assert result.ok
+    assert opened == ["tavily", "tavily"]  # the fresh session answered
     await provider.aclose()
 
 

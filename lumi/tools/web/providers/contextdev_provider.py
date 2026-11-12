@@ -48,6 +48,20 @@ log = get_logger(__name__)
 #: eat the context.
 ERROR_BODY_CHARS = 300
 
+#: The search API caps the query length; anything longer is truncated with a
+#: debug log rather than silently.
+QUERY_MAX_CHARS = 500
+
+
+class ContextScrapeFailed(RuntimeError):
+    """A scrape request answered 200 but produced no markdown.
+
+    Raised by :meth:`_fetch_with` so the pool loop can rotate keys without
+    matching on the error text; the caller renders the ``scrape failed:``
+    page the web tool already recognizes.
+    """
+
+
 #: Context.dev ranks every hit ``high`` / ``medium`` / ``low``; the other
 #: providers carry a numeric score, so the label becomes one — a rank is a
 #: score that admits only three values.
@@ -165,7 +179,16 @@ class ContextDevProvider(WebProvider):
         # Each pool attempt starts clean: a previous key's failure must not
         # stick to a result this key made healthy.
         result.error = ""
-        payload: dict[str, Any] = {"query": query[:500], "numResults": max_results}
+        if len(query) > QUERY_MAX_CHARS:
+            log.debug(
+                "context.dev query truncated from %d to %d chars",
+                len(query),
+                QUERY_MAX_CHARS,
+            )
+        payload: dict[str, Any] = {
+            "query": query[:QUERY_MAX_CHARS],
+            "numResults": max_results,
+        }
         if freshness := _freshness(days):
             payload["freshness"] = freshness
         # Highlights cost one credit per ten results and are the point of
@@ -179,10 +202,19 @@ class ContextDevProvider(WebProvider):
         try:
             response = await self._post(key, "/web/search", payload)
             data = response.json()
-        except (RuntimeError, ValueError) as exc:
-            # ValueError covers a 200 with a non-JSON body: it must read as a
-            # failed attempt — so the pool rotates — not as a provider crash.
+        except Exception as exc:
+            # Any failure — HTTP, network, a 200 with a non-JSON body, an
+            # unexpected shape — is a failed *attempt*: the pool rotates to
+            # the next key, it is not a provider crash.
             result.error = str(exc)
+            return result
+
+        # A 200 can still be an error: some compatible servers answer with
+        # ``{"error_code": "RATE_LIMITED"}`` and no results. Without this
+        # check that reads as "success with 0 hits" and the pool never
+        # learns the key is throttled.
+        if error := _search_error_of(data):
+            result.error = error
             return result
 
         for item in data.get("results") or []:
@@ -210,18 +242,26 @@ class ContextDevProvider(WebProvider):
     async def fetch(self, url: str) -> Page:
         """Scrape one page as markdown, retrying the pool on failure."""
         if not self._pool:
-            return await self._fetch_with("", url)
+            try:
+                return await self._fetch_with("", url)
+            except ContextScrapeFailed as exc:  # keyless: one attempt, no rotation
+                return Page(url=url, markdown=f"scrape failed: {exc}")
 
         tried: list[str] = []
         last_error = ""
         while (key := self._pool.pick(exclude=tried)) is not None:
             tried.append(key)
-            page = await self._fetch_with(key, url)
-            if not page.markdown.startswith("scrape failed"):
-                self._pool.report(key, ok=True)
-                return page
-            last_error = page.markdown
-            self._pool.report(key, ok=False, retryable=True)
+            try:
+                page = await self._fetch_with(key, url)
+            except ContextScrapeFailed as exc:
+                # The endpoint answered, but the scrape itself failed — the
+                # key is innocent (a 429 would have raised as HTTP 4xx), yet
+                # the attempt failed, so rotate and record why.
+                last_error = f"scrape failed: {exc}"
+                self._pool.report(key, ok=False, retryable=False)
+                continue
+            self._pool.report(key, ok=True)
+            return page
         return Page(url=url, markdown=last_error or "every context.dev key failed")
 
     async def _fetch_with(self, key: str, url: str) -> Page:
@@ -229,9 +269,10 @@ class ContextDevProvider(WebProvider):
         try:
             response = await self._post(key, "/web/scrape", payload)
             body = response.json()
-        except (RuntimeError, ValueError) as exc:
-            # Same as search: a non-JSON 200 is a failed attempt, not a crash.
-            return Page(url=url, markdown=f"scrape failed: {exc}")
+        except Exception as exc:
+            # Same as search: any failure is a failed attempt for the pool
+            # to rotate on, not a provider crash.
+            raise ContextScrapeFailed(str(exc)) from exc
 
         # Every output key is present with a ``success`` flag; check the one
         # we asked for rather than trusting the 200.
@@ -239,7 +280,7 @@ class ContextDevProvider(WebProvider):
         if isinstance(markdown, dict):
             if not markdown.get("success"):
                 reason = markdown.get("error_code") or markdown.get("message") or "no content"
-                return Page(url=url, markdown=f"scrape failed: {reason}")
+                raise ContextScrapeFailed(str(reason))
             text = str(markdown.get("data") or "")
         else:  # defensive: some compatible servers inline the string
             text = str(markdown or "")
@@ -253,6 +294,23 @@ class ContextDevProvider(WebProvider):
             title=title,
             markdown=text or "(no content)",
         )
+
+
+def _search_error_of(data: Any) -> str:
+    """The provider's own error words from a 200 body that reports failure.
+
+    Some compatible servers answer an exhausted quota or a throttled key with
+    an HTTP 200 and ``{"error_code": "RATE_LIMITED"}`` (or ``error``, or
+    ``success: false``) and no results. Without this check that reads as
+    "success with 0 hits" and the pool never learns the key is unhealthy.
+    A body that also carries results is trusted — the hits win.
+    """
+    if not isinstance(data, dict) or data.get("results"):
+        return ""
+    if data.get("success") is False:
+        return str(data.get("error_code") or data.get("message") or "search failed")
+    code = data.get("error_code") or data.get("error")
+    return str(code) if code else ""
 
 
 def _highlights_of(item: dict[str, Any]) -> str:
@@ -272,4 +330,4 @@ def _markdown_of(item: dict[str, Any]) -> str:
     return str(block.get("markdown") or "")
 
 
-__all__ = ["ContextDevProvider", "FRESHNESS"]
+__all__ = ["ContextDevProvider", "ContextScrapeFailed", "FRESHNESS"]

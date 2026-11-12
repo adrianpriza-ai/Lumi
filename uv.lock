@@ -949,6 +949,7 @@ source = { editable = "." }
 dependencies = [
     { name = "exa-py" },
     { name = "firecrawl" },
+    { name = "httpx" },
     { name = "mcp" },
     { name = "openai" },
     { name = "pillow" },
@@ -969,6 +970,7 @@ dev = [
 requires-dist = [
     { name = "exa-py", specifier = ">=2.0" },
     { name = "firecrawl", specifier = ">=4.0" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "mcp", specifier = ">=1.2" },
     { name = "openai", specifier = ">=1.60" },
     { name = "pillow", specifier = ">=10.0" },

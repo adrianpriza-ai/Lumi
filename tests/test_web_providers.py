@@ -1188,3 +1188,147 @@ async def test_contextdev_non_json_body_rotates_instead_of_crashing(monkeypatch)
     assert result.ok
     assert len(result.hits) == 1
     assert state["n"] == 2
+
+
+async def test_contextdev_a_200_error_body_rotates_instead_of_reading_as_zero_hits(
+    monkeypatch,
+) -> None:
+    """Some compatible servers answer a throttled key with HTTP 200 and
+    ``{"error_code": "RATE_LIMITED"}`` — that is a failed attempt the pool
+    rotates on, not a successful search with no hits."""
+    monkeypatch.setenv("CONTEXT_DEV_API_KEY", "cd-91, cd-92")
+    state = {"n": 0}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        state["n"] += 1
+        if state["n"] == 1:
+            return httpx.Response(200, json={"error_code": "RATE_LIMITED"})
+        return search_response([a_hit("https://a.example/1")])
+
+    install_http(monkeypatch, respond)
+    provider = ContextDevProvider(ContextDevConfig())
+
+    result = await provider.search("q", 5)
+
+    assert result.ok
+    assert state["n"] == 2
+
+
+async def test_contextdev_a_200_error_body_names_the_reason_when_every_key_fails(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("CONTEXT_DEV_API_KEY", "cd-91, cd-92")
+    install_http(
+        monkeypatch, lambda request: httpx.Response(200, json={"error_code": "RATE_LIMITED"})
+    )
+    provider = ContextDevProvider(ContextDevConfig())
+
+    result = await provider.search("q", 5)
+
+    assert not result.ok
+    assert "RATE_LIMITED" in result.error
+
+
+async def test_contextdev_an_unexpected_exception_rotates_instead_of_crashing(monkeypatch) -> None:
+    """Anything escaping the HTTP layer — a shape the parser did not expect,
+    an SDK-version surprise — is a failed attempt, the way Tavily and Exa
+    already treat it, not a provider crash that skips the remaining keys."""
+    monkeypatch.setenv("CONTEXT_DEV_API_KEY", "cd-91, cd-92")
+    install_http(monkeypatch, lambda request: search_response([a_hit("https://a.example/1")]))
+    provider = ContextDevProvider(ContextDevConfig())
+    real_post = provider._post
+    calls = {"n": 0}
+
+    async def flaky_post(key, path, payload):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TypeError("unexpected shape")
+        return await real_post(key, path, payload)
+
+    monkeypatch.setattr(provider, "_post", flaky_post)
+
+    result = await provider.search("q", 5)
+
+    assert result.ok
+    assert len(result.hits) == 1
+    assert calls["n"] == 2
+
+
+async def test_contextdev_search_truncates_an_overlong_query(monkeypatch) -> None:
+    monkeypatch.setenv("CONTEXT_DEV_API_KEY", "cd-91")
+    bodies = install_http(monkeypatch, lambda request: search_response([]))
+    provider = ContextDevProvider(ContextDevConfig())
+
+    await provider.search("x" * 600, 5)
+
+    assert bodies[0]["query"] == "x" * 500
+
+
+async def test_contextdev_fetch_rotates_keys_on_failure(monkeypatch) -> None:
+    monkeypatch.setenv("CONTEXT_DEV_API_KEY", "cd-91, cd-92")
+    state = {"n": 0}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        state["n"] += 1
+        if state["n"] == 1:
+            return httpx.Response(500, json={"error_code": "INTERNAL_ERROR"})
+        return httpx.Response(
+            200,
+            json={
+                "markdown": {"requested": True, "success": True, "data": "# body"},
+                "metadata": {"title": "Hello", "url": "https://landed.example/"},
+            },
+        )
+
+    install_http(monkeypatch, respond)
+    provider = ContextDevProvider(ContextDevConfig())
+
+    page = await provider.fetch("https://example.com")
+
+    assert page.markdown == "# body"
+    assert state["n"] == 2
+
+
+async def test_contextdev_fetch_rotation_reports_the_reason_when_every_key_fails(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("CONTEXT_DEV_API_KEY", "cd-91, cd-92")
+    install_http(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={
+                "markdown": {"requested": True, "success": False, "error_code": "WEBSITE_BLOCKED"},
+                "metadata": {},
+            },
+        ),
+    )
+    provider = ContextDevProvider(ContextDevConfig())
+
+    page = await provider.fetch("https://example.com")
+
+    assert page.markdown.startswith("scrape failed:")
+    assert "WEBSITE_BLOCKED" in page.markdown
+
+
+async def test_contextdev_keyless_fetch_failure_still_renders_the_error_page(monkeypatch) -> None:
+    """Keyless mode has no pool to rotate on: one attempt, and its failure
+    must still come back as the ``scrape failed:`` page the web tool
+    recognizes, not as an exception."""
+    monkeypatch.delenv("CONTEXT_DEV_API_KEY", raising=False)
+    install_http(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={
+                "markdown": {"requested": True, "success": False, "error_code": "WEBSITE_BLOCKED"},
+                "metadata": {},
+            },
+        ),
+    )
+    provider = ContextDevProvider(ContextDevConfig(base_url="http://localhost:9/v1"))
+
+    page = await provider.fetch("https://example.com")
+
+    assert page.markdown.startswith("scrape failed:")
+    assert "WEBSITE_BLOCKED" in page.markdown

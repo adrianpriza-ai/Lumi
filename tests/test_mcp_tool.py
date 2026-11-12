@@ -1208,6 +1208,19 @@ async def test_a_trust_refusal_is_never_a_dead_session() -> None:
     assert not _session_died(MCPTrustError("not approved"))
 
 
+async def test_an_expired_oauth_login_is_never_a_dead_session() -> None:
+    """Expired credentials are not a dead transport: the session is healthy,
+    the token is not, and re-spawning cannot mint a new one — the owner's
+    /mcp auth can. Dropping the session here would only cost a respawn on
+    the next call while the error stayed the same."""
+    from lumi.tools.web.providers.mcp_oauth import MCPOAuthLoginRequired
+    from lumi.tools.web.providers.mcp_provider import _session_died
+
+    assert not _session_died(MCPOAuthLoginRequired("the oauth login has expired"))
+    # A plain RuntimeError remains transport death.
+    assert _session_died(RuntimeError("connection lost"))
+
+
 def test_the_trust_store_lives_under_data_and_is_write_protected(config) -> None:
     """Approvals are runtime state under `data/` (gitignored, not cloned), and
     the model must never be able to write the file — writing it is exactly

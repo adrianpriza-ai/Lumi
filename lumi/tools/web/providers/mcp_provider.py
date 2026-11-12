@@ -60,6 +60,7 @@ from ....paths import resolve
 from ....util.env import scrubbed_env
 from ....util.log import get_logger
 from .base import Page, SearchHit, SearchResult, WebProvider, final_url, recent_cutoff
+from .mcp_oauth import MCPOAuthLoginRequired
 from .mcp_trust import MCPTrustError, MCPTrustStore, entry_digest, trust_path
 
 log = get_logger(__name__)
@@ -78,6 +79,13 @@ TOOL_CACHE_TTL = 300.0
 #: at their own discretion, and one that hands the same cursor back forever
 #: must not be able to keep us paging.
 LIST_PAGES_MAX = 10
+
+#: Pause before the one discovery re-send on a fresh session. A stdio server
+#: that just crashed is often mid-teardown — an immediate respawn can connect
+#: to a dying process or fail to bind — and the ``/mcp check`` probe already
+#: backs off between attempts for the same reason. One short pause, not a
+#: ladder: the model is waiting on the answer.
+DISCOVERY_RETRY_SECONDS = 1.0
 
 
 try:  # mcp is optional: the provider imports without it, only usage needs it
@@ -129,6 +137,9 @@ def _session_died(exc: BaseException) -> bool:
     and the remedy is the owner's ``/mcp approve``, not a respawn — so it
     returns False with the timeout. A timeout itself means the request went
     out and may already have been acted on, so it is never a death either.
+    The same logic keeps an ``MCPOAuthLoginRequired`` alive: the transport is
+    healthy, the *credentials* expired, and respawning cannot mint a token —
+    the owner's ``/mcp auth`` can.
 
     The subtle case is an MCP error whose code is ``CONNECTION_CLOSED``: it
     *looks* like a reply, but it is the SDK's own tombstone — when the wire
@@ -139,7 +150,8 @@ def _session_died(exc: BaseException) -> bool:
     MCP error is the server replying, however unhappy — nothing to reconnect
     to. Any non-MCP exception is a dead transport.
     """
-    if isinstance(exc, (MCPTrustError, TimeoutError)):  # >= 3.11: asyncio's is this
+    # asyncio's timeout is TimeoutError on >= 3.11
+    if isinstance(exc, (MCPTrustError, MCPOAuthLoginRequired, TimeoutError)):
         return False
     if MCP_ERRORS:
         if isinstance(exc, MCP_ERRORS):
@@ -700,8 +712,9 @@ class MCPProvider(WebProvider):
 
         * ``repeatable=True`` — *op* re-runs safely, which is tool discovery:
           a re-sent ``tools/list`` cannot repeat anything the server did. The
-          dead session is dropped and *op* re-sent once on a fresh one, so a
-          server that went away between queries costs one extra launch, not
+          dead session is dropped and *op* re-sent once on a fresh one, after
+          a short pause (:data:`DISCOVERY_RETRY_SECONDS`), so a server that
+          went away between queries costs one extra launch, not
           every later call.
         * ``repeatable=False`` — *op* is a tool *call*. The request may
           already have been acted on by the time the transport dies, and
@@ -725,6 +738,9 @@ class MCPProvider(WebProvider):
             await self._drop_session(spec.name)
             if not repeatable:
                 raise
+            # The server may need a beat before a respawn can succeed; see
+            # DISCOVERY_RETRY_SECONDS.
+            await asyncio.sleep(DISCOVERY_RETRY_SECONDS)
             try:
                 return await op(await self._session_for(spec))
             except Exception as retry_exc:
@@ -827,14 +843,30 @@ class MCPProvider(WebProvider):
         return tools
 
     async def _pick(
-        self, preferences: list[str], predicate
+        self, preferences: list[str], predicate, reasons: list[str] | None = None
     ) -> tuple[ServerSpec, DiscoveredTool] | None:
-        """Find the first (server, tool) pair matching the preference order."""
+        """Find the first (server, tool) pair matching the preference order.
+
+        When *reasons* is a list, it collects one short reason per server
+        that was skipped — unresolved variables, unreachable, awaiting
+        approval, or alive but offering no matching tool — so a web
+        search/fetch failure can say *which* server died and why, instead of
+        the bare "no tool found" whose per-server detail used to be
+        log-only.
+        """
+        recorded: set[str] = set()
+
+        def skip(name: str, why: str) -> None:
+            if reasons is not None and name not in recorded:
+                recorded.add(name)
+                reasons.append(f"{name}: {why}")
+
         for wanted in preferences:
             lowered = wanted.lower()
             for spec in self.servers():
                 if spec.unresolved():
                     log.debug("skipping mcp server %r: unresolved variables", spec.name)
+                    skip(spec.name, "unresolved ${VAR} placeholders")
                     continue
                 try:
                     tools = await self._list_tools(spec)
@@ -843,13 +875,16 @@ class MCPProvider(WebProvider):
                     # healthy, the owner just has not approved the entry. The
                     # search still fails closed — this server is skipped.
                     log.info("mcp server %r awaits approval: %s", spec.name, exc)
+                    skip(spec.name, f"awaits approval ({exc})")
                     continue
                 except Exception as exc:  # noqa: BLE001
                     log.info("mcp server %r is unreachable: %s", spec.name, exc)
+                    skip(spec.name, f"unreachable ({exc})")
                     continue
                 for tool in tools:
                     if tool.name.lower() == lowered or predicate(tool.name.lower()):
                         return spec, tool
+                skip(spec.name, f"no tool matching {wanted!r}")
         return None
 
     async def _call(
@@ -873,11 +908,16 @@ class MCPProvider(WebProvider):
 
     async def search(self, query: str, max_results: int, days: int | None = None) -> SearchResult:
         result = SearchResult(query=query, provider=self.name)
-        chosen = await self._pick(self.config.search_tools, lambda name: "search" in name)
+        skipped: list[str] = []
+        chosen = await self._pick(
+            self.config.search_tools, lambda name: "search" in name, reasons=skipped
+        )
         if chosen is None:
+            detail = "; ".join(skipped)
             result.error = (
                 f"no search tool found in {', '.join(self.sources)} "
                 f"(looked for {', '.join(self.config.search_tools)} or any tool containing 'search')"
+                + (f"; skipped: {detail}" if detail else "")
             )
             return result
 
@@ -913,14 +953,20 @@ class MCPProvider(WebProvider):
         return result
 
     async def fetch(self, url: str) -> Page:
+        skipped: list[str] = []
         chosen = await self._pick(
             self.config.fetch_tools,
             lambda name: any(k in name for k in ("scrape", "extract", "fetch")),
+            reasons=skipped,
         )
         if chosen is None:
+            detail = "; ".join(skipped)
             return Page(
                 url=url,
-                markdown=f"mcp fetch failed: no fetch tool found in {', '.join(self.sources)}",
+                markdown=(
+                    f"mcp fetch failed: no fetch tool found in {', '.join(self.sources)}"
+                    + (f"; skipped: {detail}" if detail else "")
+                ),
             )
 
         spec, tool = chosen
