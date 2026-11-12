@@ -33,7 +33,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from ....config import ContextDevConfig
-from ....llm.keypool import KeyPool
+from ....llm.keypool import KeyPool, is_retryable
 from ....util.log import get_logger
 from ....util.text import format_error, truncate
 from .base import Page, SearchHit, SearchResult, WebProvider, final_url
@@ -54,12 +54,20 @@ QUERY_MAX_CHARS = 500
 
 
 class ContextScrapeFailed(RuntimeError):
-    """A scrape request answered 200 but produced no markdown.
+    """A scrape request produced no markdown, at the HTTP layer or in the body.
 
     Raised by :meth:`_fetch_with` so the pool loop can rotate keys without
     matching on the error text; the caller renders the ``scrape failed:``
-    page the web tool already recognizes.
+    page the web tool already recognizes. ``retryable`` says whether the
+    *key* is implicated: a failure another key would share — a 429, a 5xx —
+    parks it for the cooldown, while a 400, a mangled body, or a 200 whose
+    scrape output failed (``WEBSITE_BLOCKED``) is the request's or the
+    site's fault, and the key stays fit for the next URL.
     """
+
+    def __init__(self, message: str, *, retryable: bool = True) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 #: Context.dev ranks every hit ``high`` / ``medium`` / ``low``; the other
@@ -169,7 +177,11 @@ class ContextDevProvider(WebProvider):
                 self._pool.report(key, ok=True)
                 return result
             last_error = result.error
-            self._pool.report(key, ok=False, retryable=True)
+            # Park the key only when the failure is its fault — a 429 or a
+            # 5xx, not a 400 and not a mangled body. ``is_retryable`` reads
+            # the failure text, the same duck-typing the LLM adapters rely
+            # on: a "returned HTTP 500" parks, "HTTP 400" does not.
+            self._pool.report(key, ok=False, retryable=is_retryable(RuntimeError(last_error)))
         result.error = last_error or "every context.dev key failed"
         return result
 
@@ -213,6 +225,9 @@ class ContextDevProvider(WebProvider):
         # ``{"error_code": "RATE_LIMITED"}`` and no results. Without this
         # check that reads as "success with 0 hits" and the pool never
         # learns the key is throttled.
+        if not isinstance(data, dict):
+            result.error = "unexpected response shape"
+            return result
         if error := _search_error_of(data):
             result.error = error
             return result
@@ -254,11 +269,11 @@ class ContextDevProvider(WebProvider):
             try:
                 page = await self._fetch_with(key, url)
             except ContextScrapeFailed as exc:
-                # The endpoint answered, but the scrape itself failed — the
-                # key is innocent (a 429 would have raised as HTTP 4xx), yet
-                # the attempt failed, so rotate and record why.
+                # The key is parked only when the failure is its fault —
+                # decided inside _fetch_with, by the same fault rule the
+                # search loop applies.
                 last_error = f"scrape failed: {exc}"
-                self._pool.report(key, ok=False, retryable=False)
+                self._pool.report(key, ok=False, retryable=exc.retryable)
                 continue
             self._pool.report(key, ok=True)
             return page
@@ -271,16 +286,21 @@ class ContextDevProvider(WebProvider):
             body = response.json()
         except Exception as exc:
             # Same as search: any failure is a failed attempt for the pool
-            # to rotate on, not a provider crash.
-            raise ContextScrapeFailed(str(exc)) from exc
+            # to rotate on, not a provider crash. Whether the key itself is
+            # parked follows the same fault rule the search loop applies.
+            raise ContextScrapeFailed(str(exc), retryable=is_retryable(exc)) from exc
 
         # Every output key is present with a ``success`` flag; check the one
         # we asked for rather than trusting the 200.
+        if not isinstance(body, dict):
+            raise ContextScrapeFailed("unexpected response shape")
         markdown = body.get("markdown") or {}
         if isinstance(markdown, dict):
             if not markdown.get("success"):
                 reason = markdown.get("error_code") or markdown.get("message") or "no content"
-                raise ContextScrapeFailed(str(reason))
+                # The request succeeded; the page refused to be scraped. The
+                # key stays fit for the next URL.
+                raise ContextScrapeFailed(str(reason), retryable=False)
             text = str(markdown.get("data") or "")
         else:  # defensive: some compatible servers inline the string
             text = str(markdown or "")

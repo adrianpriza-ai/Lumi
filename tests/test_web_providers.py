@@ -1287,6 +1287,8 @@ async def test_contextdev_fetch_rotates_keys_on_failure(monkeypatch) -> None:
 
     assert page.markdown == "# body"
     assert state["n"] == 2
+    # An HTTP-level failure is the key's problem: it is parked for the cooldown.
+    assert "cd-91" in provider._pool._parked_at
 
 
 async def test_contextdev_fetch_rotation_reports_the_reason_when_every_key_fails(
@@ -1309,6 +1311,8 @@ async def test_contextdev_fetch_rotation_reports_the_reason_when_every_key_fails
 
     assert page.markdown.startswith("scrape failed:")
     assert "WEBSITE_BLOCKED" in page.markdown
+    # A refused scrape is the site's fault, not the keys': neither is parked.
+    assert provider._pool._parked_at == {}
 
 
 async def test_contextdev_keyless_fetch_failure_still_renders_the_error_page(monkeypatch) -> None:
@@ -1332,3 +1336,73 @@ async def test_contextdev_keyless_fetch_failure_still_renders_the_error_page(mon
 
     assert page.markdown.startswith("scrape failed:")
     assert "WEBSITE_BLOCKED" in page.markdown
+
+
+async def test_contextdev_a_400_does_not_park_the_key(monkeypatch) -> None:
+    """A 400 is the request's fault, not the key's — the pool still rotates
+    within the call, but the key stays fit for the next one. The same rule
+    the LLM keypool applies, via its message-based ``is_retryable``."""
+    monkeypatch.setenv("CONTEXT_DEV_API_KEY", "cd-91, cd-92")
+    state = {"n": 0}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        state["n"] += 1
+        if state["n"] == 1:
+            return httpx.Response(400, json={"error_code": "BAD_QUERY"})
+        return search_response([a_hit("https://a.example/1")])
+
+    install_http(monkeypatch, respond)
+    provider = ContextDevProvider(ContextDevConfig())
+
+    result = await provider.search("q", 5)
+
+    assert result.ok
+    assert state["n"] == 2
+    assert provider._pool._parked_at == {}
+
+
+async def test_contextdev_a_non_object_json_body_is_a_failed_attempt(monkeypatch) -> None:
+    """A 200 whose JSON parses but is not an object (a bare list) must not
+    crash the provider with an AttributeError — it is a failed attempt the
+    pool rotates on, like any other malformed answer."""
+    monkeypatch.setenv("CONTEXT_DEV_API_KEY", "cd-91, cd-92")
+    state = {"n": 0}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        state["n"] += 1
+        if state["n"] == 1:
+            return httpx.Response(200, json=["not", "an", "object"])
+        return search_response([a_hit("https://a.example/1")])
+
+    install_http(monkeypatch, respond)
+    provider = ContextDevProvider(ContextDevConfig())
+
+    result = await provider.search("q", 5)
+
+    assert result.ok
+    assert state["n"] == 2
+
+
+async def test_contextdev_a_non_object_scrape_body_is_a_failed_attempt(monkeypatch) -> None:
+    monkeypatch.setenv("CONTEXT_DEV_API_KEY", "cd-91, cd-92")
+    state = {"n": 0}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        state["n"] += 1
+        if state["n"] == 1:
+            return httpx.Response(200, json=["not", "an", "object"])
+        return httpx.Response(
+            200,
+            json={
+                "markdown": {"requested": True, "success": True, "data": "# body"},
+                "metadata": {},
+            },
+        )
+
+    install_http(monkeypatch, respond)
+    provider = ContextDevProvider(ContextDevConfig())
+
+    page = await provider.fetch("https://example.com")
+
+    assert page.markdown == "# body"
+    assert state["n"] == 2
