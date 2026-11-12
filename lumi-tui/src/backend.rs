@@ -345,6 +345,9 @@ pub fn translate(text: &str) -> Translation {
             "on" | "off" => Translation::Command(json!({"cmd": "reasoning", "on": arg.eq_ignore_ascii_case("on")})),
             _ => notice("usage: /reasoning on|off".into()),
         },
+        // Empty arg reports the current mode; a name switches it. The backend
+        // validates the name, so an unknown one comes back as an error event.
+        "mode" => Translation::Command(json!({"cmd": "mode", "value": arg})),
         // §10: no frontend-side model switch — a `config.llm.model_of()` in
         // Python would contradict it one command later.
         "model" => notice(

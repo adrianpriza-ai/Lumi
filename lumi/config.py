@@ -1086,6 +1086,13 @@ def canonical_tool_name(name: str) -> str:
 
 @dataclass(slots=True)
 class ToolsConfig:
+    #: The permission mode — how much asks before it runs. One of
+    #: ``default``, ``accept-edits``, ``bypass`` or ``bypass-sudo``
+    #: (lumi.tools.safety.Mode). Set it here, or as ``LUMI__TOOLS__MODE`` in
+    #: .env / the environment. ``/mode`` in the bot or the TUI flips it for
+    #: this process; a restart returns to whatever config.toml and the
+    #: environment say, which is the right time to make a choice stick.
+    mode: str = "default"
     enabled: list[str] = field(
         default_factory=lambda: [
             "run_shell",
@@ -1546,6 +1553,15 @@ def validate(config: Config) -> list[str]:
         )
     if config.tools.files.max_write_chars <= 0:
         problems.append("tools.files.max_write_chars must be a positive number of characters")
+    # Deferred import: tools.safety pulls in nothing from config, but the
+    # lumi.tools package __init__ imports the tool modules, which import this
+    # file — a module-level import would be a cycle. At call time it is flat.
+    from .tools.safety import MODES
+
+    if config.tools.mode.strip().lower() not in {m.value for m in MODES}:
+        problems.append(
+            f"unknown tools.mode {config.tools.mode!r}. Known: {', '.join(m.value for m in MODES)}"
+        )
     if config.telegram_token is None:
         problems.append("TELEGRAM_BOT_TOKEN is unset — the Telegram bot cannot start.")
     if config.bot.group_reply_mode.strip().lower() not in {"mention", "always", "off"}:

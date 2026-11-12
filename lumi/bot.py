@@ -48,6 +48,7 @@ from .memory import History, MemoryFile, MemoryStore
 from .personality import Personality
 from .tools.docread import DocumentReader
 from .tools.mcp_tool import CheckOutcome
+from .tools.safety import MODES, parse_mode
 from .tools.web.providers.mcp_oauth import authorize_server as mcp_authorize_server
 from .util.env import SECRET_PATTERN
 from .util.log import get_logger
@@ -133,6 +134,7 @@ OWNER_HELP_TEXT = """\
 <code>/env</code> — which credentials are set, values masked
 <code>/forget [n]</code> — drop the newest n saved facts (erasing memory is a human decision, and yours)
 <code>/mcp help|list|check|approve|revoke</code> — the configured MCP servers: what they are, whether one answers, and which project entries you have approved to connect
+<code>/mode [name]</code> — show or switch the permission mode (default, accept-edits, bypass, bypass-sudo)
 <code>/reload</code> — re-read personality, memory and config
 <code>/reset</code> — forget this conversation (keeps long-term memory)
 <code>/whitelist</code> — show whitelisted users and groups
@@ -361,7 +363,8 @@ def _render_config(config: Config, memory_limit: int) -> str:
             "",
             f"<b>shell</b> — cwd {escape_html(str(shell.cwd))} · timeout {shell.timeout_seconds}s"
             f" · output {shell_output}",
-            f"- safety: {'asks before risky' if shell.ask_before_risky else 'hard block, no prompts'}"
+            f"- mode: <code>{escape_html(config.tools.mode)}</code>"
+            f" · safety: {'asks before risky' if shell.ask_before_risky else 'hard block, no prompts'}"
             f" · home: {escape_html(str(shell.home))} · writes: {escape_html(', '.join(shell.writable)) or 'whole project'}",
             "",
             "<b>files</b>",
@@ -1913,6 +1916,53 @@ def build_handlers(config: Config) -> list[Any]:
             f" (the thinking trace itself is never shown)",
         )
 
+    async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show or switch the permission mode.
+
+        ``/mode`` reports; ``/mode <name>`` flips ``tools.mode`` for this
+        process — the same scope as every other config change here: a restart
+        returns to config.toml, or to ``LUMI__TOOLS__MODE`` when the
+        environment (or .env) sets it, which is the right time to make a
+        choice stick.
+        Owner-only, because the mode is the dial on how much runs without a
+        tap: ``accept-edits`` stops asking about file writes, ``bypass`` stops
+        asking about everything short of the hard denies, ``bypass-sudo`` even
+        lets sudo through. The hard denies (fork bomb, ``rm -rf /``, reverse
+        shells, ...) survive every mode but bypass-sudo's lifted sudo rule —
+        they are the guard against a hallucinated command, not an
+        inconvenience tax.
+        """
+        if not await authorised(update):
+            return
+        user = update.effective_user
+        if user is None or not _is_owner(user, config):
+            await reply(update, NOT_OWNER_SENSITIVE)
+            return
+        argument = context.args[0].strip().lower() if context.args else ""
+        if argument:
+            if argument not in {mode.value for mode in MODES}:
+                known = ", ".join(f"<code>{mode.value}</code>" for mode in MODES)
+                await reply(
+                    update, f"unknown mode <code>{escape_html(argument)}</code>.\nknown: {known}"
+                )
+                return
+            config.tools.mode = argument
+            log.info("permission mode set to %s by chat %s", argument, chat_of(update))
+
+        descriptions = {
+            "default": "creating runs, mutating asks, destroying refuses",
+            "accept-edits": "file writes in the project run without asking; destructive commands still ask",
+            "bypass": "nothing asks; the hard denies still refuse",
+            "bypass-sudo": "bypass, plus sudo runs",
+        }
+        current = parse_mode(config.tools.mode)
+        await reply(
+            update,
+            f"<b>mode</b>: <code>{current.value}</code> — {descriptions[current.value]}\n"
+            f"switch: <code>/mode {' | '.join(mode.value for mode in MODES)}</code>\n"
+            "(a restart returns to config.toml / <code>LUMI__TOOLS__MODE</code>)",
+        )
+
     async def context_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """What the model is actually holding for this chat right now.
 
@@ -2781,6 +2831,7 @@ def build_handlers(config: Config) -> list[Any]:
         CommandHandler("forget", gated(forget_command), filters=allowed_filter),
         CommandHandler("personality", gated(personality_command), filters=allowed_filter),
         CommandHandler("reasoning", gated(reasoning_command), filters=allowed_filter),
+        CommandHandler("mode", gated(mode_command), filters=allowed_filter),
         CommandHandler("context", gated(context_command), filters=allowed_filter),
         CommandHandler("status", gated(status_command), filters=allowed_filter),
         CommandHandler("doctor", gated(doctor_command), filters=allowed_filter),

@@ -80,6 +80,7 @@ from typing import Any
 from .config import Config
 from .llm.base import DELTA_THINKING
 from .tools.base import ToolContext
+from .tools.safety import MODES, parse_mode
 from .tools.web import WebTool
 from .util.log import get_logger
 from .util.text import format_error
@@ -355,6 +356,35 @@ async def serve(
                     return True
                 config.llm.show_reasoning = on
                 send({"ev": "notice", "text": f"live steps {'on' if on else 'off'}"})
+                return True
+
+            if cmd == "mode":
+                # Same scope as every other live config change here: this
+                # process, until a restart re-reads config.toml — or the
+                # LUMI__TOOLS__MODE override, when the environment sets it.
+                # Empty value reports instead of switching.
+                value = message.get("value")
+                if isinstance(value, str) and value.strip():
+                    wanted = value.strip().lower()
+                    if wanted not in {m.value for m in MODES}:
+                        send(
+                            {
+                                "ev": "error",
+                                "text": "unknown mode "
+                                f"{wanted!r}; known: {', '.join(m.value for m in MODES)}",
+                            }
+                        )
+                        return True
+                    config.tools.mode = wanted
+                    log.info("permission mode set to %s via the TUI", wanted)
+                mode = parse_mode(config.tools.mode)
+                send(
+                    {
+                        "ev": "notice",
+                        "text": "mode: "
+                        f"{mode.value} (restart returns to config.toml / LUMI__TOOLS__MODE)",
+                    }
+                )
                 return True
 
             if cmd == "search":

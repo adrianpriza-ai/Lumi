@@ -32,6 +32,7 @@ from typing import Any
 from . import __version__
 from .config import Config, ConfigError, load_config, validate
 from .paths import ui_binary
+from .tools.safety import MODES, parse_mode
 from .util.log import get_logger, setup_logging
 from .util.text import format_error
 
@@ -196,7 +197,7 @@ async def _repl(agent: Any, config: Config) -> int:
             continue
         if lowered in {"/help", "/?"}:
             print(BANNER)
-            print("/quit  /reset  /context  /tools  /memory  /personality  /reasoning\n")
+            print("/quit  /reset  /context  /tools  /memory  /personality  /reasoning  /mode\n")
             continue
         if lowered == "/tools":
             print(agent.registry.describe(), "\n")
@@ -237,6 +238,23 @@ async def _repl(agent: Any, config: Config) -> int:
                     f"  thinking budget: {budget}\n"
                     f"  temperature: {temp}\n"
                     f"  live steps: {'on' if llm.show_reasoning else 'off'}\n"
+                )
+            continue
+
+        if lowered.startswith("/mode"):
+            parts = line.split(maxsplit=1)
+            arg = parts[1].strip().lower() if len(parts) > 1 else ""
+            if arg:
+                if arg not in {m.value for m in MODES}:
+                    print(f"unknown mode {arg!r}; known: {', '.join(m.value for m in MODES)}\n")
+                else:
+                    config.tools.mode = arg
+                    print(f"mode: {arg} (restart returns to config.toml / LUMI__TOOLS__MODE)\n")
+            else:
+                print(
+                    "mode:\n"
+                    f"  current: {parse_mode(config.tools.mode).value}\n"
+                    f"  known: {', '.join(m.value for m in MODES)}\n"
                 )
             continue
 

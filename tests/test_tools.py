@@ -402,27 +402,38 @@ async def test_approved_overwrite_runs(files: FilesTool, config) -> None:
     assert target.read_text(encoding="utf-8") == "replaced"
 
 
-async def test_a_file_authored_this_session_asks_once_then_writes_freely(
+async def test_a_new_file_writes_freely_and_a_session_authored_one_asks_once(
     files: FilesTool, config
 ) -> None:
-    """A file this session created is gated on the owner — once, not per call.
+    """Creating a file is free; replacing one this session made asks once.
 
-    This is the write half of write-then-run (audit finding 3b): the file did
-    not exist when the process started, so its contents may come from fetched
-    content and the owner sees the first write. The approval sticks to the
-    path, so the gate does not turn every follow-up fix into a tap.
+    A write to a name that does not exist yet has nothing to lose, so it runs
+    without a tap — the same rule the shell policy has always had for a
+    redirect onto a new name. The gate keeps its other half: a file that
+    *exists* and was made during this run (by the shell, say) may carry
+    fetched content, so the first write to it still goes through the owner.
+    The approval sticks to the path, so the gate does not turn every
+    follow-up fix into a tap.
     """
-    args = {"action": "write", "path": "workspace/fresh.md", "content": "x"}
+    fresh = {"action": "write", "path": "workspace/fresh.md", "content": "x"}
+    result = await files.invoke(fresh, ctx())
+    assert result.ok
+    assert (config.shell_cwd / "fresh.md").read_text(encoding="utf-8") == "x"
+
+    # A file the shell made this run: the first files-tool write asks.
+    target = config.shell_cwd / "shelled.md"
+    target.write_text("old", encoding="utf-8")
+    args = {"action": "write", "path": "workspace/shelled.md", "content": "y", "overwrite": True}
     with pytest.raises(NeedsApproval) as caught:
         await files.invoke(args, ctx())
     assert "during this session" in caught.value.reason
-    assert not (config.shell_cwd / "fresh.md").exists()  # nothing was written
+    assert target.read_text(encoding="utf-8") == "old"  # nothing was written
 
     await files.invoke(args, ctx(confirmed=True))
     # Once approved, the path is cleared: overwrite=true works without a second tap.
-    result = await files.invoke({**args, "content": "y", "overwrite": True}, ctx())
+    result = await files.invoke({**args, "content": "z"}, ctx())
     assert result.ok
-    assert (config.shell_cwd / "fresh.md").read_text(encoding="utf-8") == "y"
+    assert target.read_text(encoding="utf-8") == "z"
 
 
 async def test_edit_of_a_session_authored_file_asks_once(files: FilesTool, config) -> None:
@@ -470,6 +481,63 @@ async def test_append_to_a_session_authored_file_asks_once(files: FilesTool, con
     result = await files.invoke(args, ctx(confirmed=True))
     assert result.ok
     assert target.read_text(encoding="utf-8") == "one\ntwo\n"
+
+
+async def test_accept_edits_accepts_writes_and_overwrites(files: FilesTool, config) -> None:
+    """accept-edits is the editing-session mode: the file gates stop tapping."""
+    config.tools.mode = "accept-edits"
+    target = config.shell_cwd / "existing.md"
+    target.write_text("old\n", encoding="utf-8")  # mtime is after SESSION_START
+
+    result = await files.invoke(
+        {"action": "write", "path": "workspace/existing.md", "content": "new\n"},
+        ctx(),
+    )
+    assert result.ok
+    assert target.read_text(encoding="utf-8") == "new\n"
+
+    # A brand-new file writes freely in every mode; here it is the overwrite
+    # that proves the mode, since default would have asked for it.
+    result = await files.invoke(
+        {"action": "write", "path": "workspace/another.md", "content": "made"},
+        ctx(),
+    )
+    assert result.ok
+    assert (config.shell_cwd / "another.md").exists()
+
+
+async def test_accept_edits_still_asks_for_skill_files(files: FilesTool, config) -> None:
+    """Skill text lands in every chat's system prompt; accept-edits is not a
+    licence over instruction files, so their tap survives the mode."""
+    config.tools.mode = "accept-edits"
+    args = {"action": "write", "path": "data/skills/demo/SKILL.md", "content": "# demo"}
+    with pytest.raises(NeedsApproval):
+        await files.invoke(args, ctx())
+    assert not (config.data_dir / "skills" / "demo" / "SKILL.md").exists()
+
+    await files.invoke(args, ctx(confirmed=True))
+    assert (config.data_dir / "skills" / "demo" / "SKILL.md").exists()
+
+
+async def test_bypass_skips_the_file_gates(files: FilesTool, config) -> None:
+    """bypass means nothing asks: overwrites, session-authored files, skills."""
+    config.tools.mode = "bypass"
+    target = config.shell_cwd / "busy.md"
+    target.write_text("old\n", encoding="utf-8")
+
+    result = await files.invoke(
+        {"action": "write", "path": "workspace/busy.md", "content": "new\n"},
+        ctx(),
+    )
+    assert result.ok
+    assert target.read_text(encoding="utf-8") == "new\n"
+
+    result = await files.invoke(
+        {"action": "write", "path": "data/skills/demo/SKILL.md", "content": "# demo"},
+        ctx(),
+    )
+    assert result.ok
+    assert (config.data_dir / "skills" / "demo" / "SKILL.md").exists()
 
 
 async def test_write_creates_parent_directories(files: FilesTool, config) -> None:

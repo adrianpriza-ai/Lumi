@@ -38,7 +38,7 @@ from ..paths import is_within, relative_to_root
 from ..util.log import get_logger
 from ..util.text import truncate
 from .base import NeedsApproval, Tool, ToolContext, ToolError, ToolResult
-from .safety import SESSION_START, protected_write, read_guard
+from .safety import SESSION_START, Mode, parse_mode, protected_write, read_guard
 
 log = get_logger(__name__)
 
@@ -285,16 +285,20 @@ it validates the path, caps the size, and shows a diff before it overwrites.
     def _session_authored(self, path: Path) -> bool:
         """Whether *path* still needs its one owner approval this session.
 
-        True for a file that does not exist yet and for one whose mtime is at
-        or after :data:`SESSION_START` — in both cases the content the next
-        write would replace or extend was produced during this run, which is
-        the provenance finding 3 cares about. False once the owner has approved
-        this path, so a file costs one confirmation per session.
+        True for a file whose mtime is at or after :data:`SESSION_START` — the
+        content the next write would replace or extend was produced during
+        this run, which is the provenance finding 3 cares about. False once
+        the owner has approved this path, so a file costs one confirmation per
+        session. False too for a file that is *not there*: there is nothing to
+        replace, and the shell policy has always treated creating something
+        new inside the project as free ("> onto a name that does not exist
+        yet ... nothing to lose, so nothing to ask") — the files tool now
+        agrees with it instead of charging a tap for a brand-new file.
 
         A file under ``data/skills`` is always True until approved, whatever
-        its mtime. Skill text is catalogued into the system prompt of every
-        chat, so a skill that predates the session is not thereby trustworthy:
-        the model can edit it, and an edit made after reading a hostile page
+        its mtime or existence. Skill text is catalogued into the system
+        prompt of every chat, so nothing about a skill path is "free": the
+        model can edit it, and an edit made after reading a hostile page
         would otherwise reach every future turn with no tap (R8).
         """
         if str(path) in self._approved:
@@ -303,14 +307,29 @@ it validates the path, caps the size, and shows a diff before it overwrites.
             return True
         try:
             return path.stat().st_mtime >= SESSION_START
+        except FileNotFoundError:
+            return False
         except OSError:
             return True
+
+    def _mode(self) -> Mode:
+        """The permission mode this call runs under, read live from config."""
+        return parse_mode(self.config.tools.mode)
 
     def _require_owner(
         self, path: Path, ctx: ToolContext, arguments: dict[str, Any], preview: str
     ) -> None:
         """Raise :class:`NeedsApproval` unless *path* is already cleared."""
-        if ctx.confirmed or not self._session_authored(path):
+        mode = self._mode()
+        if ctx.confirmed or mode in (Mode.BYPASS, Mode.BYPASS_SUDO):
+            return
+        if mode is Mode.ACCEPT_EDITS and not self._is_project_skill(path):
+            # accept-edits accepts edits: content files stop asking. Skill
+            # files keep their tap even here — their text lands in every
+            # chat's system prompt, and this mode was chosen for a coding
+            # session, not as a licence over instruction files.
+            return
+        if not self._session_authored(path):
             return
         if self._is_project_skill(path):
             reason = (
@@ -434,7 +453,18 @@ it validates the path, caps the size, and shows a diff before it overwrites.
 
         self._require_owner(path, ctx, arguments, _short_diff(previous, content))
 
-        if existed and previous.strip() and not overwrite and not ctx.confirmed:
+        # Overwriting a non-empty file is the one write where content is truly
+        # lost, so in default mode it asks even when the session gate above
+        # has cleared. accept-edits and the bypass modes call that write an
+        # edit and accept it — the mode was chosen precisely so this stops
+        # tapping — while protected paths never got this far at all (_resolve).
+        if (
+            existed
+            and previous.strip()
+            and not overwrite
+            and not ctx.confirmed
+            and self._mode() is Mode.DEFAULT
+        ):
             raise NeedsApproval(
                 tool=self.name,
                 arguments=dict(arguments),

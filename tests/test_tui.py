@@ -431,6 +431,15 @@ async def test_read_only_commands_answer_with_a_notice(config) -> None:
         await fe.wait_for("error")
         assert "boolean" in fe.events[-1]["text"]
 
+        fe.push({"cmd": "mode", "value": "accept-edits"})
+        mode = await fe.wait_for("notice", count=5)
+        assert "mode: accept-edits" in mode[4]["text"]
+        assert config.tools.mode == "accept-edits"
+
+        fe.push({"cmd": "mode", "value": "sudo-everything"})
+        error = (await fe.wait_for("error", count=2))[1]
+        assert "unknown mode" in error["text"]
+
 
 # --------------------------------------------------------------------------- #
 # search

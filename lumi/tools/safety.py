@@ -22,6 +22,11 @@ below, so it stays auditable on one screen and testable case by case. The
 exceptions are the *structural* checks in :func:`explain` — ``cd`` tracking,
 quoted-string extraction, redirect targets — which read the token stream rather
 than the raw text because those are the places a pattern alone gets fooled.
+
+:class:`Mode` sits on top of the tiers: how much a CONFIRM costs the owner a
+tap is a dial the owner turns, not a property of the command. The deny tier is
+not on that dial (one exception, below) — those rules exist so a hallucinated
+or injected command cannot destroy the machine, and no mode re-litigates that.
 """
 
 from __future__ import annotations
@@ -64,6 +69,64 @@ class Verdict:
         return f"{self.tier.value.upper()}: {self.reason}" if self.reason else self.tier.value
 
 
+class Mode(StrEnum):
+    """How much asks before it runs.
+
+    ``default`` — the tier decides: creating runs, mutating asks, destroying
+    refuses. ``accept-edits`` — file writes inside the project stop asking
+    (creating, overwriting, redirecting into a file), so an editing session
+    does not become a tapping session; everything destructive still asks.
+    ``bypass`` — nothing asks. ``bypass-sudo`` — bypass plus the one deny the
+    dial is allowed to move: ``sudo``/``su`` run like everything else. Every
+    other deny survives every mode, in every mode — those rules are the guard
+    against a hallucinated or injected command destroying the machine, and
+    convenience is not a reason to lift them.
+    """
+
+    DEFAULT = "default"
+    ACCEPT_EDITS = "accept-edits"
+    BYPASS = "bypass"
+    BYPASS_SUDO = "bypass-sudo"
+
+
+MODES: tuple[Mode, ...] = (Mode.DEFAULT, Mode.ACCEPT_EDITS, Mode.BYPASS, Mode.BYPASS_SUDO)
+
+#: The CONFIRM rules :class:`Mode.ACCEPT_EDITS` waves through, named by their
+#: ``rule`` field. All three mean "this command writes a file inside the
+#: project" — overwriting one, redirecting into one, or writing just outside
+#: the workspace but still inside it — and nothing else. Everything else that
+#: asks (deleting, signalling, git history, package management, the
+#: write-then-run gate, an unfollowable target) still asks, and skill files
+#: keep their tap through the files tool, because their text lands in every
+#: chat's system prompt and "accept edits" was not said about instructions.
+ACCEPT_EDITS_RULES: frozenset[str] = frozenset(
+    {"redirect-write", "overwrite:existing", "zone:outside-workspace"}
+)
+
+
+def parse_mode(value: str | Mode | None) -> Mode:
+    """*value* as a :class:`Mode`, falling back to :attr:`Mode.DEFAULT`.
+
+    ``None`` and ``""`` mean "unset" and return the default. An unknown string
+    is logged and answered with the default rather than raised, because the
+    mode is read on every tool call and one typo in config.toml should cost a
+    warning, not the bot. ``validate()`` in config.py reports the same typo
+    properly at startup.
+    """
+    if value is None:
+        return Mode.DEFAULT
+    if isinstance(value, Mode):
+        return value
+    text = str(value).strip().lower()
+    if not text:
+        return Mode.DEFAULT
+    try:
+        return Mode(text)
+    except ValueError:
+        log.warning("unknown permission mode %r, using %r", value, Mode.DEFAULT.value)
+        return Mode.DEFAULT
+
+
 # --------------------------------------------------------------------------- #
 # Rule tables
 # --------------------------------------------------------------------------- #
@@ -72,6 +135,21 @@ DenyRule: TypeAlias = tuple[re.Pattern[str], str]
 ConfirmRule: TypeAlias = tuple[re.Pattern[str], str]
 
 #: Unrecoverable or privilege-escalating. Never runs, not even with approval.
+#: The two privilege-escalation entries are named constants so
+#: :class:`Mode.BYPASS_SUDO` can lift exactly them and nothing else: that
+#: mode's whole point is ``sudo`` runs like everything else. Tuple identity
+#: (not the pattern text) is the key, so the frozenset below must hold the
+#: same objects as this table.
+SUDO_RULE: DenyRule = (
+    re.compile(r"(^|[;&|]\s*)(sudo|doas|pkexec)\b", re.IGNORECASE),
+    "privilege escalation",
+)
+SU_RULE: DenyRule = (
+    re.compile(r"(^|[;&|]\s*)su\b(?!\w)", re.IGNORECASE),
+    "privilege escalation via su",
+)
+PRIVILEGE_RULES: frozenset[DenyRule] = frozenset({SUDO_RULE, SU_RULE})
+
 DENY_RULES: list[DenyRule] = [
     # The fork bomb under any trigger character and any quoting: `:(){ :|:& };:`
     # and `.(){ .|.&\};.` are the same program. Empty parens plus a pipe plus a
@@ -110,8 +188,8 @@ DENY_RULES: list[DenyRule] = [
         "power state change",
     ),
     (re.compile(r"\binit\s+[06]\b"), "power state change via init"),
-    (re.compile(r"(^|[;&|]\s*)(sudo|doas|pkexec)\b", re.IGNORECASE), "privilege escalation"),
-    (re.compile(r"(^|[;&|]\s*)su\b(?!\w)", re.IGNORECASE), "privilege escalation via su"),
+    SUDO_RULE,
+    SU_RULE,
     (re.compile(r"\bchmod\b[^;]*[ugoa]*\+s\b"), "setting the setuid/setgid bit"),
     (
         re.compile(r"\b(rm|unlink)\b[^;]*\s(/|/\*|~|\$HOME|\$PWD)\s*($|[;&|])"),
@@ -2458,6 +2536,7 @@ def explain(
     session_start: float | None = None,
     tilde_home: Path | None = None,
     chat_id: int | str | None = None,
+    mode: str | Mode | None = None,
 ) -> list[Verdict]:
     """Every rule that fires for *command*, in table order.
 
@@ -2481,7 +2560,14 @@ def explain(
     :param chat_id: the chat the command runs for, if any. Another chat's
         ``workspace/uploads/<id>/`` is refused on read, the way the files and
         explore tools refuse it. ``None`` (the local CLI) is not restricted.
+
+    :param mode: the permission mode (:class:`Mode`). In ``bypass-sudo`` the
+        two privilege-escalation deny rules are lifted; the other modes do not
+        change what :func:`explain` reports — the mode folding happens once,
+        in :func:`classify`, so ``explain`` keeps showing what *would* have
+        fired.
     """
+    resolved_mode = parse_mode(mode)
     verdicts: list[Verdict] = []
     command = command.strip()
     if not command:
@@ -2519,9 +2605,13 @@ def explain(
             except re.error:
                 log.warning("extra_confirm is not a valid regex, ignoring: %r", pattern)
 
-    # 1. Hard denies.
+    # 1. Hard denies. bypass-sudo lifts the two privilege-escalation rules —
+    #    that mode's whole point — and leaves every other deny standing.
+    deny_rules: list[DenyRule] = DENY_RULES
+    if resolved_mode is Mode.BYPASS_SUDO:
+        deny_rules = [rule for rule in DENY_RULES if rule not in PRIVILEGE_RULES]
     for text in dict.fromkeys((command, flattened)):
-        for pattern, reason in DENY_RULES:
+        for pattern, reason in deny_rules:
             if pattern.search(text):
                 verdicts.append(Verdict(Tier.DENY, reason, pattern.pattern[:48]))
 
@@ -3185,8 +3275,15 @@ def classify(
     session_start: float | None = None,
     tilde_home: Path | None = None,
     chat_id: int | str | None = None,
+    mode: str | Mode | None = None,
 ) -> Verdict:
-    """Fold every matching rule into one verdict; the strictest tier wins."""
+    """Fold every matching rule into one verdict; the strictest tier wins.
+
+    The *mode* is the owner's dial on the CONFIRM tier (:class:`Mode`): the
+    deny tier is decided by the tables and survives every mode but
+    ``bypass-sudo``'s lifted sudo rules.
+    """
+    resolved_mode = parse_mode(mode)
     verdicts = explain(
         command,
         cwd=cwd,
@@ -3198,6 +3295,7 @@ def classify(
         session_start=session_start,
         tilde_home=tilde_home,
         chat_id=chat_id,
+        mode=mode,
     )
     denies = [v for v in verdicts if v.tier is Tier.DENY]
     if denies:
@@ -3205,6 +3303,12 @@ def classify(
 
     confirms = [v for v in verdicts if v.tier is Tier.CONFIRM]
     if confirms:
+        if resolved_mode in (Mode.BYPASS, Mode.BYPASS_SUDO):
+            return Verdict(Tier.ALLOW)
+        if resolved_mode is Mode.ACCEPT_EDITS:
+            confirms = [v for v in confirms if v.rule not in ACCEPT_EDITS_RULES]
+            if not confirms:
+                return Verdict(Tier.ALLOW)
         if not ask_before_risky:
             return Verdict(
                 Tier.DENY,
@@ -3231,6 +3335,11 @@ def describe_policy() -> str:
 __all__ = [
     "Tier",
     "Verdict",
+    "Mode",
+    "MODES",
+    "parse_mode",
+    "ACCEPT_EDITS_RULES",
+    "PRIVILEGE_RULES",
     "classify",
     "explain",
     "tokenize",

@@ -337,6 +337,30 @@ extra_deny    = ["\\bnpm\\s+publish\\b"]
 extra_confirm = ["\\bterraform\\b"]
 ```
 
+### Permission modes
+
+`tools.mode` is the dial on how much asks before it runs. Set it in config.toml,
+or as `LUMI__TOOLS__MODE=accept-edits` in `.env` / the environment — the same
+override machinery every other tools key uses. `/mode` (owner-only in the bot,
+`/mode [name]` in the TUI and the CLI REPL) flips it for the running process; a
+restart returns to whatever config.toml and the environment say.
+
+| mode | what it changes |
+| --- | --- |
+| `default` | creating runs, mutating asks, destroying refuses |
+| `accept-edits` | file writes inside the project stop asking — creating, overwriting, redirecting into a file — so an editing session does not become a tapping session. Deleting, signalling, git history, package management and the write-then-run gate still ask. |
+| `bypass` | nothing asks. The hard denies still refuse. |
+| `bypass-sudo` | bypass, plus the one deny the dial is allowed to move: `sudo`/`su` run like everything else. |
+
+The deny tier survives every mode except bypass-sudo's lifted sudo rule — those
+rules exist so a hallucinated or injected command cannot destroy the machine,
+and convenience is not a reason to lift them. Two things even bypass does not
+reach: the protected-path refusals (`config.toml`, `data/whitelist.json`,
+credentials — those are errors, not prompts) and skill-file writes through the
+files tool, which keep their tap in `accept-edits` too, because their text
+lands in every chat's system prompt and "accept edits" was not said about
+instruction files.
+
 ### Threat model
 
 This is a guardrail, not a sandbox. Shell is Turing-complete; a determined

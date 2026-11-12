@@ -89,6 +89,29 @@ def test_env_override_of_a_list(project, monkeypatch) -> None:
     assert load_config(project).tools.web.provider_order == ["mcp", "tavily", "firecrawl"]
 
 
+def test_permission_mode_comes_from_the_environment(project, monkeypatch) -> None:
+    """``LUMI__TOOLS__MODE`` in .env or the shell sets the startup mode —
+    the generic override machinery carries it like any other tools key."""
+    monkeypatch.setenv("LUMI__TOOLS__MODE", "accept-edits")
+    assert load_config(project).tools.mode == "accept-edits"
+
+    # The raw value keeps the caller's case and whitespace; parse_mode folds
+    # that to the canonical form at use time.
+    monkeypatch.setenv("LUMI__TOOLS__MODE", "  BYPASS-SUDO  ")
+    config = load_config(project)
+    assert config.tools.mode == "  BYPASS-SUDO  "
+    from lumi.tools.safety import parse_mode
+
+    assert parse_mode(config.tools.mode).value == "bypass-sudo"
+
+    # A typo is reported by validate() and answered with the default at use
+    # time, never a crash.
+    monkeypatch.setenv("LUMI__TOOLS__MODE", "sudo-everything")
+    config = load_config(project)
+    assert any("tools.mode" in p for p in validate(config))
+    assert parse_mode(config.tools.mode).value == "default"
+
+
 # --------------------------------------------------------------------------- #
 # [tools.web.providers.*] maps onto the flat web fields
 # --------------------------------------------------------------------------- #
@@ -240,6 +263,13 @@ def test_validate_flags_a_missing_owner(project, monkeypatch) -> None:
 def test_validate_flags_a_missing_api_key(config, monkeypatch) -> None:
     monkeypatch.delenv("OPENAI_API_KEY")
     assert any("OPENAI_API_KEY" in p for p in validate(config))
+
+
+def test_validate_flags_an_unknown_permission_mode(config) -> None:
+    config.tools.mode = "sudo-everything"
+    assert any("tools.mode" in p for p in validate(config))
+    config.tools.mode = "bypass-sudo"
+    assert validate(config) == []
 
 
 def test_validate_flags_a_missing_personality_file(config) -> None:

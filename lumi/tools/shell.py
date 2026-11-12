@@ -213,6 +213,9 @@ Rules:
             extra_confirm=self.shell_config.extra_confirm,
             # Who is asking decides whose uploads the command may read.
             chat_id=chat_id,
+            # The permission mode is read live from config, so /mode lands on
+            # the very next command without a restart.
+            mode=safety.parse_mode(self.config.tools.mode),
         )
 
     # -- execution --------------------------------------------------------- #
@@ -227,7 +230,11 @@ Rules:
         verdict = self.classify(command, cwd, ctx.chat_id)
 
         log.info(
-            "shell verdict=%s cwd=%s cmd=%s", verdict.tier.value, cwd, truncate(command, 200, "…")
+            "shell verdict=%s mode=%s cwd=%s cmd=%s",
+            verdict.tier.value,
+            safety.parse_mode(self.config.tools.mode).value,
+            cwd,
+            truncate(command, 200, "…"),
         )
 
         if verdict.blocked:

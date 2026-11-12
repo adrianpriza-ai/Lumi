@@ -3407,6 +3407,30 @@ async def test_reasoning_rejects_nonsense(config) -> None:
     assert "usage" in texts(bot).lower()
 
 
+async def test_mode_reports_the_current_mode(config) -> None:
+    bot, _ = await send(config, [], "/mode")
+    body = texts(bot)
+    assert "<code>default</code>" in body
+    assert "accept-edits" in body  # the switch list names the alternatives
+
+
+async def test_mode_switches_and_reports(config) -> None:
+    bot, _ = await send(config, [], "/mode accept-edits")
+    assert "<code>accept-edits</code>" in texts(bot)
+    assert config.tools.mode == "accept-edits"
+
+    # And back down again — the dial moves both ways.
+    bot, _ = await send(config, [], "/mode default")
+    assert "<code>default</code>" in texts(bot)
+
+
+async def test_mode_rejects_an_unknown_name(config) -> None:
+    bot, _ = await send(config, [], "/mode sudo-everything")
+    body = texts(bot)
+    assert "unknown mode" in body
+    assert config.tools.mode == "default"
+
+
 async def test_status_mentions_reasoning(config) -> None:
     bot, _ = await send(config, [], "/status")
     assert "reasoning: off" in texts(bot)

@@ -39,6 +39,7 @@ from typing import Any
 from ..config import Config
 from ..util.text import fence_untrusted, truncate
 from .base import NeedsApproval, Tool, ToolContext, ToolError, ToolResult
+from .safety import Mode, parse_mode
 from .web.providers.mcp_provider import MCPProvider, ServerSpec, _flatten, _read_timeout
 from .web.providers.mcp_trust import MCPTrustError
 
@@ -123,6 +124,9 @@ Use it when the owner asks for something that lives in an external service: crea
     }
 
     def __init__(self, config: Config) -> None:
+        # Kept for the permission mode, which is read live so /mode lands on
+        # the very next call without a restart.
+        self.config = config
         # The same MCPConfig the web provider reads: one place names the
         # files, the transports and the timeout, whichever surface calls.
         self.settings = config.tools.web.mcp
@@ -339,7 +343,14 @@ Use it when the owner asks for something that lives in an external service: crea
                 f"{fence_untrusted(offered)}"
             )
 
-        if self.settings.ask_before_call and not ctx.confirmed:
+        mode = parse_mode(self.config.tools.mode)
+        if (
+            self.settings.ask_before_call
+            and not ctx.confirmed
+            # bypass means nothing asks, external servers included; accept-edits
+            # does not reach in here — an external call is not an edit.
+            and mode not in (Mode.BYPASS, Mode.BYPASS_SUDO)
+        ):
             # The *matched* name, not the one the model sent: the fallback
             # above can resolve a case-insensitive hit, and the owner must be
             # prompted with — and approve — the tool that will actually run.
