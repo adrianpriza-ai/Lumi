@@ -206,10 +206,14 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
         checks.append(Check("ocr", WARN, "disabled in config"))
     elif problem := ocr_cfg.endpoint_problem():
         checks.append(Check("ocr", FAIL, problem))
-    elif ocr_cfg.provider_of():
+    elif problem := ocr_cfg.model_problem():
+        # Not an error: the tool simply stays out of the model's tool list,
+        # the same way it does without a key.
+        checks.append(Check("ocr", WARN, f"{problem}; the ocr tool is unavailable"))
+    elif ocr_cfg.uses_api():
         ocr_key = ocr_cfg.api_key()
         if ocr_key:
-            detail = f"{ocr_cfg.model} via {ocr_cfg.base_url} ({ocr_cfg.api_key_env})"
+            detail = f"{ocr_cfg.model_of()} via {ocr_cfg.base_url_of()} ({ocr_cfg.api_key_env})"
             checks.append(Check("ocr", OK, detail))
         elif ocr_cfg.needs_key():
             checks.append(
@@ -226,29 +230,57 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
                 Check(
                     "ocr",
                     OK,
-                    f"{ocr_cfg.model} via {ocr_cfg.base_url} (keyless; set "
+                    f"{ocr_cfg.model_of()} via {ocr_cfg.base_url_of()} (keyless; set "
                     f"{ocr_cfg.api_key_env} if the endpoint needs a key)",
                 )
             )
     elif config.tools.is_enabled("ocr"):
-        checks.append(
-            Check(
-                "ocr",
-                OK,
-                f"local path (embedded text + {config.llm.ocr_model_of()} for scans); "
-                'set [tools.ocr] provider = "mistral" for a dedicated OCR API',
+        # Same check the tool's available() applies: without these the local
+        # path cannot open a PDF, so doctor must not report it as running.
+        from .tools.ocr import _missing_local_library
+
+        if missing := _missing_local_library():
+            package, install = missing
+            checks.append(
+                Check(
+                    "ocr",
+                    FAIL,
+                    f"{package} is not installed; the local PDF path needs it "
+                    f"(pip install {install}), or set [tools.ocr] base_url",
+                )
             )
-        )
+        else:
+            # Scanned pages are refused without an explicitly configured file
+            # model — a warning, not a failure: embedded-text PDFs and images
+            # still read fine on the local path.
+            checks.append(
+                Check(
+                    "ocr",
+                    OK if config.llm.has_file_model() else WARN,
+                    (
+                        f"local path (embedded text + {config.llm.file_model_of()} for scans); "
+                        "set [tools.ocr] base_url for a dedicated OCR API"
+                    )
+                    if config.llm.has_file_model()
+                    else "local path (embedded text only — scanned pages are refused; "
+                    "set llm.file_model to a model that accepts image input, or "
+                    "[tools.ocr] base_url for a dedicated OCR API)",
+                )
+            )
 
     img_cfg = config.tools.image_gen
     if not config.tools.is_enabled("image_gen") or not img_cfg.enabled:
         checks.append(Check("image_gen", WARN, "disabled in config"))
     elif problem := img_cfg.endpoint_problem():
         checks.append(Check("image_gen", FAIL, problem))
+    elif problem := img_cfg.model_problem():
+        checks.append(Check("image_gen", WARN, f"{problem}; the image_gen tool is unavailable"))
     elif img_cfg.api_key():
         checks.append(
             Check(
-                "image_gen", OK, f"{img_cfg.model} via {img_cfg.base_url} ({img_cfg.api_key_env})"
+                "image_gen",
+                OK,
+                f"{img_cfg.model_of()} via {img_cfg.base_url_of()} ({img_cfg.api_key_env})",
             )
         )
     elif img_cfg.needs_key():
@@ -264,7 +296,7 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
             Check(
                 "image_gen",
                 OK,
-                f"{img_cfg.model} via {img_cfg.base_url} (keyless; set "
+                f"{img_cfg.model_of()} via {img_cfg.base_url_of()} (keyless; set "
                 f"{img_cfg.api_key_env} if the endpoint needs a key)",
             )
         )
@@ -303,6 +335,8 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
         ("firecrawl", config.tools.web.firecrawl),
         ("exa", config.tools.web.exa),
         ("contextdev", config.tools.web.contextdev),
+        ("keenable", config.tools.web.keenable),
+        ("jina", config.tools.web.jina),
         ("you", config.tools.web.you),
     ):
         if not cfg.enabled:

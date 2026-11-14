@@ -83,19 +83,7 @@ def test_unavailable_without_httpx(
     assert "httpx" in reason
 
 
-def test_custom_endpoint_without_key_is_available(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A self-hosted endpoint may take no auth; keyless is a real configuration."""
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    tool = make_tool(
-        tmp_path,
-        toml='[tools.image_gen]\nprovider = "custom"\nbase_url = "http://localhost:8787/v1"\n',
-    )
-    assert tool.available() == (True, "")
-
-
-async def test_a_keyless_custom_endpoint_sends_no_auth_header(
+async def test_a_keyless_endpoint_sends_no_auth_header(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     import httpx
@@ -127,7 +115,7 @@ async def test_a_keyless_custom_endpoint_sends_no_auth_header(
     monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
     tool = make_tool(
         tmp_path,
-        toml='[tools.image_gen]\nprovider = "custom"\nbase_url = "http://localhost:8787/v1"\n',
+        toml='[tools.image_gen]\nbase_url = "http://localhost:8787/v1"\nmodel = "local-image"\n',
     )
     tool._api = ImageGenClient(tool._settings)
 
@@ -200,20 +188,53 @@ async def test_empty_prompt_fails(key: None, tmp_path: Path) -> None:
     assert not result.ok
 
 
-def test_custom_provider_needs_base_url() -> None:
-    assert "base_url" in ImageGenConfig(provider="custom", base_url="").endpoint_problem()
+def test_an_overridden_endpoint_without_key_is_available(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A base_url away from OpenAI's default is the owner's endpoint: keyless."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    tool = make_tool(
+        tmp_path,
+        toml='[tools.image_gen]\nbase_url = "http://localhost:8787/v1"\nmodel = "local-image"\n',
+    )
+    assert tool.available() == (True, "")
 
 
-def test_custom_provider_pointed_at_openai_default_is_caught() -> None:
-    assert "base_url" in ImageGenConfig(provider="custom").endpoint_problem()
+def test_a_custom_endpoint_without_a_model_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No image model id is portable: another host must name its own."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    tool = make_tool(tmp_path, toml='[tools.image_gen]\nbase_url = "http://localhost:8787/v1"\n')
+    ok, reason = tool.available()
+    assert not ok
+    assert "tools.image_gen" in reason and "model" in reason
 
 
-def test_unknown_provider_is_rejected() -> None:
-    assert "unknown tools.image_gen.provider" in ImageGenConfig(provider="dalle").endpoint_problem()
+def test_the_model_default_belongs_to_openai() -> None:
+    assert ImageGenConfig().model_of() == "gpt-image-1"
+    assert ImageGenConfig(base_url="https://api.openai.com/v1/").model_of() == "gpt-image-1"
+    custom = ImageGenConfig(base_url="https://img.example/v1")
+    assert custom.model_of() == ""
+    assert custom.model_problem() == custom.config_problem()
+    assert "model" in custom.model_problem()
 
 
-def test_openai_provider_keeps_default_base_url() -> None:
-    assert ImageGenConfig().endpoint_problem() == ""
+def test_an_empty_base_url_means_openai() -> None:
+    config = ImageGenConfig()
+    assert config.base_url_of() == "https://api.openai.com/v1"
+    assert config.needs_key()
+    assert ImageGenConfig(base_url="http://host/v1/").base_url_of() == "http://host/v1"
+
+
+def test_openai_by_another_name_still_needs_its_key() -> None:
+    """The endpoint decides, not a provider label: OpenAI's URL is OpenAI."""
+    config = ImageGenConfig(base_url="https://api.openai.com/v1/")
+    assert config.needs_key()
+
+
+def test_an_invalid_base_url_is_rejected() -> None:
+    assert "base_url" in ImageGenConfig(base_url="not-a-url").endpoint_problem()
 
 
 def test_stem_is_safe_and_bounded() -> None:

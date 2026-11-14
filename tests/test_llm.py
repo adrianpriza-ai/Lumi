@@ -445,20 +445,13 @@ async def test_an_unknown_strategy_falls_back_instead_of_booting(config, monkeyp
 
 
 # --------------------------------------------------------------------------- #
-# registry
+# build
 # --------------------------------------------------------------------------- #
 
 
-def test_every_documented_provider_builds_the_same_client(config) -> None:
-    for name in ("openai", "openai-compatible", "ollama", "lmstudio", "vllm", "groq", "openrouter"):
-        config.llm.provider = name
-        assert isinstance(build_llm(config), OpenAICompatClient)
-
-
-def test_unknown_provider_is_rejected(config) -> None:
-    config.llm.provider = "skynet"
-    with pytest.raises(LLMError, match="unknown llm.provider"):
-        build_llm(config)
+def test_build_llm_builds_the_one_client(config) -> None:
+    """No provider registry: every endpoint is the same adapter, base_url decides."""
+    assert isinstance(build_llm(config), OpenAICompatClient)
 
 
 def test_describe_names_the_model_and_endpoint(config) -> None:
@@ -879,36 +872,19 @@ def test_build_llm_without_a_route_has_no_vision_client(config) -> None:
 
 def test_build_llm_attaches_the_vision_route(config, monkeypatch) -> None:
     monkeypatch.setenv("OR_API_KEY", "sk-or")
-    config.llm.vision.provider = "openrouter"
     config.llm.vision.model = "google/gemini-2.0-flash-001"
+    config.llm.vision.base_url = "https://openrouter.ai/api/v1"
     config.llm.vision.api_key_env = "OR_API_KEY"
 
     client = build_llm(config)
 
     assert isinstance(client, OpenAICompatClient)
     assert client.vision is not None
-    assert client.vision.config.provider == "openrouter"
     assert client.vision.config.api_key_env == "OR_API_KEY"
+    assert client.vision.config.base_url_of() == "https://openrouter.ai/api/v1"
     assert client.vision.config.vision_model_of() == "google/gemini-2.0-flash-001"
     # The main client is untouched.
-    assert client.config.provider == "openai"
-
-
-def test_an_unknown_vision_provider_is_rejected_at_boot(config) -> None:
-    config.llm.vision.provider = "skynet"
-    with pytest.raises(LLMError, match="llm.vision.provider"):
-        build_llm(config)
-
-
-def test_the_vision_route_uses_its_own_provider_factory(config, monkeypatch) -> None:
-    from lumi.llm import PROVIDERS
-
-    class VisionClient(OpenAICompatClient):
-        pass
-
-    monkeypatch.setitem(PROVIDERS, "test-vision", VisionClient)
-    config.llm.vision.provider = "test-vision"
-    assert isinstance(build_llm(config).vision, VisionClient)
+    assert client.config.base_url_of() != client.vision.config.base_url_of()
 
 
 async def test_image_turns_go_to_the_vision_client(config) -> None:

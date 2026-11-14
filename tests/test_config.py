@@ -205,7 +205,7 @@ def test_defaults_apply_with_no_config_file(project) -> None:
     (project / "config.toml").unlink()
     config = load_config(project)
     assert isinstance(config, Config)
-    assert config.llm.provider == "openai"
+    assert config.llm.api_key_env == "OPENAI_API_KEY"
     assert config.tools.enabled == [
         "run_shell",
         "files",
@@ -327,7 +327,17 @@ def test_validate_flags_an_unknown_firecrawl_strategy(config) -> None:
 def test_validate_accepts_every_documented_strategy(config, strategy: str) -> None:
     config.tools.web.tavily.key_strategy = strategy
     config.tools.web.firecrawl.key_strategy = strategy
+    config.tools.web.keenable.key_strategy = strategy
+    config.tools.web.jina.key_strategy = strategy
     assert not [p for p in validate(config) if "key_strategy" in p]
+
+
+def test_validate_flags_an_unknown_keenable_or_jina_strategy(config) -> None:
+    config.tools.web.keenable.key_strategy = "telepathy"
+    config.tools.web.jina.key_strategy = "telepathy"
+    problems = validate(config)
+    assert any("tools.web.keenable.key_strategy" in p for p in problems)
+    assert any("tools.web.jina.key_strategy" in p for p in problems)
 
 
 @pytest.mark.parametrize("mode", ["mention", "always", "off"])
@@ -729,68 +739,78 @@ def test_minus_one_bootstrap_retries_validate(config) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# per-role provider routes ([llm.vision], [llm.ocr])
+# per-role routes ([llm.vision], [llm.file])
 # --------------------------------------------------------------------------- #
 
 
 def test_unset_routes_stay_unset(config) -> None:
     assert config.llm.vision_route_of() is None
     assert not config.llm.vision.is_set()
-    assert not config.llm.ocr.is_set()
-    # The ocr route degrades to the default endpoint rather than disappearing.
-    assert config.llm.ocr_route_of().model_of() == config.llm.model_of()
+    assert not config.llm.file.is_set()
+    # The file route degrades to the default endpoint rather than disappearing.
+    assert config.llm.file_route_of().model_of() == config.llm.model_of()
 
 
 def test_a_vision_route_merges_only_what_it_states(config, monkeypatch) -> None:
     monkeypatch.setenv("OR_API_KEY", "sk-or")
-    config.llm.vision.provider = "openrouter"
     config.llm.vision.model = "google/gemini-2.0-flash-001"
+    config.llm.vision.base_url = "https://openrouter.ai/api/v1"
     config.llm.vision.api_key_env = "OR_API_KEY"
 
     route = config.llm.vision_route_of()
     assert route is not None
-    assert route.provider == "openrouter"  # from the route
+    assert route.base_url_of() == "https://openrouter.ai/api/v1"  # from the route
     assert route.api_key() == "sk-or"  # its own key
     assert route.vision_model_of() == "google/gemini-2.0-flash-001"
     assert route.model_of() == config.llm.model_of()  # text model inherited
-    assert route.base_url_of() == config.llm.base_url_of()
     assert route.strategy_of() == "fallback"
 
 
-def test_the_ocr_route_stays_on_the_default_even_with_a_vision_route(config) -> None:
-    """A vision route is for photos; a PDF stays on the default endpoint."""
-    config.llm.vision.provider = "openrouter"
+def test_the_file_route_stays_on_the_default_even_with_a_vision_route(config) -> None:
+    """A vision route is for photos; a document stays on the default endpoint."""
     config.llm.vision.model = "google/gemini-2.0-flash-001"
-    ocr = config.llm.ocr_route_of()
-    assert ocr.provider == config.llm.provider  # default endpoint, not vision's
-    assert ocr.base_url_of() == config.llm.base_url_of()
-    assert config.llm.ocr_model_of() == config.llm.model_of()
+    config.llm.vision.base_url = "https://openrouter.ai/api/v1"
+    file = config.llm.file_route_of()
+    assert file.base_url_of() == config.llm.base_url_of()  # default, not vision's
+    assert config.llm.file_model_of() == config.llm.model_of()
 
-    # [llm.ocr] overrides, exactly like any other route.
-    config.llm.ocr.model = "gpt-4o-mini"
-    assert config.llm.ocr_route_of().vision_model_of() == "gpt-4o-mini"
-    assert config.llm.ocr_model_of() == "gpt-4o-mini"
+    # [llm.file] overrides, exactly like any other route.
+    config.llm.file.model = "qwen2.5-vl"
+    assert config.llm.file_route_of().vision_model_of() == "qwen2.5-vl"
+    assert config.llm.file_model_of() == "qwen2.5-vl"
 
 
-def test_the_ocr_model_falls_back_to_the_default_not_the_vision_model(config) -> None:
+def test_the_file_model_falls_back_to_the_default_not_the_vision_model(config) -> None:
     config.llm.vision_model = "gpt-4o"
-    assert config.llm.ocr_model_of() == config.llm.model_of()
+    assert config.llm.file_model_of() == config.llm.model_of()
 
 
-def test_the_ocr_model_resolves_from_the_flat_field(config) -> None:
-    config.llm.ocr_model = "paddleocr-v4"
-    assert config.llm.ocr_model_of() == "paddleocr-v4"
+def test_the_file_model_counts_only_when_explicit(config) -> None:
+    """The inherited default is not a file model: most endpoints answer text
+    with a model that cannot see images, so readers must not trust it."""
+    assert not config.llm.has_file_model()
+    assert config.llm.file_model_of() == config.llm.model_of()  # still resolves
+    config.llm.file_model = "qwen2.5-vl"
+    assert config.llm.has_file_model()
+    config.llm.file_model = ""
+    config.llm.file.model = "from-route"
+    assert config.llm.has_file_model()
 
 
-def test_the_ocr_route_model_beats_the_flat_field(config) -> None:
-    config.llm.ocr_model = "from-flat"
-    config.llm.ocr.model = "from-route"
-    assert config.llm.ocr_model_of() == "from-route"
+def test_the_file_model_resolves_from_the_flat_field(config) -> None:
+    config.llm.file_model = "qwen2.5-vl"
+    assert config.llm.file_model_of() == "qwen2.5-vl"
 
 
-def test_the_ocr_model_can_come_from_the_environment(project, monkeypatch) -> None:
-    monkeypatch.setenv("LUMI__LLM__OCR_MODEL", "paddleocr-v4")
-    assert load_config(project).llm.ocr_model_of() == "paddleocr-v4"
+def test_the_file_route_model_beats_the_flat_field(config) -> None:
+    config.llm.file_model = "from-flat"
+    config.llm.file.model = "from-route"
+    assert config.llm.file_model_of() == "from-route"
+
+
+def test_the_file_model_can_come_from_the_environment(project, monkeypatch) -> None:
+    monkeypatch.setenv("LUMI__LLM__FILE_MODEL", "qwen2.5-vl")
+    assert load_config(project).llm.file_model_of() == "qwen2.5-vl"
 
 
 def test_routes_can_come_from_toml(project, monkeypatch) -> None:
@@ -800,25 +820,37 @@ def test_routes_can_come_from_toml(project, monkeypatch) -> None:
         "[llm]\n"
         "model = 'gpt-4.1-mini'\n"
         "[llm.vision]\n"
-        "provider = 'openrouter'\n"
         "model = 'google/gemini-2.0-flash-001'\n"
+        "base_url = 'https://openrouter.ai/api/v1'\n"
         "api_key_env = 'OR_API_KEY'\n"
-        "[llm.ocr]\n"
-        "model = 'gpt-4o-mini'\n"
+        "[llm.file]\n"
+        "model = 'qwen2.5-vl'\n"
         "[tools.ocr]\n"
-        "provider = 'mistral'\n"
+        "base_url = 'https://api.mistral.ai/v1'\n"
         "api_key_env = 'MISTRAL_API_KEY'\n",
         encoding="utf-8",
     )
     loaded = load_config(project)
     route = loaded.llm.vision_route_of()
     assert route is not None
-    assert route.provider == "openrouter"
+    assert route.base_url_of() == "https://openrouter.ai/api/v1"
     assert route.api_key() == "sk-or"
-    assert loaded.llm.ocr_model_of() == "gpt-4o-mini"
-    assert loaded.tools.ocr.provider_of() == "mistral"
+    assert loaded.llm.file_model_of() == "qwen2.5-vl"
+    assert loaded.tools.ocr.base_url_of() == "https://api.mistral.ai/v1"
     assert loaded.tools.ocr.api_key() == "mk-1"
     assert not any("tools.ocr" in p for p in validate(loaded))
+
+
+def test_a_route_provider_key_is_ignored_not_an_error(project) -> None:
+    """``provider`` used to be a route field; old configs must still boot."""
+    (project / "config.toml").write_text(
+        "[llm]\nprovider = 'openai'\n"
+        "[llm.vision]\nprovider = 'openrouter'\nmodel = 'm'\n",
+        encoding="utf-8",
+    )
+    loaded = load_config(project)
+    assert loaded.llm.vision_route_of() is not None
+
 
 
 def test_an_unknown_route_key_strategy_is_reported(config) -> None:
@@ -826,23 +858,31 @@ def test_an_unknown_route_key_strategy_is_reported(config) -> None:
     assert any("llm.vision.key_strategy" in p for p in validate(config))
 
 
-def test_an_unknown_ocr_provider_is_reported(config) -> None:
-    config.tools.ocr.provider = "tesseract-cloud"
-    assert any("tools.ocr.provider" in p for p in validate(config))
-
-
-def test_a_custom_ocr_provider_requires_a_base_url(config) -> None:
-    config.tools.ocr.provider = "custom"
-    config.tools.ocr.base_url = ""
+def test_an_invalid_ocr_endpoint_is_reported(config) -> None:
+    config.tools.ocr.base_url = "not-a-url"
     assert any("tools.ocr.base_url" in p for p in validate(config))
+
+
+def test_an_unknown_ocr_table_format_is_reported(config) -> None:
+    config.tools.ocr.table_format = "latex"
+    assert any("tools.ocr.table_format" in p for p in validate(config))
+    config.tools.ocr.table_format = "html"
+    assert not any("tools.ocr.table_format" in p for p in validate(config))
+    config.tools.ocr.table_format = ""
+    assert not any("tools.ocr.table_format" in p for p in validate(config))
+
+
+def test_an_empty_ocr_base_url_is_the_local_path(config) -> None:
+    config.tools.ocr.base_url = ""
+    assert not config.tools.ocr.uses_api()
+    assert not any("tools.ocr.base_url" in p for p in validate(config))
 
     config.tools.ocr.base_url = "https://ocr.internal/v1"
     assert not any("tools.ocr.base_url" in p for p in validate(config))
 
 
-@pytest.mark.parametrize("base_url", ["", "relative/path", "file:///tmp/ocr", "https://"])
-def test_a_dedicated_ocr_provider_requires_an_http_endpoint(config, base_url) -> None:
-    config.tools.ocr.provider = "mistral"
+@pytest.mark.parametrize("base_url", ["relative/path", "file:///tmp/ocr", "https://"])
+def test_a_dedicated_ocr_endpoint_requires_an_http_url(config, base_url) -> None:
     config.tools.ocr.base_url = base_url
     assert any("tools.ocr.base_url" in p for p in validate(config))
 

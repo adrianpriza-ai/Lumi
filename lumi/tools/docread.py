@@ -134,7 +134,7 @@ def open_pdf(path: Path) -> Any:
     except ImportError as exc:
         raise ToolError(
             "pypdfium2 is not installed — the local PDF path needs it "
-            "(pip install pypdfium2), or configure [tools.ocr] provider."
+            "(pip install pypdfium2), or set [tools.ocr] base_url."
         ) from exc
     try:
         return pdfium.PdfDocument(str(path))
@@ -158,7 +158,7 @@ def render_page(page: Any, scale: float) -> str:
     except ImportError as exc:
         raise ToolError(
             "Pillow is not installed — rendering scanned pages needs it (pip install Pillow), "
-            "or configure [tools.ocr] provider."
+            "or set [tools.ocr] base_url."
         ) from exc
     bitmap = page.render(scale=scale)
     try:
@@ -260,11 +260,11 @@ class DocumentReader:
 
     def _ocr_client(self) -> Any:
         if self._llm is None:
-            # [llm.ocr] decides provider, endpoint, key and model — a route,
-            # exactly like [llm.vision]. Falls back to the *default* model:
-            # a scanned page is document work, and a configured vision model
-            # for photos must not change what reads a PDF.
-            self._llm = OpenAICompatClient(self._config.llm.ocr_route_of())
+            # [llm.file] decides endpoint, key and model — a route, exactly
+            # like [llm.vision]. Falls back to the *default* model: a scanned
+            # page is document work, and a configured vision model for photos
+            # must not change what reads a PDF.
+            self._llm = OpenAICompatClient(self._config.llm.file_route_of())
         return self._llm
 
     def _image_client(self) -> Any:
@@ -317,6 +317,21 @@ class DocumentReader:
                     embedded[index] = text
                 else:
                     scanned.append(index)
+
+            # Scanned pages are never sent to the default model: most
+            # endpoints answer text with a model that cannot see images, so
+            # the pixels would come back as a 400 — or worse, a guess.
+            # Reading them needs an explicitly configured file model (or the
+            # dedicated OCR API the `ocr` tool offers); the embedded-text
+            # pages below need no model at all and still go out.
+            if scanned and not self._config.llm.has_file_model():
+                return ToolResult.failure(
+                    f"{relative_to_root(path)}: {len(scanned)} of {limit} page(s) have no "
+                    "embedded text, and no file model is configured to read them — scanned "
+                    "pages are never sent to the default model. Set `llm.file_model` to a "
+                    "chat model that accepts image input, or set `[tools.ocr] base_url` to "
+                    "a dedicated OCR API."
+                )
 
             rendered: dict[int, str] = {}
             for index in scanned:

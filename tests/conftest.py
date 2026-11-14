@@ -74,6 +74,8 @@ def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "TAVILY_API_KEY",
         "FIRECRAWL_API_KEY",
         "EXA_API_KEY",
+        "KEENABLE_API_KEY",
+        "JINA_API_KEY",
         "LUMI_MCP_URL",
         "OPENAI_MODEL",
         "OPENAI_BASE_URL",

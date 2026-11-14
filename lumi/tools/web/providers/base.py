@@ -1,8 +1,8 @@
 """Web provider contract.
 
-Four implementations ship: the Firecrawl SDK, the Exa SDK, the Tavily SDK, and
-a generic MCP client that reads ``.mcp.json`` and ``~/.agents/mcp.json``. They
-all normalise to
+Implementations range from the Firecrawl, Exa and Tavily SDKs to raw-httpx
+clients (Context.dev, Keenable, Jina) and a generic MCP client that reads
+``.mcp.json`` and ``~/.agents/mcp.json``. They all normalise to
 :class:`SearchHit` and :class:`Page` so the tool layer never has to care which
 one answered.
 """
@@ -126,6 +126,11 @@ class WebProvider(abc.ABC):
     """One way of reaching the web."""
 
     name: str = "unnamed"
+
+    #: False when this provider cannot search right now (Jina Search needs a
+    #: key while its Reader half does not). The tool skips it when searching,
+    #: so a fetch-only fallback is never counted as a failed search attempt.
+    supports_search: bool = True
 
     @abc.abstractmethod
     def available(self) -> tuple[bool, str]:

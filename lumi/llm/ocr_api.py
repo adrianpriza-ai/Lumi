@@ -3,8 +3,9 @@
 Not a chat model: the whole document goes in — a public URL or the bytes
 base64-encoded — and per-page markdown comes back. That is a different
 conversation than "look at this image and transcribe it", so it gets its own
-client rather than a prompt. The wire format is Mistral's OCR API; any
-compatible service works by pointing ``tools.ocr.base_url`` at it.
+client rather than a prompt. The wire format is Mistral's OCR API
+(docs.mistral.ai/api/endpoint/ocr); any compatible service works by pointing
+``tools.ocr.base_url`` at it.
 
 .. code-block:: bash
 
@@ -17,6 +18,7 @@ compatible service works by pointing ``tools.ocr.base_url`` at it.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from ..config import OCRConfig
@@ -44,6 +46,47 @@ CONTENT_TYPES = {
 }
 
 
+def error_body(text: str) -> str:
+    """The endpoint's own error words, or the raw body when it has none.
+
+    Mistral answers errors as JSON — ``{"message": "..."}``, FastAPI-style
+    ``{"detail": "..."}`` — and that message is what the owner needs; a raw
+    wall of HTML or a minified body is the fallback.
+    """
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return truncate(text, ERROR_BODY_CHARS)
+    if isinstance(data, dict):
+        for field in ("message", "detail"):
+            value = data.get(field)
+            if isinstance(value, str) and value.strip():
+                return truncate(value, ERROR_BODY_CHARS)
+    return truncate(text, ERROR_BODY_CHARS)
+
+
+def page_numbers(pages_data: list[dict[str, Any]], requested: list[int] | None) -> list[int]:
+    """1-based page numbers for the endpoint's returned pages.
+
+    When specific pages were requested, the response follows that order, so
+    the requested numbers (0-based) are the truth. Otherwise the endpoint's
+    ``index`` field decides — the documented convention is 0-based, but a
+    sequence that already starts at 1 is read as finished page numbers, since
+    compatible servers disagree and a wrong page number is worse than no
+    number. Missing or garbled indexes fall back to position.
+    """
+    count = len(pages_data)
+    if requested:
+        return [number + 1 for number in requested]
+    indexes = [page.get("index") for page in pages_data]
+    if all(isinstance(index, int) for index in indexes):
+        if indexes == list(range(0, count)):
+            return list(range(1, count + 1))
+        if indexes == list(range(1, count + 1)):
+            return list(indexes)
+    return list(range(1, count + 1))
+
+
 class OCRDocumentClient:
     """One HTTP call: document in, per-page text out.
 
@@ -59,12 +102,41 @@ class OCRDocumentClient:
     @property
     def endpoint(self) -> str:
         """The full OCR URL: ``<base_url>/ocr``, whatever the trailing slash state."""
-        if problem := self.config.endpoint_problem():
+        if problem := self.config.config_problem():
             raise LLMError(problem)
-        return self.config.base_url.strip().rstrip("/") + "/ocr"
+        return self.config.base_url_of() + "/ocr"
 
     def describe(self) -> str:
-        return f"{self.config.model} via {self.endpoint}"
+        return f"{self.config.model_of()} via {self.endpoint}"
+
+    def _payload(
+        self,
+        document: dict[str, Any],
+        pages: list[int] | None,
+    ) -> dict[str, Any]:
+        """The request body, per the documented Mistral shape.
+
+        Only fields the owner configured are sent — an empty ``table_format``
+        or an ``extract_header`` left off means "the endpoint decides", and
+        ``pages`` goes out only when the caller actually wants a window.
+        ``include_blocks`` is the one unconditional lie-by-omission: the
+        documented default ``true`` doubles the payload with paragraph
+        bounding boxes this client only ever throws away.
+        """
+        payload: dict[str, Any] = {
+            "model": self.config.model_of(),
+            "document": document,
+            "include_blocks": False,
+        }
+        if pages:
+            payload["pages"] = pages
+        if table_format := self.config.table_format.strip().lower():
+            payload["table_format"] = table_format
+        if self.config.extract_header:
+            payload["extract_header"] = True
+        if self.config.extract_footer:
+            payload["extract_footer"] = True
+        return payload
 
     async def ocr(
         self,
@@ -72,14 +144,16 @@ class OCRDocumentClient:
         document_url: str | None = None,
         document_b64: str | None = None,
         content_type: str = "application/pdf",
+        pages: list[int] | None = None,
     ) -> list[tuple[int, str]]:
         """OCR one document. Exactly one of *document_url* / *document_b64*.
 
-        Returns ``(page_number, text)`` pairs in page order. Raises
-        :class:`LLMError` with the endpoint, status and a snippet of the
-        provider's own response body — an OCR API fails in specific ways
-        ("unsupported file type", "model not found") and the owner needs the
-        exact words, not a guess.
+        *pages* is optional and 0-based (Mistral's ``pages`` parameter:
+        ``None`` reads the whole document). Returns ``(page_number, text)``
+        pairs in page order. Raises :class:`LLMError` with the endpoint,
+        status and the provider's own response body — an OCR API fails in
+        specific ways ("unsupported file type", "model not found") and the
+        owner needs the exact words, not a guess.
         """
         try:
             import httpx
@@ -111,20 +185,19 @@ class OCRDocumentClient:
             )
         headers = {"Authorization": f"Bearer {key}"} if key else {}
 
-        payload = {"model": self.config.model, "document": document}
         try:
             async with httpx.AsyncClient(
                 timeout=self.config.timeout_seconds,
                 headers=headers,
             ) as http:
-                response = await http.post(endpoint, json=payload)
+                response = await http.post(endpoint, json=self._payload(document, pages))
         except httpx.HTTPError as exc:
             raise LLMError(f"could not reach {self.endpoint}: {format_error(exc)}") from exc
 
         if response.status_code >= 400:
             raise LLMError(
                 f"{self.endpoint} returned HTTP {response.status_code}: "
-                f"{truncate(response.text, ERROR_BODY_CHARS)}"
+                f"{error_body(response.text)}"
             )
 
         try:
@@ -132,11 +205,12 @@ class OCRDocumentClient:
         except ValueError as exc:
             raise LLMError(f"{self.endpoint} returned a non-JSON body") from exc
 
-        pages = data.get("pages") or []
-        if pages:
+        pages_data = data.get("pages") or []
+        if pages_data:
+            numbers = page_numbers(pages_data, pages)
             return [
-                (int(page.get("page_number") or index), str(page.get("markdown") or ""))
-                for index, page in enumerate(pages, start=1)
+                (number, str(page.get("markdown") or ""))
+                for number, page in zip(numbers, pages_data)
             ]
         # Some compatible servers answer with one flat body instead of pages;
         # take it rather than declaring an empty document.
@@ -146,4 +220,4 @@ class OCRDocumentClient:
         raise LLMError(f"{self.endpoint} returned no pages and no content")
 
 
-__all__ = ["OCRDocumentClient", "CONTENT_TYPES"]
+__all__ = ["OCRDocumentClient", "CONTENT_TYPES", "error_body", "page_numbers"]

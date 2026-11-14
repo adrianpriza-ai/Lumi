@@ -169,10 +169,20 @@ def test_doctor_is_happy_with_a_complete_setup(config, capsys) -> None:
 
 
 def test_doctor_does_not_promise_a_missing_ocr_key_fallback(config, monkeypatch, capsys) -> None:
-    monkeypatch.setenv("LUMI__TOOLS__OCR__PROVIDER", "mistral")
+    monkeypatch.setenv("LUMI__TOOLS__OCR__BASE_URL", "https://api.mistral.ai/v1")
     monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
     assert main(["doctor"]) == 0
     assert "unavailable (no automatic fallback)" in capsys.readouterr().out
+
+
+def test_doctor_warns_about_a_missing_model_instead_of_failing(config, monkeypatch, capsys) -> None:
+    """A custom endpoint with no model just stays out of the tool list."""
+    monkeypatch.setenv("LUMI__TOOLS__OCR__BASE_URL", "https://ocr.example/v1")
+    monkeypatch.setenv("LUMI__TOOLS__IMAGE_GEN__BASE_URL", "https://img.example/v1")
+    assert main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "[tools.ocr] model is unset" in out and "ocr tool is unavailable" in out
+    assert "[tools.image_gen] model is unset" in out
 
 
 def test_doctor_reports_disabled_ocr(config, monkeypatch, capsys) -> None:

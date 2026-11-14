@@ -215,6 +215,7 @@ def test_reader_re_asks_the_guards(config, project: Path) -> None:
 async def test_reader_pdf_scan_pages_use_the_ocr_client(config, project: Path) -> None:
     path = project / "workspace" / "scan.pdf"
     path.write_bytes(make_pdf(""))  # blank page -> rendered and transcribed
+    config.llm.file_model = "qwen2.5-vl"
     reader = DocumentReader(config)
     reader._llm = StubLLM(["transcribed words"])
 
@@ -223,6 +224,23 @@ async def test_reader_pdf_scan_pages_use_the_ocr_client(config, project: Path) -
     assert result.ok
     assert "transcribed words" in result.text
     assert result.data["scanned"] == 1
+
+
+async def test_reader_pdf_scan_pages_are_refused_without_a_file_model(
+    config, project: Path
+) -> None:
+    """The gate lives on the shared reader, so read_file and files: read
+    refuse scans exactly like the ocr tool does."""
+    path = project / "workspace" / "scan.pdf"
+    path.write_bytes(make_pdf(""))  # blank page -> nothing embedded
+    reader = DocumentReader(config)
+    reader._llm = StubLLM(["transcribed words"])
+
+    result = await reader.read_pdf(path)
+
+    assert not result.ok
+    assert "no file model is configured" in result.text
+    assert "[page 1]" not in result.text
 
 
 # --------------------------------------------------------------------------- #

@@ -26,8 +26,8 @@ group_upload_retention_days = 7
 personal_upload_retention_days = 30
 
 [llm]
-# Any OpenAI-compatible endpoint (OpenAI, Ollama, LM Studio, vLLM, Groq, ...).
-provider = "openai"
+# Any OpenAI-compatible endpoint (OpenAI, Ollama, LM Studio, vLLM, Groq, ...):
+# base_url picks it, there is no provider preset.
 # Empty = OPENAI_BASE_URL / OPENAI_API_BASE from .env, then OpenAI.
 #   base_url = "http://localhost:11434/v1"   # Ollama
 base_url = ""
@@ -35,8 +35,10 @@ base_url = ""
 model = ""
 # Model for image turns. Empty = use `model`.
 vision_model = ""
-# Model the ocr tool reads PDFs with. Empty = use `model` (never vision_model).
-ocr_model = ""
+# Model that reads file contents needing a model call (scanned PDF pages the
+# ocr tool transcribes). Must accept image input; never the default model —
+# empty = scanned pages are refused, embedded-text pages still read free.
+file_model = ""
 # Env var holding the key. Comma-separated values make a rotation pool.
 api_key_env = "OPENAI_API_KEY"
 # fallback | round_robin | random
@@ -120,7 +122,7 @@ auto_remember = true
 [tools.web]
 enabled = true
 # Providers tried in order; the first available one answers.
-provider_order = ["firecrawl", "exa", "tavily", "contextdev", "you", "mcp"]
+provider_order = ["firecrawl", "exa", "tavily", "contextdev", "keenable", "jina", "you", "mcp"]
 # Hits per search. 0 = whatever the model asks for.
 max_results = 10
 # Top up from the next provider below this many hits.
@@ -182,6 +184,35 @@ timeout_seconds = 90
 # fallback | round_robin | random.
 key_strategy = "fallback"
 
+[tools.web.providers.keenable]
+enabled = true
+# Keenable's own index, built for agents. Works keyless: the public
+# endpoints need no account, just the app name below. A KEENABLE_API_KEY
+# lifts the per-IP hourly cap and uses the free monthly allowance.
+api_key_env = "KEENABLE_API_KEY"
+base_url = "https://api.keenable.ai/v1"
+# Sent as X-Keenable-Title on keyless calls (the API requires one).
+app_title = "Lumi"
+# pro (deeper retrieval) | realtime (fastest); empty = server default.
+mode = "pro"
+# Characters of page text per hit. 0 = the server default.
+snippet_max_length = 0
+timeout_seconds = 90
+# fallback | round_robin | random.
+key_strategy = "fallback"
+
+[tools.web.providers.jina]
+# Jina Reader: a URL in, clean markdown out. Fetch works keyless
+# (https://r.jina.ai/<url>); a JINA_API_KEY also enables Search
+# (https://s.jina.ai/<query>) as a last-resort search fallback.
+enabled = true
+api_key_env = "JINA_API_KEY"
+base_url = "https://r.jina.ai"
+search_base_url = "https://s.jina.ai"
+timeout_seconds = 60
+# fallback | round_robin | random.
+key_strategy = "fallback"
+
 [tools.web.providers.you]
 enabled = true
 # You.com's keyless MCP profile: no account, no key, low rate limit.
@@ -212,15 +243,28 @@ timeout_seconds = 30
 # fallback | round_robin | random
 key_strategy = "fallback"
 
+[tools.ocr]
+# Reads PDFs and scans. Empty base_url = the local path: embedded PDF text
+# extracted free, scanned pages refused unless llm.file_model is set.
+base_url = ""                # e.g. https://api.mistral.ai/v1 (needs MISTRAL_API_KEY)
+model = ""                   # OCR model id; Mistral's endpoint defaults to mistral-ocr-latest
+api_key_env = "MISTRAL_API_KEY"
+# max_pages = 20              # local path: pages per call, 0 = all
+# render_scale = 3.0          # scan render scale (1.0 = 72 DPI)
+# table_format = ""           # "" | markdown | html (dedicated API, tables)
+# extract_header = false      # strip the repeating page header (dedicated API)
+# extract_footer = false      # ...and footer, from each page's markdown
+
 [tools.image_gen]
 # Text-to-image over the OpenAI Images wire format (POST /images/generations).
-# With provider = "openai" the tool hides itself from the model until
-# OPENAI_API_KEY is set. provider = "custom" may run keyless (self-hosted).
+# Empty base_url means OpenAI, where the tool hides itself from the model
+# until OPENAI_API_KEY is set. Any other base_url (self-hosted, a proxy,
+# another compatible host) is called keyless.
 enabled = true
-# "openai" (hosted) or "custom" (any compatible endpoint, needs base_url).
-provider = "openai"
-base_url = "https://api.openai.com/v1"
-model = "gpt-image-1"
+# Empty = https://api.openai.com/v1. Any endpoint serving the wire format.
+# Empty = gpt-image-1. Required when base_url is not OpenAI's, because no
+# image model id is portable between services.
+model = ""
 api_key_env = "OPENAI_API_KEY"
 # Default image size, WIDTHxHEIGHT. Empty or "auto" = provider default.
 size = "1024x1024"

@@ -1,14 +1,14 @@
 """Read text from PDFs and document images.
 
-With ``tools.ocr.provider`` set to ``mistral`` or ``custom``, documents go to
-a Mistral-compatible ``POST /ocr`` API. Without it, pypdfium2 extracts embedded
-PDF text locally; scanned pages use ``llm.ocr_model`` or the default model.
+With ``tools.ocr.base_url`` set, documents go to a Mistral-compatible
+``POST /ocr`` API. Without it, pypdfium2 extracts embedded PDF text locally;
+scanned pages use ``llm.file_model`` or the default model.
 Local image files always use the photo route (vision when set, else default).
 
 The local machinery lives in :mod:`lumi.tools.docread`, shared with
 ``read_file`` and ``files: read`` — one implementation of "what a PDF or an
 image turns into", so the tools cannot drift apart. What this tool adds on
-top is the URL route (a dedicated OCR provider can fetch a public document
+top is the URL route (a dedicated OCR endpoint can fetch a public document
 itself) and the transcription contract: *text out*, never an attached image.
 """
 
@@ -80,7 +80,7 @@ class OCRTool(Tool):
     description = (
         "Extract text from a PDF, scan or document image (receipt, screenshot, "
         "scanned page, paper). Works on project files and — with a dedicated OCR "
-        "provider — on public document URLs directly. Use it when the owner sends "
+        "endpoint — on public document URLs directly. Use it when the owner sends "
         "or references a PDF and wants its contents. NOT for code or plain-text "
         "files: `read_file` handles those without a model call."
     )
@@ -91,14 +91,15 @@ class OCRTool(Tool):
                 "type": "string",
                 "description": (
                     "Path to the PDF/image file inside the project, or an http(s) "
-                    "URL to a document (URLs need a dedicated OCR provider)."
+                    "URL to a document (URLs need tools.ocr.base_url set)."
                 ),
             },
             "max_pages": {
                 "type": "integer",
                 "description": (
-                    "Stop after this many pages (local path only; default from "
-                    "tools.ocr.max_pages)."
+                    "Stop after this many pages. Local path: default from "
+                    "tools.ocr.max_pages, read the rest with a later call. "
+                    "Dedicated OCR API: only the first N pages are sent."
                 ),
             },
         },
@@ -145,26 +146,26 @@ class OCRTool(Tool):
         ocr = self._config.tools.ocr
         if not ocr.enabled:
             return False, "disabled by tools.ocr.enabled"
-        if problem := ocr.endpoint_problem():
+        if problem := ocr.config_problem():
             return False, problem
         # The hosted API bills per call, so it needs a key; a custom endpoint
         # may be self-hosted and keyless, and that is a usable configuration.
         if ocr.needs_key() and not ocr.api_key():
-            return False, f"{ocr.api_key_env} is unset (needed by tools.ocr.provider)"
+            return False, f"{ocr.api_key_env} is unset (needed by the OCR endpoint)"
         # Only the dedicated API is an httpx client. The local path uses
         # pypdfium2 and the vision model, so a missing httpx must not switch
         # off PDF and image reading that would still work.
-        if ocr.provider_of():
+        if ocr.uses_api():
             try:
                 import httpx  # noqa: F401
             except ImportError:
-                return False, "httpx is not installed; tools.ocr.provider needs it"
+                return False, "httpx is not installed; the OCR endpoint needs it"
             return True, ""
         if missing := _missing_local_library():
             package, install = missing
             return False, (
                 f"{package} is not installed; the local PDF path needs it "
-                f"(pip install {install}), or set [tools.ocr] provider"
+                f"(pip install {install}), or set [tools.ocr] base_url"
             )
         return True, ""
 
@@ -179,20 +180,35 @@ class OCRTool(Tool):
                 return ToolResult.failure(
                     f"refusing to OCR {raw!r}: {reason} (only globally reachable http/https hosts)"
                 )
-            return await self._url(raw)
+            return await self._url(raw, arguments)
         return await self._file(Path(raw), arguments, ctx)
 
-    async def _url(self, url: str) -> ToolResult:
+    @staticmethod
+    def _requested_pages(arguments: dict[str, Any]) -> list[int] | None:
+        """0-based pages for the dedicated API, or ``None`` for the whole document.
+
+        Only the model's explicit ``max_pages`` ask limits the API path — the
+        configured ``tools.ocr.max_pages`` default is a local-render knob, and
+        silently capping a document the endpoint pages itself would hide most
+        of a long PDF behind a number the model never asked for.
+        """
+        limit = max_pages_clamped(arguments.get("max_pages"), 0)
+        return list(range(limit)) if limit > 0 else None
+
+    async def _url(self, url: str, arguments: dict[str, Any]) -> ToolResult:
         """OCR a public document URL — only the dedicated API can do this."""
         ocr = self._config.tools.ocr
-        if not ocr.provider_of():
+        if not ocr.uses_api():
             return ToolResult.failure(
-                "Reading a document from a URL needs a dedicated OCR provider. "
-                'Set `[tools.ocr] provider = "mistral"` (and MISTRAL_API_KEY) in '
-                "config.toml, or download the file into the project and call `ocr` on its path."
+                "Reading a document from a URL needs a dedicated OCR endpoint. "
+                'Set `[tools.ocr] base_url = "https://api.mistral.ai/v1"` (and '
+                "MISTRAL_API_KEY) in config.toml, or download the file into the "
+                "project and call `ocr` on its path."
             )
         try:
-            pages = await self._api_client().ocr(document_url=url)
+            pages = await self._api_client().ocr(
+                document_url=url, pages=self._requested_pages(arguments)
+            )
         except LLMError as exc:
             raise ToolError(str(exc)) from exc
         return _result(pages, source=url)
@@ -218,7 +234,7 @@ class OCRTool(Tool):
         if mime and not is_pdf:
             return await self._image_locally(path, mime)
 
-        if ocr.provider_of():
+        if ocr.uses_api():
             if not is_pdf and suffix != ".docx":
                 return ToolResult.failure(
                     f"{relative_to_root(path)} is not a supported OCR document. "
@@ -228,6 +244,7 @@ class OCRTool(Tool):
                 pages = await self._api_client().ocr(
                     document_b64=_read_b64(path),
                     content_type="application/pdf" if is_pdf else CONTENT_TYPES[suffix],
+                    pages=self._requested_pages(arguments),
                 )
             except LLMError as exc:
                 raise ToolError(str(exc)) from exc

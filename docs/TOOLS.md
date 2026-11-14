@@ -108,13 +108,15 @@ from `tools.enabled` to take it away from the model.
 The `ocr` tool reads PDFs, scans, and document images from project paths. It
 keeps the input-type routing explicit:
 
-- without a dedicated provider, embedded PDF text is extracted locally without
-  a model call;
-- locally rendered PDF pages use `llm.ocr.model`, then `llm.ocr_model`, then
-  the default `llm.model` route, never the photo-only vision route;
+- without `tools.ocr.base_url`, embedded PDF text is extracted locally
+  without a model call;
+- locally rendered PDF pages use the explicit file model (`llm.file.model` or
+  `llm.file_model`) — with none configured, scanned pages are refused instead
+  of being sent to the default `llm.model`, which on most endpoints cannot see
+  images at all;
 - image files use `llm.vision_model` or the `[llm.vision]` route, even when a
   dedicated OCR API is configured;
-- a dedicated `tools.ocr` provider can process whole PDFs and public document
+- a dedicated `tools.ocr.base_url` can process whole PDFs and public document
   URLs through a Mistral-compatible `POST /ocr` endpoint.
 
 The local machinery — rendering, guards, page windows — lives in
@@ -125,9 +127,34 @@ transcription contract: *text out*, never an attached image (attaching is
 
 The committed configuration enables the tool. Remove `"ocr"` from
 `tools.enabled` or set `tools.ocr.enabled = false` to disable it. Set
-`tools.ocr.provider = "mistral"` for the
-dedicated API path. With no provider, local PDF extraction needs `pypdfium2`
-and only scanned pages use the configured model.
+`tools.ocr.base_url` (for example `https://api.mistral.ai/v1`) for the
+dedicated API path, with `tools.ocr.model` as the model id it sends. With no
+`base_url`, local PDF extraction needs `pypdfium2` and only scanned pages use
+the configured model. Availability follows the endpoint: the hosted Mistral
+API needs `MISTRAL_API_KEY`, while a `base_url` pointed at your own compatible
+server runs keyless. There is no provider preset to choose — the URL is the
+provider.
+
+`tools.ocr.model` is required as soon as `base_url` is not Mistral's, since
+no OCR model id is portable between services: doctor and `available()` report
+the missing model rather than sending Mistral's id to another host. It may be
+left empty when `base_url` is empty (the local path sends no model) or is
+`https://api.mistral.ai/v1` (where `mistral-ocr-latest` is the default).
+
+On the dedicated API path the request follows Mistral's documented OCR shape:
+
+- `max_pages` becomes the 0-based `pages` parameter — only the first N pages
+  are sent. Without it the endpoint pages itself; the `tools.ocr.max_pages`
+  default is a local-render knob and never silently caps the API path.
+- `table_format` (`""` = endpoint default, `"markdown"`, `"html"`) picks the
+  table output format — HTML keeps merged cells and spans markdown flattens.
+- `extract_header` / `extract_footer` pull the repeating page header/footer
+  out of each page's markdown instead of leaving it duplicated per page.
+- `include_blocks` is always sent `false`: the documented default `true`
+  doubles the payload with paragraph bounding boxes the tool throws away.
+- page numbers come from the response's `index` field (both the 0-based
+  convention Mistral documents and 1-based servers are handled), and errors
+  quote the parsed `message` field rather than the raw body.
 
 ## Image generation (`image_gen`)
 
@@ -141,21 +168,27 @@ endpoint works by pointing `tools.image_gen.base_url` at it.
   read, rename or process afterwards;
 - it is delivered to the chat as an artifact, the same file-delivery path
   `files` uploads use;
-- `provider = "openai"` uses OpenAI's hosted API; `provider = "custom"` needs
-  its own `base_url` (validate refuses a custom provider still pointing at
-  the OpenAI default — that is a typo);
+- an empty `base_url` means OpenAI's hosted API; any other value is the
+  endpoint to call. There is no provider preset — the URL is the provider;
 - both `data[0].b64_json` and `data[0].url` answers are accepted, so models
   that host the result (dall-e-3's default) work unchanged;
-- availability follows the endpoint, not just the key: the hosted provider
-  bills per call, so with `api_key_env` unset the tool registers but
-  `available()` reports false and the model never sees it; a `custom`
-  endpoint may be self-hosted and take no auth, in which case the tool runs
-  keyless and sends no `Authorization` header at all.
+- availability follows the endpoint, not just the key: OpenAI bills per
+  call, so with `api_key_env` unset and `base_url` empty (OpenAI) the tool
+  registers but `available()` reports false and the model never sees it. A
+  `base_url` pointed anywhere else — self-hosted, a proxy, another compatible
+  host — is taken at its word and runs keyless; no `Authorization` header is
+  sent at all.
+
+`tools.image_gen.model` is required as soon as `base_url` is not OpenAI's,
+for the same reason: no image model id is portable between services. It may
+be left empty when `base_url` is empty or is `https://api.openai.com/v1`,
+where `gpt-image-1` is the default. A missing model is a doctor failure and
+an `available()` reason, never a guessed id.
 
 ```toml
 [tools.image_gen]
-provider = "openai"          # or "custom" + base_url = "https://…/v1"
-model = "gpt-image-1"
+base_url = "https://api.openai.com/v1"   # empty = this default
+model = ""                 # empty = gpt-image-1; required for any other host
 api_key_env = "OPENAI_API_KEY"
 size = "1024x1024"           # default size; "auto" = provider default
 ```
@@ -385,13 +418,15 @@ the guardrails assume about the machine they run on is written down in
 
 ```toml
 [tools.web]
-provider_order = ["firecrawl", "exa", "tavily", "you", "mcp"]
+provider_order = ["firecrawl", "exa", "tavily", "contextdev", "keenable", "jina", "you", "mcp"]
 ```
 
 - **firecrawl** — best for reading a specific page. Renders JavaScript, returns clean markdown. The hosted API needs a `FIRECRAWL_API_KEY`; point `base_url` at a self-hosted instance (Firecrawl is open source) and it runs keyless. A comma-separated key pool with the same three strategies (`tools.web.firecrawl.key_strategy`) keeps the bot up when one key is rate-limited.
 - **exa** — neural search built for agents: natural-language queries in, semantically ranked pages out, with highlights or full text per hit. The hosted API needs an `EXA_API_KEY`; an overridden `base_url` (your own endpoint or proxy) runs keyless. Same rotation rules as the others (`tools.web.exa.key_strategy`). Optional `search_type` (`auto` / `neural` / `keyword`) and `category` (`news`, `github`, `paper`, `pdf`, ...) knobs in `[tools.web.providers.exa]`.
 - **tavily** — best for agentic search. LLM-ready snippets, optional bundled answer. **Works without an API key** — the SDK runs in its free tier (low rate limit; `search` and `extract` only) when `TAVILY_API_KEY` is unset. With one or more keys, a failed key is parked for a minute and the next one answers; `tools.web.tavily.key_strategy` picks `fallback` / `round_robin` / `random`.
 - **contextdev** — [Context.dev](https://context.dev) search built for AI agents: relevance-ranked hits with query-relevant highlight passages (`highlights = true`, +1 credit per 10 results) and optional per-hit page markdown (`include_markdown`, +1 credit per page). The hosted API has a free tier (1,000 credits/month) but needs a `CONTEXT_DEV_API_KEY`; an overridden `base_url` runs keyless. Speaks the REST API directly over httpx — no SDK dependency. Same rotation rules as the others (`tools.web.contextdev.key_strategy`).
+- **keenable** — [Keenable](https://keenable.ai) search and page fetch on its own index: ranked pages with their text already extracted, and a fetched URL as clean markdown. **Works without a key** — the `/search/public` and `/fetch/public` endpoints need only an app name (`app_title`, sent as `X-Keenable-Title`, 1,000 requests/hour per IP). A `KEENABLE_API_KEY` lifts that cap and uses the account's free monthly allowance. Speaks the REST API directly over httpx — no SDK dependency. Same rotation rules as the others (`tools.web.keenable.key_strategy`); `mode` picks `pro` (deeper retrieval, the default) or `realtime` (fastest).
+- **jina** — [Jina Reader](https://r.jina.ai) fetch, plus [Jina Search](https://s.jina.ai) as an optional fallback. Reader is the whole API as the URL (`https://r.jina.ai/<url>`, like `curl https://r.jina.ai/https://www.example.com`), returning the page as clean markdown, so a page no search provider can read still has a last resort. Fetch works keyless (rate-limited). Search is the same shape (`https://s.jina.ai/<query>`) but **needs a key**, so it is only offered while `JINA_API_KEY` is set; without one the provider is skipped for search rather than counted as a failure. Search hits arrive already read — title, URL, description and full page content. The endpoint takes no recency parameter, so a `days` window is applied to the publication dates the hits report (undated hits are kept rather than discarded). Keys rotate for both (`tools.web.jina.key_strategy`), and `search_base_url` points search at a proxy or the EU host.
 - **you** — You.com's hosted MCP endpoint, `https://api.you.com/mcp?profile=free`. **Keyless by design**: no account and no API key, so a fresh clone still has a working search (low rate limit). A `YOU_API_KEY`, when set, is sent as an `X-API-Key` header. Disable it with `enabled = false` in `[tools.web.providers.you]`.
 - **mcp** — reads `.mcp.json` from the project root and `~/.agents/mcp.json` (for servers configured once for every project; the project file wins on a duplicate server name, and `tools.web.providers.mcp.user_config_file = ""` turns the user file off), expands `${VAR}` from the environment, and speaks MCP over streamable HTTP or stdio. It discovers each server's tools and reads their input schemas, so it works with a server whose parameter is called `q` instead of `query`. It only ever calls a tool that looks like a search or a page read — the server's *other* tools belong to the [`mcp` tool](#mcp-action-surface) below. A project-file entry connects only after the owner approved it (see [MCP (action surface)](#mcp-action-surface)); unapproved servers are skipped, so a search never dials one.
 

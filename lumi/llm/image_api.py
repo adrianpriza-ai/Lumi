@@ -55,12 +55,12 @@ class ImageGenClient:
     @property
     def endpoint(self) -> str:
         """The full URL: ``<base_url>/images/generations``, whatever the slash state."""
-        if problem := self.config.endpoint_problem():
+        if problem := self.config.config_problem():
             raise LLMError(problem)
-        return self.config.base_url.strip().rstrip("/") + "/images/generations"
+        return self.config.base_url_of() + "/images/generations"
 
     def describe(self) -> str:
-        return f"{self.config.model} via {self.endpoint}"
+        return f"{self.config.model_of()} via {self.endpoint}"
 
     async def generate(self, prompt: str, size: str = "") -> tuple[str, bytes]:
         """Generate one image. Returns ``(mime, bytes)``.
@@ -87,7 +87,11 @@ class ImageGenClient:
             )
         headers = {"Authorization": f"Bearer {key}"} if key else {}
 
-        payload: dict[str, Any] = {"model": self.config.model, "prompt": prompt, "n": 1}
+        payload: dict[str, Any] = {
+            "model": self.config.model_of(),
+            "prompt": prompt,
+            "n": 1,
+        }
         if size := size.strip() or self.config.size.strip():
             payload["size"] = size
 

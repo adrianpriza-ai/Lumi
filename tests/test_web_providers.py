@@ -15,6 +15,14 @@ touches the network. The contract under test:
 - **Context.dev** — raw httpx (no SDK): availability follows the key on the
   hosted endpoint, an overridden base_url runs keyless, freshness maps to
   its day buckets, highlights become the hit body, and the pool rotates.
+- **Keenable** — raw httpx (no SDK) and keyless by default: the public
+  endpoints carry an app name instead of a key, a configured key switches to
+  the keyed paths, the config knobs map to the API's own fields (clamped to
+  the ranges it accepts), and a 400 does not park the key.
+- **Jina** — Reader is the whole API as a URL (`<base>/<url>`) and works
+  keyless; Search needs a key, so the provider offers it only then and the
+  web tool skips it otherwise. Its recency window is applied to the publish
+  dates the hits report, because the endpoint takes no date parameter.
 """
 
 from __future__ import annotations
@@ -25,10 +33,21 @@ from typing import Any
 
 import httpx
 
-from lumi.config import ContextDevConfig, ExaConfig, FirecrawlConfig, MCPConfig, TavilyConfig
+from lumi.config import (
+    ContextDevConfig,
+    ExaConfig,
+    FirecrawlConfig,
+    JinaConfig,
+    KeenableConfig,
+    MCPConfig,
+    TavilyConfig,
+)
+from lumi.tools.web.providers.base import Page, SearchHit, SearchResult, WebProvider
 from lumi.tools.web.providers.contextdev_provider import ContextDevProvider
 from lumi.tools.web.providers.exa_provider import ExaProvider
 from lumi.tools.web.providers.firecrawl_provider import FirecrawlProvider
+from lumi.tools.web.providers.jina_provider import JinaProvider
+from lumi.tools.web.providers.keenable_provider import KeenableProvider
 from lumi.tools.web.providers.mcp_provider import DiscoveredTool, MCPProvider
 from lumi.tools.web.providers.tavily_provider import TavilyProvider
 
@@ -1406,3 +1425,636 @@ async def test_contextdev_a_non_object_scrape_body_is_a_failed_attempt(monkeypat
 
     assert page.markdown == "# body"
     assert state["n"] == 2
+
+
+# --------------------------------------------------------------------------- #
+# Keenable — raw httpx, keyless by default
+# --------------------------------------------------------------------------- #
+
+
+def install_recording_http(monkeypatch, respond) -> list[httpx.Request]:
+    """Route the provider's httpx calls through a MockTransport; return the
+    requests so tests can check paths, headers and query parameters."""
+    requests: list[httpx.Request] = []
+
+    def respond_and_record(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return respond(request)
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: _REAL_ASYNC_CLIENT(
+            transport=httpx.MockTransport(respond_and_record), **kwargs
+        ),
+    )
+    return requests
+
+
+def test_keenable_is_available_without_a_key(monkeypatch) -> None:
+    monkeypatch.delenv("KEENABLE_API_KEY", raising=False)
+    ok, reason = KeenableProvider(KeenableConfig()).available()
+    assert ok, reason
+
+
+async def test_keenable_keyless_search_uses_the_public_endpoint(monkeypatch) -> None:
+    monkeypatch.delenv("KEENABLE_API_KEY", raising=False)
+    requests = install_recording_http(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={
+                "query": "q",
+                "mode": "pro",
+                "results": [
+                    {
+                        "title": "One",
+                        "url": "https://one.test",
+                        "snippet": "page text",
+                        "published_at": "2026-10-30T00:00:00Z",
+                    }
+                ],
+            },
+        ),
+    )
+    provider = KeenableProvider(KeenableConfig())
+
+    result = await provider.search("q", 5, days=7)
+
+    assert result.ok
+    hit = result.hits[0]
+    assert (hit.url, hit.title) == ("https://one.test", "One")
+    assert hit.content == "page text"
+    assert hit.published == "2026-10-30T00:00:00Z"
+    (request,) = requests
+    assert request.url.path == "/v1/search/public"
+    assert request.headers["X-Keenable-Title"] == "Lumi"
+    assert "X-API-Key" not in request.headers
+    body = json.loads(request.content)
+    assert body["max_results"] == 5
+    assert body["mode"] == "pro"
+    assert body["published_after"] == "7d"
+    assert "snippet_max_length" not in body  # 0 leaves the server default
+
+
+async def test_keenable_keyed_search_sends_the_key(monkeypatch) -> None:
+    monkeypatch.setenv("KEENABLE_API_KEY", "keen-91")
+    requests = install_recording_http(
+        monkeypatch, lambda request: httpx.Response(200, json={"results": []})
+    )
+    provider = KeenableProvider(KeenableConfig())
+
+    result = await provider.search("q", 3)
+
+    assert result.ok
+    (request,) = requests
+    assert request.url.path == "/v1/search"
+    assert request.headers["X-API-Key"] == "keen-91"
+    assert "published_after" not in json.loads(request.content)
+
+
+async def test_keenable_pool_rotates_on_failure(monkeypatch) -> None:
+    monkeypatch.setenv("KEENABLE_API_KEY", "keen-91, keen-92")
+    state = {"n": 0}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        state["n"] += 1
+        if state["n"] == 1:
+            return httpx.Response(429, json={"error": "rate_limited", "message": "slow down"})
+        return httpx.Response(200, json={"results": [{"url": "https://ok", "title": "OK"}]})
+
+    install_recording_http(monkeypatch, respond)
+    provider = KeenableProvider(KeenableConfig())
+
+    result = await provider.search("q", 5)
+
+    assert result.ok
+    assert len(result.hits) == 1
+    assert state["n"] == 2
+
+
+async def test_keenable_fetch_returns_markdown_and_the_final_url(monkeypatch) -> None:
+    monkeypatch.setenv("KEENABLE_API_KEY", "keen-91")
+    requests = install_recording_http(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={
+                "url": "https://landed.test/page",
+                "title": "Hello",
+                "content": "# body",
+            },
+        ),
+    )
+    provider = KeenableProvider(KeenableConfig())
+
+    page = await provider.fetch("https://example.com")
+
+    assert page.title == "Hello"
+    assert page.url == "https://landed.test/page"
+    assert page.markdown == "# body"
+    (request,) = requests
+    assert request.url.path == "/v1/fetch"
+    assert request.url.params["url"] == "https://example.com"
+
+
+async def test_keenable_fetch_failure_renders_the_error_page(monkeypatch) -> None:
+    monkeypatch.setenv("KEENABLE_API_KEY", "keen-91")
+    install_recording_http(
+        monkeypatch,
+        lambda request: httpx.Response(
+            422, json={"error": "Unprocessable", "message": "content could not be extracted"}
+        ),
+    )
+    provider = KeenableProvider(KeenableConfig())
+
+    page = await provider.fetch("https://example.com")
+
+    assert page.markdown.startswith("scrape failed:")
+    assert "content could not be extracted" in page.markdown
+
+
+def test_keenable_strategy_unknown_falls_back(monkeypatch) -> None:
+    monkeypatch.setenv("KEENABLE_API_KEY", "keen-91")
+    provider = KeenableProvider(KeenableConfig(key_strategy="telepathy"))
+    assert provider._pool.strategy == "fallback"
+
+
+# --------------------------------------------------------------------------- #
+# Jina Reader — fetch only, keyless by default
+# --------------------------------------------------------------------------- #
+
+
+def test_jina_is_available_without_a_key(monkeypatch) -> None:
+    monkeypatch.delenv("JINA_API_KEY", raising=False)
+    ok, reason = JinaProvider(JinaConfig()).available()
+    assert ok, reason
+
+
+async def test_jina_fetch_builds_the_reader_url(monkeypatch) -> None:
+    monkeypatch.delenv("JINA_API_KEY", raising=False)
+    requests = install_recording_http(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={
+                "code": 200,
+                "data": {
+                    "title": "Example Domain",
+                    "url": "https://www.example.com/",
+                    "content": "# Example\n\nbody",
+                },
+            },
+        ),
+    )
+    page = await JinaProvider(JinaConfig()).fetch("https://www.example.com")
+
+    assert page.title == "Example Domain"
+    assert page.url == "https://www.example.com/"
+    assert page.markdown == "# Example\n\nbody"
+    (request,) = requests
+    assert request.url.path == "/https://www.example.com"
+    assert request.headers["Accept"] == "application/json"
+    assert "Authorization" not in request.headers
+
+
+async def test_jina_key_goes_out_as_a_bearer_token(monkeypatch) -> None:
+    monkeypatch.setenv("JINA_API_KEY", "jina-91")
+    requests = install_recording_http(
+        monkeypatch,
+        lambda request: httpx.Response(200, json={"data": {"content": "text"}}),
+    )
+    page = await JinaProvider(JinaConfig()).fetch("https://example.com")
+
+    assert page.markdown == "text"
+    (request,) = requests
+    assert request.headers["Authorization"] == "Bearer jina-91"
+
+
+async def test_jina_plain_text_body_is_still_the_page(monkeypatch) -> None:
+    monkeypatch.delenv("JINA_API_KEY", raising=False)
+    install_recording_http(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200, text="# Markdown\n\ntext", headers={"content-type": "text/plain"}
+        ),
+    )
+    page = await JinaProvider(JinaConfig()).fetch("https://example.com")
+    assert "Markdown" in page.markdown
+
+
+async def test_jina_http_error_becomes_a_scrape_failure(monkeypatch) -> None:
+    monkeypatch.delenv("JINA_API_KEY", raising=False)
+    install_recording_http(
+        monkeypatch,
+        lambda request: httpx.Response(404, text="Target URL returned a 404"),
+    )
+    page = await JinaProvider(JinaConfig()).fetch("https://example.com/missing")
+
+    assert page.markdown.startswith("scrape failed:")
+    assert "HTTP 404" in page.markdown
+
+
+async def test_jina_pool_rotates_on_failure(monkeypatch) -> None:
+    monkeypatch.setenv("JINA_API_KEY", "jina-91, jina-92")
+    state = {"n": 0}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        state["n"] += 1
+        if state["n"] == 1:
+            return httpx.Response(429, text="rate limited")
+        return httpx.Response(200, json={"data": {"content": "text"}})
+
+    install_recording_http(monkeypatch, respond)
+    page = await JinaProvider(JinaConfig()).fetch("https://example.com")
+
+    assert page.markdown == "text"
+    assert state["n"] == 2
+
+
+async def test_web_search_skips_jina_without_a_key(config, monkeypatch) -> None:
+    """Keyless Jina can only fetch; it must not cost a failed search attempt."""
+    monkeypatch.delenv("JINA_API_KEY", raising=False)
+    from lumi.tools.web.tool import WebTool
+
+    class Stub(WebProvider):
+        name = "stub"
+
+        def available(self) -> tuple[bool, str]:
+            return True, ""
+
+        async def search(
+            self, query: str, max_results: int, days: int | None = None
+        ) -> SearchResult:
+            return SearchResult(
+                query=query,
+                provider=self.name,
+                hits=[SearchHit(title="T", url="https://hit.test")],
+            )
+
+        async def fetch(self, url: str) -> Page:
+            return Page(url=url)
+
+    tool = WebTool(config)
+    tool.providers = {"jina": JinaProvider(JinaConfig()), "stub": Stub()}
+
+    result = await tool._search({"query": "q", "max_results": 3})
+
+    assert result.data["provider"] == "stub"
+    assert "jina" not in result.text
+
+
+def test_jina_search_needs_a_key(monkeypatch) -> None:
+    monkeypatch.delenv("JINA_API_KEY", raising=False)
+    provider = JinaProvider(JinaConfig())
+    assert provider.supports_search is False
+
+    monkeypatch.setenv("JINA_API_KEY", "jina-91")
+    assert JinaProvider(JinaConfig()).supports_search is True
+
+
+async def test_jina_keyless_search_says_it_needs_a_key(monkeypatch) -> None:
+    monkeypatch.delenv("JINA_API_KEY", raising=False)
+    result = await JinaProvider(JinaConfig()).search("lumi", 5)
+
+    assert not result.ok
+    assert "JINA_API_KEY" in result.error
+
+
+async def test_jina_search_maps_the_json_result_list(monkeypatch) -> None:
+    monkeypatch.setenv("JINA_API_KEY", "jina-91")
+    requests = install_recording_http(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={
+                "code": 200,
+                "data": [
+                    {
+                        "title": "First",
+                        "url": "https://first.test",
+                        "description": "the snippet",
+                        "content": "# First\n\nfull text",
+                        "publishedTime": "2026-01-02",
+                    },
+                    {"title": "Second", "url": "https://second.test"},
+                    {"title": "No URL"},
+                ],
+            },
+        ),
+    )
+    result = await JinaProvider(JinaConfig()).search("capital of france", 3)
+
+    assert result.ok
+    assert [hit.title for hit in result.hits] == ["First", "Second"]
+    first, second = result.hits
+    assert first.url == "https://first.test"
+    assert first.snippet == "the snippet"
+    assert first.content == "# First\n\nfull text"
+    assert first.published == "2026-01-02"
+    assert second.url == "https://second.test"
+
+    (request,) = requests
+    assert str(request.url).startswith("https://s.jina.ai/capital%20of%20france")
+    assert request.url.params["num"] == "3"
+    assert request.headers["Authorization"] == "Bearer jina-91"
+    assert request.headers["Accept"] == "application/json"
+
+
+async def test_jina_search_trims_to_the_requested_count(monkeypatch) -> None:
+    monkeypatch.setenv("JINA_API_KEY", "jina-91")
+    install_recording_http(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"title": "A", "url": "https://a.test"},
+                    {"title": "B", "url": "https://b.test"},
+                ]
+            },
+        ),
+    )
+    result = await JinaProvider(JinaConfig()).search("q", 1)
+    assert [hit.url for hit in result.hits] == ["https://a.test"]
+
+
+async def test_jina_search_pool_rotates_on_failure(monkeypatch) -> None:
+    monkeypatch.setenv("JINA_API_KEY", "jina-91, jina-92")
+    seen: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers["Authorization"])
+        if len(seen) == 1:
+            return httpx.Response(429, text="rate limited")
+        return httpx.Response(200, json={"data": [{"title": "A", "url": "https://a.test"}]})
+
+    install_recording_http(monkeypatch, respond)
+    result = await JinaProvider(JinaConfig()).search("q", 5)
+
+    assert result.ok
+    assert seen == ["Bearer jina-91", "Bearer jina-92"]
+
+
+async def test_jina_search_http_error_is_reported(monkeypatch) -> None:
+    monkeypatch.setenv("JINA_API_KEY", "jina-91")
+    install_recording_http(
+        monkeypatch,
+        lambda request: httpx.Response(401, text="Authentication required"),
+    )
+    result = await JinaProvider(JinaConfig()).search("q", 5)
+
+    assert not result.ok
+    assert "HTTP 401" in result.error
+    assert "Authentication required" in result.error
+
+
+async def test_jina_search_without_a_json_list_is_a_failure(monkeypatch) -> None:
+    monkeypatch.setenv("JINA_API_KEY", "jina-91")
+    install_recording_http(
+        monkeypatch,
+        lambda request: httpx.Response(200, text="a markdown SERP"),
+    )
+    result = await JinaProvider(JinaConfig()).search("q", 5)
+
+    assert not result.ok
+    assert "no JSON result list" in result.error
+
+
+async def test_web_search_falls_back_to_keyed_jina(config, monkeypatch) -> None:
+    from lumi.tools.web.tool import WebTool
+
+    monkeypatch.setenv("JINA_API_KEY", "jina-91")
+    install_recording_http(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={"data": [{"title": "Jina hit", "url": "https://jina.test"}]},
+        ),
+    )
+
+    class Down(WebProvider):
+        name = "down"
+
+        def available(self) -> tuple[bool, str]:
+            return True, ""
+
+        async def search(
+            self, query: str, max_results: int, days: int | None = None
+        ) -> SearchResult:
+            return SearchResult(query=query, provider=self.name, error="offline")
+
+        async def fetch(self, url: str) -> Page:
+            return Page(url=url)
+
+    tool = WebTool(config)
+    tool.providers = {"down": Down(), "jina": JinaProvider(JinaConfig())}
+
+    result = await tool._search({"query": "q", "max_results": 3})
+
+    assert result.data["provider"] == "jina"
+    assert "jina.test" in result.text
+
+
+def test_jina_status_says_what_reader_and_search_run_on(monkeypatch) -> None:
+    monkeypatch.delenv("JINA_API_KEY", raising=False)
+    assert "search off" in JinaProvider(JinaConfig()).status()
+
+    monkeypatch.setenv("JINA_API_KEY", "jina-91")
+    assert JinaProvider(JinaConfig()).status() == "reader + search (1 key)"
+
+    monkeypatch.setenv("JINA_API_KEY", "jina-91, jina-92")
+    assert JinaProvider(JinaConfig()).status() == "reader + search (2 keys)"
+
+    assert JinaProvider(JinaConfig(enabled=False)).status().startswith("off —")
+
+
+async def test_jina_search_applies_the_recency_window_to_dated_hits(monkeypatch) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    monkeypatch.setenv("JINA_API_KEY", "jina-91")
+    today = datetime.now(UTC).date()
+    install_recording_http(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "title": "old",
+                        "url": "https://old.test",
+                        "publishedTime": (today - timedelta(days=30)).isoformat(),
+                    },
+                    {"title": "new", "url": "https://new.test", "publishedTime": today.isoformat()},
+                    {"title": "undated", "url": "https://undated.test"},
+                ]
+            },
+        ),
+    )
+    result = await JinaProvider(JinaConfig()).search("q", 5, days=7)
+
+    assert [hit.url for hit in result.hits] == [
+        "https://new.test",
+        "https://undated.test",
+    ]
+
+
+async def test_jina_search_drops_duplicate_urls(monkeypatch) -> None:
+    monkeypatch.setenv("JINA_API_KEY", "jina-91")
+    install_recording_http(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"title": "A", "url": "https://a.test"},
+                    {"title": "A again", "url": "https://a.test"},
+                ]
+            },
+        ),
+    )
+    result = await JinaProvider(JinaConfig()).search("q", 5)
+    assert [hit.title for hit in result.hits] == ["A"]
+
+
+def test_web_status_lists_jina_tier(config, monkeypatch) -> None:
+    from lumi.tools.web.tool import WebTool
+
+    monkeypatch.delenv("JINA_API_KEY", raising=False)
+    lines = WebTool(config).status_lines()
+    assert "jina: reader keyless · search off (JINA_API_KEY unset)" in lines
+
+
+def test_web_status_says_when_a_new_provider_is_not_in_the_order(config) -> None:
+    from lumi.tools.web.tool import WebTool
+
+    tool = WebTool(config)
+    tool.providers.pop("keenable")
+    tool.providers.pop("jina")
+    lines = tool.status_lines()
+    assert "keenable: not in provider_order" in lines
+    assert "jina: not in provider_order" in lines
+
+
+def test_keenable_status_names_the_tier(monkeypatch) -> None:
+    monkeypatch.delenv("KEENABLE_API_KEY", raising=False)
+    assert KeenableProvider(KeenableConfig()).status() == (
+        "keyless (public endpoints as 'Lumi') · mode pro"
+    )
+
+    monkeypatch.setenv("KEENABLE_API_KEY", "keen-91, keen-92")
+    assert KeenableProvider(KeenableConfig()).status() == "keyed (2 keys) · mode pro"
+
+    assert KeenableProvider(KeenableConfig(enabled=False)).status().startswith("off —")
+
+
+def test_keenable_and_jina_are_unavailable_without_httpx(monkeypatch) -> None:
+    """Both sit in the web tool's fixed import graph: a missing httpx must
+    switch the provider off, not crash startup for the whole bot."""
+    import builtins
+
+    from lumi.tools.web.providers import jina_provider, keenable_provider
+
+    assert "httpx" not in vars(keenable_provider)
+    assert "httpx" not in vars(jina_provider)
+
+    real_import = builtins.__import__
+
+    def no_httpx(name, *args, **kwargs):
+        if name == "httpx":
+            raise ImportError("No module named 'httpx'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_httpx)
+
+    for provider in (KeenableProvider(KeenableConfig()), JinaProvider(JinaConfig())):
+        ok, reason = provider.available()
+        assert not ok
+        assert "httpx" in reason
+
+
+async def test_keenable_keyless_fetch_uses_the_public_endpoint(monkeypatch) -> None:
+    monkeypatch.delenv("KEENABLE_API_KEY", raising=False)
+    requests = install_recording_http(
+        monkeypatch,
+        lambda request: httpx.Response(
+            200,
+            json={"url": "https://example.com/", "title": "Example", "content": "# body"},
+        ),
+    )
+
+    page = await KeenableProvider(KeenableConfig()).fetch("https://example.com")
+
+    assert (page.url, page.markdown) == ("https://example.com/", "# body")
+    (request,) = requests
+    assert request.url.path == "/v1/fetch/public"
+    assert request.headers["X-Keenable-Title"] == "Lumi"
+    assert "X-API-Key" not in request.headers
+
+
+async def test_keenable_clamps_snippet_length_to_the_api_floor(monkeypatch) -> None:
+    """The API answers 400 below 180 characters; the request is raised to the
+    floor it accepts instead of failing the search over a config typo."""
+    monkeypatch.setenv("KEENABLE_API_KEY", "keen-91")
+    requests = install_recording_http(
+        monkeypatch, lambda request: httpx.Response(200, json={"results": []})
+    )
+
+    await KeenableProvider(KeenableConfig(snippet_max_length=100)).search("q", 5)
+
+    assert json.loads(requests[0].content)["snippet_max_length"] == 180
+
+
+async def test_keenable_a_400_does_not_park_the_key(monkeypatch) -> None:
+    """A rejected parameter is the request's fault: the pool still rotates
+    within the call, but the key stays fit for the next one."""
+    monkeypatch.setenv("KEENABLE_API_KEY", "keen-91, keen-92")
+    state = {"n": 0}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        state["n"] += 1
+        if state["n"] == 1:
+            return httpx.Response(400, json={"message": 'Unknown parameter(s): "nope"'})
+        return httpx.Response(200, json={"results": [{"url": "https://ok.test"}]})
+
+    install_recording_http(monkeypatch, respond)
+    provider = KeenableProvider(KeenableConfig())
+
+    result = await provider.search("q", 5)
+
+    assert result.ok
+    assert state["n"] == 2
+    assert provider._pool._parked_at == {}
+
+
+async def test_keenable_a_non_object_json_body_is_a_failed_attempt(monkeypatch) -> None:
+    monkeypatch.setenv("KEENABLE_API_KEY", "keen-91, keen-92")
+    state = {"n": 0}
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        state["n"] += 1
+        if state["n"] == 1:
+            return httpx.Response(200, json=["not", "an", "object"])
+        return httpx.Response(200, json={"results": [{"url": "https://ok.test"}]})
+
+    install_recording_http(monkeypatch, respond)
+    provider = KeenableProvider(KeenableConfig())
+
+    result = await provider.search("q", 5)
+
+    assert result.ok
+    assert state["n"] == 2
+
+
+async def test_keenable_names_the_reason_when_every_key_fails(monkeypatch) -> None:
+    monkeypatch.setenv("KEENABLE_API_KEY", "keen-91")
+    install_recording_http(
+        monkeypatch,
+        lambda request: httpx.Response(402, json={"message": "insufficient_credits"}),
+    )
+
+    result = await KeenableProvider(KeenableConfig()).search("q", 5)
+
+    assert not result.ok
+    assert "HTTP 402" in result.error
+    assert "insufficient_credits" in result.error

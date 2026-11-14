@@ -8,9 +8,9 @@ then read, edit or process like any other file) and travels to the chat as an
 artifact, the same file-delivery path ``files`` uses for uploads out.
 
 Generation is delegated, not local: no diffusion model runs in-process. The
-tool is available only when an endpoint and key are configured, and
-``available()`` says which piece is missing so ``/doctor`` and ``/tools`` can
-show the owner why.
+tool is available only when the endpoint can be called — OpenAI needs its key,
+an overridden ``base_url`` may be keyless — and ``available()`` says which
+piece is missing so ``/doctor`` and ``/tools`` can show the owner why.
 """
 
 from __future__ import annotations
@@ -116,14 +116,14 @@ class ImageGenTool(Tool):
     def available(self) -> tuple[bool, str]:
         if not self._settings.enabled:
             return False, "disabled by tools.image_gen.enabled"
-        if problem := self._settings.endpoint_problem():
+        if problem := self._settings.config_problem():
             return False, problem
         # The hosted API bills per call, so it needs a key; a custom endpoint
         # may be self-hosted and keyless, and that is a usable configuration.
         if self._settings.needs_key() and not self._settings.api_key():
             return (
                 False,
-                f"{self._settings.api_key_env} is unset (needed by tools.image_gen.provider)",
+                f"{self._settings.api_key_env} is unset (needed by the image endpoint)",
             )
         # The wire client imports httpx inside the request, so without this
         # check a missing module surfaced only as a failure on every prompt.

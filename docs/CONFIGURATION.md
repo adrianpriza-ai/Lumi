@@ -32,7 +32,7 @@ OPENAI_MODEL=nemotron-3-nano-reasoning
 [llm]
 base_url = "https://openrouter.ai/api/v1"
 model = "anthropic/claude-sonnet-4.5"
-api_key_env = "OPENROUTER_API_KEY"   # this provider's own key variable
+api_key_env = "OPENROUTER_API_KEY"   # this endpoint's own key variable
 inference_retries = 4                 # extra attempts; 5 requests total
 inference_retry_delay = 0.5           # seconds before the first retry
 ```
@@ -61,7 +61,7 @@ Always check what actually took effect:
 lumi config --key llm.base_url      # -> http://localhost:20128/v1
 lumi config --key llm.model         # -> nemotron-3-nano-reasoning
 lumi config --key llm.vision_model  # -> gpt-4o (empty means: use llm.model for photos)
-lumi config --key llm.ocr_model     # resolved PDF model, including the default fallback
+lumi config --key llm.file_model    # resolved file model, including the default fallback
 lumi config --key llm.key_strategy  # -> fallback
 lumi doctor | grep llm              # -> model via endpoint (from OPENAI_BASE_URL), keys: fallback
 ```
@@ -70,46 +70,60 @@ If a call fails, the error names the endpoint, model, and key variable it used, 
 
 ### Photo and PDF routing
 
-With no dedicated OCR provider, the model choice is:
+With no dedicated OCR endpoint (`tools.ocr.base_url` empty), the model choice
+is:
 
 | Configured models | Text-only context | Photos / image files | Scanned PDF pages |
 |-|-|-|-|
-| Default only | default | default | default |
-| Default + vision | default | vision | default |
-| Default + OCR | default | default | OCR |
-| All three | default | vision | OCR |
+| Default only | default | default | refused |
+| Default + vision | default | vision | refused |
+| Default + file | default | default | file |
+| All three | default | vision | file |
 
-Use `LUMI__LLM__VISION_MODEL` for photos and `LUMI__LLM__OCR_MODEL` for scanned
+Use `LUMI__LLM__VISION_MODEL` for photos and `LUMI__LLM__FILE_MODEL` for scanned
 PDFs. PDF pages with embedded text are extracted locally without inference.
 The selected model for image files or rendered PDF pages must accept images;
-`ocr_model` is a chat-completions model, not a dedicated `/ocr` model ID.
+`file_model` is a chat-completions model, not a dedicated `/ocr` model ID.
 Chat turns remain on the vision route while any image is still in their context.
 
-For separate endpoints or credentials, use `[llm.vision]` and `[llm.ocr]`:
+Scanned pages are never sent to the default model: most endpoints answer text
+with a model that cannot see images, so without an explicitly configured file
+model the read is refused with the fix in the message. Embedded-text pages
+still come out — they need no model at all.
+
+For separate endpoints or credentials, use `[llm.vision]` and `[llm.file]`:
 
 ```toml
 [llm.vision]
-provider = "openrouter"
 base_url = "https://openrouter.ai/api/v1"
 api_key_env = "OPENROUTER_API_KEY"
 # model = "your-vision-model"
 
-[llm.ocr]
+[llm.file]
 # model = "your-document-chat-model"
 ```
 
 Each route inherits unspecified fields from `[llm]`. A route's `model` takes
-precedence over its flat `vision_model` or `ocr_model` setting. The PDF route
-never inherits the vision endpoint, model, or key. A provider name alone does
-not select an endpoint: set `base_url` when changing hosts.
+precedence over its flat `vision_model` or `file_model` setting. The file
+route never inherits the vision endpoint, model, or key. `base_url` is the
+whole routing decision — every endpoint speaks the same wire format, so there
+is no provider preset to pick.
 
-`tools.ocr.provider = "mistral"` or `"custom"` selects a dedicated document
-API instead of local PDF extraction. That path uses `tools.ocr.model`,
-`tools.ocr.base_url`, and `tools.ocr.api_key_env`; it does not use `llm.ocr_model`.
-`custom` requires your own absolute HTTP(S) base URL. Missing OCR credentials
-make the tool unavailable, with no automatic switch to another provider.
-Local image files still use the photo route. Public document URLs require the
-dedicated API, and `max_pages` applies only to local PDF processing.
+`tools.ocr.base_url` selects a dedicated document API instead of local PDF
+extraction; there is no provider preset, only the endpoint. That path uses
+`tools.ocr.model`, `tools.ocr.base_url`, and `tools.ocr.api_key_env`; it does
+not use `llm.file_model`. The URL must be absolute HTTP(S). A `base_url` other
+than Mistral's also needs `tools.ocr.model`; there is no portable default, so
+an empty model makes the tool unavailable instead of sending Mistral's id to
+another host. Missing OCR credentials on the hosted Mistral endpoint make the
+tool unavailable too, with no automatic switch to another provider. The API
+path follows Mistral's documented request shape: an explicit `max_pages` ask
+becomes the 0-based `pages` parameter, `table_format` (`""` / `markdown` /
+`html`) picks the table output format, `extract_header` / `extract_footer`
+strip the repeating page header/footer, and page numbers come from the
+response's `index` field. Local image files still use the photo
+route. Public document URLs require the dedicated API, and `max_pages` applies
+only to local PDF processing.
 
 ## No output ceiling
 
@@ -351,7 +365,7 @@ the behaviour is unchanged.
 
 `CONTEXT7_API_KEY` accepts the same shape and the same three strategies via `tools.context7.key_strategy`, so the `context7` tool gets the same self-healing when one of a pool of keys is rate-limited.
 
-The web providers do too: `TAVILY_API_KEY`, `FIRECRAWL_API_KEY`, and `EXA_API_KEY` are all pools under the hood (`tools.web.tavily.key_strategy`, `tools.web.firecrawl.key_strategy`, `tools.web.exa.key_strategy`). Tavily additionally accepts a **keyless** mode — leave the variable unset and the SDK falls back to its free tier (lower rate limit; `search` and `extract` only). You.com is keyless the whole way: its free MCP profile (`tools.web.providers.you.url`) needs no account at all, and `YOU_API_KEY`, when set, is only sent as a header to raise the rate limit. Firecrawl and Exa have no keyless tier, so an unset env var means the provider is unavailable, not a fallback option. All of them share one parser and one rotation policy — `lumi/util/keys.py` and `lumi/llm/keypool.py` — so the rules above hold for every one of them.
+The web providers do too: `TAVILY_API_KEY`, `FIRECRAWL_API_KEY`, `EXA_API_KEY`, `CONTEXT_DEV_API_KEY`, `KEENABLE_API_KEY`, and `JINA_API_KEY` are all pools under the hood (`tools.web.<provider>.key_strategy`). Tavily additionally accepts a **keyless** mode — leave the variable unset and the SDK falls back to its free tier (lower rate limit; `search` and `extract` only). Keenable is keyless the same way: without `KEENABLE_API_KEY` it calls its public search and fetch endpoints (per-IP rate limit, app named by `tools.web.providers.keenable.app_title`), and a key only lifts that limit and bills the account's free allowance. Jina Reader reads any URL keyless; `JINA_API_KEY` raises its rate limit and is what enables Jina Search, so without one the provider is simply skipped for searches and used only for fetches. You.com is keyless the whole way: its free MCP profile (`tools.web.providers.you.url`) needs no account at all, and `YOU_API_KEY`, when set, is only sent as a header to raise the rate limit. Firecrawl and Exa have no keyless tier, so an unset env var means the provider is unavailable, not a fallback option. All of them share one parser and one rotation policy — `lumi/util/keys.py` and `lumi/llm/keypool.py` — so the rules above hold for every one of them.
 
 `TAVILY_API_KEY`, `FIRECRAWL_API_KEY`, and `EXA_API_KEY` take a single key each. A comma in any of them is not a pool; it is a broken key.
 

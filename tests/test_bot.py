@@ -1026,6 +1026,9 @@ async def test_status_command(config) -> None:
     assert "uptime" in body
     assert "test-model" in body
     assert "run_shell" in body  # tool inventory lives here now that /tools is gone
+    assert "web: tavily active" in body  # no keys in the fixture, so keyless Tavily answers
+    assert "keenable:" in body
+    assert "jina: reader keyless" in body
 
 
 async def test_context_command_reports_the_window(config) -> None:
@@ -3451,7 +3454,7 @@ async def test_config_shows_the_resolved_settings(config) -> None:
     bot, _ = await send(config, [], "/config")
     body = texts(bot)
     assert "test-model" in body
-    assert "firecrawl → exa → tavily → contextdev → you → mcp" in body
+    assert "firecrawl → exa → tavily → contextdev → keenable → jina → you → mcp" in body
     assert "group mode: mention" in body
     assert "upload retention: 7d groups / 30d personal" in body
     assert "workspace" in body

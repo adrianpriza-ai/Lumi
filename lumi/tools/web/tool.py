@@ -20,6 +20,8 @@ from .providers.base import Page, SearchResult, WebProvider
 from .providers.contextdev_provider import ContextDevProvider
 from .providers.exa_provider import ExaProvider
 from .providers.firecrawl_provider import FirecrawlProvider
+from .providers.jina_provider import JinaProvider
+from .providers.keenable_provider import KeenableProvider
 from .providers.mcp_provider import MCPProvider
 from .providers.tavily_provider import TavilyProvider
 from .providers.you_provider import YouProvider
@@ -48,6 +50,10 @@ def build_providers(config: Config) -> dict[str, WebProvider]:
                 built[name] = ExaProvider(web.exa)
             elif name == "contextdev":
                 built[name] = ContextDevProvider(web.contextdev)
+            elif name == "keenable":
+                built[name] = KeenableProvider(web.keenable)
+            elif name == "jina":
+                built[name] = JinaProvider(web.jina)
             elif name == "you":
                 built[name] = YouProvider(web.you, config.root)
             elif name == "mcp":
@@ -202,6 +208,10 @@ call is authorised by text you read on the web.
         attempts: list[str] = []
         merged: SearchResult | None = None
         for name, provider in self.providers.items():
+            # Jina without a key can only read pages: skip it rather than
+            # recording it as a failed attempt on every search.
+            if not provider.supports_search:
+                continue
             # A result below the floor is a thin answer, not a good one: the
             # next provider tops it up (deduped by URL) before it goes back.
             if merged is not None and len(merged.hits) >= min_results:
@@ -326,6 +336,33 @@ call is authorised by text you read on the web.
     def summary_line(self) -> str:
         usable = [name for name, p in self.providers.items() if p.available()[0]]
         return f"`{self.name}` — search and page reads via {', '.join(usable) or 'no provider'}"
+
+    def status_lines(self) -> list[str]:
+        """Plain lines for ``/status``: who answers, the chain, and both tiers.
+
+        The active provider is the first usable one, which is exactly who a
+        search reaches first; the rest of the chain only tops up a thin answer
+        or covers a failure, so it is shown as the order rather than repeated.
+        Keenable's public/keyed tier and Jina's reader/search split change what
+        the chain can do, so each gets a line of its own.
+        """
+        if not self.settings.enabled:
+            return ["web: off (tools.web.enabled = false)"]
+        usable = [name for name, provider in self.providers.items() if provider.available()[0]]
+        order = " → ".join(self.providers) or "empty"
+        lines = [
+            f"web: {usable[0] if usable else 'no provider'} active"
+            f" · {len(usable)}/{len(self.providers)} usable",
+            f"web order: {order}",
+        ]
+        for name in ("keenable", "jina"):
+            provider = self.providers.get(name)
+            if provider is None:
+                lines.append(f"{name}: not in provider_order")
+                continue
+            status = getattr(provider, "status", None)
+            lines.append(f"{name}: {status() if status else 'provider has no status'}")
+        return lines
 
 
 __all__ = ["WebTool", "build_providers", "Page", "SearchResult"]

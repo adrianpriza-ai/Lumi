@@ -488,8 +488,8 @@ class OpenAICompatClient(LLMClient):
             )
 
         if self.vision is not None and has_image_part(messages):
-            # [llm.vision] owns this request: separate provider, endpoint and
-            # key. The sub-client does its own retries and error explanation,
+            # [llm.vision] owns this request: separate endpoint and key. The
+            # sub-client does its own retries and error explanation,
             # naming its own endpoint — which is the point of the route.
             return await self.vision.complete(messages, tools=tools, on_delta=on_delta)
 

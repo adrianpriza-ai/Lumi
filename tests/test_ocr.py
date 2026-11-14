@@ -9,7 +9,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from lumi.config import OCRConfig
+from lumi.config import OCR_DEFAULT_BASE_URL, OCRConfig
 from lumi.llm.base import LLMError, LLMReply
 from lumi.llm.ocr_api import OCRDocumentClient
 from lumi.llm.openai_compat import OpenAICompatClient, request_model
@@ -98,12 +98,20 @@ class StubOCRServer:
         self.pages = pages
         self.calls: list[dict] = []
 
-    async def ocr(self, *, document_url=None, document_b64=None, content_type="application/pdf"):
+    async def ocr(
+        self,
+        *,
+        document_url=None,
+        document_b64=None,
+        content_type="application/pdf",
+        pages=None,
+    ):
         self.calls.append(
             {
                 "document_url": document_url,
                 "document_b64": document_b64,
                 "content_type": content_type,
+                "pages": pages,
             }
         )
         return self.pages
@@ -135,9 +143,28 @@ async def test_a_text_pdf_never_touches_the_model(config, project: Path) -> None
     assert result.data["scanned"] == 0
 
 
-async def test_a_scanned_page_falls_back_to_the_vision_model(config, project: Path) -> None:
+async def test_a_scanned_page_is_refused_without_a_file_model(config, project: Path) -> None:
+    """Most endpoints answer text with a model that cannot see images — so
+    without an explicit file model, rendered pages are never sent anywhere."""
     path = project / "workspace" / "scan.pdf"
     path.write_bytes(make_pdf(""))  # blank page: nothing embedded
+    tool = OCRTool(config)
+    stub = StubLLM(["transcribed words"])
+    tool._llm = stub
+
+    result = await tool.invoke({"path": str(path)}, ctx())
+
+    assert not result.ok
+    assert stub.calls == []  # nothing reached a model
+    assert "no file model is configured" in result.text
+    assert "llm.file_model" in result.text
+    assert "[tools.ocr] base_url" in result.text
+
+
+async def test_a_scanned_page_goes_to_the_file_model(config, project: Path) -> None:
+    path = project / "workspace" / "scan.pdf"
+    path.write_bytes(make_pdf(""))  # blank page: nothing embedded
+    config.llm.file_model = "qwen2.5-vl"
     tool = OCRTool(config)
     stub = StubLLM(["transcribed words"])
     tool._llm = stub
@@ -204,7 +231,7 @@ async def test_an_image_still_uses_the_vision_route_with_a_dedicated_ocr_provide
 ) -> None:
     path = project / "workspace" / "receipt.png"
     path.write_bytes(base64.b64decode(PNG_1PX))
-    config.tools.ocr.provider = "mistral"
+    config.tools.ocr.base_url = OCR_DEFAULT_BASE_URL
     image = StubLLM(["TOTAL 42.00"])
     tool = OCRTool(config)
     tool._image_llm = image
@@ -226,7 +253,7 @@ async def test_a_dedicated_ocr_provider_does_not_accept_plain_text_files(
 ) -> None:
     path = project / "workspace" / "notes.txt"
     path.write_text("just text", encoding="utf-8")
-    config.tools.ocr.provider = "mistral"
+    config.tools.ocr.base_url = OCR_DEFAULT_BASE_URL
 
     result = await OCRTool(config).invoke({"path": str(path)}, ctx())
 
@@ -250,7 +277,7 @@ def test_a_vision_model_never_changes_what_reads_a_pdf(config) -> None:
 
 def test_an_ocr_model_takes_pdfs_and_leaves_images_alone(config) -> None:
     config.llm.vision_model = "gpt-4o"
-    config.llm.ocr_model = "paddleocr-v4"
+    config.llm.file_model = "paddleocr-v4"
     tool = OCRTool(config)
     assert request_model(IMAGE_MESSAGES, tool._ocr_client().config) == "paddleocr-v4"
     assert request_model(IMAGE_MESSAGES, tool._image_client().config) == "gpt-4o"
@@ -263,12 +290,12 @@ def test_with_nothing_set_images_and_pdfs_share_the_default(config) -> None:
 
 
 @pytest.mark.parametrize("vision_model", ["", "photo-model"])
-@pytest.mark.parametrize("ocr_model", ["", "document-model"])
+@pytest.mark.parametrize("file_model", ["", "document-model"])
 async def test_routing_matrix_through_file_dispatch(
-    config, project, monkeypatch, vision_model, ocr_model
+    config, project, monkeypatch, vision_model, file_model
 ) -> None:
     config.llm.vision_model = vision_model
-    config.llm.ocr_model = ocr_model
+    config.llm.file_model = file_model
     used_models = []
 
     async def capture(client, messages, *, tools=None):
@@ -282,9 +309,13 @@ async def test_routing_matrix_through_file_dispatch(
     image.write_bytes(base64.b64decode(PNG_1PX))
     tool = OCRTool(config)
 
-    assert (await tool.invoke({"path": str(pdf)}, ctx())).ok
+    # A scanned PDF only ever reads when a file model is explicitly set;
+    # an image file always reads (the vision model, else the default).
+    assert (await tool.invoke({"path": str(pdf)}, ctx())).ok == bool(file_model)
     assert (await tool.invoke({"path": str(image)}, ctx())).ok
-    assert used_models == [ocr_model or "test-model", vision_model or "test-model"]
+    assert used_models == ([file_model] if file_model else []) + [
+        vision_model or "test-model"
+    ]
     assert request_model([{"role": "user", "content": "text"}], config.llm) == "test-model"
 
 
@@ -330,13 +361,13 @@ async def test_a_credential_file_is_not_sent_for_ocr(config, project: Path) -> N
 
 
 # --------------------------------------------------------------------------- #
-# the dedicated OCR API ([tools.ocr] provider = "mistral")
+# the dedicated OCR API (tools.ocr.base_url set)
 # --------------------------------------------------------------------------- #
 
 
 async def test_a_local_file_goes_to_the_api_base64(config, project: Path, monkeypatch) -> None:
     monkeypatch.setenv("MISTRAL_API_KEY", "mk-1")
-    config.tools.ocr.provider = "mistral"
+    config.tools.ocr.base_url = OCR_DEFAULT_BASE_URL
     path = project / "workspace" / "paper.pdf"
     data = make_pdf("hello api")
     path.write_bytes(data)
@@ -357,7 +388,7 @@ async def test_a_local_file_goes_to_the_api_base64(config, project: Path, monkey
 
 async def test_a_url_goes_to_the_api_as_a_document_url(config, monkeypatch) -> None:
     monkeypatch.setenv("MISTRAL_API_KEY", "mk-1")
-    config.tools.ocr.provider = "mistral"
+    config.tools.ocr.base_url = OCR_DEFAULT_BASE_URL
     tool = OCRTool(config)
     stub = StubOCRServer([(1, "arxiv text")])
     tool._api = stub
@@ -367,6 +398,25 @@ async def test_a_url_goes_to_the_api_as_a_document_url(config, monkeypatch) -> N
     assert result.ok
     assert stub.calls[0]["document_url"] == "https://arxiv.org/pdf/2201.04234"
     assert "arxiv text" in result.text
+
+
+async def test_max_pages_asks_the_api_for_a_zero_based_page_window(
+    config, monkeypatch
+) -> None:
+    """An explicit max_pages is the documented pages param; without one the
+    endpoint pages itself — the config default must not silently cap it."""
+    monkeypatch.setenv("MISTRAL_API_KEY", "mk-1")
+    config.tools.ocr.base_url = OCR_DEFAULT_BASE_URL
+    tool = OCRTool(config)
+    stub = StubOCRServer([(1, "one"), (2, "two")])
+    tool._api = stub
+
+    limited = await tool.invoke({"path": "https://example.com/doc.pdf", "max_pages": 2}, ctx())
+    whole = await tool.invoke({"path": "https://example.com/doc.pdf"}, ctx())
+
+    assert limited.ok and whole.ok
+    assert stub.calls[0]["pages"] == [0, 1]
+    assert stub.calls[1]["pages"] is None
 
 
 @pytest.mark.parametrize(
@@ -382,7 +432,7 @@ async def test_a_url_goes_to_the_api_as_a_document_url(config, monkeypatch) -> N
 async def test_a_private_host_url_is_refused_before_the_api(config, monkeypatch, url: str) -> None:
     """SSRF-shaped OCR URLs never reach the OCR API."""
     monkeypatch.setenv("MISTRAL_API_KEY", "mk-1")
-    config.tools.ocr.provider = "mistral"
+    config.tools.ocr.base_url = OCR_DEFAULT_BASE_URL
     tool = OCRTool(config)
     stub = StubOCRServer([(1, "should not be called")])
     tool._api = stub
@@ -394,7 +444,7 @@ async def test_a_private_host_url_is_refused_before_the_api(config, monkeypatch,
     assert stub.calls == []
 
 
-async def test_a_url_without_a_provider_explains_the_fix(config) -> None:
+async def test_a_url_without_an_endpoint_explains_the_fix(config) -> None:
     result = await OCRTool(config).invoke({"path": "https://example.com/x.pdf"}, ctx())
     assert not result.ok
     assert "tools.ocr" in result.text
@@ -402,7 +452,7 @@ async def test_a_url_without_a_provider_explains_the_fix(config) -> None:
 
 async def test_the_tool_is_unavailable_without_the_provider_key(config, monkeypatch) -> None:
     monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
-    config.tools.ocr.provider = "mistral"
+    config.tools.ocr.base_url = OCR_DEFAULT_BASE_URL
     ok, reason = OCRTool(config).available()
     assert not ok
     assert "MISTRAL_API_KEY" in reason
@@ -411,12 +461,23 @@ async def test_the_tool_is_unavailable_without_the_provider_key(config, monkeypa
 async def test_a_custom_endpoint_without_key_is_available(config, monkeypatch) -> None:
     """A self-hosted endpoint may take no auth; keyless is a real configuration."""
     monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
-    config.tools.ocr.provider = "custom"
     config.tools.ocr.base_url = "http://localhost:8787/v1"
+    config.tools.ocr.model = "local-ocr"
     assert OCRTool(config).available() == (True, "")
 
 
-def test_the_provider_route_is_unavailable_without_httpx(config, monkeypatch) -> None:
+def test_a_custom_endpoint_without_a_model_is_unavailable(config, monkeypatch) -> None:
+    """No OCR model id is portable: another host must name its own."""
+    monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    config.tools.ocr.base_url = "http://localhost:8787/v1"
+
+    ok, reason = OCRTool(config).available()
+
+    assert not ok
+    assert "tools.ocr" in reason and "model" in reason
+
+
+def test_the_endpoint_route_is_unavailable_without_httpx(config, monkeypatch) -> None:
     import builtins
 
     real_import = builtins.__import__
@@ -428,7 +489,7 @@ def test_the_provider_route_is_unavailable_without_httpx(config, monkeypatch) ->
 
     monkeypatch.setenv("MISTRAL_API_KEY", "mk-1")
     monkeypatch.setattr(builtins, "__import__", no_httpx)
-    config.tools.ocr.provider = "mistral"
+    config.tools.ocr.base_url = OCR_DEFAULT_BASE_URL
 
     ok, reason = OCRTool(config).available()
 
@@ -457,7 +518,6 @@ def test_the_local_path_is_unavailable_without_its_libraries(
     monkeypatch.delitem(sys.modules, blocked, raising=False)
     monkeypatch.setattr(builtins, "__import__", no_module)
     config.tools.ocr.enabled = True
-    config.tools.ocr.provider = ""
 
     ok, reason = OCRTool(config).available()
 
@@ -478,7 +538,6 @@ def test_a_missing_httpx_does_not_disable_the_local_path(config, monkeypatch) ->
 
     monkeypatch.setattr(builtins, "__import__", no_httpx)
     config.tools.ocr.enabled = True
-    config.tools.ocr.provider = ""
 
     assert OCRTool(config).available() == (True, "")
 
@@ -508,7 +567,7 @@ async def test_a_keyless_custom_endpoint_sends_no_auth_header(config, monkeypatc
 
     monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
     monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
-    client = OCRDocumentClient(OCRConfig(provider="custom", base_url="http://localhost:8787/v1"))
+    client = OCRDocumentClient(OCRConfig(base_url="http://localhost:8787/v1", model="local-ocr"))
 
     pages = await client.ocr(document_b64="JVBERg==")
 
@@ -523,11 +582,8 @@ def test_the_ocr_enabled_flag_is_honoured(config) -> None:
     assert "disabled" in reason
 
 
-@pytest.mark.parametrize("base_url", ["", "https://api.mistral.ai/v1/", "not-a-url"])
-async def test_invalid_custom_endpoint_is_blocked_before_http(
-    config, monkeypatch, base_url
-) -> None:
-    config.tools.ocr.provider = "custom"
+@pytest.mark.parametrize("base_url", ["not-a-url", "localhost:8787", "ftp://host/v1"])
+async def test_an_invalid_endpoint_is_blocked_before_http(config, monkeypatch, base_url) -> None:
     config.tools.ocr.base_url = base_url
     monkeypatch.setenv("MISTRAL_API_KEY", "test-ocr-key")
 
@@ -548,10 +604,19 @@ async def test_invalid_custom_endpoint_is_blocked_before_http(
 
 
 def test_the_endpoint_is_base_url_plus_ocr() -> None:
-    client = OCRDocumentClient(OCRConfig(provider="mistral"))
+    client = OCRDocumentClient(OCRConfig())
     assert client.endpoint == "https://api.mistral.ai/v1/ocr"
-    client = OCRDocumentClient(OCRConfig(provider="mistral", base_url="http://host/v1/"))
+    client = OCRDocumentClient(OCRConfig(base_url="http://host/v1/", model="host-ocr"))
     assert client.endpoint == "http://host/v1/ocr"
+
+
+def test_the_model_default_belongs_to_the_default_endpoint() -> None:
+    assert OCRConfig().model_of() == ""  # the local path sends no model
+    assert OCRConfig(base_url=OCR_DEFAULT_BASE_URL).model_of() == "mistral-ocr-latest"
+    custom = OCRConfig(base_url="https://ocr.example/v1")
+    assert custom.model_of() == ""
+    assert "model" in custom.model_problem()
+    assert custom.model_problem() == custom.config_problem()
 
 
 async def test_the_request_matches_the_mistral_shape(monkeypatch) -> None:
@@ -581,7 +646,9 @@ async def test_the_request_matches_the_mistral_shape(monkeypatch) -> None:
 
     monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
     monkeypatch.setenv("MISTRAL_API_KEY", "mk-9")
-    client = OCRDocumentClient(OCRConfig(provider="mistral", api_key_env="MISTRAL_API_KEY"))
+    client = OCRDocumentClient(
+        OCRConfig(base_url=OCR_DEFAULT_BASE_URL, api_key_env="MISTRAL_API_KEY")
+    )
 
     pages = await client.ocr(document_url="https://arxiv.org/pdf/2201.04234")
 
@@ -593,6 +660,115 @@ async def test_the_request_matches_the_mistral_shape(monkeypatch) -> None:
         "type": "document_url",
         "document_url": "https://arxiv.org/pdf/2201.04234",
     }
+    # Per the documented shape: no bbox payload, and nothing the owner did
+    # not configure — pages/table_format/headers only go out when asked.
+    assert captured["json"]["include_blocks"] is False
+    assert "pages" not in captured["json"]
+    assert "table_format" not in captured["json"]
+    assert "extract_header" not in captured["json"]
+    assert "extract_footer" not in captured["json"]
+
+
+def capture_transport(monkeypatch, *, status_code: int = 200, body: dict | None = None) -> dict:
+    """Swap httpx for a recorder; returns ``{url, json, headers}`` of the call."""
+    captured: dict = {}
+    spec = {"status": status_code, "body": body}
+
+    class FakeResponse:
+        def __init__(self):
+            self.status_code = spec["status"]
+            self.text = json.dumps(spec["body"]) if spec["body"] is not None else "{}"
+
+        def json(self):
+            return spec["body"] or {}
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            captured["headers"] = kwargs.get("headers")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, *, json):
+            captured["url"] = url
+            captured["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+    return captured
+
+
+async def test_max_pages_becomes_the_documented_zero_based_pages_param(monkeypatch) -> None:
+    monkeypatch.setenv("MISTRAL_API_KEY", "mk-9")
+    captured = capture_transport(
+        monkeypatch,
+        body={"pages": [{"index": 0, "markdown": "one"}, {"index": 1, "markdown": "two"}]},
+    )
+    client = OCRDocumentClient(OCRConfig())
+
+    pages = await client.ocr(document_b64="JVBERg==", pages=[0, 1])
+
+    assert pages == [(1, "one"), (2, "two")]  # requested numbers, not positions
+    assert captured["json"]["pages"] == [0, 1]
+
+
+async def test_zero_based_response_indexes_become_one_based_page_numbers(monkeypatch) -> None:
+    monkeypatch.setenv("MISTRAL_API_KEY", "mk-9")
+    capture_transport(
+        monkeypatch,
+        body={
+            "pages": [
+                {"index": 0, "markdown": "a"},
+                {"index": 1, "markdown": "b"},
+                {"index": 2, "markdown": "c"},
+            ]
+        },
+    )
+    client = OCRDocumentClient(OCRConfig())
+
+    pages = await client.ocr(document_b64="JVBERg==")
+
+    assert [number for number, _ in pages] == [1, 2, 3]
+
+
+async def test_one_based_response_indexes_pass_through_unchanged(monkeypatch) -> None:
+    """Compatible servers disagree about the index convention; a sequence
+    that already starts at 1 is read as finished page numbers."""
+    monkeypatch.setenv("MISTRAL_API_KEY", "mk-9")
+    capture_transport(
+        monkeypatch,
+        body={"pages": [{"index": 1, "markdown": "a"}, {"index": 2, "markdown": "b"}]},
+    )
+    client = OCRDocumentClient(OCRConfig())
+
+    pages = await client.ocr(document_b64="JVBERg==")
+
+    assert [number for number, _ in pages] == [1, 2]
+
+
+async def test_table_and_header_knobs_reach_the_request(monkeypatch) -> None:
+    monkeypatch.setenv("MISTRAL_API_KEY", "mk-9")
+    captured = capture_transport(monkeypatch, body={"pages": [{"index": 0, "markdown": "x"}]})
+    client = OCRDocumentClient(
+        OCRConfig(table_format="html", extract_header=True, extract_footer=True)
+    )
+
+    await client.ocr(document_b64="JVBERg==")
+
+    assert captured["json"]["table_format"] == "html"
+    assert captured["json"]["extract_header"] is True
+    assert captured["json"]["extract_footer"] is True
+
+
+async def test_an_error_response_quotes_the_parsed_message(monkeypatch) -> None:
+    monkeypatch.setenv("MISTRAL_API_KEY", "mk-9")
+    capture_transport(monkeypatch, status_code=422, body={"message": "image file is corrupted"})
+
+    with pytest.raises(LLMError, match="HTTP 422.*image file is corrupted"):
+        await OCRDocumentClient(OCRConfig()).ocr(document_b64="JVBERg==")
 
 
 async def test_an_error_response_quotes_the_body(monkeypatch) -> None:
@@ -618,7 +794,7 @@ async def test_an_error_response_quotes_the_body(monkeypatch) -> None:
 
     monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
     monkeypatch.setenv("MISTRAL_API_KEY", "mk-9")
-    client = OCRDocumentClient(OCRConfig(provider="mistral"))
+    client = OCRDocumentClient(OCRConfig())
 
     with pytest.raises(LLMError, match="HTTP 400.*unsupported file type"):
         await client.ocr(document_url="https://example.com/x.pdf")
@@ -626,13 +802,12 @@ async def test_an_error_response_quotes_the_body(monkeypatch) -> None:
 
 async def test_a_missing_key_is_named_before_any_request(monkeypatch) -> None:
     monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
-    client = OCRDocumentClient(OCRConfig(provider="mistral"))
+    client = OCRDocumentClient(OCRConfig(base_url=OCR_DEFAULT_BASE_URL))
     with pytest.raises(LLMError, match="MISTRAL_API_KEY is not set"):
         await client.ocr(document_url="https://example.com/x.pdf")
 
 
-@pytest.mark.parametrize("provider", ["mistral", "custom"])
-async def test_local_pdf_upload_uses_a_document_data_uri(monkeypatch, provider) -> None:
+async def test_local_pdf_upload_uses_a_document_data_uri(monkeypatch) -> None:
     requests = []
 
     def respond(request):
@@ -646,7 +821,7 @@ async def test_local_pdf_upload_uses_a_document_data_uri(monkeypatch, provider) 
         lambda **kwargs: client_class(transport=httpx.MockTransport(respond), **kwargs),
     )
     monkeypatch.setenv("MISTRAL_API_KEY", "test-ocr-key")
-    client = OCRDocumentClient(OCRConfig(provider=provider, base_url="https://ocr.example/v1"))
+    client = OCRDocumentClient(OCRConfig(base_url="https://ocr.example/v1", model="ocr-1"))
     encoded = base64.b64encode(make_pdf("hello")).decode("ascii")
 
     assert await client.ocr(document_b64=encoded) == [(1, "text")]

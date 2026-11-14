@@ -2016,6 +2016,10 @@ def build_handlers(config: Config) -> list[Any]:
             ok, reason = agent.registry.availability(tool)
             if not ok:
                 lines.append(f"- <code>{tool.name}</code>: {escape_html(reason)}")
+        web = agent.registry.get("web")
+        status = getattr(web, "status_lines", None)
+        if status is not None:
+            lines.extend(escape_html(line) for line in status())
         await reply(update, "\n".join(lines))
 
     async def doctor_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -106,29 +106,29 @@ class BotConfig:
 
 @dataclass(slots=True)
 class ModelRouteConfig:
-    """A per-role provider override — ``[llm.vision]`` and ``[llm.ocr]``.
+    """A per-role endpoint override — ``[llm.vision]`` and ``[llm.file]``.
 
     One model is rarely right for every request: a cheap text model answers
     most turns, while images and scanned documents want a vision-capable one —
-    possibly on a different provider, with its own endpoint and its own API
-    key. A route states only what differs; every empty field inherits the
-    ``[llm]`` table.
+    possibly on a different endpoint, with its own API key. A route states
+    only what differs; every empty field inherits the ``[llm]`` table. Every
+    endpoint speaks the OpenAI chat-completions wire format, so ``base_url``
+    is the whole routing decision — there is no provider preset to pick.
 
     .. code-block:: toml
 
         [llm]
-        model = "gpt-4.1-mini"          # provider A, key A
+        model = "gpt-4.1-mini"          # endpoint A, key A
 
         [llm.vision]
-        provider = "openrouter"
         model = "google/gemini-2.0-flash-001"
-        api_key_env = "OPENROUTER_API_KEY"   # provider B, key B
+        base_url = "https://openrouter.ai/api/v1"
+        api_key_env = "OPENROUTER_API_KEY"   # endpoint B, key B
 
-        [llm.ocr]
-        model = "gpt-4o-mini"           # the `ocr` tool's model for PDFs
+        [llm.file]
+        model = "qwen2.5-vl"            # the model that reads file contents
     """
 
-    provider: str = ""
     model: str = ""
     base_url: str = ""
     api_key_env: str = ""
@@ -138,13 +138,7 @@ class ModelRouteConfig:
         """Whether the route says anything at all — an empty table is unset."""
         return any(
             value.strip()
-            for value in (
-                self.provider,
-                self.model,
-                self.base_url,
-                self.api_key_env,
-                self.key_strategy,
-            )
+            for value in (self.model, self.base_url, self.api_key_env, self.key_strategy)
         )
 
 
@@ -178,7 +172,6 @@ DEFAULT_REASONING_EFFORT = "medium"
 
 @dataclass(slots=True)
 class LLMConfig:
-    provider: str = "openai"
     #: Model id to send. Empty means "unset" — see :meth:`model_of` for the
     #: precedence that fills it in: this value (whatever it is, including the
     #: default id itself), then ``OPENAI_MODEL``, then
@@ -191,17 +184,17 @@ class LLMConfig:
     #: routes to this model once an image is anywhere in the replayed context,
     #: because a text-only default could not read the history back either.
     vision_model: str = ""
-    #: Model the ``ocr`` tool reads PDFs with (scanned pages included).
-    #: Empty means "use ``model``" — the same default that answers text.
-    #: Deliberately not the vision model: photos go to ``vision_model``,
-    #: documents go here, everything else goes to ``model``. Env spelling:
-    #: ``LUMI__LLM__OCR_MODEL``.
-    ocr_model: str = ""
-    #: Per-role provider overrides; see :class:`ModelRouteConfig`. ``[llm.vision]``
-    #: sends image-bearing turns to their own provider/endpoint/key; ``[llm.ocr]``
-    #: does the same for the ``ocr`` tool. Empty tables inherit ``[llm]``.
+    #: Model that reads file contents needing a model call — scanned PDF
+    #: pages the ``ocr`` tool transcribes. Empty means "use ``model``" — the
+    #: same default that answers text. Deliberately not the vision model:
+    #: photos go to ``vision_model``, documents go here, everything else goes
+    #: to ``model``. Env spelling: ``LUMI__LLM__FILE_MODEL``.
+    file_model: str = ""
+    #: Per-role endpoint overrides; see :class:`ModelRouteConfig`. ``[llm.vision]``
+    #: sends image-bearing turns to their own endpoint/key; ``[llm.file]`` does
+    #: the same for file contents (scans). Empty tables inherit ``[llm]``.
     vision: ModelRouteConfig = field(default_factory=ModelRouteConfig)
-    ocr: ModelRouteConfig = field(default_factory=ModelRouteConfig)
+    file: ModelRouteConfig = field(default_factory=ModelRouteConfig)
     #: Empty means "ask the environment". See :meth:`base_url_of`.
     base_url: str = ""
     api_key_env: str = "OPENAI_API_KEY"
@@ -413,7 +406,6 @@ class LLMConfig:
         """*base* with the route's non-empty fields on top; *model* as the vision model."""
         return replace(
             base,
-            provider=route.provider.strip() or base.provider,
             base_url=route.base_url.strip() or base.base_url,
             api_key_env=route.api_key_env.strip() or base.api_key_env,
             key_strategy=route.key_strategy.strip() or base.key_strategy,
@@ -426,38 +418,50 @@ class LLMConfig:
         None when the route is unset — everything then goes to the default
         endpoint, exactly as before. A set route is a full :class:`LLMConfig`
         merged over ``[llm]``, so the vision client is built by the same code
-        as the main one: same provider registry, same key-pool machinery.
+        as the main one: same client, same key-pool machinery.
         """
         if not self.vision.is_set():
             return None
         return self._with_route(self.vision, self, self.vision.model.strip() or self.vision_model)
 
-    def ocr_model_of(self) -> str:
-        """The model the ``ocr`` tool sends PDF pages to.
+    def file_model_of(self) -> str:
+        """The model that reads file contents needing a model call.
 
-        ``[llm.ocr].model`` wins, then the flat ``llm.ocr_model`` (env spelling
-        ``LUMI__LLM__OCR_MODEL``), then the default model — the one that also
-        answers text. Deliberately *not* the vision model: one setting per
-        input type — photos to ``vision_model``, PDFs to ``ocr_model``,
-        everything to ``model`` — so configuring a vision model never
-        silently changes what reads a document.
+        ``[llm.file].model`` wins, then the flat ``llm.file_model`` (env
+        spelling ``LUMI__LLM__FILE_MODEL``), then the default model — the one
+        that also answers text. Deliberately *not* the vision model: one
+        setting per input type — photos to ``vision_model``, documents to
+        ``file_model``, everything to ``model`` — so configuring a vision
+        model never silently changes what reads a document.
         """
-        if self.ocr.model.strip():
-            return self.ocr.model.strip()
-        if self.ocr_model.strip():
-            return self.ocr_model.strip()
+        if self.file.model.strip():
+            return self.file.model.strip()
+        if self.file_model.strip():
+            return self.file_model.strip()
         return self.model_of()
 
-    def ocr_route_of(self) -> LLMConfig:
-        """The endpoint the ``ocr`` tool uses: ``[llm.ocr]`` merged over
-        ``[llm]``. Never None — the tool degrades to the default endpoint
+    def has_file_model(self) -> bool:
+        """Whether a file-reading model is *explicitly* configured.
+
+        Only ``[llm.file].model`` or the flat ``llm.file_model`` count — the
+        default model inherited by :meth:`file_model_of` does not, because
+        most endpoints answer text with a model that cannot see images at
+        all. Readers use this to refuse rendering scanned pages to an
+        unverified model rather than shipping pixels that come back as a 400
+        or a guess.
+        """
+        return bool(self.file.model.strip() or self.file_model.strip())
+
+    def file_route_of(self) -> LLMConfig:
+        """The endpoint file contents go to: ``[llm.file]`` merged over
+        ``[llm]``. Never None — reading degrades to the default endpoint
         rather than disappearing.
 
-        It merges over the *default* route, not the vision one: a PDF goes to
-        the default endpoint and model unless ``[llm.ocr]`` says otherwise,
-        even when a vision model is configured for photos.
+        It merges over the *default* route, not the vision one: a document
+        goes to the default endpoint and model unless ``[llm.file]`` says
+        otherwise, even when a vision model is configured for photos.
         """
-        return self._with_route(self.ocr, self, self.ocr_model_of())
+        return self._with_route(self.file, self, self.file_model_of())
 
     def where_from(self) -> str:
         """Where the endpoint came from, for /status, /doctor and error messages."""
@@ -521,35 +525,27 @@ class FilesConfig:
 OCR_DEFAULT_BASE_URL = "https://api.mistral.ai/v1"
 OCR_DEFAULT_MODEL = "mistral-ocr-latest"
 
-#: The OCR endpoint spellings accepted. Both speak the same wire format —
-#: Mistral's ``POST /ocr``: a ``document`` (URL or base64) in, per-page
-#: markdown out — which any compatible service can serve by pointing
-#: ``base_url`` at it. ``"mistral"`` is the hosted default; ``"custom"``
-#: means "my own host", and validate() insists on a ``base_url`` for it.
-OCR_PROVIDERS = ("mistral", "custom")
-
 
 @dataclass(slots=True)
 class OCRConfig:
     """The ``ocr`` tool: PDFs and scanned images, two ways to read them.
 
-    With ``provider`` set (``"mistral"``, or ``"custom"`` for your own host),
-    the whole document goes to a dedicated OCR API — the Mistral OCR shape:
-    ``POST <base_url>/ocr`` with ``document`` (a public URL or base64) and a
-    model, per-page markdown back. No local rendering, no per-page model
-    tokens. ``custom`` is the same wire format pointed at any compatible
-    endpoint — it needs its own ``base_url``.
+    With ``base_url`` set, the whole document goes to a dedicated OCR API —
+    the Mistral OCR shape: ``POST <base_url>/ocr`` with ``document`` (a public
+    URL or base64) and a model, per-page markdown back. No local rendering, no
+    per-page model tokens. Any compatible service works by pointing
+    ``base_url`` at it; there is no provider preset to pick.
 
     .. code-block:: toml
 
         [tools.ocr]
-        provider = "mistral"        # or "custom" + base_url = "https://…/v1"
+        base_url = "https://api.mistral.ai/v1"   # empty = the local path
+        model = "mistral-ocr-latest"
         api_key_env = "MISTRAL_API_KEY"
-        # model = "mistral-ocr-latest"   # base_url = "https://api.mistral.ai/v1"
 
-    With ``provider`` empty (the default), the tool works locally: text
+    With ``base_url`` empty (the default), the tool works locally: text
     embedded in the PDF is extracted for free, and only pages that come back
-    empty (scans) are rendered and transcribed — by ``[llm.ocr]``'s model
+    empty (scans) are rendered and transcribed — by ``[llm.file]``'s model
     when one is set, else the default model (``llm.model``), never the vision
     model. Image files follow the photo rule instead: vision model if set,
     else the default.
@@ -557,13 +553,14 @@ class OCRConfig:
 
     enabled: bool = True
     #: Dedicated OCR endpoint to use, or empty for the local path (embedded
-    #: text + a model call only for scans). See :data:`OCR_PROVIDERS`.
-    provider: str = ""
-    #: Root of the OCR API. Only meaningful with ``provider`` set.
-    base_url: str = OCR_DEFAULT_BASE_URL
-    #: OCR model id. Only meaningful with ``provider`` set.
-    model: str = OCR_DEFAULT_MODEL
-    #: Env var holding the OCR API key. Only meaningful with ``provider`` set.
+    #: text + a model call only for scans). Any host serving the Mistral
+    #: ``POST /ocr`` shape is valid here.
+    base_url: str = ""
+    #: OCR model id, sent verbatim. Only meaningful with ``base_url`` set:
+    #: the default applies to Mistral's own endpoint, any other endpoint must
+    #: name one, because no model id is portable between OCR services.
+    model: str = ""
+    #: Env var holding the OCR API key. Only meaningful with ``base_url`` set.
     api_key_env: str = "MISTRAL_API_KEY"
     timeout_seconds: float = 120.0
     #: Ceiling on pages of one PDF processed per call in the local path.
@@ -575,38 +572,68 @@ class OCRConfig:
     #: per 1.0, so 3.0 is ~216 DPI — crisp small print without quadrupling
     #: the image tokens.
     render_scale: float = 3.0
+    #: Table output format the dedicated endpoint should return. Empty (the
+    #: default) sends nothing and the endpoint decides — Mistral's own
+    #: default is markdown. ``"html"`` keeps merged cells and spans that
+    #: markdown flattens. Only sent on the dedicated API path.
+    table_format: str = ""
+    #: Pull the page's repeating header (letterhead, page number) out of the
+    #: markdown into its own response field, per Mistral's OCR API — the
+    #: header stops being duplicated at the top of every page's text. Off by
+    #: default, matching the endpoint default; only sent when true.
+    extract_header: bool = False
+    #: Same as :attr:`extract_header`, for the page footer.
+    extract_footer: bool = False
 
     def api_key(self) -> str | None:
         """The OCR API key, or None when the variable is unset or empty."""
         keys = parse_env_var(self.api_key_env)
         return keys[0] if keys else None
 
-    def provider_of(self) -> str:
-        """The configured provider, normalised; empty means the local path."""
-        return self.provider.strip().lower()
+    def uses_api(self) -> bool:
+        """Whether a dedicated OCR endpoint is configured; empty means local."""
+        return bool(self.base_url.strip())
+
+    def base_url_of(self) -> str:
+        """The endpoint to call: ``base_url``, or Mistral's when it is unset.
+
+        Only meaningful with :meth:`uses_api`; the local path never sends a
+        document anywhere, so the default is just what an empty ``base_url``
+        would have meant as a hosted endpoint.
+        """
+        return self.base_url.strip().rstrip("/") or OCR_DEFAULT_BASE_URL
+
+    def model_of(self) -> str:
+        """The OCR model to send, or empty when the configuration names none.
+
+        ``model`` wins when set. An empty one means the default model only on
+        Mistral's own endpoint; on any other host the model is required and
+        this returns ``""`` so the caller can say so instead of sending an id
+        that endpoint has never heard of. The local path sends no model at all.
+        """
+        if self.model.strip():
+            return self.model.strip()
+        if self.uses_api() and self.base_url_of() == OCR_DEFAULT_BASE_URL:
+            return OCR_DEFAULT_MODEL
+        return ""
 
     def needs_key(self) -> bool:
         """Whether the endpoint cannot work without a key.
 
-        Only the hosted Mistral API bills per call. A ``custom`` endpoint may
-        be self-hosted and take no auth, so the key is optional there: when
-        it is unset the request goes out with no ``Authorization`` header.
+        Only the hosted Mistral API bills per call. A ``base_url`` pointed
+        anywhere else is the owner's endpoint — self-hosted, a proxy, a
+        compatible re-implementation — and is taken at its word, the same
+        rule the web providers follow. The key is optional there: when it is
+        unset the request goes out with no ``Authorization`` header, and an
+        endpoint that does want auth answers 401 itself.
         """
-        return self.provider_of() == "mistral"
+        return self.uses_api() and self.base_url_of() == OCR_DEFAULT_BASE_URL
 
     def endpoint_problem(self) -> str:
         """Reject unusable OCR endpoints before a document can be uploaded."""
-        provider = self.provider_of()
-        if not provider:
+        if not self.uses_api():
             return ""
-        if provider not in OCR_PROVIDERS:
-            return (
-                f"unknown tools.ocr.provider {self.provider!r}. "
-                f"Known: {', '.join(OCR_PROVIDERS)} (or empty for the local path)"
-            )
-        url = self.base_url.strip().rstrip("/")
-        if provider == "custom" and url in ("", OCR_DEFAULT_BASE_URL):
-            return 'tools.ocr.provider = "custom" needs tools.ocr.base_url pointed at your own OCR endpoint'
+        url = self.base_url_of()
         try:
             parsed = urlsplit(url)
             valid = parsed.scheme in {"http", "https"} and bool(parsed.hostname)
@@ -616,15 +643,25 @@ class OCRConfig:
             return "tools.ocr.base_url must be an absolute http(s) URL"
         return ""
 
+    def model_problem(self) -> str:
+        """Reject a dedicated endpoint that names no model."""
+        if not self.uses_api() or self.model_of():
+            return ""
+        return (
+            "[tools.ocr] model is unset; a custom base_url needs the OCR model "
+            "id that endpoint serves"
+        )
 
-#: The image-generation endpoint spellings accepted. Both speak the same wire
-#: format — the OpenAI Images API, ``POST /images/generations``: a prompt in,
-#: ``data[0].b64_json`` or ``data[0].url`` out — which any compatible service
-#: can serve by pointing ``base_url`` at it. ``"openai"`` is the hosted
-#: default; ``"custom"`` means "my own host", and validate() insists on a
-#: ``base_url`` for it.
-IMAGEGEN_PROVIDERS = ("openai", "custom")
+    def config_problem(self) -> str:
+        """The first reason this configuration cannot call an OCR API, or ``""``."""
+        return self.endpoint_problem() or self.model_problem()
 
+
+#: The image-generation endpoint: the OpenAI Images API, ``POST
+#: /images/generations`` — a prompt in, ``data[0].b64_json`` or
+#: ``data[0].url`` out. Any compatible service serves the same shape, so
+#: ``base_url`` is the whole configuration: empty means OpenAI, anything else
+#: is that host's endpoint. There is no provider preset to choose.
 IMAGEGEN_DEFAULT_BASE_URL = "https://api.openai.com/v1"
 IMAGEGEN_DEFAULT_MODEL = "gpt-image-1"
 
@@ -636,26 +673,25 @@ class ImageGenConfig:
     .. code-block:: toml
 
         [tools.image_gen]
-        provider = "openai"         # or "custom" + base_url = "https://…/v1"
+        base_url = "https://api.openai.com/v1"   # empty = this default
+        model = "gpt-image-1"
         api_key_env = "OPENAI_API_KEY"
-        # model = "gpt-image-1"
         # size = "1024x1024"
 
     The tool saves what comes back under ``output_dir`` (inside the project)
     and hands it to the chat as an artifact — the same file-delivery path the
-    ``files`` tool's uploads use. ``custom`` is the same wire format pointed
-    at any compatible endpoint; it needs its own ``base_url``.
+    ``files`` tool's uploads use. Any endpoint speaking the wire format works
+    by pointing ``base_url`` at it; the model id is sent verbatim.
     """
 
     enabled: bool = True
-    #: Endpoint family. See :data:`IMAGEGEN_PROVIDERS`.
-    provider: str = "openai"
-    #: Root of the Images API. Only meaningful with ``provider`` set; a
-    #: ``custom`` provider pointing at the OpenAI default is a typo caught in
-    #: :meth:`endpoint_problem`.
-    base_url: str = IMAGEGEN_DEFAULT_BASE_URL
-    #: Image model id.
-    model: str = IMAGEGEN_DEFAULT_MODEL
+    #: Root of the Images API. Empty means OpenAI's default; any other value
+    #: is the endpoint to call, whichever host it belongs to.
+    base_url: str = ""
+    #: Image model id, sent verbatim. The default applies to OpenAI's
+    #: endpoint; any other endpoint must name one, because no model id is
+    #: portable between image services.
+    model: str = ""
     #: Env var holding the image API key. Comma-separated values are accepted
     #: by :meth:`api_key` like everywhere else; the first is used.
     api_key_env: str = "OPENAI_API_KEY"
@@ -673,34 +709,38 @@ class ImageGenConfig:
         keys = parse_env_var(self.api_key_env)
         return keys[0] if keys else None
 
-    def provider_of(self) -> str:
-        """The configured provider, normalised."""
-        return self.provider.strip().lower()
+    def base_url_of(self) -> str:
+        """The endpoint to call: ``base_url``, or OpenAI's when it is unset."""
+        return self.base_url.strip().rstrip("/") or IMAGEGEN_DEFAULT_BASE_URL
+
+    def model_of(self) -> str:
+        """The image model to send, or empty when the configuration names none.
+
+        ``model`` wins when set. An empty one means the default model only on
+        OpenAI's endpoint; on any other host the model is required and this
+        returns ``""`` so the caller can say so instead of sending an id that
+        endpoint has never heard of.
+        """
+        if self.model.strip():
+            return self.model.strip()
+        if self.base_url_of() == IMAGEGEN_DEFAULT_BASE_URL:
+            return IMAGEGEN_DEFAULT_MODEL
+        return ""
 
     def needs_key(self) -> bool:
         """Whether the endpoint cannot work without a key.
 
-        The hosted provider bills per call, so it does. A ``custom`` endpoint
-        may be self-hosted — a LAN server, a local queue — and take no auth
-        at all, so the key is optional there: when it is unset the tool runs
-        keyless and no ``Authorization`` header is sent.
+        OpenAI bills per call, so it does. A ``base_url`` pointed anywhere
+        else is the owner's endpoint — a LAN server, a proxy, a local queue —
+        and is taken at its word, the same rule the web providers follow. The
+        key is optional there: when it is unset the tool runs keyless and no
+        ``Authorization`` header is sent.
         """
-        return self.provider_of() == "openai"
+        return self.base_url_of() == IMAGEGEN_DEFAULT_BASE_URL
 
     def endpoint_problem(self) -> str:
         """Reject unusable image endpoints before a prompt is sent."""
-        provider = self.provider_of()
-        if provider not in IMAGEGEN_PROVIDERS:
-            return (
-                f"unknown tools.image_gen.provider {self.provider!r}. "
-                f"Known: {', '.join(IMAGEGEN_PROVIDERS)}"
-            )
-        url = self.base_url.strip().rstrip("/")
-        if provider == "custom" and url in ("", IMAGEGEN_DEFAULT_BASE_URL):
-            return (
-                'tools.image_gen.provider = "custom" needs tools.image_gen.base_url '
-                "pointed at your own image endpoint"
-            )
+        url = self.base_url_of()
         try:
             parsed = urlsplit(url)
             valid = parsed.scheme in {"http", "https"} and bool(parsed.hostname)
@@ -709,6 +749,19 @@ class ImageGenConfig:
         if not valid:
             return "tools.image_gen.base_url must be an absolute http(s) URL"
         return ""
+
+    def model_problem(self) -> str:
+        """Reject a custom endpoint that names no model."""
+        if self.model_of():
+            return ""
+        return (
+            "[tools.image_gen] model is unset; a custom base_url needs the "
+            "image model id that endpoint serves"
+        )
+
+    def config_problem(self) -> str:
+        """The first reason this configuration cannot generate, or ``""``."""
+        return self.endpoint_problem() or self.model_problem()
 
 
 @dataclass(slots=True)
@@ -919,6 +972,111 @@ class ContextDevConfig:
 
 
 @dataclass(slots=True)
+class KeenableConfig:
+    """Keenable (https://keenable.ai) — web search and page fetch for agents.
+
+    Keenable runs its own index and returns ranked pages with their text
+    already extracted, plus clean markdown for a fetched URL.
+
+    Keyless is a supported tier: ``/search/public`` and ``/fetch/public``
+    need no account or key, only an ``X-Keenable-Title`` header naming the
+    calling app. A ``KEENABLE_API_KEY`` lifts the per-IP hourly cap and puts
+    the calls on the account's free monthly allowance. The key is therefore
+    optional, and the provider stays available without one.
+    """
+
+    enabled: bool = True
+    api_key_env: str = "KEENABLE_API_KEY"
+    base_url: str = "https://api.keenable.ai/v1"
+    #: Name sent as ``X-Keenable-Title`` on keyless calls. The public
+    #: endpoints reject a request without one (400 "Missing app identifier").
+    app_title: str = "Lumi"
+    #: ``pro`` (deeper retrieval) or ``realtime`` (fastest). Empty uses the
+    #: server default, which is ``pro``.
+    mode: str = "pro"
+    #: Characters of page text kept per hit. 0 leaves the server default,
+    #: which is generous: the snippet is the evidence the model reads, and
+    #: cutting it produces a search that has to be repeated.
+    snippet_max_length: int = 0
+    timeout_seconds: int = 90
+    #: How to spend several keys. See :data:`WEB_KEY_STRATEGIES`.
+    key_strategy: str = "fallback"
+
+    def api_keys(self) -> list[str]:
+        """Every key in ``api_key_env``, in the order they were written."""
+        return parse_env_var(self.api_key_env)
+
+    def api_key(self) -> str | None:
+        """The primary key, or None when the variable is unset or empty."""
+        keys = self.api_keys()
+        return keys[0] if keys else None
+
+    def needs_key(self) -> bool:
+        """False: the public endpoints work with no key."""
+        return False
+
+    def key_strategy_of(self) -> str:
+        """The rotation strategy, normalised. Unknown values fall back to ``fallback``."""
+        chosen = self.key_strategy.strip().lower() or "fallback"
+        if chosen in WEB_KEY_STRATEGIES:
+            return chosen
+        log.warning(
+            "unknown tools.web.keenable.key_strategy %r; falling back to %r. Known: %s",
+            self.key_strategy,
+            "fallback",
+            ", ".join(WEB_KEY_STRATEGIES),
+        )
+        return "fallback"
+
+
+@dataclass(slots=True)
+class JinaConfig:
+    """Jina Reader (https://r.jina.ai) and Search (https://s.jina.ai).
+
+    Reader turns a URL into clean markdown (``https://r.jina.ai/<url>``) and
+    needs no account, so fetch works keyless. Search (``https://s.jina.ai/
+    <query>``) requires a key, so it is only offered while ``JINA_API_KEY`` is
+    set — a fallback that is skipped, not failed, on a fresh clone.
+    ``JINA_API_KEY`` goes out as a bearer token for both and lifts the keyless
+    fetch rate limit.
+    """
+
+    enabled: bool = True
+    api_key_env: str = "JINA_API_KEY"
+    base_url: str = "https://r.jina.ai"
+    search_base_url: str = "https://s.jina.ai"
+    timeout_seconds: int = 60
+    #: How to spend several keys. See :data:`WEB_KEY_STRATEGIES`.
+    key_strategy: str = "fallback"
+
+    def api_keys(self) -> list[str]:
+        """Every key in ``api_key_env``, in the order they were written."""
+        return parse_env_var(self.api_key_env)
+
+    def api_key(self) -> str | None:
+        """The primary key, or None when the variable is unset or empty."""
+        keys = self.api_keys()
+        return keys[0] if keys else None
+
+    def needs_key(self) -> bool:
+        """False: Reader works with no key."""
+        return False
+
+    def key_strategy_of(self) -> str:
+        """The rotation strategy, normalised. Unknown values fall back to ``fallback``."""
+        chosen = self.key_strategy.strip().lower() or "fallback"
+        if chosen in WEB_KEY_STRATEGIES:
+            return chosen
+        log.warning(
+            "unknown tools.web.jina.key_strategy %r; falling back to %r. Known: %s",
+            self.key_strategy,
+            "fallback",
+            ", ".join(WEB_KEY_STRATEGIES),
+        )
+        return "fallback"
+
+
+@dataclass(slots=True)
 class YouConfig:
     """You.com search over its hosted MCP endpoint.
 
@@ -1049,7 +1207,16 @@ class Context7Config:
 class WebConfig:
     enabled: bool = True
     provider_order: list[str] = field(
-        default_factory=lambda: ["firecrawl", "exa", "tavily", "contextdev", "you", "mcp"]
+        default_factory=lambda: [
+            "firecrawl",
+            "exa",
+            "tavily",
+            "contextdev",
+            "keenable",
+            "jina",
+            "you",
+            "mcp",
+        ]
     )
     #: How many hits a search returns. The ceiling is the provider's, not ours:
     #: 10 covers a hard question with room for the angles that do not pan out,
@@ -1069,6 +1236,8 @@ class WebConfig:
     firecrawl: FirecrawlConfig = field(default_factory=FirecrawlConfig)
     exa: ExaConfig = field(default_factory=ExaConfig)
     contextdev: ContextDevConfig = field(default_factory=ContextDevConfig)
+    keenable: KeenableConfig = field(default_factory=KeenableConfig)
+    jina: JinaConfig = field(default_factory=JinaConfig)
     you: YouConfig = field(default_factory=YouConfig)
     mcp: MCPConfig = field(default_factory=MCPConfig)
 
@@ -1518,6 +1687,12 @@ def validate(config: Config) -> list[str]:
         problems.append("tools.ocr.render_scale must be a positive number (1.0 = 72 DPI)")
     if config.tools.ocr.timeout_seconds <= 0:
         problems.append("tools.ocr.timeout_seconds must be a positive number of seconds")
+    table_format = config.tools.ocr.table_format.strip().lower()
+    if table_format and table_format not in ("markdown", "html"):
+        problems.append(
+            'tools.ocr.table_format must be "markdown" or "html" '
+            "(or empty for the endpoint's default)"
+        )
     if config.tools.web.mcp.timeout_seconds <= 0:
         problems.append(
             "tools.web.providers.mcp.timeout_seconds must be a positive number of seconds"
@@ -1530,7 +1705,7 @@ def validate(config: Config) -> list[str]:
         problems.append("tools.image_gen.timeout_seconds must be a positive number of seconds")
     # A route states what differs from [llm]; an unknown rotation strategy in
     # one is a typo worth naming, same as in the main block.
-    for label, route in (("llm.vision", config.llm.vision), ("llm.ocr", config.llm.ocr)):
+    for label, route in (("llm.vision", config.llm.vision), ("llm.file", config.llm.file)):
         if route.key_strategy.strip() and route.key_strategy.strip().lower() not in KEY_STRATEGIES:
             problems.append(
                 f"unknown {label}.key_strategy {route.key_strategy!r}. "
@@ -1610,7 +1785,17 @@ def validate(config: Config) -> list[str]:
     providers = [
         p
         for p in config.tools.web.provider_order
-        if p not in {"tavily", "firecrawl", "exa", "contextdev", "you", "mcp"}
+        if p
+        not in {
+            "tavily",
+            "firecrawl",
+            "exa",
+            "contextdev",
+            "keenable",
+            "jina",
+            "you",
+            "mcp",
+        }
     ]
     if providers:
         problems.append(
@@ -1644,6 +1829,16 @@ def validate(config: Config) -> list[str]:
             "tools.web.contextdev",
             config.tools.web.contextdev.enabled,
             config.tools.web.contextdev.key_strategy,
+        ),
+        (
+            "tools.web.keenable",
+            config.tools.web.keenable.enabled,
+            config.tools.web.keenable.key_strategy,
+        ),
+        (
+            "tools.web.jina",
+            config.tools.web.jina.enabled,
+            config.tools.web.jina.key_strategy,
         ),
     ):
         if enabled and strategy.strip().lower() not in WEB_KEY_STRATEGIES:
