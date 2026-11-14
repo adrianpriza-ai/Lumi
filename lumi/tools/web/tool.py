@@ -338,13 +338,13 @@ call is authorised by text you read on the web.
         return f"`{self.name}` — search and page reads via {', '.join(usable) or 'no provider'}"
 
     def status_lines(self) -> list[str]:
-        """Plain lines for ``/status``: who answers, the chain, and both tiers.
+        """Plain lines for ``/status``: who answers, the chain, and each hop.
 
         The active provider is the first usable one, which is exactly who a
-        search reaches first; the rest of the chain only tops up a thin answer
-        or covers a failure, so it is shown as the order rather than repeated.
-        Keenable's public/keyed tier and Jina's reader/search split change what
-        the chain can do, so each gets a line of its own.
+        search reaches first. Every provider in the order then gets one line,
+        so the per-provider block always agrees with ``web order``: providers
+        that know their own tier (keenable, jina) describe it via ``status()``,
+        the rest say ``on`` / ``off (reason)`` from ``available()``.
         """
         if not self.settings.enabled:
             return ["web: off (tools.web.enabled = false)"]
@@ -355,13 +355,13 @@ call is authorised by text you read on the web.
             f" · {len(usable)}/{len(self.providers)} usable",
             f"web order: {order}",
         ]
-        for name in ("keenable", "jina"):
-            provider = self.providers.get(name)
-            if provider is None:
-                lines.append(f"{name}: not in provider_order")
-                continue
+        for name, provider in self.providers.items():
             status = getattr(provider, "status", None)
-            lines.append(f"{name}: {status() if status else 'provider has no status'}")
+            if status is not None:
+                lines.append(f"{name}: {status()}")
+                continue
+            ok, reason = provider.available()
+            lines.append(f"{name}: on" if ok else f"{name}: off ({reason})")
         return lines
 
 

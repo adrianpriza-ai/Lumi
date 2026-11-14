@@ -1925,15 +1925,27 @@ def test_web_status_lists_jina_tier(config, monkeypatch) -> None:
     assert "jina: reader keyless · search off (JINA_API_KEY unset)" in lines
 
 
-def test_web_status_says_when_a_new_provider_is_not_in_the_order(config) -> None:
+def test_web_status_gives_every_provider_one_line_in_order(config) -> None:
+    from lumi.tools.web.tool import WebTool
+
+    tool = WebTool(config)
+    lines = tool.status_lines()
+    # After the two header lines, one line per provider, same order as the chain.
+    assert [line.split(":")[0] for line in lines[2:]] == list(tool.providers)
+    # Providers without a status() fall back to available(): tavily is keyless
+    # in the fixture, firecrawl has no key, so each lands on its own side.
+    assert "tavily: on" in lines
+    assert "firecrawl: off (FIRECRAWL_API_KEY is not set)" in lines
+
+
+def test_web_status_only_lists_providers_in_the_order(config) -> None:
     from lumi.tools.web.tool import WebTool
 
     tool = WebTool(config)
     tool.providers.pop("keenable")
     tool.providers.pop("jina")
     lines = tool.status_lines()
-    assert "keenable: not in provider_order" in lines
-    assert "jina: not in provider_order" in lines
+    assert not any(line.startswith(("keenable:", "jina:")) for line in lines)
 
 
 def test_keenable_status_names_the_tier(monkeypatch) -> None:

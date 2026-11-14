@@ -681,16 +681,18 @@ class ImageGenConfig:
     The tool saves what comes back under ``output_dir`` (inside the project)
     and hands it to the chat as an artifact — the same file-delivery path the
     ``files`` tool's uploads use. Any endpoint speaking the wire format works
-    by pointing ``base_url`` at it; the model id is sent verbatim.
+    by pointing ``base_url`` at it; the model id is sent verbatim. The model
+    must be named for the tool to activate at all: an empty ``model`` keeps
+    image_gen hidden, with that reason in ``/status``, whatever the endpoint.
     """
 
     enabled: bool = True
     #: Root of the Images API. Empty means OpenAI's default; any other value
     #: is the endpoint to call, whichever host it belongs to.
     base_url: str = ""
-    #: Image model id, sent verbatim. The default applies to OpenAI's
-    #: endpoint; any other endpoint must name one, because no model id is
-    #: portable between image services.
+    #: Image model id, sent verbatim. Required — while it is unset the tool
+    #: stays off, because no model id is portable between image services and
+    #: a quiet fallback would make the tool look configured when it is not.
     model: str = ""
     #: Env var holding the image API key. Comma-separated values are accepted
     #: by :meth:`api_key` like everywhere else; the first is used.
@@ -716,10 +718,12 @@ class ImageGenConfig:
     def model_of(self) -> str:
         """The image model to send, or empty when the configuration names none.
 
-        ``model`` wins when set. An empty one means the default model only on
-        OpenAI's endpoint; on any other host the model is required and this
-        returns ``""`` so the caller can say so instead of sending an id that
-        endpoint has never heard of.
+        ``model`` wins when set. An empty one falls back to the default model
+        on OpenAI's endpoint only; on any other host the model is required and
+        this returns ``""`` so the caller can say so instead of sending an id
+        that endpoint has never heard of. Sending-time fallback only — the
+        availability gate is stricter and refuses to run with an unset model,
+        so this default is never reached from an unconfigured tool.
         """
         if self.model.strip():
             return self.model.strip()

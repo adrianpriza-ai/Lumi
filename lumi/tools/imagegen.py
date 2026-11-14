@@ -8,9 +8,10 @@ then read, edit or process like any other file) and travels to the chat as an
 artifact, the same file-delivery path ``files`` uses for uploads out.
 
 Generation is delegated, not local: no diffusion model runs in-process. The
-tool is available only when the endpoint can be called — OpenAI needs its key,
-an overridden ``base_url`` may be keyless — and ``available()`` says which
-piece is missing so ``/doctor`` and ``/tools`` can show the owner why.
+tool is available only when it has something to call — a model named in
+``tools.image_gen.model``, plus a key on OpenAI's endpoint (an overridden
+``base_url`` may be keyless) — and ``available()`` says which piece is
+missing so ``/doctor`` and ``/tools`` can show the owner why.
 """
 
 from __future__ import annotations
@@ -118,6 +119,11 @@ class ImageGenTool(Tool):
             return False, "disabled by tools.image_gen.enabled"
         if problem := self._settings.config_problem():
             return False, problem
+        # Read the raw field, not model_of(): that one quietly falls back to
+        # gpt-image-1 on OpenAI's endpoint, which is how an "unset" model
+        # would look active to the owner. No model named, no tool.
+        if not self._settings.model.strip():
+            return False, 'tools.image_gen.model is not set (e.g. model = "gpt-image-1")'
         # The hosted API bills per call, so it needs a key; a custom endpoint
         # may be self-hosted and keyless, and that is a usable configuration.
         if self._settings.needs_key() and not self._settings.api_key():

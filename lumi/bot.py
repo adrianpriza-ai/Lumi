@@ -169,36 +169,15 @@ MCP_HELP = """\
 <code>/mcp list</code> — what is configured: transport, command or URL, env
 <code>/mcp check &lt;name&gt;</code> — connect to one and report, retrying if it fails
 <code>/mcp auth &lt;name&gt;</code> — browser login for a server marked <code>"auth": "oauth"</code>
-<code>/mcp approve [name]</code> — bare: list entries waiting for approval · with a name: allow that entry to connect
+<code>/mcp approve [name]</code> — bare: list entries waiting · named: allow that entry to connect
 <code>/mcp revoke &lt;name&gt;</code> — withdraw an approval
 <code>/mcp help</code> — this message
 
-<b>Where servers come from</b> — <code>.mcp.json</code> in this project, plus
-<code>~/.agents/mcp.json</code> for ones shared across every project; the
-project file wins when a name appears in both. Two transports: <b>stdio</b>
-(a local command spawned with <code>command</code>/<code>args</code>, run in
-the project directory unless the entry sets its own <code>cwd</code>) and
-<b>streamable HTTP</b> (a <code>url</code>, with <code>headers</code> if it
-wants them). An entry with a <code>command</code> and no <code>type</code> is
-stdio already.
-
-<b>Approvals</b> — the project <code>.mcp.json</code> can arrive by <code>git
-clone</code> as easily as by your own hand, so its entries connect only once
-you approve them. <code>/mcp approve</code> lists what is waiting;
-<code>/mcp approve &lt;name&gt;</code> allows that exact command or URL, as it
-stands right now — editing the entry asks again.
-<code>/mcp revoke &lt;name&gt;</code> withdraws it. Entries in
-<code>~/.agents/mcp.json</code> are yours already and need no approval.
-
-<b>OAuth</b> — a server whose entry says <code>"auth": "oauth"</code> wants your
-own account, not a static key. Run <code>/mcp auth &lt;name&gt;</code>: i send you a
-link, you approve in the browser, and the tokens are stored under
-<code>.mcp-tokens/</code> (mode 0600, never sent to any chat) and refreshed on
-their own from then on. The browser redirect lands on this machine's
-localhost, so this works when your browser and the bot share one; otherwise
-give the server a header token instead. If the provider only grants access
-for named scopes (Atlassian is one), write them into the entry:
-<code>"auth": {"type": "oauth", "scopes": "read:jira-work offline_access"}</code>.
+<b>sources:</b> <code>.mcp.json</code> (this project) + <code>~/.agents/mcp.json</code> (shared across projects); project wins on a name clash
+<b>transports:</b> stdio (<code>command</code>/<code>args</code>, optional <code>cwd</code>) · streamable HTTP (<code>url</code>, optional <code>headers</code>) — a command with no <code>type</code> is stdio already
+<b>approvals:</b> a cloned <code>.mcp.json</code> connects to nothing until <code>/mcp approve &lt;name&gt;</code>; an edit asks again; <code>/mcp revoke</code> withdraws
+<b>oauth:</b> <code>/mcp auth &lt;name&gt;</code> sends a browser link; tokens live in <code>.mcp-tokens/</code> (0600, never sent to chat) and refresh themselves; the redirect lands on localhost
+<b>scopes:</b> some providers (Atlassian) want them named in the entry: <code>"auth": {"type": "oauth", "scopes": "read:jira-work offline_access"}</code>
 
 None of these calls a server's tools — that is the model's <code>mcp</code> tool, and it asks you first."""
 

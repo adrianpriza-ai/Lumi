@@ -1047,22 +1047,33 @@ async def test_status_command(config) -> None:
     assert "run_shell" in body  # tool inventory lives here now that /tools is gone
     assert "tools:" in body  # the on/off count precedes the names
     assert "web: tavily active" in body  # no keys in the fixture, so keyless Tavily answers
-    assert "keenable:" in body
+    assert "tavily: on" in body  # every provider in the order gets its own line
+    assert "keenable: keyless (public endpoints as 'Lumi')" in body
     assert "jina: reader keyless" in body
 
 
 async def test_status_names_off_tools_with_the_reason(config, monkeypatch) -> None:
     """A tool that cannot run says why, not just that it is off.
 
-    With the image key gone, image_gen hides from the model (OpenAI hosted
-    needs one) but stays registered — so /status is where the reason shows.
+    The model is named so the key is the only thing missing: with it gone,
+    image_gen hides from the model (OpenAI hosted needs one) but stays
+    registered — so /status is where the reason shows.
     """
+    config.tools.image_gen.model = "gpt-image-1"
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     bot, _ = await send(config, [], "/status")
     body = texts(bot)
     assert "image_gen" in body
     assert "OPENAI_API_KEY" in body
     assert "off" in body  # the tools line counts what cannot run
+
+
+async def test_status_says_when_the_image_model_is_unset(config) -> None:
+    """The key alone is not enough: an unconfigured model is a reason of its own."""
+    bot, _ = await send(config, [], "/status")
+    body = texts(bot)
+    assert "image_gen" in body
+    assert "tools.image_gen.model is not set" in body
 
 
 async def test_context_command_reports_the_window(config) -> None:

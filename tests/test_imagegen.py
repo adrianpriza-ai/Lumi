@@ -51,15 +51,30 @@ def key(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
 
 
+#: The OpenAI endpoint with its model named — the minimal working config,
+#: which availability requires (an unset model keeps the tool off).
+OPENAI_TOML = '[tools.image_gen]\nmodel = "gpt-image-1"\n'
+
+
+def test_an_unset_model_keeps_the_tool_off(key: None, tmp_path: Path) -> None:
+    """model_of() would quietly fall back to gpt-image-1 on OpenAI; the
+    availability gate reads the raw field instead, so an unconfigured tool
+    says what is missing rather than posing as configured."""
+    assert make_tool(tmp_path).available() == (
+        False,
+        'tools.image_gen.model is not set (e.g. model = "gpt-image-1")',
+    )
+
+
 def test_unavailable_without_key(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    ok, reason = make_tool(tmp_path).available()
+    ok, reason = make_tool(tmp_path, toml=OPENAI_TOML).available()
     assert not ok
     assert "OPENAI_API_KEY" in reason
 
 
 def test_available_with_key(key: None, tmp_path: Path) -> None:
-    assert make_tool(tmp_path).available() == (True, "")
+    assert make_tool(tmp_path, toml=OPENAI_TOML).available() == (True, "")
 
 
 def test_unavailable_without_httpx(
@@ -77,7 +92,7 @@ def test_unavailable_without_httpx(
 
     monkeypatch.setattr(builtins, "__import__", no_httpx)
 
-    ok, reason = make_tool(tmp_path).available()
+    ok, reason = make_tool(tmp_path, toml=OPENAI_TOML).available()
 
     assert not ok
     assert "httpx" in reason

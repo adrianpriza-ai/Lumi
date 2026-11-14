@@ -257,13 +257,14 @@ api_key_env = "MISTRAL_API_KEY"
 
 [tools.image_gen]
 # Text-to-image over the OpenAI Images wire format (POST /images/generations).
-# Empty base_url means OpenAI, where the tool hides itself from the model
-# until OPENAI_API_KEY is set. Any other base_url (self-hosted, a proxy,
-# another compatible host) is called keyless.
+# Empty base_url means OpenAI. The tool only activates once model is named —
+# and OPENAI_API_KEY too, on OpenAI — until then it hides from the model and
+# /status says why. Any other base_url (self-hosted, a proxy, another
+# compatible host) is called keyless.
 enabled = true
 # Empty = https://api.openai.com/v1. Any endpoint serving the wire format.
-# Empty = gpt-image-1. Required when base_url is not OpenAI's, because no
-# image model id is portable between services.
+# Required. Name the model id your endpoint serves; no image model id is
+# portable between services, so with this unset the tool stays off.
 model = ""
 api_key_env = "OPENAI_API_KEY"
 # Default image size, WIDTHxHEIGHT. Empty or "auto" = provider default.
