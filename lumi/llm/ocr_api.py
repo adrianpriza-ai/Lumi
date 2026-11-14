@@ -210,7 +210,7 @@ class OCRDocumentClient:
             numbers = page_numbers(pages_data, pages)
             return [
                 (number, str(page.get("markdown") or ""))
-                for number, page in zip(numbers, pages_data)
+                for number, page in zip(numbers, pages_data, strict=True)
             ]
         # Some compatible servers answer with one flat body instead of pages;
         # take it rather than declaring an empty document.
