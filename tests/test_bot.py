@@ -21,6 +21,7 @@ from conftest import FakeLLM, backdate, make_reply, make_store
 from telegram import Bot, Chat, InaccessibleMessage, Message, TextQuote, Update, User
 from telegram.error import TelegramError
 
+from lumi import __version__
 from lumi.agent import Agent
 from lumi.bot import (
     CB_NO,
@@ -130,6 +131,17 @@ class FakeBot(Bot):
         elif isinstance(document, bytes):
             payload = document
         self._sent.append({"chat_id": chat_id, "document": payload, **kwargs})
+        return None
+
+    async def send_photo(self, chat_id: Any, photo: Any = None, **kwargs: Any) -> Any:
+        """Record a photo send, the same way send_document records a document."""
+        payload = None
+        if hasattr(photo, "read"):
+            payload = photo.read()
+            photo.seek(0) if hasattr(photo, "seek") else None
+        elif isinstance(photo, bytes):
+            payload = photo
+        self._sent.append({"chat_id": chat_id, "photo": payload, **kwargs})
         return None
 
 
@@ -310,6 +322,11 @@ def prompts(agent: Agent) -> str:
 def documents(bot: FakeBot) -> list[dict[str, Any]]:
     """Every document the bot tried to send (payload bytes recorded)."""
     return [message for message in bot.sent if "document" in message]
+
+
+def photos(bot: FakeBot) -> list[dict[str, Any]]:
+    """Every photo the bot tried to send (payload bytes recorded)."""
+    return [message for message in bot.sent if "photo" in message]
 
 
 @pytest.fixture(autouse=True)
@@ -1023,12 +1040,29 @@ async def test_personality_command_shows_the_file(config) -> None:
 async def test_status_command(config) -> None:
     bot, _ = await send(config, [], "/status")
     body = texts(bot)
-    assert "uptime" in body
+    assert "up " in body  # humanized uptime, never raw seconds
+    assert "mode <code>default</code>" in body  # /status and /mode agree on the mode
+    assert f"v{__version__}" in body  # version comes from lumi.__version__
     assert "test-model" in body
     assert "run_shell" in body  # tool inventory lives here now that /tools is gone
+    assert "tools:" in body  # the on/off count precedes the names
     assert "web: tavily active" in body  # no keys in the fixture, so keyless Tavily answers
     assert "keenable:" in body
     assert "jina: reader keyless" in body
+
+
+async def test_status_names_off_tools_with_the_reason(config, monkeypatch) -> None:
+    """A tool that cannot run says why, not just that it is off.
+
+    With the image key gone, image_gen hides from the model (OpenAI hosted
+    needs one) but stays registered — so /status is where the reason shows.
+    """
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    bot, _ = await send(config, [], "/status")
+    body = texts(bot)
+    assert "image_gen" in body
+    assert "OPENAI_API_KEY" in body
+    assert "off" in body  # the tools line counts what cannot run
 
 
 async def test_context_command_reports_the_window(config) -> None:
@@ -2781,6 +2815,64 @@ async def test_the_document_caption_is_plain_and_identifies_the_file(config) -> 
     caption = docs[0]["caption"]
     assert "notes.md" in caption
     assert "from files" in caption, "the origin names the tool that produced it"
+
+
+# A 1x1 transparent PNG: enough for Telegram's photo path, small for the repo.
+PNG_BYTES = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000d49444154789c626001000000ffff03000006000557bfabd40000000049454e44ae426082"
+)
+
+
+async def test_an_uploaded_image_is_delivered_as_a_photo(config) -> None:
+    """A picture travels as a photo so it displays inline, not as an attachment."""
+    application, bot, _ = build(
+        config,
+        [
+            make_reply("", [("c1", "files", {"action": "upload", "path": "workspace/pic.png"})]),
+            make_reply("here it is"),
+        ],
+    )
+    (config.shell_cwd / "pic.png").write_bytes(PNG_BYTES)
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "send the picture"))
+    finally:
+        await application.shutdown()
+
+    pics = photos(bot)
+    assert len(pics) == 1, "the png must go out as a photo"
+    assert pics[0]["photo"] == PNG_BYTES
+    assert documents(bot) == [], "a delivered photo must not be doubled as a document"
+
+
+async def test_a_rejected_photo_falls_back_to_a_document(config) -> None:
+    """If the photo send fails, the file still reaches the owner as a document."""
+
+    class NoPhotoBot(FakeBot):
+        async def send_photo(self, chat_id: Any, photo: Any = None, **kwargs: Any) -> Any:
+            from telegram.error import BadRequest
+
+            raise BadRequest("photo rejected")
+
+    application, bot, _ = build(
+        config,
+        [
+            make_reply("", [("c1", "files", {"action": "upload", "path": "workspace/pic.png"})]),
+            make_reply("here it is"),
+        ],
+        bot=NoPhotoBot(),
+    )
+    (config.shell_cwd / "pic.png").write_bytes(PNG_BYTES)
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "send the picture"))
+    finally:
+        await application.shutdown()
+
+    docs = documents(bot)
+    assert docs, "the fallback must still deliver the file"
+    assert docs[0]["document"] == PNG_BYTES
 
 
 async def test_a_failed_delivery_degrades_to_a_path(config, monkeypatch) -> None:

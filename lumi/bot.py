@@ -39,6 +39,7 @@ from telegram.ext import (
     filters,
 )
 
+from . import __version__
 from .agent import Agent, PendingAction, TurnHooks, TurnResult
 from .artifacts import Artifact, ArtifactError, ArtifactStore
 from .chatlog import CHATLOG, entry_from, media_entry_from
@@ -133,7 +134,7 @@ OWNER_HELP_TEXT = """\
 <code>/config</code> — the resolved configuration this process runs on
 <code>/env</code> — which credentials are set, values masked
 <code>/forget [n]</code> — drop the newest n saved facts (erasing memory is a human decision, and yours)
-<code>/mcp help|list|check|approve|revoke</code> — the configured MCP servers: what they are, whether one answers, and which project entries you have approved to connect
+<code>/mcp help|list|check|auth|approve|revoke</code> — the configured MCP servers: what they are, whether one answers, browser login for OAuth ones, and which project entries you have approved to connect
 <code>/mode [name]</code> — show or switch the permission mode (default, accept-edits, bypass, bypass-sudo)
 <code>/reload</code> — re-read personality, memory and config
 <code>/reset</code> — forget this conversation (keeps long-term memory)
@@ -163,30 +164,30 @@ MCP_USAGE = (
 )
 
 MCP_HELP = """\
-<b>mcp help</b>
-Servers come from <code>.mcp.json</code> in this project and
-<code>~/.agents/mcp.json</code> for servers shared across projects; the project
-file wins when a name appears in both.
+<b>mcp</b> — the configured MCP servers (bare <code>/mcp</code> shows this too)
 
-<code>/mcp list</code> — the configured servers: transport, command or URL, env
-<code>/mcp check &lt;name&gt;</code> — connect and report, retrying a server that fails
-<code>/mcp auth &lt;name&gt;</code> — browser login for a server with <code>"auth": "oauth"</code>
-<code>/mcp approve [name]</code> — allow a project-file server to connect (see below)
-<code>/mcp revoke &lt;name&gt;</code> — withdraw that approval
+<code>/mcp list</code> — what is configured: transport, command or URL, env
+<code>/mcp check &lt;name&gt;</code> — connect to one and report, retrying if it fails
+<code>/mcp auth &lt;name&gt;</code> — browser login for a server marked <code>"auth": "oauth"</code>
+<code>/mcp approve [name]</code> — bare: list entries waiting for approval · with a name: allow that entry to connect
+<code>/mcp revoke &lt;name&gt;</code> — withdraw an approval
 <code>/mcp help</code> — this message
 
-Both transports are supported: <b>stdio</b> (a local command spawned with
-<code>command</code>/<code>args</code>, run in the project directory unless the
-entry sets its own <code>cwd</code>) and <b>streamable HTTP</b> (a <code>url</code>,
-with <code>headers</code> if it wants them). A config with a <code>command</code>
-and no <code>type</code> is stdio already.
+<b>Where servers come from</b> — <code>.mcp.json</code> in this project, plus
+<code>~/.agents/mcp.json</code> for ones shared across every project; the
+project file wins when a name appears in both. Two transports: <b>stdio</b>
+(a local command spawned with <code>command</code>/<code>args</code>, run in
+the project directory unless the entry sets its own <code>cwd</code>) and
+<b>streamable HTTP</b> (a <code>url</code>, with <code>headers</code> if it
+wants them). An entry with a <code>command</code> and no <code>type</code> is
+stdio already.
 
 <b>Approvals</b> — the project <code>.mcp.json</code> can arrive by <code>git
 clone</code> as easily as by your own hand, so its entries connect only once
-you approve them: <code>/mcp approve</code> lists what is waiting,
-<code>/mcp approve &lt;name&gt;</code> allows that exact entry (the command or
-URL, as it stands right now), and nothing connects before you have. Editing an
-entry asks again; <code>/mcp revoke &lt;name&gt;</code> withdraws it. Entries in
+you approve them. <code>/mcp approve</code> lists what is waiting;
+<code>/mcp approve &lt;name&gt;</code> allows that exact command or URL, as it
+stands right now — editing the entry asks again.
+<code>/mcp revoke &lt;name&gt;</code> withdraws it. Entries in
 <code>~/.agents/mcp.json</code> are yours already and need no approval.
 
 <b>OAuth</b> — a server whose entry says <code>"auth": "oauth"</code> wants your
@@ -199,7 +200,22 @@ give the server a header token instead. If the provider only grants access
 for named scopes (Atlassian is one), write them into the entry:
 <code>"auth": {"type": "oauth", "scopes": "read:jira-work offline_access"}</code>.
 
-Neither command calls a server's tools — that is the model's <code>mcp</code> tool, and it asks you first."""
+None of these calls a server's tools — that is the model's <code>mcp</code> tool, and it asks you first."""
+
+
+def _humanize_uptime(seconds: float) -> str:
+    """Uptime in chat words: 45s, 3m 12s, 2h 14m, 5d 3h — never raw seconds."""
+    seconds = int(seconds)
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, secs = divmod(rest, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
 
 
 def _mask(value: str | None) -> str:
@@ -1484,9 +1500,17 @@ async def _refresh_approvals(
 # --------------------------------------------------------------------------- #
 
 
-async def send_artifact(update: Update, artifact: Artifact) -> None:
-    """Send one artifact as a document, degrading to a path when it fails.
+#: MIME types Telegram renders as an inline photo. Everything else (zip,
+#: pdf, svg — Telegram does not rasterise svg photos) goes out as a document.
+PHOTO_MIMES = frozenset({"image/png", "image/jpeg", "image/webp"})
 
+
+async def send_artifact(update: Update, artifact: Artifact) -> None:
+    """Send one artifact, degrading to a path when it fails.
+
+    Images go out as photos so they display in the chat instead of arriving
+    as a file attachment the owner has to tap open; a send that Telegram
+    refuses falls back to the document path rather than dropping the file.
     The caption is deliberately plain text (no parse mode): filenames with
     underscores would fight legacy Markdown parsing, and the file is the
     payload — the caption only has to identify it.
@@ -1496,6 +1520,13 @@ async def send_artifact(update: Update, artifact: Artifact) -> None:
         return
     try:
         with artifact.absolute.open("rb") as handle:
+            if artifact.mime in PHOTO_MIMES:
+                try:
+                    await message.reply_photo(photo=handle, caption=artifact.caption())
+                    return
+                except (BadRequest, TelegramError) as exc:
+                    log.warning("photo send failed for %s, falling back: %s", artifact.path, exc)
+                    handle.seek(0)
             await message.reply_document(
                 document=handle,
                 filename=Path(artifact.path).name,
@@ -1994,13 +2025,20 @@ def build_handlers(config: Config) -> list[Any]:
         await reply(update, "\n".join(lines))
 
     async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """The one-glance view: how long up, which model and endpoint, what runs.
+
+        Per-chat state (context budget, transcript) is ``/context``'s job; this
+        is the process. Tools that are off are named with the reason so the
+        owner sees why without running ``/doctor`` first.
+        """
         if not await authorised(update):
             return
         agent = agent_of(context)
         uptime = time.monotonic() - STARTED
         lines = [
             "<b>status</b>",
-            f"uptime: {uptime:.0f}s",
+            f"up {_humanize_uptime(uptime)} · v{__version__} · "
+            f"mode <code>{parse_mode(config.tools.mode).value}</code>",
             f"model: <code>{escape_html(config.llm.model_of())}</code>",
         ]
         vision = config.llm.vision_model_of()
@@ -2010,15 +2048,22 @@ def build_handlers(config: Config) -> list[Any]:
             f"endpoint: {escape_html(config.llm.base_url_of())} (from {escape_html(config.llm.where_from())})",
             f"reasoning: {'on' if config.llm.reasoning else 'off'}"
             + (f" at {escape_html(config.llm.effort_of())}" if config.llm.reasoning else ""),
-            f"tools: {escape_html(', '.join(agent.registry.names())) or 'none'}",
         ]
-        for tool in agent.registry.all():
-            ok, reason = agent.registry.availability(tool)
-            if not ok:
-                lines.append(f"- <code>{tool.name}</code>: {escape_html(reason)}")
+        tools = agent.registry.all()
+        off = [t for t in tools if not agent.registry.availability(t)[0]]
+        summary = f"tools: {len(tools) - len(off)} on"
+        if off:
+            summary += f" · {len(off)} off"
+        lines.append(summary)
+        if tools:
+            lines.append(f"enabled: {escape_html(', '.join(t.name for t in tools if t not in off))}")
+        for tool in off:
+            _, reason = agent.registry.availability(tool)
+            lines.append(f"  <code>{tool.name}</code>: {escape_html(reason)}")
         web = agent.registry.get("web")
         status = getattr(web, "status_lines", None)
         if status is not None:
+            lines.append("")
             lines.extend(escape_html(line) for line in status())
         await reply(update, "\n".join(lines))
 
