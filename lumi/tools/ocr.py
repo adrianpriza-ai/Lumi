@@ -2,7 +2,8 @@
 
 With ``tools.ocr.base_url`` set, documents go to a Mistral-compatible
 ``POST /ocr`` API. Without it, pypdfium2 extracts embedded PDF text locally;
-scanned pages use ``llm.file_model`` or the default model.
+scanned pages use the explicitly configured ``llm.file_model`` — never the
+chat model: with no file model set, the read is refused.
 Local image files always use the photo route (vision when set, else default).
 
 The local machinery lives in :mod:`lumi.tools.docread`, shared with

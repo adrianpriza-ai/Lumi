@@ -420,7 +420,7 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         if self._reader is None:
             self._reader = DocumentReader(self.config)
         display = self._display(path)
-        ok, reason = self._reader.available()
+        ok, reason = self._reader.available(kind)
         if not ok:
             return ToolResult.failure(
                 f"{display} is a {'PDF' if kind == 'pdf' else 'picture'}, but reading it "

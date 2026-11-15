@@ -129,8 +129,9 @@ The committed configuration enables the tool. Remove `"ocr"` from
 `tools.enabled` or set `tools.ocr.enabled = false` to disable it. Set
 `tools.ocr.base_url` (for example `https://api.mistral.ai/v1`) for the
 dedicated API path, with `tools.ocr.model` as the model id it sends. With no
-`base_url`, local PDF extraction needs `pypdfium2` and only scanned pages use
-the configured model. Availability follows the endpoint: the hosted Mistral
+`base_url`, local PDF extraction needs `pypdfium2`, embedded text reads free,
+and scanned pages are read by the file model (`llm.file_model`) — refused
+when it is not set. Availability follows the endpoint: the hosted Mistral
 API needs `MISTRAL_API_KEY`, while a `base_url` pointed at your own compatible
 server runs keyless. There is no provider preset to choose — the URL is the
 provider.

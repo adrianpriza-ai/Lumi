@@ -185,10 +185,10 @@ class LLMConfig:
     #: because a text-only default could not read the history back either.
     vision_model: str = ""
     #: Model that reads file contents needing a model call — scanned PDF
-    #: pages the ``ocr`` tool transcribes. Empty means "use ``model``" — the
-    #: same default that answers text. Deliberately not the vision model:
-    #: photos go to ``vision_model``, documents go here, everything else goes
-    #: to ``model``. Env spelling: ``LUMI__LLM__FILE_MODEL``.
+    #: pages the ``ocr`` tool transcribes. Must accept image input, and it
+    #: needs an explicit id: empty means scanned pages are refused, never
+    #: "use ``model``" — vision is the only route that falls back to the
+    #: chat model. Env spelling: ``LUMI__LLM__FILE_MODEL``.
     file_model: str = ""
     #: Per-role endpoint overrides; see :class:`ModelRouteConfig`. ``[llm.vision]``
     #: sends image-bearing turns to their own endpoint/key; ``[llm.file]`` does
@@ -425,41 +425,30 @@ class LLMConfig:
         return self._with_route(self.vision, self, self.vision.model.strip() or self.vision_model)
 
     def file_model_of(self) -> str:
-        """The model that reads file contents needing a model call.
+        """The model that reads file contents needing a model call, or ``""``.
 
         ``[llm.file].model`` wins, then the flat ``llm.file_model`` (env
-        spelling ``LUMI__LLM__FILE_MODEL``), then the default model — the one
-        that also answers text. Deliberately *not* the vision model: one
-        setting per input type — photos to ``vision_model``, documents to
-        ``file_model``, everything to ``model`` — so configuring a vision
-        model never silently changes what reads a document.
+        spelling ``LUMI__LLM__FILE_MODEL``). Unlike the vision model there is
+        *no* fallback to ``llm.model``: most endpoints answer text with a
+        model that cannot see images at all, so an unset file model means
+        unset — readers refuse scanned pages rather than shipping pixels
+        that come back as a 400 or a guess. Vision is the only route that
+        may fall back to the chat model.
         """
         if self.file.model.strip():
             return self.file.model.strip()
-        if self.file_model.strip():
-            return self.file_model.strip()
-        return self.model_of()
-
-    def has_file_model(self) -> bool:
-        """Whether a file-reading model is *explicitly* configured.
-
-        Only ``[llm.file].model`` or the flat ``llm.file_model`` count — the
-        default model inherited by :meth:`file_model_of` does not, because
-        most endpoints answer text with a model that cannot see images at
-        all. Readers use this to refuse rendering scanned pages to an
-        unverified model rather than shipping pixels that come back as a 400
-        or a guess.
-        """
-        return bool(self.file.model.strip() or self.file_model.strip())
+        return self.file_model.strip()
 
     def file_route_of(self) -> LLMConfig:
         """The endpoint file contents go to: ``[llm.file]`` merged over
         ``[llm]``. Never None — reading degrades to the default endpoint
         rather than disappearing.
 
-        It merges over the *default* route, not the vision one: a document
-        goes to the default endpoint and model unless ``[llm.file]`` says
-        otherwise, even when a vision model is configured for photos.
+        Usable only when :meth:`file_model_of` names a model; with none set,
+        readers refuse before ever building a request. It merges over the
+        *default* route, not the vision one: a document goes to the default
+        endpoint unless ``[llm.file]`` says otherwise, even when a vision
+        model is configured for photos.
         """
         return self._with_route(self.file, self, self.file_model_of())
 
@@ -545,10 +534,10 @@ class OCRConfig:
 
     With ``base_url`` empty (the default), the tool works locally: text
     embedded in the PDF is extracted for free, and only pages that come back
-    empty (scans) are rendered and transcribed — by ``[llm.file]``'s model
-    when one is set, else the default model (``llm.model``), never the vision
-    model. Image files follow the photo rule instead: vision model if set,
-    else the default.
+    empty (scans) are rendered and transcribed — by ``[llm.file]``'s model,
+    which must be explicitly set: scanned pages are never sent to the chat
+    model, so with no file model configured the read is refused. Image files
+    follow the photo rule instead: vision model if set, else the default.
     """
 
     enabled: bool = True
@@ -565,7 +554,7 @@ class OCRConfig:
     timeout_seconds: float = 120.0
     #: Ceiling on pages of one PDF processed per call in the local path.
     #: Pages with embedded text are free; this bounds the ones that fall
-    #: through to the vision model, which are the ones that cost. 0 means
+    #: through to the file model, which are the ones that cost. 0 means
     #: every page. Unused by the dedicated API — the server pages itself.
     max_pages: int = 20
     #: Render scale for pages that need scanning. pypdfium2 scales by 72 DPI

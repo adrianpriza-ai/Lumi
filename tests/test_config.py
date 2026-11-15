@@ -772,7 +772,7 @@ def test_the_file_route_stays_on_the_default_even_with_a_vision_route(config) ->
     config.llm.vision.base_url = "https://openrouter.ai/api/v1"
     file = config.llm.file_route_of()
     assert file.base_url_of() == config.llm.base_url_of()  # default, not vision's
-    assert config.llm.file_model_of() == config.llm.model_of()
+    assert config.llm.file_model_of() == ""  # nothing explicit: unset, not the chat model
 
     # [llm.file] overrides, exactly like any other route.
     config.llm.file.model = "qwen2.5-vl"
@@ -780,21 +780,12 @@ def test_the_file_route_stays_on_the_default_even_with_a_vision_route(config) ->
     assert config.llm.file_model_of() == "qwen2.5-vl"
 
 
-def test_the_file_model_falls_back_to_the_default_not_the_vision_model(config) -> None:
+def test_the_file_model_never_falls_back_to_the_chat_model(config) -> None:
+    """Vision may fall back to the chat model; the file model may not —
+    most endpoints answer text with a model that cannot see images."""
     config.llm.vision_model = "gpt-4o"
-    assert config.llm.file_model_of() == config.llm.model_of()
-
-
-def test_the_file_model_counts_only_when_explicit(config) -> None:
-    """The inherited default is not a file model: most endpoints answer text
-    with a model that cannot see images, so readers must not trust it."""
-    assert not config.llm.has_file_model()
-    assert config.llm.file_model_of() == config.llm.model_of()  # still resolves
-    config.llm.file_model = "qwen2.5-vl"
-    assert config.llm.has_file_model()
-    config.llm.file_model = ""
-    config.llm.file.model = "from-route"
-    assert config.llm.has_file_model()
+    assert config.llm.vision_model_of() == "gpt-4o"
+    assert config.llm.file_model_of() == ""
 
 
 def test_the_file_model_resolves_from_the_flat_field(config) -> None:

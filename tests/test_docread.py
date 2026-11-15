@@ -16,6 +16,8 @@ from typing import Any
 import pytest
 from test_ocr import PNG_1PX, StubLLM, make_pdf
 
+from lumi.config import OCR_DEFAULT_BASE_URL
+
 from lumi.agent import _tool_message_content
 from lumi.bot import _quoted_prefix
 from lumi.chatlog import ChatLog, LogEntry, media_entry_from
@@ -125,6 +127,36 @@ async def test_read_file_media_when_disabled_names_the_switch(config, project: P
 
     assert not result.ok
     assert "tools.ocr.enabled" in result.text
+
+
+async def test_read_file_attaches_an_image_even_with_a_broken_ocr_endpoint(
+    config, project: Path
+) -> None:
+    """Attaching touches neither the OCR API nor the local PDF machinery —
+    a broken tools.ocr.base_url must not refuse a photo with an irrelevant fix."""
+    path = project / "workspace" / "pic.png"
+    path.write_bytes(base64.b64decode(PNG_1PX))
+    config.tools.ocr.base_url = "not-a-url"
+    tool = ReadFileTool(config)
+
+    result = await tool.invoke({"path": str(path)}, ctx())
+
+    assert result.ok
+    assert len(result.images) == 1
+
+
+async def test_read_file_refuses_a_pdf_with_a_broken_ocr_endpoint(config, project: Path) -> None:
+    """The PDF path goes through the dedicated API when one is configured,
+    so the endpoint problem is exactly the right reason to refuse here."""
+    path = project / "workspace" / "doc.pdf"
+    path.write_bytes(make_pdf("hello"))
+    config.tools.ocr.base_url = "not-a-url"
+    tool = ReadFileTool(config)
+
+    result = await tool.invoke({"path": str(path)}, ctx())
+
+    assert not result.ok
+    assert "base_url" in result.text
 
 
 async def test_read_file_refuses_another_chats_upload_image(config, project: Path) -> None:
@@ -241,6 +273,25 @@ async def test_reader_pdf_scan_pages_are_refused_without_a_file_model(
     assert not result.ok
     assert "no file model is configured" in result.text
     assert "[page 1]" not in result.text
+
+
+async def test_reader_refusal_names_the_ocr_tool_when_the_api_is_configured(
+    config, project: Path, monkeypatch
+) -> None:
+    """With a dedicated OCR API already there, the working fix is the `ocr`
+    tool — not more configuration."""
+    path = project / "workspace" / "scan.pdf"
+    path.write_bytes(make_pdf(""))  # blank page -> nothing embedded
+    config.tools.ocr.base_url = OCR_DEFAULT_BASE_URL
+    monkeypatch.setenv("MISTRAL_API_KEY", "mk-1")
+    reader = DocumentReader(config)
+    reader._llm = StubLLM(["transcribed words"])
+
+    result = await reader.read_pdf(path)
+
+    assert not result.ok
+    assert "`ocr` tool" in result.text
+    assert "llm.file_model" not in result.text
 
 
 # --------------------------------------------------------------------------- #

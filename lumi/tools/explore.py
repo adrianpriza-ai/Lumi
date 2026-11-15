@@ -347,7 +347,7 @@ never hangs, and the line numbers make `files.edit` calls unambiguous. Use the
         if self._reader is None:
             self._reader = DocumentReader(self._config)
         display = _display(self.root, path)
-        ok, reason = self._reader.available()
+        ok, reason = self._reader.available(kind)
         if not ok:
             return ToolResult.failure(
                 f"{display} is a {'PDF' if kind == 'pdf' else 'picture'}, but reading it "

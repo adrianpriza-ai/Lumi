@@ -224,12 +224,19 @@ class DocumentReader:
 
     # -- availability and guards ------------------------------------------- #
 
-    def available(self) -> tuple[bool, str]:
-        """Whether media reading is on at all: the ``ocr`` tool's own switch."""
+    def available(self, kind: str | None = None) -> tuple[bool, str]:
+        """Whether media reading is on: the ``ocr`` tool's own switch.
+
+        *kind* is ``"pdf"`` or ``"image"`` when the caller knows. A PDF goes
+        through the local extractor or the dedicated OCR API, so a broken
+        endpoint config is a PDF problem; an image attaches to the chat turn
+        and touches neither, so only the master switch governs it — refusing
+        a photo over a ``tools.ocr.base_url`` typo would name the wrong fix.
+        """
         ocr = self._config.tools.ocr
         if not ocr.enabled:
             return False, "disabled by tools.ocr.enabled"
-        if problem := ocr.endpoint_problem():
+        if kind != "image" and (problem := ocr.endpoint_problem()):
             return False, problem
         return True, ""
 
@@ -318,19 +325,30 @@ class DocumentReader:
                 else:
                     scanned.append(index)
 
-            # Scanned pages are never sent to the default model: most
+            # Scanned pages are never sent to the chat model: most
             # endpoints answer text with a model that cannot see images, so
             # the pixels would come back as a 400 — or worse, a guess.
             # Reading them needs an explicitly configured file model (or the
             # dedicated OCR API the `ocr` tool offers); the embedded-text
-            # pages below need no model at all and still go out.
-            if scanned and not self._config.llm.has_file_model():
+            # pages below need no model at all and still go out. The fix
+            # named depends on what is already configured: with a dedicated
+            # API, the `ocr` tool can read this document right now.
+            if scanned and not self._config.llm.file_model_of():
+                if self._config.tools.ocr.uses_api():
+                    hint = (
+                        "the `ocr` tool can read it — call it on this file "
+                        "path (the dedicated OCR API is configured)"
+                    )
+                else:
+                    hint = (
+                        "set `llm.file_model` to a chat model that accepts "
+                        "image input, or set `[tools.ocr] base_url` to a "
+                        "dedicated OCR API"
+                    )
                 return ToolResult.failure(
                     f"{relative_to_root(path)}: {len(scanned)} of {limit} page(s) have no "
                     "embedded text, and no file model is configured to read them — scanned "
-                    "pages are never sent to the default model. Set `llm.file_model` to a "
-                    "chat model that accepts image input, or set `[tools.ocr] base_url` to "
-                    "a dedicated OCR API."
+                    f"pages are never sent to the chat model. {hint}."
                 )
 
             rendered: dict[int, str] = {}

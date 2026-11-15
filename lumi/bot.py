@@ -2062,9 +2062,15 @@ def build_handlers(config: Config) -> list[Any]:
         vision = config.llm.vision_model_of()
         if vision:
             lines.append(f"vision: <code>{escape_html(vision)}</code> (photos)")
+        # The file model never falls back to the chat model, so "unset" is
+        # the honest state to show — not the model that would have been
+        # wrongly sent.
         file_model = config.llm.file_model_of()
-        if file_model:
-            lines.append(f"file model: <code>{escape_html(file_model)}</code> (scanned PDFs)")
+        lines.append(
+            f"file model: <code>{escape_html(file_model)}</code> (scanned PDFs)"
+            if file_model
+            else "file model: unset — scanned PDFs are refused"
+        )
 
         # The chat this was typed in — the same numbers /context expands.
         chat_id = chat_of(update)

@@ -256,12 +256,12 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
             checks.append(
                 Check(
                     "ocr",
-                    OK if config.llm.has_file_model() else WARN,
+                    OK if config.llm.file_model_of() else WARN,
                     (
                         f"local path (embedded text + {config.llm.file_model_of()} for scans); "
                         "set [tools.ocr] base_url for a dedicated OCR API"
                     )
-                    if config.llm.has_file_model()
+                    if config.llm.file_model_of()
                     else "local path (embedded text only — scanned pages are refused; "
                     "set llm.file_model to a model that accepts image input, or "
                     "[tools.ocr] base_url for a dedicated OCR API)",
