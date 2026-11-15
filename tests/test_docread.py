@@ -16,11 +16,10 @@ from typing import Any
 import pytest
 from test_ocr import PNG_1PX, StubLLM, make_pdf
 
-from lumi.config import OCR_DEFAULT_BASE_URL
-
 from lumi.agent import _tool_message_content
 from lumi.bot import _quoted_prefix
 from lumi.chatlog import ChatLog, LogEntry, media_entry_from
+from lumi.config import OCR_DEFAULT_BASE_URL
 from lumi.context import ELIDED_FLAG, content_chars
 from lumi.tools.base import ToolContext, ToolError, ToolResult
 from lumi.tools.docread import DocumentReader, media_kind, prepare_attachment
