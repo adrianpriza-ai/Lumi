@@ -197,6 +197,36 @@ def _humanize_uptime(seconds: float) -> str:
     return f"{secs}s"
 
 
+def _human_bytes(size: int) -> str:
+    """Bytes in chat words: 512 B, 3.4 KB, 12.4 MB — never a raw count."""
+    if size >= 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f} MB"
+    if size >= 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size} B"
+
+
+def _outbox_stats(store: ArtifactStore) -> tuple[int, int]:
+    """The outbox as (file count, total bytes); 0/0 when it does not exist yet.
+
+    Walks ``data/outbox`` on every call — the store stages one copy per
+    delivered artifact there, so in a long-lived process it holds at most a
+    few hundred small files and the walk is cheap next to the reply itself.
+    """
+    root = store.outbox_dir()
+    if not root.is_dir():
+        return 0, 0
+    files = 0
+    total = 0
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        files += 1
+        with contextlib.suppress(OSError):
+            total += path.stat().st_size
+    return files, total
+
+
 def _mask(value: str | None) -> str:
     """A credential safe to show in chat.
 
@@ -2004,11 +2034,13 @@ def build_handlers(config: Config) -> list[Any]:
         await reply(update, "\n".join(lines))
 
     async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """The one-glance view: how long up, which model and endpoint, what runs.
+        """The one-glance view, in sections: process, model, this chat, tools, web.
 
-        Per-chat state (context budget, transcript) is ``/context``'s job; this
-        is the process. Tools that are off are named with the reason so the
-        owner sees why without running ``/doctor`` first.
+        ``/context`` stays the deep dive (the full budget breakdown, the
+        condensed record, the transcript path); this is the digest — one line
+        per area, a pointer's depth. Tools that are off are named with the
+        reason so the owner sees why without running ``/doctor`` first, and
+        the key count is a count: the keys themselves are ``/env``'s secret.
         """
         if not await authorised(update):
             return
@@ -2018,32 +2050,77 @@ def build_handlers(config: Config) -> list[Any]:
             "<b>status</b>",
             f"up {_humanize_uptime(uptime)} · v{__version__} · "
             f"mode <code>{parse_mode(config.tools.mode).value}</code>",
-            f"model: <code>{escape_html(config.llm.model_of())}</code>",
+            "",
+            "<b>model</b>",
+            f"model: <code>{escape_html(config.llm.model_of())}</code>"
+            f" · reasoning: {'on' if config.llm.reasoning else 'off'}"
+            + (f" at {escape_html(config.llm.effort_of())}" if config.llm.reasoning else ""),
+            f"endpoint: {escape_html(config.llm.base_url_of())}"
+            f" (from {escape_html(config.llm.where_from())})"
+            f" · {len(config.llm.api_keys())} key(s), {escape_html(config.llm.strategy_of())}",
         ]
         vision = config.llm.vision_model_of()
         if vision:
-            lines.append(f"vision model: <code>{escape_html(vision)}</code> (for photos)")
+            lines.append(f"vision: <code>{escape_html(vision)}</code> (photos)")
+        file_model = config.llm.file_model_of()
+        if file_model:
+            lines.append(f"file model: <code>{escape_html(file_model)}</code> (scanned PDFs)")
+
+        # The chat this was typed in — the same numbers /context expands.
+        chat_id = chat_of(update)
+        report = agent.context_report(chat_id)
+        transcript = history_of(context).stats(chat_id)
+        facts = len(memory_of(update, context).managed())
         lines += [
-            f"endpoint: {escape_html(config.llm.base_url_of())} (from {escape_html(config.llm.where_from())})",
-            f"reasoning: {'on' if config.llm.reasoning else 'off'}"
-            + (f" at {escape_html(config.llm.effort_of())}" if config.llm.reasoning else ""),
+            "",
+            "<b>this chat</b>",
+            f"context: {report.tokens:,} / {report.budget:,} tokens ({report.fill:.0%})"
+            f" · {report.messages} message(s)",
+            f"memory: {facts} fact(s) · transcript {_human_bytes(transcript['bytes'])}"
+            f" · {transcript['turns']} turn(s) on replay",
         ]
+        if report.summarised or report.elided or report.dropped:
+            lines.append(
+                f"condensed: {report.summarised} summarised · {report.elided} elided"
+                f" · {report.dropped} dropped"
+            )
+        if report.over_window:
+            lines.append(
+                "⚠ the system prompt and the newest turn alone exceed the window — "
+                "raise llm.context_window or lower llm.context_keep_recent"
+            )
+
         tools = agent.registry.all()
         off = [t for t in tools if not agent.registry.availability(t)[0]]
-        summary = f"tools: {len(tools) - len(off)} on"
+        lines += ["", "<b>tools</b>"]
+        summary = f"{len(tools) - len(off)} on"
         if off:
             summary += f" · {len(off)} off"
-        lines.append(summary)
+        lines.append(f"tools: {summary}")
         if tools:
-            lines.append(f"enabled: {escape_html(', '.join(t.name for t in tools if t not in off))}")
+            lines.append(
+                f"enabled: {escape_html(', '.join(t.name for t in tools if t not in off))}"
+            )
         for tool in off:
             _, reason = agent.registry.availability(tool)
             lines.append(f"  <code>{tool.name}</code>: {escape_html(reason)}")
+
         web = agent.registry.get("web")
         status = getattr(web, "status_lines", None)
         if status is not None:
-            lines.append("")
+            lines += ["", "<b>web</b>"]
             lines.extend(escape_html(line) for line in status())
+
+        # Process-wide state that is not the model's business: how many chats
+        # the loop holds, and what is staged for delivery in the outbox.
+        artifacts: ArtifactStore = context.application.bot_data["artifacts"]
+        outbox_files, outbox_bytes = _outbox_stats(artifacts)
+        lines += [
+            "",
+            "<b>process</b>",
+            f"chats in memory: {agent.conversations_in_memory()}"
+            f" · outbox: {outbox_files} file(s), {_human_bytes(outbox_bytes)}",
+        ]
         await reply(update, "\n".join(lines))
 
     async def doctor_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

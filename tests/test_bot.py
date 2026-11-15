@@ -1076,6 +1076,22 @@ async def test_status_says_when_the_image_model_is_unset(config) -> None:
     assert "tools.image_gen.model is not set" in body
 
 
+async def test_status_reports_this_chat_and_the_process(config) -> None:
+    """The digest covers the chat it was typed in, and the process behind it."""
+    bot, _ = await send(config, [], "/status")
+    body = texts(bot)
+    assert "<b>this chat</b>" in body
+    assert "context: " in body
+    assert "/ 184,000 tokens" in body  # the fixture's window: 200k minus 16k headroom
+    assert "memory: 0 fact(s)" in body  # the fixture's managed region is empty
+    assert "transcript" in body
+    assert "<b>process</b>" in body
+    assert "chats in memory:" in body
+    assert "outbox:" in body
+    assert "1 key(s)" in body  # the fixture sets exactly one key
+    assert "test-key" not in body  # keys are counted, never printed — that is /env's job
+
+
 async def test_context_command_reports_the_window(config) -> None:
     """A bot that forgets is hard to argue with, so what it is holding has to
     be inspectable rather than a matter of trust."""
