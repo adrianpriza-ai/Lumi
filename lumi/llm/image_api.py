@@ -25,6 +25,7 @@ from typing import Any
 
 from ..config import ImageGenConfig
 from ..util.log import get_logger
+from ..util.net import validate_fetch_url
 from ..util.text import format_error, truncate
 from .base import LLMError
 
@@ -129,7 +130,14 @@ class ImageGenClient:
         )
 
     async def _download(self, url: str) -> tuple[str, bytes]:
-        """Fetch an image the provider hosted at a URL instead of inlining."""
+        """Fetch an image the provider hosted at a URL instead of inlining.
+
+        The URL comes from the provider's response body — attacker-shaped if
+        the endpoint is — so it is guarded like a web fetch: refused when the
+        guard names a reason, and re-checked on the final URL in case the
+        redirect chain ended somewhere the start did not."""
+        if reason := validate_fetch_url(url):
+            raise LLMError(f"the image host was refused: {reason} ({url})")
         try:
             import httpx
         except ImportError as exc:  # pragma: no cover - openai always pulls httpx in
@@ -144,6 +152,11 @@ class ImageGenClient:
             raise LLMError(
                 f"could not download the generated image from {url}: {format_error(exc)}"
             ) from exc
+        # follow_redirects=True means response.url is where the chain ended —
+        # re-run the guard on it, exactly as web fetch does for its providers.
+        final = str(response.url)
+        if final != url and (reason := validate_fetch_url(final)):
+            raise LLMError(f"the image host was refused after redirecting: {reason} ({final})")
         if response.status_code >= 400:
             raise LLMError(
                 f"the image host returned HTTP {response.status_code} for the generated image"

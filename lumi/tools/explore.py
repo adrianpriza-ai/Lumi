@@ -25,6 +25,7 @@ from typing import Any
 
 from ..config import Config
 from ..paths import is_within, relative_to_root
+from ..util.text import fence_untrusted
 from .base import Tool, ToolContext, ToolError, ToolResult
 from .docread import DocumentReader, media_kind
 from .files import MAX_LIST_ENTRIES, READABLE_SYSTEM_PATHS, foreign_uploads
@@ -375,7 +376,10 @@ never hangs, and the line numbers make `files.edit` calls unambiguous. Use the
         if total is not None:
             span += f" of {total:,}"
         header = f"--- {display} ({span}, {size:,} bytes) ---"
-        body = "\n".join(f"{lineno:6d}  {text}" for lineno, text in collected)
+        # The lines are file content — possibly an attacker-uploaded one — so
+        # the body travels as data, not instructions. Only the body: the header
+        # and the continue-here tail are ours and stay outside the fence.
+        body = fence_untrusted("\n".join(f"{lineno:6d}  {text}" for lineno, text in collected))
         tail = ""
         if more:
             tail = (

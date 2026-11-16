@@ -39,6 +39,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from ..config import OPENAI_DEFAULT_BASE_URL, LLMConfig
+from ..util.env import SECRET_PATTERN
 from ..util.log import get_logger
 from ..util.text import format_error
 from .base import (
@@ -79,6 +80,33 @@ class _StreamBroken(LLMError):
     the request itself succeeded. Raised only by :meth:`_stream` once
     :attr:`_StreamState.sent_text` is set.
     """
+
+
+def _redact_url(url: str) -> str:
+    """A base_url safe to quote in chat-facing error text and log lines.
+
+    Some endpoints put the credential in the URL itself — ``…/v1?api_key=sk-…``
+    or ``scheme://user:pass@host`` — and :meth:`_explain` always names the
+    endpoint, so a secret-named query value and the userinfo are masked before
+    the string leaves the process. The log lines share the wording, so they
+    share the helper too.
+    """
+    scheme, sep, rest = url.partition("://")
+    if sep:
+        authority, slash, tail = rest.partition("/")
+        if "@" in authority:
+            # Everything before the last '@' is the credential; mask it whole.
+            userinfo, _, host = authority.rpartition("@")
+            authority = f"{mask(userinfo)}@{host}"
+        url = scheme + "://" + authority + ("/" + tail if slash else "")
+    base, sep, query = url.partition("?")
+    if not sep:
+        return url
+    pairs = []
+    for pair in query.split("&"):
+        key, eq, value = pair.partition("=")
+        pairs.append(f"{key}={mask(value)}" if eq and SECRET_PATTERN.search(key) else pair)
+    return base + sep + "&".join(pairs)
 
 
 class _StreamState:
@@ -237,7 +265,7 @@ class OpenAICompatClient(LLMClient):
             log.info(
                 "llm ready: model=%s endpoint=%s (from %s) keys=%s",
                 self.config.model_of(),
-                self.config.base_url_of(),
+                _redact_url(self.config.base_url_of()),
                 self.config.where_from(),
                 self._pool.describe(),
             )
@@ -348,7 +376,7 @@ class OpenAICompatClient(LLMClient):
                 if rejects_param(exc) and index + 1 < len(variants):
                     log.warning(
                         "%s rejected this request: %s. Retrying without %s",
-                        self.config.base_url_of(),
+                        _redact_url(self.config.base_url_of()),
                         format_error(exc),
                         _dropped(params),
                     )
@@ -525,7 +553,7 @@ class OpenAICompatClient(LLMClient):
                     raise LLMError(
                         "the connection dropped while the answer was streaming: "
                         f"{format_error(exc)}\n\n"
-                        f"Endpoint: {self.config.base_url_of()} "
+                        f"Endpoint: {_redact_url(self.config.base_url_of())} "
                         f"(from {self.config.where_from()})\n"
                         f"Model: {self.config.model_of()}"
                     ) from exc
@@ -563,7 +591,7 @@ class OpenAICompatClient(LLMClient):
                     log.warning(
                         "%s from %s; retrying inference in %.1fs (%d/%d)",
                         "empty response" if empty else format_error(error),
-                        self.config.base_url_of(),
+                        _redact_url(self.config.base_url_of()),
                         delay,
                         retry_number,
                         self.config.inference_retries,
@@ -584,7 +612,7 @@ class OpenAICompatClient(LLMClient):
                 self._pool.report(key, ok=False, retryable=retryable)
                 log.error(
                     "llm call to %s failed on key %s: %s",
-                    self.config.base_url_of(),
+                    _redact_url(self.config.base_url_of()),
                     mask(key),
                     format_error(error),
                 )
@@ -602,9 +630,11 @@ class OpenAICompatClient(LLMClient):
         """The message the owner sees. Names the endpoint, model and key source.
 
         Always name the endpoint: "401 invalid_api_key" against the wrong host is
-        the most confusing failure this program can produce.
+        the most confusing failure this program can produce. The endpoint is
+        quoted redacted — a key-in-query base_url is a credential, not a label.
         """
-        endpoint = self.config.base_url_of()
+        base_url = self.config.base_url_of()
+        endpoint = _redact_url(base_url)
         model, with_images = self._last_request
         if failure is None:  # pragma: no cover - only if the pool goes empty mid-call
             return (
@@ -650,7 +680,7 @@ class OpenAICompatClient(LLMClient):
                 "add a multimodal model to the [llm] block of config.toml: "
                 '`vision_model = "gpt-4o"` (or any vision-capable id your endpoint serves).'
             )
-        elif endpoint == OPENAI_DEFAULT_BASE_URL:
+        elif base_url == OPENAI_DEFAULT_BASE_URL:
             hint = (
                 "\n\nThat is OpenAI itself. If you meant a different provider, set "
                 "OPENAI_BASE_URL in .env, or base_url in the [llm] block of config.toml."

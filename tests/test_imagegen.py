@@ -166,6 +166,20 @@ async def test_generate_saves_png_and_registers_artifact(key: None, tmp_path: Pa
     (artifact,) = result.artifacts
     assert artifact.path == result.data["path"]
     assert artifact.absolute.is_file()
+    # No chat in the context: the CLI stages under its literal scope.
+    assert artifact.absolute.is_relative_to(tmp_path / "data" / "outbox" / "cli")
+
+
+async def test_the_artifact_is_staged_under_the_requesting_chat(key: None, tmp_path: Path) -> None:
+    """Outbox copies are per chat, like the files tool stages them."""
+    tool = make_tool(tmp_path)
+    tool._api = StubClient(("image/png", base64.b64decode(PNG_1PX)))
+
+    result = await tool.invoke({"prompt": "chat bound"}, ToolContext(chat_id=42))
+
+    assert result.ok
+    (artifact,) = result.artifacts
+    assert artifact.absolute.is_relative_to(tmp_path / "data" / "outbox" / "42")
 
 
 async def test_size_reaches_the_client(key: None, tmp_path: Path) -> None:

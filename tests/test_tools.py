@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,19 @@ from lumi.util.env import scrubbed_env
 
 def ctx(**kwargs) -> ToolContext:
     return ToolContext(**kwargs)
+
+
+def predate_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make fixtures created *now* count as predating the session.
+
+    The session gate reads ctime as well as mtime — ``touch -r`` forges mtime
+    but stamps ctime with now, so :func:`conftest.backdate` alone cannot make a
+    freshly created fixture pre-session any more. Shifting the files tool's
+    SESSION_START past the fixtures' creation is the honest stand-in: the gate
+    then sees what it would have seen for a file that really was on disk
+    before this run started.
+    """
+    monkeypatch.setattr("lumi.tools.files.SESSION_START", time.time() + 60)
 
 
 # --------------------------------------------------------------------------- #
@@ -374,10 +388,11 @@ async def test_overwriting_a_non_empty_file_needs_approval(files: FilesTool, con
     assert target.read_text(encoding="utf-8") == "original"
 
 
-async def test_overwrite_flag_skips_approval(files: FilesTool, config) -> None:
+async def test_overwrite_flag_skips_approval(files: FilesTool, config, monkeypatch) -> None:
     target = config.shell_cwd / "exists.md"
     target.write_text("original", encoding="utf-8")
     backdate(target)  # a file from before this session: only the overwrite rule applies
+    predate_session(monkeypatch)  # ctime cannot be backdated, so shift the gate instead
     result = await files.invoke(
         {
             "action": "write",
@@ -399,6 +414,52 @@ async def test_approved_overwrite_runs(files: FilesTool, config) -> None:
         {"action": "write", "path": "workspace/exists.md", "content": "replaced"},
         ctx(confirmed=True),
     )
+    assert target.read_text(encoding="utf-8") == "replaced"
+
+
+async def test_an_approved_overwrite_still_runs_when_the_content_is_unchanged(
+    files: FilesTool, config, monkeypatch
+) -> None:
+    """The digest binding only bites when the file moved: the confirmed re-run
+    of an approval granted against the content still on disk writes normally."""
+    target = config.shell_cwd / "exists.md"
+    target.write_text("original", encoding="utf-8")
+    predate_session(monkeypatch)  # the overwrite rule asks, not the session gate
+    args = {"action": "write", "path": "workspace/exists.md", "content": "replaced"}
+
+    with pytest.raises(NeedsApproval):
+        await files.invoke(args, ctx())
+    assert target.read_text(encoding="utf-8") == "original"
+
+    result = await files.invoke(args, ctx(confirmed=True))
+    assert result.ok
+    assert target.read_text(encoding="utf-8") == "replaced"
+
+
+async def test_an_overwrite_approval_does_not_cover_content_that_arrived_later(
+    files: FilesTool, config, monkeypatch
+) -> None:
+    """The approval binds to the content it previewed: between the tap and the
+    confirmed re-run, `victim` landed in the file. Overwriting it silently
+    would destroy exactly the bytes the owner never saw, so the tool re-asks
+    with a fresh preview instead of spending the approval."""
+    target = config.shell_cwd / "f.md"
+    target.write_text("original", encoding="utf-8")
+    predate_session(monkeypatch)  # the overwrite rule asks, not the session gate
+    args = {"action": "write", "path": "workspace/f.md", "content": "replaced"}
+
+    with pytest.raises(NeedsApproval):
+        await files.invoke(args, ctx())
+    target.write_text("victim", encoding="utf-8")
+
+    with pytest.raises(NeedsApproval, match="changed since this overwrite was approved"):
+        await files.invoke(args, ctx(confirmed=True))
+    assert target.read_text(encoding="utf-8") == "victim"
+
+    # One approval = one binding: the mismatch spent it, so approving the new
+    # preview once more is enough for the write to land.
+    result = await files.invoke(args, ctx(confirmed=True))
+    assert result.ok
     assert target.read_text(encoding="utf-8") == "replaced"
 
 
@@ -549,12 +610,31 @@ async def test_write_creates_parent_directories(files: FilesTool, config) -> Non
     assert (config.shell_cwd / "deep" / "nested" / "file.md").is_file()
 
 
-async def test_append(files: FilesTool, config) -> None:
+async def test_append(files: FilesTool, config, monkeypatch) -> None:
     target = config.shell_cwd / "log.md"
     target.write_text("one\n", encoding="utf-8")
     backdate(target)
+    predate_session(monkeypatch)  # ctime cannot be backdated; see predate_session
     await files.invoke({"action": "append", "path": "workspace/log.md", "content": "two\n"}, ctx())
     assert target.read_text(encoding="utf-8") == "one\ntwo\n"
+
+
+async def test_append_through_a_hard_link_to_a_protected_file_is_refused(
+    files: FilesTool, config
+) -> None:
+    """A hard link made before the session shares a protected file's inode
+    under a name the deny list never sees: appending through the link writes
+    the config exactly as much as appending to it would, so it is refused."""
+    config_toml = config.root / "config.toml"
+    before = config_toml.read_text(encoding="utf-8")
+    link = config.root / "workspace" / "lnk"
+    os.link(config_toml, link)
+
+    with pytest.raises(ToolError, match="hard link"):
+        await files.invoke({"action": "append", "path": "workspace/lnk", "content": "x\n"}, ctx())
+
+    assert config_toml.read_text(encoding="utf-8") == before
+    assert link.read_text(encoding="utf-8") == before
 
 
 async def test_append_needs_no_approval_even_when_the_file_exists(files: FilesTool) -> None:
@@ -600,6 +680,51 @@ async def test_search_with_a_glob(files: FilesTool) -> None:
     result = await files.invoke({"action": "search", "pattern": "**/*.toml"}, ctx())
     assert result.ok
     assert "config.toml" in result.text
+
+
+async def test_search_judges_each_match_like_a_read(files: FilesTool, config) -> None:
+    """A glob can name files the start directory's own resolution never saw:
+    a link pointing out of the project, another chat's uploads, a credential.
+    A file a read would refuse is not listed either — the search returns only
+    what it could have shown, instead of handing over the addresses."""
+    foreign = config.root / "workspace" / "uploads" / "42" / "f.pdf"
+    foreign.parent.mkdir(parents=True)
+    foreign.write_text("chat 42 only", encoding="utf-8")
+    own = config.root / "workspace" / "uploads" / "7" / "own.md"
+    own.parent.mkdir(parents=True)
+    own.write_text("chat 7 own", encoding="utf-8")
+    outside = config.root.parent / "outside-search-target.md"
+    outside.write_text("not project material", encoding="utf-8")
+    link = config.root / "workspace" / "escapes.md"
+    os.symlink(outside, link)
+    secret = config.root / "workspace" / ".env"
+    secret.write_text("TOKEN=1\n", encoding="utf-8")
+
+    for pattern in ("workspace/uploads/42/*", "workspace/escapes.md", "workspace/.env"):
+        result = await files.invoke({"action": "search", "pattern": pattern}, ctx(chat_id=7))
+        assert result.ok
+        assert "(none)" in result.text, pattern
+        assert not result.data["matches"], pattern
+
+    result = await files.invoke(
+        {"action": "search", "pattern": "workspace/uploads/7/*"}, ctx(chat_id=7)
+    )
+    assert result.data["matches"] == ["workspace/uploads/7/own.md"]
+
+    outside.unlink(missing_ok=True)
+
+
+async def test_search_refuses_dotdot_patterns(files: FilesTool) -> None:
+    """A '..' component walks the glob out of the start directory, past the
+    resolution the start itself went through — refused outright."""
+    with pytest.raises(ToolError, match=r"may not contain '\.\.'"):
+        await files.invoke({"action": "search", "pattern": "../../outside/*"}, ctx())
+    with pytest.raises(ToolError, match=r"may not contain '\.\.'"):
+        await files.invoke({"action": "search", "pattern": "uploads/../7/*"}, ctx())
+
+    # Listing a path outside the project is still refused as it always was.
+    with pytest.raises(ToolError, match="outside the project"):
+        await files.invoke({"action": "list", "path": "../outside"}, ctx())
 
 
 async def test_search_with_a_bad_pattern_does_not_crash(files: FilesTool) -> None:
@@ -724,10 +849,11 @@ async def test_write_size_limit(files: FilesTool, config) -> None:
 # --------------------------------------------------------------------------- #
 
 
-async def test_edit_replaces_exact_text(files: FilesTool, config) -> None:
+async def test_edit_replaces_exact_text(files: FilesTool, config, monkeypatch) -> None:
     target = config.shell_cwd / "note.md"
     target.write_text("hello world\n", encoding="utf-8")
     backdate(target)
+    predate_session(monkeypatch)  # ctime cannot be backdated; see predate_session
 
     result = await files.invoke(
         {
@@ -744,7 +870,9 @@ async def test_edit_replaces_exact_text(files: FilesTool, config) -> None:
     assert "before" in result.text and "after" in result.text  # a diff is shown
 
 
-async def test_edit_needs_no_approval_even_on_an_existing_file(files: FilesTool, config) -> None:
+async def test_edit_needs_no_approval_even_on_an_existing_file(
+    files: FilesTool, config, monkeypatch
+) -> None:
     """An anchored edit cannot clobber what it does not name, so no tap.
 
     The whole-file `write` to the same non-empty file must still ask — the
@@ -754,6 +882,7 @@ async def test_edit_needs_no_approval_even_on_an_existing_file(files: FilesTool,
     target = config.shell_cwd / "exists.md"
     target.write_text("original content", encoding="utf-8")
     backdate(target)
+    predate_session(monkeypatch)  # ctime cannot be backdated; see predate_session
 
     with pytest.raises(NeedsApproval):
         await files.invoke(
@@ -773,11 +902,14 @@ async def test_edit_needs_no_approval_even_on_an_existing_file(files: FilesTool,
     assert target.read_text(encoding="utf-8") == "edited content"
 
 
-async def test_edit_leaves_the_rest_of_the_file_untouched(files: FilesTool, config) -> None:
+async def test_edit_leaves_the_rest_of_the_file_untouched(
+    files: FilesTool, config, monkeypatch
+) -> None:
     target = config.shell_cwd / "code.py"
     original = "def add(a, b):\n    return a + b\n\n# keep me\n"
     target.write_text(original, encoding="utf-8")
     backdate(target)
+    predate_session(monkeypatch)  # ctime cannot be backdated; see predate_session
 
     result = await files.invoke(
         {
@@ -810,10 +942,13 @@ async def test_edit_refuses_an_ambiguous_match_and_changes_nothing(
     assert target.read_text(encoding="utf-8") == "x = 1\nx = 2\n"
 
 
-async def test_edit_replace_all_touches_every_occurrence(files: FilesTool, config) -> None:
+async def test_edit_replace_all_touches_every_occurrence(
+    files: FilesTool, config, monkeypatch
+) -> None:
     target = config.shell_cwd / "dup.md"
     target.write_text("x = 1\nx = 2\n", encoding="utf-8")
     backdate(target)
+    predate_session(monkeypatch)  # ctime cannot be backdated; see predate_session
 
     result = await files.invoke(
         {
@@ -1697,7 +1832,9 @@ async def test_explore_tools_reach_no_other_chats_uploads(config) -> None:
     assert own.data["matches"]
 
 
-async def test_files_write_refuses_another_chats_uploads(files: FilesTool, config) -> None:
+async def test_files_write_refuses_another_chats_uploads(
+    files: FilesTool, config, monkeypatch
+) -> None:
     """Reads already refuse workspace/uploads/<other chat>; writes must too.
     An upload predating the session carries no mtime freshness, so editing
     another chat's file used to land with no tap at all (R14) — the
@@ -1706,6 +1843,7 @@ async def test_files_write_refuses_another_chats_uploads(files: FilesTool, confi
     foreign.parent.mkdir(parents=True)
     foreign.write_text("chat 42 only", encoding="utf-8")
     os.utime(foreign, (1_000, 1_000))  # pre-session: no freshness to tap on
+    predate_session(monkeypatch)  # ctime cannot be backdated; see predate_session
 
     for arguments in (
         {"action": "write", "path": "workspace/uploads/42/notes.md", "content": "pwned"},
@@ -1717,7 +1855,7 @@ async def test_files_write_refuses_another_chats_uploads(files: FilesTool, confi
             "new_string": "pwned",
         },
     ):
-        with pytest.raises(ToolError, match="belongs to another chat"):
+        with pytest.raises(ToolError, match="another chat"):
             await files.invoke(arguments, ctx(chat_id=43))
 
     # The owning chat still writes its own upload, and the local CLI is not

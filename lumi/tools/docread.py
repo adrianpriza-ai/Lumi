@@ -73,6 +73,12 @@ IMAGE_MIMES = {
 #: conversation evicts its own history.
 MAX_TEXT_CHARS = 120_000
 
+#: Cap on a page render's pixel *area* (~4000 x 10000). Generous for real
+#: documents, but a crafted MediaBox (say 500000 x 500000 pt) scaled up would
+#: otherwise ask pdfium for a bitmap of trillions of pixels — and the render
+#: happens before any resize could save the process.
+MAX_RENDER_PIXELS = 40_000_000
+
 #: Refuse (without reading) files bigger than this. Both paths charge by the
 #: byte — the API upload and the context window alike — so a runaway file
 #: gets a named limit instead of a bill.
@@ -160,6 +166,14 @@ def render_page(page: Any, scale: float) -> str:
             "Pillow is not installed — rendering scanned pages needs it (pip install Pillow), "
             "or set [tools.ocr] base_url."
         ) from exc
+    # The bitmap is allocated before anything could resize it, so an area cap
+    # is the only guard: get_size() is in points and render() multiplies by
+    # scale, and a page carrying a huge MediaBox must not reach that multiply.
+    width, height = page.get_size()
+    if width * scale * height * scale > MAX_RENDER_PIXELS:
+        raise ToolError(
+            f"page is too large to render ({width * scale:.0f}x{height * scale:.0f} px)"
+        )
     bitmap = page.render(scale=scale)
     try:
         image = bitmap.to_pil()
@@ -470,6 +484,7 @@ __all__ = [
     "DESCRIBE_PROMPT",
     "IMAGE_MIMES",
     "MAX_FILE_MB",
+    "MAX_RENDER_PIXELS",
     "MAX_TEXT_CHARS",
     "MIN_EMBEDDED_CHARS",
     "DocumentReader",

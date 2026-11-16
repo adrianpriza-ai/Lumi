@@ -111,6 +111,13 @@ def validate_fetch_url(url: str) -> str | None:
     # reports example.com, and a parser differential here is a bypass.
     if "\\" in parts.netloc or "\\" in host:
         return "backslash in the authority"
+    # Percent escapes in the hostname are the same differential one more way:
+    # a WHATWG fetcher canonicalises '127%2e0%2e0%2e1' to the loopback literal,
+    # while urlsplit's hostname still reads as the escaped text, so the
+    # literal-IP check never sees an address at all. A percent in the *path*
+    # is ordinary URL encoding and stays allowed.
+    if "%" in parts.netloc or "%" in host:
+        return "percent-escape in the hostname"
     if not host.isascii():
         try:
             host = host.encode("idna").decode("ascii")

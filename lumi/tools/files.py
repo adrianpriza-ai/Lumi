@@ -29,6 +29,7 @@ read, list, stat and upload alike.
 from __future__ import annotations
 
 import difflib
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -56,9 +57,10 @@ MAX_LIST_ENTRIES = 500
 
 
 def foreign_uploads(path: Path, root: Path, chat_id: int | str | None) -> str | None:
-    """The *other* chat whose upload directory *path* sits in, if any.
+    """The *other* chat whose per-chat area *path* sits in, if any.
 
-    Incoming documents are stored per chat (``workspace/uploads/<chat_id>/``),
+    Incoming documents are stored per chat (``workspace/uploads/<chat_id>/``)
+    and outbound artifacts are staged per chat too (``data/outbox/<chat>/``),
     but every read inside the project used to be allowed from any chat, so
     chat B could list and pull chat A's files back to itself with no approval
     anywhere. Read-side calls only: the component is compared as a string with
@@ -78,6 +80,10 @@ def foreign_uploads(path: Path, root: Path, chat_id: int | str | None) -> str | 
         and parts[1] == "uploads"
         and parts[2] != str(chat_id)
     ):
+        return parts[2]
+    # Outbox copies are per chat exactly like uploads: a staged artifact is
+    # that chat's delivery, so another chat must not read or rewrite it.
+    if len(parts) > 2 and parts[0] == "data" and parts[1] == "outbox" and parts[2] != str(chat_id):
         return parts[2]
     return None
 
@@ -197,6 +203,12 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         #: the session). One tap per file, not one tap per call — a gate the
         #: model has to clear on every keystroke would be tapped blind.
         self._approved: set[str] = set()
+        #: Overwrite approvals in flight, keyed by resolved path: the digest of
+        #: the content the owner saw when they approved. The confirmed re-run
+        #: re-reads the file and must find exactly that content — anything else
+        #: means the approval was granted to a preview that no longer matches
+        #: the bytes on disk, and it re-asks instead of overwriting them.
+        self._pending_digests: dict[str, str] = {}
 
     @property
     def store(self) -> ArtifactStore:
@@ -245,8 +257,9 @@ it validates the path, caps the size, and shows a diff before it overwrites.
             # first-write prompt only ever fired for session-authored files.
             if (foreign := foreign_uploads(resolved, self.root, chat_id)) is not None:
                 raise ToolError(
-                    f"writing to {resolved} is not allowed: workspace/uploads/{foreign} "
-                    "belongs to another chat. Each chat only sees its own uploads."
+                    f"writing to {resolved} is not allowed: it sits in chat {foreign}'s "
+                    "per-chat area, and another chat's uploads and outbox are off limits. "
+                    "Each chat only sees its own."
                 )
             guard = protected_write(resolved, self.root)
             if guard is not None:
@@ -260,8 +273,9 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         if is_within(resolved, self.root):
             if (foreign := foreign_uploads(resolved, self.root, chat_id)) is not None:
                 raise ToolError(
-                    f"reading {resolved} is not allowed: workspace/uploads/{foreign} "
-                    "belongs to another chat. Each chat only sees its own uploads."
+                    f"reading {resolved} is not allowed: it sits in chat {foreign}'s "
+                    "per-chat area, and another chat's uploads and outbox are off limits. "
+                    "Each chat only sees its own."
                 )
             guard = read_guard(candidate) or read_guard(resolved)
             if guard is not None:
@@ -282,21 +296,60 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         """Whether *path* is a skill file the system prompt will read back."""
         return is_within(path, self.config.data_dir / "skills")
 
+    def _links_protected(self, path: Path) -> str | None:
+        """The protected project file *path* is a hard link to, if any.
+
+        ``protected_write`` refuses writes to config.toml and friends by
+        *name*, but a hard link made before this session shares the inode
+        under an innocent name — ``ln config.toml workspace/lnk`` writes the
+        config through ``workspace/lnk`` and slips past every name check
+        (run_shell refuses the same trick on its side). Matching by
+        ``(st_dev, st_ino)`` against the protected list closes it; ``None``
+        for a missing path or one that is not linked to anything protected.
+        """
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        if stat.st_nlink <= 1:
+            return None
+        identity = (stat.st_dev, stat.st_ino)
+        for name in (
+            "config.toml",
+            "config.local.toml",
+            ".mcp.json",
+            "data/mcp-trust.json",
+            "data/whitelist.json",
+        ):
+            candidate = self.root / name
+            try:
+                other = candidate.stat()
+            except OSError:
+                continue
+            if (other.st_dev, other.st_ino) == identity:
+                return name
+        return None
+
     def _session_authored(self, path: Path) -> bool:
         """Whether *path* still needs its one owner approval this session.
 
-        True for a file whose mtime is at or after :data:`SESSION_START` — the
-        content the next write would replace or extend was produced during
-        this run, which is the provenance finding 3 cares about. False once
-        the owner has approved this path, so a file costs one confirmation per
-        session. False too for a file that is *not there*: there is nothing to
-        replace, and the shell policy has always treated creating something
-        new inside the project as free ("> onto a name that does not exist
-        yet ... nothing to lose, so nothing to ask") — the files tool now
-        agrees with it instead of charging a tap for a brand-new file.
+        True for a file whose ctime or mtime is at or after
+        :data:`SESSION_START` — the content the next write would replace or
+        extend was produced during this run, which is the provenance finding 3
+        cares about. mtime alone is forgeable: ``touch -r`` copies another
+        file's timestamps and forges only mtime, while the inode change it
+        stamps ctime with is set by the kernel to *now* — so ctime is the
+        half that cannot be backdated, and either one matching counts. False
+        once the owner has approved this path, so a file costs one
+        confirmation per session. False too for a file that is *not there*:
+        there is nothing to replace, and the shell policy has always treated
+        creating something new inside the project as free ("> onto a name
+        that does not exist yet ... nothing to lose, so nothing to ask") —
+        the files tool now agrees with it instead of charging a tap for a
+        brand-new file.
 
         A file under ``data/skills`` is always True until approved, whatever
-        its mtime or existence. Skill text is catalogued into the system
+        its timestamps or existence. Skill text is catalogued into the system
         prompt of every chat, so nothing about a skill path is "free": the
         model can edit it, and an edit made after reading a hostile page
         would otherwise reach every future turn with no tap (R8).
@@ -306,11 +359,12 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         if self._is_project_skill(path):
             return True
         try:
-            return path.stat().st_mtime >= SESSION_START
+            st = path.stat()
         except FileNotFoundError:
             return False
         except OSError:
             return True
+        return st.st_ctime >= SESSION_START or st.st_mtime >= SESSION_START
 
     def _mode(self) -> Mode:
         """The permission mode this call runs under, read live from config."""
@@ -465,12 +519,31 @@ it validates the path, caps the size, and shows a diff before it overwrites.
             and not ctx.confirmed
             and self._mode() is Mode.DEFAULT
         ):
+            # The approval binds to this exact content: the confirmed re-run
+            # re-reads the file and only writes if it still matches, so an
+            # approval granted against one preview cannot overwrite different
+            # bytes that landed in between.
+            self._pending_digests[str(path)] = hashlib.sha256(previous.encode("utf-8")).hexdigest()
             raise NeedsApproval(
                 tool=self.name,
                 arguments=dict(arguments),
                 reason=f"{self._display(path)} already exists and is not empty",
                 preview=_short_diff(previous, content),
             )
+
+        # One approval = one binding: the digest is spent by the write it was
+        # granted for, and a mismatch spends it too (the re-raise below asks
+        # again, which rebinds it to the content the owner then sees).
+        expected = self._pending_digests.get(str(path))
+        if expected is not None:
+            self._pending_digests.pop(str(path), None)
+            if hashlib.sha256(previous.encode("utf-8")).hexdigest() != expected:
+                raise NeedsApproval(
+                    tool=self.name,
+                    arguments=dict(arguments),
+                    reason=f"{self._display(path)} changed since this overwrite was approved",
+                    preview=_short_diff(previous, content),
+                )
 
         try:
             self._atomic_write(path, content)
@@ -489,19 +562,26 @@ it validates the path, caps the size, and shows a diff before it overwrites.
             summary=f"{verb} {self._display(path)}",
         )
         if arguments.get("upload") and self.settings.uploads:
-            await self._attach(result, path)
+            await self._attach(result, path, ctx.chat_id)
         return result
 
     # -- delivery to the chat ----------------------------------------------- #
 
-    async def _attach(self, result: ToolResult, path: Path) -> None:
+    async def _attach(self, result: ToolResult, path: Path, chat_id: int | str | None) -> None:
         """Stage *path* onto *result* as an artifact, best effort.
 
         A failure to deliver must not fail the write that already succeeded, so
-        every error path here degrades to a note in the result text.
+        every error path here degrades to a note in the result text. The outbox
+        copy is filed under the requesting chat's own directory; the CLI (no
+        chat) stages under the literal scope it operates in.
         """
         try:
-            artifact = self.store.send(path, origin=self.name, project_root=self.root)
+            artifact = self.store.send(
+                path,
+                chat_id=chat_id if chat_id is not None else "cli",
+                origin=self.name,
+                project_root=self.root,
+            )
         except ArtifactError as exc:
             result.text += f"\n(note: not sent to the chat — {exc})"
             return
@@ -530,7 +610,7 @@ it validates the path, caps the size, and shows a diff before it overwrites.
             return ToolResult.failure(f"no such file: {self._display(path)}")
 
         result = ToolResult(text="", ok=True, summary=f"upload {self._display(path)}")
-        await self._attach(result, path)
+        await self._attach(result, path, ctx.chat_id)
         if not result.artifacts:
             result.ok = False
             result.text = result.text.strip() or "could not stage that file for delivery"
@@ -543,6 +623,14 @@ it validates the path, caps the size, and shows a diff before it overwrites.
             raise ToolError("content must be a string")
         if not content:
             return ToolResult.failure("nothing to append")
+        # protected_write refuses the config by name, but a hard link shares
+        # its inode under a name the deny list never sees — appending through
+        # the link is the same write, so it is refused too.
+        if hit := self._links_protected(path):
+            raise ToolError(
+                f"{self._display(path)} is a hard link to {hit}, which run_shell "
+                "refuses to write; appending through the link is refused too."
+            )
 
         created = not path.exists()
         self._require_owner(path, ctx, arguments, truncate(content, 400))
@@ -648,7 +736,7 @@ it validates the path, caps the size, and shows a diff before it overwrites.
             summary=f"edited {self._display(path)} ({made} replacement(s))",
         )
         if arguments.get("upload") and self.settings.uploads:
-            await self._attach(result, path)
+            await self._attach(result, path, ctx.chat_id)
         return result
 
     @staticmethod
@@ -703,18 +791,38 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         pattern = str(arguments.get("pattern") or "").strip()
         if not pattern:
             raise ToolError("pattern is required for a search")
+        # A '..' component walks the glob out of the start directory, past the
+        # resolution the start itself went through — refuse it outright.
+        if ".." in Path(pattern).parts:
+            raise ToolError("pattern may not contain '..'")
         start = self._resolve(arguments.get("path") or ".", for_write=False, chat_id=ctx.chat_id)
         if not start.is_dir():
             start = start.parent
 
+        matches: list[str] = []
         try:
-            matches = sorted(
-                str(p.relative_to(start))
-                for p in start.glob(pattern)
-                if p.is_file() and not _ignored(p)
-            )
+            for p in start.glob(pattern):
+                # Per-match guards: a glob can name files the start directory's
+                # own resolution never saw — a link pointing out of the tree,
+                # another chat's uploads or outbox, a credential. Each match is
+                # judged exactly like a read of it would be, and a file a read
+                # would refuse is not listed either.
+                if not p.is_file() or _ignored(p):
+                    continue
+                try:
+                    resolved = p.resolve()
+                except OSError:
+                    continue
+                if not is_within(resolved, self.root):
+                    continue
+                if foreign_uploads(resolved, self.root, ctx.chat_id) is not None:
+                    continue
+                if read_guard(p) or read_guard(resolved):
+                    continue
+                matches.append(str(p.relative_to(start)))
         except (ValueError, OSError) as exc:
             return ToolResult.failure(f"bad pattern {pattern!r}: {exc}")
+        matches.sort()
 
         return ToolResult(
             text=f"{len(matches)} match(es) for {pattern!r} under {self._display(start)}:\n"

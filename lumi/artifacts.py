@@ -238,13 +238,22 @@ class ArtifactStore:
     # -- the outbox -------------------------------------------------------- #
 
     def send(
-        self, path: Path | str, *, origin: str = "", project_root: Path | None = None
+        self,
+        path: Path | str,
+        *,
+        chat_id: int | str,
+        origin: str = "",
+        project_root: Path | None = None,
     ) -> Artifact:
         """Register *path* for delivery and return its :class:`Artifact`.
 
         The file is copied into the outbox so it survives even if the tool later
         deletes or rewrites the original. Relative paths resolve against
-        *project_root* (default: the store's own idea of it).
+        *project_root* (default: the store's own idea of it). *chat_id* is
+        required: the outbox copy is filed under ``data/outbox/<chat>/`` so
+        each chat's staged deliveries are its own, and no other chat can reach
+        them through the per-chat path guards. A caller with no chat (the CLI)
+        passes the literal scope it operates in, ``"cli"``.
 
         Raises :class:`ArtifactError` with a model-readable reason when the
         path is missing, unreadable, disallowed or too large — callers turn
@@ -282,7 +291,7 @@ class ArtifactStore:
                 f"{self.max_bytes / (1024 * 1024):.0f} MB artifact limit"
             )
 
-        out = self._outbox_path(resolved)
+        out = self._outbox_path(resolved, chat_id)
         try:
             out.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(resolved, out)
@@ -301,15 +310,18 @@ class ArtifactStore:
         log.info("artifact staged: %s (%d bytes, origin=%s)", artifact.path, size, origin)
         return artifact
 
-    def _outbox_path(self, source: Path) -> Path:
-        """Where the outbox copy lives: <chat-token>/dedup-key.ext.
+    def _outbox_path(self, source: Path, chat_id: int | str) -> Path:
+        """Where the outbox copy lives: <chat>/<dedup-key>-<name>.ext.
 
+        Per chat, so one chat's staged deliveries are not another chat's
+        reachable state (the files and shell read guards refuse another
+        chat's ``data/outbox/<chat>/`` the same way they refuse its uploads).
         The dedup key is name + size + mtime, so re-sending an unchanged file
         does not pile up copies, while a genuinely rewritten file gets a new one.
         """
         stat = source.stat()
         key = uuid.uuid5(uuid.NAMESPACE_URL, f"{source}|{stat.st_size}|{int(stat.st_mtime)}")
-        return self.outbox_dir() / key.hex[:2] / f"{key.hex[:8]}-{source.name}"
+        return self.outbox_dir() / str(chat_id) / f"{key.hex[:8]}-{source.name}"
 
     def outbox_dir(self) -> Path:
         return self.root / "data" / "outbox"

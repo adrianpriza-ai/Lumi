@@ -14,9 +14,11 @@ from typing import Any
 
 import pytest
 
+from lumi.config import ImageGenConfig
 from lumi.context import ContextWindow
 from lumi.llm import build_llm
 from lumi.llm.base import DELTA_TEXT, DELTA_THINKING, USAGE_PROMPT, USAGE_REASONING, LLMError
+from lumi.llm.image_api import ImageGenClient
 from lumi.llm.keypool import mask
 from lumi.llm.openai_compat import OpenAICompatClient
 
@@ -491,6 +493,32 @@ async def test_sdk_errors_name_the_endpoint(config, monkeypatch) -> None:
     assert "OPENAI_BASE_URL" in message  # where it came from
     assert "test-model" in message
     assert "OPENAI_API_KEY" in message
+
+
+def test_redact_url_masks_userinfo_and_secret_query_values() -> None:
+    """A base_url that carries its credential in the URL is quoted redacted:
+    the endpoint stays readable, the key does not travel with the message."""
+    from lumi.llm.openai_compat import _redact_url
+
+    shown = _redact_url("http://user:secretpw@localhost:20128/v1?api_key=sk-dummy-key-9876")
+    assert "secretpw" not in shown
+    assert "sk-dummy-key-9876" not in shown
+    assert "localhost:20128" in shown
+
+
+async def test_an_error_never_echoes_a_key_in_the_base_url(config, monkeypatch) -> None:
+    """Some endpoints take the key in the URL itself; without redaction every
+    failure message would name the credential."""
+    monkeypatch.setenv(
+        "OPENAI_BASE_URL", "http://localhost:20128/v1?api_key=sk-dummy-query-key-9876"
+    )
+    completions = StubCompletions(error=RuntimeError("401 invalid_api_key"))
+    with pytest.raises(LLMError) as caught:
+        await client_with(config, completions).complete([{"role": "user", "content": "q"}])
+
+    message = str(caught.value)
+    assert "sk-dummy-query-key-9876" not in message
+    assert "localhost:20128" in message  # the endpoint is still named
 
 
 async def test_an_openai_endpoint_failure_suggests_the_fix(config, monkeypatch) -> None:
@@ -1188,3 +1216,107 @@ async def test_the_vision_route_forwards_on_delta(config) -> None:
 
     assert result.text == "from vision"
     assert seen["on_delta"] is callback
+
+
+# --------------------------------------------------------------------------- #
+# imagegen: the provider-returned image URL is guarded before it is fetched
+# --------------------------------------------------------------------------- #
+
+
+def image_client() -> ImageGenClient:
+    """A keyless custom endpoint, the way a self-hosted image server is wired."""
+    return ImageGenClient(ImageGenConfig(base_url="http://api.example/v1", model="local-image"))
+
+
+def fake_http(monkeypatch: pytest.MonkeyPatch, *, post_data: dict, get_reply=None):
+    """Swap httpx.AsyncClient for a stub: one scripted POST JSON body, one
+    scripted GET reply (``None`` means any GET is a test failure). Records
+    every request it saw."""
+    import httpx
+
+    requests: list = []
+
+    class FakeResponse:
+        def __init__(self, *, status_code=200, json_data=None, content=b"", url="", headers=None):
+            self.status_code = status_code
+            self._json = json_data
+            self.content = content
+            self.url = url
+            self.headers = headers or {"content-type": "image/png"}
+            self.text = json.dumps(json_data or {})
+
+        def json(self):
+            return self._json
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs) -> None:
+            requests.append(("client", kwargs))
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, *, json):
+            requests.append(("post", url, json))
+            return FakeResponse(json_data=post_data)
+
+        async def get(self, url):
+            requests.append(("get", url))
+            if get_reply is None:
+                raise AssertionError(f"GET {url} must never be issued by this test")
+            return get_reply
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+    return requests
+
+
+async def test_a_provider_url_to_an_internal_address_is_refused_unfetched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The image URL comes from the endpoint's response body, so it is guarded
+    like any fetched URL: a loopback target is named and never requested."""
+    requests = fake_http(monkeypatch, post_data={"data": [{"url": "http://127.0.0.1/x"}]})
+
+    with pytest.raises(LLMError, match="refused"):
+        await image_client().generate("a red cube")
+
+    assert ("get", "http://127.0.0.1/x") not in requests
+
+
+async def test_a_public_image_url_is_downloaded(monkeypatch: pytest.MonkeyPatch) -> None:
+    get_reply = SimpleNamespace(
+        status_code=200,
+        content=b"PNGBYTES",
+        url="http://img.example/pic.png",
+        headers={"content-type": "image/png"},
+    )
+    fake_http(
+        monkeypatch,
+        post_data={"data": [{"url": "http://img.example/pic.png"}]},
+        get_reply=get_reply,
+    )
+
+    mime, blob = await image_client().generate("a red cube")
+
+    assert (mime, blob) == ("image/png", b"PNGBYTES")
+
+
+async def test_a_redirect_to_an_internal_address_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """follow_redirects=True exposes the final URL: a clean start that 302s
+    into the internal network is refused before the bytes are used."""
+    get_reply = SimpleNamespace(
+        status_code=200,
+        content=b"SECRET",
+        url="http://127.0.0.1/private",
+        headers={"content-type": "image/png"},
+    )
+    fake_http(
+        monkeypatch, post_data={"data": [{"url": "http://img.example/a.png"}]}, get_reply=get_reply
+    )
+
+    with pytest.raises(LLMError, match="refused after redirecting"):
+        await image_client().generate("a red cube")

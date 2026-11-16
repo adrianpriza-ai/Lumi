@@ -82,10 +82,23 @@ def test_private_hostnames_are_refused(host: str) -> None:
         # so the fetcher connects to 127.0.0.1 while urlsplit reports
         # example.com — a parser differential, refused rather than guessed at.
         "http://127.0.0.1\\@example.com/",
+        # WHATWG canonicalisation decodes percent escapes in the host, so a
+        # fetcher reaches 127.0.0.1 while urlsplit's hostname still reads as
+        # the escaped text and the literal-IP check sees nothing to refuse.
+        "http://127%2e0%2e0%2e1/x",
+        # The hex spelling does not read as a literal IP either; only the
+        # resolver catches it, and the refusal must survive.
+        "http://0x7f.0.0.1/x",
     ],
 )
 def test_parser_differential_hosts_are_refused(url: str) -> None:
     assert validate_fetch_url(url) is not None
+
+
+def test_a_percent_encoded_path_stays_allowed() -> None:
+    # The refusal is scoped to the hostname: percent escapes in the path are
+    # ordinary URL encoding, and refusing those would break real fetches.
+    assert validate_fetch_url("https://example.com/a%20b") is None
 
 
 def test_an_idn_host_is_checked_as_the_punycode_the_fetcher_resolves() -> None:

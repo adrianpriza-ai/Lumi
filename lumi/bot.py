@@ -305,8 +305,11 @@ def _render_env(config: Config) -> str:
     if overrides:
         lines += ["", "<b>LUMI__ overrides:</b>"]
         for name in overrides:
+            # The name stays plain — it says what is overridden — but the value
+            # is masked like every other credential here: an override such as
+            # LUMI__BOT__PROXY_URL routinely carries a password in its URL.
             lines.append(
-                f"- <code>{escape_html(name)}={escape_html(truncate(os.environ[name], 60))}</code>"
+                f"- <code>{escape_html(name)}={escape_html(_mask(os.environ[name]))}</code>"
             )
 
     lines += [
@@ -347,7 +350,7 @@ def _render_config(config: Config, memory_limit: int) -> str:
             "<b>config</b> — resolved, live",
             "",
             "<b>model</b>",
-            f"- <code>{escape_html(llm.model_of())}</code> via {escape_html(llm.base_url_of())} (from {escape_html(llm.where_from())})"
+            f"- <code>{escape_html(llm.model_of())}</code> via {escape_html(_redact_url(llm.base_url_of()))} (from {escape_html(llm.where_from())})"
             + (
                 f"\n- vision: <code>{escape_html(llm.vision_model_of())}</code> for image turns"
                 if llm.vision_model_of()
@@ -458,11 +461,20 @@ def _redact_word(word: str) -> str:
 
 
 def _redact_url(url: str) -> str:
-    """*url* with the value of every secret-looking query parameter masked.
+    """*url* with credentials masked: secret-looking query values and userinfo.
 
     The documented Tavily URL is ``…/mcp/?tavilyApiKey=${TAVILY_API_KEY}``, so
-    a URL in this project routinely *is* the credential.
+    a URL in this project routinely *is* the credential — and a proxy-style
+    ``scheme://user:pass@host`` hides one in the authority just as well.
     """
+    scheme, sep, rest = url.partition("://")
+    if sep:
+        authority, slash, tail = rest.partition("/")
+        if "@" in authority:
+            # Everything before the last '@' is the credential; mask it whole.
+            userinfo, _, host = authority.rpartition("@")
+            authority = f"{_mask(userinfo)}@{host}"
+        url = scheme + "://" + authority + ("/" + tail if slash else "")
     base, sep, query = url.partition("?")
     if not sep:
         return url
@@ -473,15 +485,29 @@ def _redact_url(url: str) -> str:
     return base + sep + "&".join(pairs)
 
 
-def _mcp_pairs(pairs: dict[str, str], label: str) -> str:
+def _mcp_pairs(spec: Any, which: str, label: str) -> str:
     """``env: <code>TOKEN=(len 8)</code>, <code>PORT=8080</code>`` — values masked
     when the name reads like a credential, truncated when it does not.
+
+    A pair whose value was expanded from a secret-named environment variable —
+    or whose raw form still holds a ``${VAR}`` placeholder — is rendered as the
+    config file wrote it, so the display matches what the trust digest covers
+    and no environment-sourced secret reaches the chat.
     """
+    pairs = getattr(spec, which, None) or {}
     if not pairs:
         return ""
+    raw = getattr(spec, f"raw_{which}", None) or {}
+    sourced = getattr(spec, "env_sourced", None) or set()
     rendered = []
     for key, value in pairs.items():
-        shown = _mask(value) if _secret_name(key) else truncate(value, 40, " …")
+        raw_value = raw.get(key, "")
+        if raw_value and (key in sourced or "${" in raw_value):
+            shown = raw_value
+        elif key in sourced or _secret_name(key):
+            shown = _mask(value)
+        else:
+            shown = truncate(value, 40, " …")
         rendered.append(f"<code>{escape_html(key)}={escape_html(shown)}</code>")
     return f"{label}: " + ", ".join(rendered)
 
@@ -508,10 +534,10 @@ def _mcp_endpoint(spec: Any) -> str:
             # Only worth a line when it differs from the default (the project
             # root), which is what the command's relative paths already mean.
             parts.append(f"cwd: <code>{escape_html(spec.cwd)}</code>")
-        extra = _mcp_pairs(spec.env, "env")
+        extra = _mcp_pairs(spec, "env", "env")
     else:
         parts = [f"<code>{escape_html(_redact_url(spec.url))}</code>"]
-        extra = _mcp_pairs(spec.headers, "headers")
+        extra = _mcp_pairs(spec, "headers", "headers")
     if extra:
         parts.append(extra)
     return "\n  ".join(parts)
@@ -2055,7 +2081,7 @@ def build_handlers(config: Config) -> list[Any]:
             f"model: <code>{escape_html(config.llm.model_of())}</code>"
             f" · reasoning: {'on' if config.llm.reasoning else 'off'}"
             + (f" at {escape_html(config.llm.effort_of())}" if config.llm.reasoning else ""),
-            f"endpoint: {escape_html(config.llm.base_url_of())}"
+            f"endpoint: {escape_html(_redact_url(config.llm.base_url_of()))}"
             f" (from {escape_html(config.llm.where_from())})"
             f" · {len(config.llm.api_keys())} key(s), {escape_html(config.llm.strategy_of())}",
         ]
@@ -3163,7 +3189,7 @@ async def _post_init(application: Application) -> None:
     _install_stop_handlers(application)
     me = await application.bot.get_me()
     log.info("telegram: @%s (%s) ready", me.username, me.id)
-    log.info("model: %s via %s", config.llm.model_of(), config.llm.base_url_of())
+    log.info("model: %s via %s", config.llm.model_of(), _redact_url(config.llm.base_url_of()))
     log.info("tools: %s", ", ".join(agent.registry.names()) or "none")
     log.info("memory: %s", agent.memory.stats())
     if config.bot.startup_chat_id:

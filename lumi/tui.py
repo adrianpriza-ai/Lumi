@@ -97,6 +97,33 @@ CHAT_ID = "cli"
 SOURCE = "tui"
 
 
+def _clean(text: str) -> str:
+    """Strip control characters from a string crossing the protocol.
+
+    Event payloads are model output, tool results and room text — a delta
+    carrying ``\\x1b]52;c;x\\x07`` or ``\\x1b[2J`` would otherwise be executed
+    by a terminal renderer as a clipboard write or a screen clear. C0 (except
+    newline and tab, which the frontend's renderer wants) and the C1 range go;
+    ordinary text, punctuation and non-ASCII pass through untouched.
+    """
+    return "".join(
+        char
+        for char in text
+        if char in ("\n", "\t") or not (char < " " or "\x80" <= char <= "\x9f")
+    )
+
+
+def _clean_value(value: Any) -> Any:
+    """_clean over a whole event payload, recursing through lists and dicts."""
+    if isinstance(value, str):
+        return _clean(value)
+    if isinstance(value, dict):
+        return {key: _clean_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_clean_value(item) for item in value]
+    return value
+
+
 def _sender(stream: Any) -> Callable[[dict[str, Any]], None]:
     """One event per line, flushed as it is written.
 
@@ -105,7 +132,10 @@ def _sender(stream: Any) -> Callable[[dict[str, Any]], None]:
     """
 
     def send(event: dict[str, Any]) -> None:
-        stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+        # The one boundary every emitted event crosses, so the filter lives
+        # here instead of at each send site (deltas, notices, errors,
+        # approvals, search results).
+        stream.write(json.dumps(_clean_value(event), ensure_ascii=False) + "\n")
         flush = getattr(stream, "flush", None)
         if flush is not None:
             flush()

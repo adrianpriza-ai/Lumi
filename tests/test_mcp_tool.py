@@ -1234,6 +1234,62 @@ def test_the_trust_store_lives_under_data_and_is_write_protected(config) -> None
 
 
 # --------------------------------------------------------------------------- #
+# env expansion — what the display shows and what a child inherits
+# --------------------------------------------------------------------------- #
+
+
+def test_an_env_sourced_header_is_displayed_as_its_placeholder(config, monkeypatch) -> None:
+    """The approval display shows what the config file wrote, not what the
+    environment expanded it to: a header whose value came from a secret-named
+    variable renders as ``${VAR}`` — matching the digest input — and never as
+    the credential itself."""
+    from lumi.bot import _mcp_endpoint
+    from lumi.tools.web.providers.mcp_provider import ServerSpec
+
+    secret = "12:AAHdummy-secret-value-9876"
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", secret)
+    spec = ServerSpec.from_json(
+        "metrics",
+        {
+            "type": "remote",
+            "url": "https://metrics.test",
+            "headers": {"X-Metrics": "${TELEGRAM_BOT_TOKEN}"},
+        },
+    )
+    shown = _mcp_endpoint(spec)
+    assert secret not in shown
+    assert "${TELEGRAM_BOT_TOKEN}" in shown
+    assert "X-Metrics" in shown
+
+
+def test_a_non_secret_header_expansion_still_shows_its_placeholder(config, monkeypatch) -> None:
+    """Placeholder-intact display is the rule, not just for secret names: any
+    value the config wrote as ``${VAR}`` is rendered as written."""
+    from lumi.bot import _mcp_endpoint
+    from lumi.tools.web.providers.mcp_provider import ServerSpec
+
+    monkeypatch.setenv("METRICS_PORT", "9090")
+    spec = ServerSpec.from_json(
+        "metrics",
+        {"type": "local", "command": "srv", "env": {"PORT": "${METRICS_PORT}"}},
+    )
+    shown = _mcp_endpoint(spec)
+    assert "${METRICS_PORT}" in shown
+    assert "9090" not in shown
+
+
+def test_scrubbed_env_drops_secret_shaped_override_values() -> None:
+    """An owner-configured override is trusted for its name, not its value:
+    a value that itself reads like a credential is dropped, while a plain
+    value passes through."""
+    from lumi.util.env import scrubbed_env
+
+    env = scrubbed_env(overrides={"DIST_ID": "sk-dummy-secret-value-1234", "PORT": "8080"})
+    assert "DIST_ID" not in env
+    assert env["PORT"] == "8080"
+
+
+# --------------------------------------------------------------------------- #
 # presentation and registration
 # --------------------------------------------------------------------------- #
 

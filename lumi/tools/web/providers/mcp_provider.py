@@ -57,7 +57,7 @@ from typing import Any
 
 from ....config import MCPConfig
 from ....paths import resolve
-from ....util.env import scrubbed_env
+from ....util.env import SECRET_PATTERN, scrubbed_env
 from ....util.log import get_logger
 from .base import Page, SearchHit, SearchResult, WebProvider, final_url, recent_cutoff
 from .mcp_oauth import MCPOAuthLoginRequired
@@ -203,14 +203,30 @@ def _read_timeout(seconds: float | int) -> timedelta | float:
     return timedelta(seconds=float(seconds)) if _READ_TIMEOUT_WANTS_TD else float(seconds)
 
 
-def expand_env(value: str) -> str:
-    """Expand ``${VAR}`` and ``${VAR:-default}`` from the process environment."""
+def _expand_env_tracked(value: str) -> tuple[str, set[str]]:
+    """Expand ``${VAR}`` and report which secret-named variables it read.
+
+    The second half is for the approval display, not the connection: when a
+    value was sourced from a variable whose *name* matches
+    :data:`SECRET_PATTERN`, the expansion pulled a credential out of the
+    bot's environment, and the rendered spec shows the ``${VAR}`` placeholder
+    instead of the expanded value — matching the digest input and never
+    echoing an environment-sourced secret into chat.
+    """
+    sourced: set[str] = set()
 
     def replace(match: re.Match[str]) -> str:
         name, default = match.group(1), match.group(2)
+        if os.environ.get(name) and SECRET_PATTERN.search(name):
+            sourced.add(name)
         return os.environ.get(name) or (default or "")
 
-    return _ENV_PATTERN.sub(replace, value)
+    return _ENV_PATTERN.sub(replace, value), sourced
+
+
+def expand_env(value: str) -> str:
+    """Expand ``${VAR}`` and ``${VAR:-default}`` from the process environment."""
+    return _expand_env_tracked(value)[0]
 
 
 @dataclass(slots=True)
@@ -231,6 +247,16 @@ class ServerSpec:
     #: The unexpanded strings, kept so we can still tell "unset variable" apart
     #: from "variable set to the empty string" after expansion has run.
     raw: list[str] = field(default_factory=list)
+    #: The unexpanded ``env`` and ``headers`` pairs, keyed as written. The
+    #: approval display renders these (placeholders intact) for the keys in
+    #: :attr:`env_sourced`, so what the owner approves is byte-for-byte what
+    #: the trust digest covers — and no expanded secret ever reaches chat.
+    raw_env: dict[str, str] = field(default_factory=dict)
+    raw_headers: dict[str, str] = field(default_factory=dict)
+    #: Keys of ``env``/``headers`` whose expanded value was sourced from an
+    #: environment variable whose name matches :data:`SECRET_PATTERN` —
+    #: the expansions that pulled a credential out of the environment.
+    env_sourced: set[str] = field(default_factory=set)
     #: ``"auth": "oauth"`` in the server's entry: the server wants the *owner's*
     #: authorization, negotiated per :mod:`~lumi.tools.web.providers.mcp_oauth`
     #: (browser login, stored tokens) rather than a static header token.
@@ -306,6 +332,19 @@ class ServerSpec:
             if isinstance(raw_headers_value, dict)
             else {}
         )
+        # Expansion remembers which pairs read a secret-named variable, so the
+        # display can fall back to the placeholder the config file wrote.
+        env: dict[str, str] = {}
+        headers: dict[str, str] = {}
+        env_sourced: set[str] = set()
+        for key, value in raw_env.items():
+            env[key], sourced = _expand_env_tracked(value)
+            if sourced:
+                env_sourced.add(key)
+        for key, value in raw_headers.items():
+            headers[key], sourced = _expand_env_tracked(value)
+            if sourced:
+                env_sourced.add(key)
 
         return cls(
             name=name,
@@ -320,8 +359,8 @@ class ServerSpec:
             url=expand_env(raw_url),
             command=command_parts[0] if command_parts else "",
             args=[expand_env(a) for a in command_parts[1:] + args],
-            env={k: expand_env(v) for k, v in raw_env.items()},
-            headers={k: expand_env(v) for k, v in raw_headers.items()},
+            env=env,
+            headers=headers,
             cwd=expand_env(raw_cwd),
             raw=[
                 raw_url,
@@ -332,6 +371,9 @@ class ServerSpec:
                 raw_cwd,
                 raw_scopes,
             ],
+            raw_env=raw_env,
+            raw_headers=raw_headers,
+            env_sourced=env_sourced,
             oauth=oauth,
             oauth_scope=expand_env(raw_scopes),
             origin=origin,

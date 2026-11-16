@@ -547,6 +547,31 @@ def test_normalize_multiline_survives_unbalanced_quotes() -> None:
     assert heredocs == []
 
 
+def test_normalize_multiline_stays_linear_on_a_newline_dense_command() -> None:
+    # continuation() used to re-join the whole folded output for every
+    # newline, which made a command of N lines cost O(N^2): a few hundred
+    # kilobytes of line continuations stalled the event loop. Folding the same
+    # text now has to stay in well under a second, and the fold must still
+    # treat a newline after `&&` as a continuation, not a separator.
+    command = "echo a &&\n" * 26_000  # ~260 KiB, one continuation per line
+    started = time.perf_counter()
+    rewritten, heredocs = safety._normalize_multiline(command)
+    elapsed = time.perf_counter() - started
+    assert elapsed < 1.0, elapsed
+    assert rewritten == "echo a && " * 26_000
+    assert heredocs == []
+
+
+def test_an_oversized_command_asks_instead_of_being_judged() -> None:
+    # Past the cap the policy does not guess on a prefix the shell will not
+    # run: the whole command goes to the owner.
+    result = verdict("echo " + "x" * (safety.COMMAND_LENGTH_CAP + 1))
+    assert result.tier is safety.Tier.CONFIRM
+    assert result.rule == "command:length"
+    # Normal commands never see the guard.
+    assert verdict("echo hi").tier is safety.Tier.ALLOW
+
+
 def test_newline_does_not_hide_the_second_command() -> None:
     # shlex reads a newline as whitespace, so `echo hi\nrm -rf ~/x` used to be
     # tokenised as one echo with three operands - and the rm ran without a tap.
@@ -890,9 +915,13 @@ def test_a_script_that_predates_the_run_stays_allowed(tmp_path: Path) -> None:
     script = workspace / "existing.py"
     script.write_text("print(1)")
     os.utime(script, (1_000, 1_000))
+    # The session starts after the file's last status change. ctime is part of
+    # the freshness gate now (utime can backdate mtime but not ctime), so
+    # "predates the run" has to clear the ctime the backdate just created.
+    session_start = script.stat().st_ctime + 1
 
     result = _session_verdict(
-        "python3 existing.py", root, workspace, home, session_start=time.time()
+        "python3 existing.py", root, workspace, home, session_start=session_start
     )
 
     assert result.tier is safety.Tier.ALLOW
@@ -922,26 +951,72 @@ def test_a_script_edited_this_session_asks_before_running(tmp_path: Path) -> Non
     """``files: edit`` runs without an approval prompt by design, so the guard
     is not at write time: the edit changes the file's mtime, and running it
     afterwards is what asks. Without that, fetched content could rewrite an
-    existing script and have it run with no owner interaction at all."""
+    existing script and have it run with no owner interaction at all. A forged
+    mtime does not buy the same pass: utime backdates mtime but not ctime, and
+    the gate reads both."""
     root, workspace, home = _session_project(tmp_path)
     script = workspace / "existing.py"
-    script.write_text("print(1)")
-    os.utime(script, (1_000, 1_000))
-
     session_start = time.time()
-    assert (
-        _session_verdict(
-            "python3 existing.py", root, workspace, home, session_start=session_start
-        ).tier
-        is safety.Tier.ALLOW
-    )
+    script.write_text("print(1)")
+    os.utime(script, (1_000, 1_000))  # backdate mtime, like a planted file would
 
-    # What `files: edit` does to the file it changes.
+    result = _session_verdict(
+        "python3 existing.py", root, workspace, home, session_start=session_start
+    )
+    assert result.needs_approval
+    assert result.rule == "exec:recent-script"
+
+    # A genuine edit this session asks for the same reason it always did.
     script.write_text("print(2)")
 
     result = _session_verdict(
         "python3 existing.py", root, workspace, home, session_start=session_start
     )
+    assert result.needs_approval
+    assert result.rule == "exec:recent-script"
+
+
+def test_a_stdin_redirected_script_is_freshness_gated(tmp_path: Path) -> None:
+    """`python3 < fresh.py` executes fresh.py exactly like `python3 fresh.py`
+    does — stdin is the script — but the token after the program is `<`, so
+    script_paths used to come back with a junk path named `<` and the
+    exec:recent-script gate never named the file."""
+    root, workspace, home = _session_project(tmp_path)
+    script = workspace / "fresh.py"
+    script.write_text("print(1)")
+
+    result = _session_verdict("python3 < fresh.py", root, workspace, home)
+
+    assert result.needs_approval
+    assert result.rule == "exec:recent-script"
+
+    # A script that predates the run stays free, and the named form still asks.
+    os.utime(script, (1_000, 1_000))
+    session_start = script.stat().st_ctime + 1
+    assert (
+        _session_verdict(
+            "python3 < fresh.py", root, workspace, home, session_start=session_start
+        ).tier
+        is safety.Tier.ALLOW
+    )
+    assert _session_verdict("python3 fresh.py", root, workspace, home).needs_approval
+
+
+def test_a_backdated_mtime_does_not_sneak_past_the_freshness_gate(tmp_path: Path) -> None:
+    """A script written this session and then `utime`d into the past looked
+    pre-existing: _written_since read only the mtime, which userspace can set
+    to anything. ctime follows the metadata change and cannot be set at all,
+    so the backdate itself is what gets caught."""
+    root, workspace, home = _session_project(tmp_path)
+    script = workspace / "planted.py"
+    session_start = time.time()
+    script.write_text("print('pwned')")
+    os.utime(script, (1_000, 1_000))
+
+    result = _session_verdict(
+        "python3 planted.py", root, workspace, home, session_start=session_start
+    )
+
     assert result.needs_approval
     assert result.rule == "exec:recent-script"
 
@@ -1585,6 +1660,56 @@ def test_writing_a_skill_asks_even_when_the_project_is_the_write_zone(
     assert v("echo hi > ../workspace/notes.md").tier is safety.Tier.ALLOW
 
 
+def test_an_interpreter_span_cannot_write_protected_state(tmp_path: Path) -> None:
+    """After `cd ..` the interpreter runs one level up, and a bare
+    ``open("config.toml","w")`` inside its script names the project's own
+    state file. The span scan resolves every quoted span at the directory the
+    interpreter runs in, but it only asked the read and approval guards —
+    ``config.toml`` is neither, so the write used to run silently."""
+    root, home = _project(tmp_path)
+
+    def v(command: str) -> safety.Verdict:
+        return safety.classify(
+            command, cwd=root / "workspace", project_root=root, home=home, write_root=root
+        )
+
+    result = v('cd .. && python3 -c \'open("config.toml","w").write("x")\'')
+    assert result.tier is safety.Tier.DENY, result
+    assert result.rule == "zone:protected-state", result
+
+    # An ordinary bare name in the same script is nobody's state file.
+    assert (
+        v('python3 -c \'open("notes.txt","w")\'').tier is safety.Tier.ALLOW
+    )
+    # And a span that names the approval subpath keeps its tap, not a deny.
+    skill = v('cd ../data/skills/evil && python3 -c "open(\'SKILL.md\',\'w\').write(\'x\')"')
+    assert skill.needs_approval
+    assert skill.rule == "zone:approval-state"
+
+
+def test_writing_the_personality_file_asks(tmp_path: Path) -> None:
+    """PERSONALITY.md sits at the project root and is rendered into every
+    chat's system prompt, so a silent write is the same persistent
+    prompt-injection sink that made data/skills ask. It sat outside every
+    guard: not a protected state file, not under data/skills, and the
+    whole-project write zone waved it through."""
+    root, home = _project(tmp_path)
+
+    def v(command: str) -> safety.Verdict:
+        return safety.classify(
+            command, cwd=root / "workspace", project_root=root, home=home, write_root=root
+        )
+
+    result = v("echo pwned > ../PERSONALITY.md")
+    assert result.tier is safety.Tier.CONFIRM, result
+    assert result.rule == "zone:approval-state", result
+
+    # The data/skills control asks the same way it did before.
+    skill = v("echo pwned > ../data/skills/evil/SKILL.md")
+    assert skill.needs_approval
+    assert skill.rule == "zone:approval-state"
+
+
 def test_parallel_templates_are_judged_like_a_shell_line(tmp_path: Path) -> None:
     """GNU parallel runs its first non-flag word through a shell itself, so a
     template is code — not the program name a delegator normally hands over.
@@ -1725,6 +1850,71 @@ def test_a_path_carried_inside_a_flag_is_read_guarded_too(tmp_path: Path) -> Non
     assert _verdict("grep -rn chat .", root, home, chat_id=42).tier is safety.Tier.CONFIRM
     assert _verdict("grep -rn chat .", root, home).tier is safety.Tier.ALLOW
     assert _verdict("sort -oleak.txt NOTES.md", root, home, chat_id=43).tier is safety.Tier.ALLOW
+
+
+def test_a_bare_operand_of_a_mutating_command_is_read_guarded(tmp_path: Path) -> None:
+    """R6, residual: the read-only branch feeds its operands to the read
+    guard, but the mutating branch only judged the sources its path walks
+    found. A bare name is invisible to those walks — `xargs -a .env` and the
+    stdin redirect `done < .env` name the credential with nothing path-shaped
+    about it — so both read the secret with no verdict anywhere."""
+    root, home = _uploads_project(tmp_path)
+    (root / ".env").write_text("TELEGRAM_BOT_TOKEN=test-token\n", encoding="utf-8")
+
+    for command in (
+        "cd .. && xargs -a .env",
+        "cd .. && while read l; do echo $l; done < .env",
+    ):
+        verdict_ = _verdict(command, root, home, chat_id=43)
+        assert verdict_.tier is safety.Tier.DENY, (command, verdict_)
+        assert verdict_.rule == "zone:secret-read", (command, verdict_)
+
+    # A search *for* the name is still a search: without the cd, `.env`
+    # resolves into the workspace, where no such file exists (the fictional
+    # project of the verdict() helper keeps every existence check negative).
+    assert verdict("grep -rn .env .").tier is safety.Tier.ALLOW
+    # The spaced read of the real file keeps its deny.
+    assert _verdict("cat ../.env", root, home, chat_id=43).tier is safety.Tier.DENY
+
+
+def test_relocating_the_uploads_tree_is_denied(tmp_path: Path) -> None:
+    """`_foreign_upload` only speaks about paths inside one chat's directory,
+    so a mutating command whose source is the tree itself — `mv uploads out`,
+    `tar cf out.tgz uploads` — moved or copied every chat's documents at once,
+    out of the prefix every other guard checks against."""
+    root, home = _uploads_project(tmp_path)
+
+    for command in ("mv uploads out", "tar cf out.tgz uploads"):
+        verdict_ = _verdict(command, root, home, chat_id=43)
+        assert verdict_.tier is safety.Tier.DENY, (command, verdict_)
+        assert verdict_.rule == "zone:foreign-upload-read", (command, verdict_)
+
+    # A chat reading its own upload, and a path nowhere near the tree, are
+    # not relocations.
+    assert _verdict("cat uploads/43/notes.md", root, home, chat_id=43).tier is safety.Tier.ALLOW
+    assert _verdict("cat ../notes.md", root, home, chat_id=43).tier is safety.Tier.ALLOW
+
+
+def test_writes_into_another_chats_uploads_are_refused(tmp_path: Path) -> None:
+    """Reads of workspace/uploads/<other chat> were refused (R5) but writes
+    were not: the write zone covers the whole uploads tree, so
+    `echo pwn > uploads/42/new.md` from chat 43 planted a file in another
+    chat's document area with no verdict at all."""
+    root, home = _uploads_project(tmp_path)
+
+    result = _verdict("echo pwn > uploads/42/new.md", root, home, chat_id=43)
+    assert result.tier is safety.Tier.DENY, result
+    assert result.rule == "zone:foreign-upload-write", result
+
+    # The owning chat writes its own uploads creation-free, as before.
+    assert (
+        _verdict("echo own > uploads/43/own.md", root, home, chat_id=43).tier
+        is safety.Tier.ALLOW
+    )
+    # And the other spellings — an append onto an existing foreign file, a
+    # move into the foreign directory — are refused too.
+    assert _verdict("echo pwn >> uploads/42/notes.md", root, home, chat_id=43).blocked
+    assert _verdict("mv notes.md uploads/42/", root, home, chat_id=43).blocked
 
 
 # --------------------------------------------------------------------------- #

@@ -156,7 +156,14 @@ class ImageGenTool(Tool):
                 f"the image endpoint returned {mime!r}, which I don't know how to save."
             )
         path = self._save(prompt, suffix, data)
-        artifact = self.store.send(path, origin=self.name, project_root=self._config.root)
+        # Outbox copies are filed per chat, like the files tool stages them;
+        # the CLI (no chat) stages under the literal scope it operates in.
+        artifact = self.store.send(
+            path,
+            chat_id=ctx.chat_id if ctx.chat_id is not None else "cli",
+            origin=self.name,
+            project_root=self._config.root,
+        )
         return ToolResult(
             text=(
                 f"Generated {relative_to_root(path)} "

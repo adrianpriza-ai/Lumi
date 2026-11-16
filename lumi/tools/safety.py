@@ -493,8 +493,13 @@ PROTECTED_PROJECT_PATHS: frozenset[tuple[str, ...]] = frozenset(
 #: system prompt of every chat, which makes a silent write a persistent
 #: prompt-injection sink — the same consequence that made ``data/memory`` a
 #: hard deny. Skills differ in intent: they are the model's to maintain, so the
-#: owner taps once instead of the write being refused. See lumi/tools/skills.py.
-APPROVAL_SUBPATHS: frozenset[tuple[str, ...]] = frozenset({("data", "skills")})
+#: owner taps once instead of the write being refused. ``PERSONALITY.md`` is
+#: the same shape at the project root: one file whose text is rendered into
+#: every chat's system prompt, so a silent write is a persistent
+#: prompt-injection sink too. See lumi/tools/skills.py.
+APPROVAL_SUBPATHS: frozenset[tuple[str, ...]] = frozenset(
+    {("data", "skills"), ("PERSONALITY.md",)}
+)
 
 #: Files whose *contents* are credentials. The write guards above protect
 #: files because changing them changes what the machine does; this list
@@ -918,6 +923,14 @@ _AWK_FILE_FLAGS: frozenset[str] = frozenset({"-f", "--file"})
 #: no approval of its own.
 SESSION_START = time.time()
 
+#: Commands past this size are not analysed. Every layer below — the regex
+#: tables, the tokeniser, the per-segment zoning walks — runs over the text,
+#: and a command of half a megabyte turns classification itself into a
+#: denial-of-service against the bot's event loop. The command is not
+#: truncated and judged on a prefix it did not run: a size the policy cannot
+#: afford to read is one the owner approves by hand.
+COMMAND_LENGTH_CAP = 200_000
+
 #: Programs that take a free-text message, where a path in the text is prose and
 #: not a target. ``git commit -m "drop the /etc fallback"`` writes to .git and
 #: nowhere else, and treating the message as a path made such commits
@@ -1088,9 +1101,21 @@ def _normalize_multiline(command: str) -> tuple[str, list[_Heredoc]]:
     in_single = in_double = in_backtick = False
     index = 0
     length = len(command)
+    # The last few characters of the folded output, trailing whitespace
+    # stripped, kept in lockstep with `out` by `emit`. Re-joining the whole
+    # output for every newline made a newline-dense command quadratic; only
+    # what the endswith check below can see — a final `|`, `&&` or `||` — has
+    # to survive, and trailing whitespace never changes what the text ends
+    # with, so whitespace emits leave `tail` alone.
+    tail = ""
+
+    def emit(text: str) -> None:
+        nonlocal tail
+        out.append(text)
+        if text.strip():
+            tail = (tail + text)[-8:]
 
     def continuation() -> bool:
-        tail = "".join(out).rstrip()
         return tail.endswith(("|", "&&", "||"))
 
     def collect_body(delimiter: str, dash: bool, start: int) -> tuple[str, bool, int]:
@@ -1112,7 +1137,7 @@ def _normalize_multiline(command: str) -> tuple[str, list[_Heredoc]]:
     while index < length:
         char = command[index]
         if in_single:
-            out.append(char)
+            emit(char)
             if char == "'":
                 in_single = False
             index += 1
@@ -1122,17 +1147,17 @@ def _normalize_multiline(command: str) -> tuple[str, list[_Heredoc]]:
                 if command[index + 1] == "\n":
                     index += 2  # escaped newline: a line continuation
                     continue
-                out.append(char)
-                out.append(command[index + 1])
+                emit(char)
+                emit(command[index + 1])
                 index += 2
                 continue
-            out.append(char)
+            emit(char)
             if char == '"':
                 in_double = False
             index += 1
             continue
         if in_backtick:
-            out.append(char)
+            emit(char)
             if char == "`":
                 in_backtick = False
             index += 1
@@ -1141,17 +1166,17 @@ def _normalize_multiline(command: str) -> tuple[str, list[_Heredoc]]:
         # Unquoted.
         if char == "'":
             in_single = True
-            out.append(char)
+            emit(char)
             index += 1
             continue
         if char == '"':
             in_double = True
-            out.append(char)
+            emit(char)
             index += 1
             continue
         if char == "`":
             in_backtick = True
-            out.append(char)
+            emit(char)
             index += 1
             continue
         if char == "\\":
@@ -1159,11 +1184,11 @@ def _normalize_multiline(command: str) -> tuple[str, list[_Heredoc]]:
                 if command[index + 1] == "\n":
                     index += 2  # escaped newline: bash joins the lines as-is
                     continue
-                out.append(char)
-                out.append(command[index + 1])
+                emit(char)
+                emit(command[index + 1])
                 index += 2
                 continue
-            out.append(char)
+            emit(char)
             index += 1
             continue
         if char == "\n":
@@ -1177,9 +1202,9 @@ def _normalize_multiline(command: str) -> tuple[str, list[_Heredoc]]:
                     delimiter, dash = pending.pop(0)
                     body, terminated, index = collect_body(delimiter, dash, index)
                     heredocs.append(_Heredoc(delimiter, body, terminated))
-                out.append(";")
+                emit(";")
                 continue
-            out.append(" " if continuation() else ";")
+            emit(" " if continuation() else ";")
             index += 1
             continue
         if char == "#" and (not out or out[-1] in " \t;&|("):
@@ -1187,21 +1212,21 @@ def _normalize_multiline(command: str) -> tuple[str, list[_Heredoc]]:
             index = length if end == -1 else end + 1
             continue  # the comment owns its newline too
         if char == "<" and command.startswith("<<<", index):
-            out.append("<<<")
+            emit("<<<")
             index += 3
             continue
         if char == "<":
             match = _HEREDOC_START.match(command, index)
             if match is not None:
-                out.append(match.group(0))
+                emit(match.group(0))
                 delimiter = next(group for group in match.groups()[1:] if group is not None)
                 pending.append((delimiter, match.group(1) == "-"))
                 index = match.end()
                 continue
-            out.append(char)
+            emit(char)
             index += 1
             continue
-        out.append(char)
+        emit(char)
         index += 1
 
     if pending:
@@ -2051,6 +2076,18 @@ def script_paths(tokens: list[str], cwd: Path, home: Path | None) -> list[Path]:
         word = tokens[word_index]
         if word in _SEPARATORS:
             break
+        if word == "<":
+            # `python3 < fresh.py` feeds the file to the interpreter on stdin,
+            # which executes it exactly like a named script, so the next
+            # non-flag token is the executed script and the freshness gate has
+            # to name it. (`<` deliberately stays out of `_REDIRECTS`: the
+            # file is read, never written.)
+            word_index += 1
+            while word_index < len(tokens) and tokens[word_index].startswith("-"):
+                word_index += 1
+            if word_index < len(tokens) and tokens[word_index] not in _SEPARATORS:
+                return [_absolute(tokens[word_index], cwd, home)]
+            return []
         if word.startswith("-"):
             word_index += 2 if word in value_flags else 1
             continue
@@ -2098,11 +2135,17 @@ def _command_write_targets(tokens: list[str], base: Path, home: Path | None) -> 
 
 
 def _written_since(path: Path, session_start: float) -> bool:
-    """True when *path* exists and was created or changed after *session_start*."""
+    """True when *path* exists and was created or changed after *session_start*.
+
+    ctime counts alongside mtime: ``utime`` backdates an mtime for free, but a
+    metadata change updates ctime and userspace cannot set ctime at all — so a
+    file planted with a forged "old" mtime still shows the write.
+    """
     try:
-        return path.stat().st_mtime >= session_start
+        stat = path.stat()
     except OSError:
         return False
+    return stat.st_mtime >= session_start or stat.st_ctime >= session_start
 
 
 def _zone(path: Path, project_root: Path, home: Path | None) -> str:
@@ -2446,6 +2489,32 @@ def _read_deny(target: Path, project_root: Path, chat_id: int | str | None) -> V
             f"{guard} holds credentials or is protected "
             "state, so its contents are not handed to commands",
             "zone:secret-read",
+        )
+    return None
+
+
+def _uploads_relocation(source: Path, project_root: Path) -> Verdict | None:
+    """The verdict that stops a mutating command reading the uploads *tree*.
+
+    ``_foreign_upload`` only speaks about a path inside one chat's directory,
+    so the tree itself — and anything that contains it — came back ``None``
+    from every guard: ``mv uploads out`` and ``tar cf out.tgz uploads`` copy
+    or move every chat's documents at once, landing them outside the prefix
+    the read guard checks against. A source *inside* the tree is left to the
+    per-file guards, so a chat writing into its own uploads stays free.
+    """
+    uploads = project_root / "workspace" / "uploads"
+    try:
+        resolved = source.resolve()
+        root = uploads.resolve()
+    except OSError:  # pragma: no cover - broken symlink loop
+        return None
+    if resolved == root or resolved in root.parents:
+        return Verdict(
+            Tier.DENY,
+            "the uploads tree holds every chat's documents; relocating it would "
+            "move other chats' files out of the guarded prefix",
+            "zone:foreign-upload-read",
         )
     return None
 
@@ -3041,6 +3110,18 @@ def explain(
                             "zone:approval-state",
                         )
                     )
+                elif (protected := _protected_project_path(target, project_root)) is not None:
+                    # The same bare-name gap, one tier up: after `cd ..` a span
+                    # of `open("config.toml","w")` is the project's own state
+                    # file, and the write zoning never saw a path token for it.
+                    verdicts.append(
+                        Verdict(
+                            Tier.DENY,
+                            f"{protected} controls the bot's own access or configuration; "
+                            "ask the owner to change it by hand",
+                            "zone:protected-state",
+                        )
+                    )
             targets += quoted_paths(segment_text, segment_base, home)
         # What the segment *reads*, noted before the destination truncation
         # below throws the sources away: a mutating command still reads its
@@ -3090,6 +3171,23 @@ def explain(
         for path in dict.fromkeys(targets):
             if _is_dev_sink(path):
                 continue  # /dev/null and friends destroy nothing
+            # Another chat's uploads are refused on the write side the way the
+            # read side refuses them: the files tool turns the same write away,
+            # and a shell operand (`cp x uploads/42/f`, the link name of `ln`)
+            # must not be the way around it.
+            if (
+                chat_id is not None
+                and (foreign := _foreign_upload(path, project_root, chat_id)) is not None
+            ):
+                verdicts.append(
+                    Verdict(
+                        Tier.DENY,
+                        f"workspace/uploads/{foreign} belongs to another chat; "
+                        "writes into another chat's uploads are refused",
+                        "zone:foreign-upload-write",
+                    )
+                )
+                continue
             zone = _zone(path, project_root, home)
             protected_subpath = _has_protected_subpath(path)
             # The protected-name check runs against the *resolved* path as well
@@ -3206,6 +3304,22 @@ def explain(
         ):
             if _is_dev_sink(path):
                 continue
+            # The same write-side refusal for a destination only the redirect
+            # spelled out; the final dedup folds this into the target-loop
+            # verdict when both walks saw the same path.
+            if (
+                chat_id is not None
+                and (foreign := _foreign_upload(path, project_root, chat_id)) is not None
+            ):
+                verdicts.append(
+                    Verdict(
+                        Tier.DENY,
+                        f"workspace/uploads/{foreign} belongs to another chat; "
+                        "writes into another chat's uploads are refused",
+                        "zone:foreign-upload-write",
+                    )
+                )
+                continue
             approval_path = _approval_project_path(path, project_root)
             if approval_path is not None:
                 verdicts.append(
@@ -3220,8 +3334,23 @@ def explain(
         # Judged after the write zoning, so a path that is both stays described
         # as the write it also is; a read-only source of a mutating command
         # has no write verdict of its own, which is the whole gap this closes.
-        for source in dict.fromkeys(source_paths):
+        # The segment's bare operands are fed through as well, exactly like the
+        # read-only branch feeds its own: `xargs -a .env` and the stdin
+        # redirect `done < .env` name their source with nothing path-shaped
+        # about it, so neither `referenced_paths` nor the program-gated
+        # operand walk above ever saw it. The destination of a destination-last
+        # command is deliberately not carved out by position — for
+        # `tar cf out.tgz uploads` the last operand is the source, not the
+        # destination — and a destination that trips a read guard is one the
+        # write side refuses anyway, so feeding it only ever tightens.
+        read_sources = [
+            *source_paths,
+            *(_absolute(word, segment_base, home) for word in _operands(segment)),
+        ]
+        for source in dict.fromkeys(read_sources):
             denied = _read_deny(source, project_root, chat_id)
+            if denied is None and chat_id is not None:
+                denied = _uploads_relocation(source, project_root)
             if denied is not None:
                 verdicts.append(denied)
 
@@ -3283,6 +3412,13 @@ def classify(
     deny tier is decided by the tables and survives every mode but
     ``bypass-sudo``'s lifted sudo rules.
     """
+    if len(command) > COMMAND_LENGTH_CAP:
+        return Verdict(
+            Tier.CONFIRM,
+            f"the command is {len(command)} characters, past the {COMMAND_LENGTH_CAP} "
+            "the policy analyses; approve it by hand",
+            "command:length",
+        )
     resolved_mode = parse_mode(mode)
     verdicts = explain(
         command,
@@ -3359,4 +3495,5 @@ __all__ = [
     "PIPE_TARGETS",
     "PROTECTED_SUBPATHS",
     "APPROVAL_SUBPATHS",
+    "COMMAND_LENGTH_CAP",
 ]

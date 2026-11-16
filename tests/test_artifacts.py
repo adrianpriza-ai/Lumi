@@ -7,6 +7,8 @@ turn. The Telegram delivery layer is covered in ``test_bot.py``.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 from conftest import FakeLLM, backdate, make_reply
 
@@ -24,6 +26,19 @@ def ctx(**kwargs) -> ToolContext:
     return ToolContext(**kwargs)
 
 
+def predate_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make fixtures created *now* count as predating the session.
+
+    The session gate reads ctime as well as mtime — ``touch -r`` forges mtime
+    but stamps ctime with now, so :func:`conftest.backdate` alone cannot make a
+    freshly created fixture pre-session any more. Shifting the files tool's
+    SESSION_START past the fixtures' creation is the honest stand-in: the gate
+    then sees what it would have seen for a file that really was on disk
+    before this run started.
+    """
+    monkeypatch.setattr("lumi.tools.files.SESSION_START", time.time() + 60)
+
+
 @pytest.fixture
 def store(config) -> ArtifactStore:
     return ArtifactStore(config.root, max_bytes=1 * 1024 * 1024)
@@ -38,7 +53,7 @@ async def test_send_stages_a_copy_in_the_outbox(store: ArtifactStore, config) ->
     target = config.root / "workspace" / "report.md"
     target.write_text("# report", encoding="utf-8")
 
-    artifact = store.send(target, origin="test", project_root=config.root)
+    artifact = store.send(target, chat_id=42, origin="test", project_root=config.root)
 
     assert artifact.absolute.is_file(), "the outbox copy must exist"
     assert artifact.absolute != target, "the outbox copy is not the original"
@@ -49,11 +64,24 @@ async def test_send_stages_a_copy_in_the_outbox(store: ArtifactStore, config) ->
     assert artifact.absolute.is_relative_to(store.outbox_dir()), "staged inside the outbox"
 
 
+async def test_send_files_the_copy_under_the_requesting_chat(store: ArtifactStore, config) -> None:
+    """Outbox copies are per chat: one chat's staged deliveries live under
+    data/outbox/<chat>/, so the per-chat path guards can keep every other chat
+    out of them exactly the way they keep it out of that chat's uploads."""
+    target = config.root / "workspace" / "chat-bound.md"
+    target.write_text("for 42", encoding="utf-8")
+
+    artifact = store.send(target, chat_id=42, project_root=config.root)
+
+    assert artifact.absolute.is_relative_to(config.root / "data" / "outbox" / "42")
+    assert artifact.absolute.parent == config.root / "data" / "outbox" / "42"
+
+
 async def test_send_survives_deletion_of_the_original(store: ArtifactStore, config) -> None:
     """The whole point of the outbox: the chat still gets the file."""
     target = config.root / "workspace" / "temp.csv"
     target.write_text("a,b\n1,2\n", encoding="utf-8")
-    artifact = store.send(target, project_root=config.root)
+    artifact = store.send(target, chat_id=42, project_root=config.root)
     target.unlink()
     assert artifact.absolute.read_text(encoding="utf-8") == "a,b\n1,2\n"
 
@@ -61,64 +89,64 @@ async def test_send_survives_deletion_of_the_original(store: ArtifactStore, conf
 async def test_send_dedupes_unchanged_files(store: ArtifactStore, config) -> None:
     target = config.root / "workspace" / "same.md"
     target.write_text("same", encoding="utf-8")
-    first = store.send(target, project_root=config.root)
-    second = store.send(target, project_root=config.root)
+    first = store.send(target, chat_id=42, project_root=config.root)
+    second = store.send(target, chat_id=42, project_root=config.root)
     assert first.absolute == second.absolute
 
 
 async def test_send_a_rewritten_file_gets_a_new_copy(store: ArtifactStore, config) -> None:
     target = config.root / "workspace" / "changing.md"
     target.write_text("v1", encoding="utf-8")
-    first = store.send(target, project_root=config.root)
+    first = store.send(target, chat_id=42, project_root=config.root)
     target.write_text("v2 — longer now", encoding="utf-8")
-    second = store.send(target, project_root=config.root)
+    second = store.send(target, chat_id=42, project_root=config.root)
     assert first.absolute != second.absolute
     assert second.absolute.read_text(encoding="utf-8") == "v2 — longer now"
 
 
 async def test_send_refuses_paths_outside_the_project(store: ArtifactStore, config) -> None:
     with pytest.raises(ArtifactError, match="outside the project"):
-        store.send("/etc/os-release", project_root=config.root)
+        store.send("/etc/os-release", chat_id=42, project_root=config.root)
 
 
 async def test_send_refuses_missing_files(store: ArtifactStore, config) -> None:
     with pytest.raises(ArtifactError, match="not a file"):
-        store.send("workspace/nope.md", project_root=config.root)
+        store.send("workspace/nope.md", chat_id=42, project_root=config.root)
 
 
 async def test_send_refuses_unknown_extensions(store: ArtifactStore, config) -> None:
     target = config.root / "workspace" / "evil.exe"
     target.write_bytes(b"MZ")
     with pytest.raises(ArtifactError, match="refusing to deliver"):
-        store.send(target, project_root=config.root)
+        store.send(target, chat_id=42, project_root=config.root)
 
 
 async def test_send_refuses_extensionless_files(store: ArtifactStore, config) -> None:
     target = config.root / "workspace" / "Makefile"
     target.write_text("all:\n\techo hi\n", encoding="utf-8")
     with pytest.raises(ArtifactError, match="no extension"):
-        store.send(target, project_root=config.root)
+        store.send(target, chat_id=42, project_root=config.root)
 
 
 async def test_send_refuses_empty_files(store: ArtifactStore, config) -> None:
     target = config.root / "workspace" / "empty.txt"
     target.write_text("", encoding="utf-8")
     with pytest.raises(ArtifactError, match="empty"):
-        store.send(target, project_root=config.root)
+        store.send(target, chat_id=42, project_root=config.root)
 
 
 async def test_send_refuses_oversized_files(store: ArtifactStore, config) -> None:
     target = config.root / "workspace" / "big.txt"
     target.write_text("x" * (2 * 1024 * 1024), encoding="utf-8")
     with pytest.raises(ArtifactError, match="over the"):
-        store.send(target, project_root=config.root)
+        store.send(target, chat_id=42, project_root=config.root)
 
 
 async def test_send_resolves_relative_paths_against_the_project(
     store: ArtifactStore, config
 ) -> None:
     (config.root / "workspace" / "rel.txt").write_text("hi", encoding="utf-8")
-    artifact = store.send("workspace/rel.txt", project_root=config.root)
+    artifact = store.send("workspace/rel.txt", chat_id=42, project_root=config.root)
     assert artifact.path == "workspace/rel.txt"
 
 
@@ -129,7 +157,7 @@ def test_the_default_cap_is_twenty_megabytes() -> None:
 def test_recent_returns_the_newest_last(store: ArtifactStore, config) -> None:
     for name in ("a.md", "b.md", "c.md"):
         (config.root / "workspace" / name).write_text(name, encoding="utf-8")
-        store.send(config.root / "workspace" / name, project_root=config.root)
+        store.send(config.root / "workspace" / name, chat_id=42, project_root=config.root)
     names = [a.path for a in store.recent(3)]
     assert names[-1].endswith("c.md")
     assert len(store.recent(2)) == 2
@@ -140,14 +168,17 @@ def test_recent_lists_a_re_registered_file_once(store: ArtifactStore, config) ->
     path = config.root / "workspace" / "dup.md"
     path.write_text("hi", encoding="utf-8")
     for _ in range(3):
-        store.send(path, project_root=config.root)
+        store.send(path, chat_id=42, project_root=config.root)
     assert len(store.recent(10)) == 1
 
 
 def test_caption_is_human_readable(store: ArtifactStore, config) -> None:
     (config.root / "workspace" / "tiny.txt").write_text("hi", encoding="utf-8")
     artifact = store.send(
-        config.root / "workspace" / "tiny.txt", origin="files", project_root=config.root
+        config.root / "workspace" / "tiny.txt",
+        chat_id=42,
+        origin="files",
+        project_root=config.root,
     )
     caption = artifact.caption()
     assert "workspace/tiny.txt" in caption
@@ -274,6 +305,28 @@ async def test_another_chats_uploads_are_out_of_reach(files: FilesTool, config) 
     assert (await files.invoke({"action": "read", "path": path}, ctx())).ok
 
 
+async def test_outbox_copies_are_bound_to_the_sending_chat(files: FilesTool, config) -> None:
+    """A staged artifact is the sending chat's delivery: it lands under
+    data/outbox/<chat>/, the owning chat can still read (and so re-upload) it,
+    and another chat is refused exactly like it is for foreign uploads."""
+    result = await files.invoke(
+        {"action": "write", "path": "workspace/out.md", "content": "# hi", "upload": True},
+        ctx(chat_id=42, confirmed=True),
+    )
+    assert result.ok
+    (artifact,) = result.artifacts
+    assert artifact.absolute.is_relative_to(config.root / "data" / "outbox" / "42")
+    staged = artifact.absolute.relative_to(config.root).as_posix()
+
+    assert (await files.invoke({"action": "read", "path": staged}, ctx(chat_id=42))).ok
+    assert (await files.invoke({"action": "upload", "path": staged}, ctx(chat_id=42))).ok
+
+    with pytest.raises(ToolError, match="another chat"):
+        await files.invoke({"action": "read", "path": staged}, ctx(chat_id=77))
+    with pytest.raises(ToolError, match="another chat"):
+        await files.invoke({"action": "upload", "path": staged}, ctx(chat_id=77))
+
+
 async def test_upload_of_a_missing_file_fails_cleanly(files: FilesTool) -> None:
     result = await files.invoke({"action": "upload", "path": "workspace/ghost.md"}, ctx())
     assert not result.ok
@@ -340,7 +393,7 @@ def test_the_schema_advertises_upload(files: FilesTool) -> None:
 # --------------------------------------------------------------------------- #
 
 
-async def test_the_agent_collects_artifacts_into_the_turn(config) -> None:
+async def test_the_agent_collects_artifacts_into_the_turn(config, monkeypatch) -> None:
     from lumi.agent import Agent
     from lumi.memory import History
     from lumi.personality import Personality
@@ -351,6 +404,7 @@ async def test_the_agent_collects_artifacts_into_the_turn(config) -> None:
     made = config.shell_cwd / "agent-made.md"
     made.write_text("", encoding="utf-8")
     backdate(made)
+    predate_session(monkeypatch)  # ctime cannot be backdated; see predate_session
 
     memory = config.build_memory_store()
     agent = Agent(

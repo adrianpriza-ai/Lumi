@@ -20,6 +20,7 @@ from typing import Any
 
 from ..chatlog import CHATLOG, CHATLOG_MAXLEN, ChatLog
 from ..config import Config
+from ..util.text import fence_untrusted
 from .base import Tool, ToolContext, ToolResult
 
 #: Rough chars-per-token for the output cap. Same divisor as ``read_file``;
@@ -169,7 +170,11 @@ PDFs and images. The log lives in memory, so it starts fresh on a restart."""
         if more:
             head += " — " + "; ".join(more)
         body = "\n".join(entry.render(i) for i, entry in enumerate(window, start=1))
-        text = f"{head}:\n{body}"
+        # Room talk is third-party content the model was not addressed in, so
+        # the rendered log travels as data, not instructions — same fence the
+        # web and read tools wrap their payloads in. The head line (counts and
+        # paging hints) is ours and stays outside.
+        text = f"{head}:\n{fence_untrusted(body)}"
 
         tokens = len(text) // CHARS_PER_TOKEN + 1
         if tokens > MAX_OUTPUT_TOKENS:

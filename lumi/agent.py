@@ -850,8 +850,18 @@ class Agent:
         try:
             tool_result = await self.registry.invoke(call.name, call.arguments, ctx)
         except NeedsApproval as exc:
+            # A pending id must be unique within the queue and never collide
+            # with the Telegram bulk sentinel "all" (bot.CB_ALL — bot.py cannot
+            # be imported here, it imports this module): a duplicate id would
+            # let one resolve() answer two pendings, and "all" would let a
+            # single tap approve or cancel the whole queue.
+            pending_id = call.id or ""
+            if not pending_id or pending_id == "all" or any(
+                action.id == pending_id for action in conv.pending
+            ):
+                pending_id = uuid.uuid4().hex
             pending = PendingAction(
-                id=call.id or uuid.uuid4().hex,
+                id=pending_id,
                 tool=exc.tool,
                 arguments=exc.arguments,
                 reason=exc.reason,

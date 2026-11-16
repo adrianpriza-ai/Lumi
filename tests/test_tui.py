@@ -511,3 +511,39 @@ async def test_search_reports_when_no_provider_is_usable(
         fe.push({"cmd": "search"})
         await fe.wait_for("error", count=2)
         assert 'needs a "query"' in fe.events[-1]["text"]
+
+
+# --------------------------------------------------------------------------- #
+# protocol hygiene: control characters never cross the stream
+# --------------------------------------------------------------------------- #
+
+
+def test_clean_strips_c0_and_c1_but_keeps_newlines_and_tabs() -> None:
+    assert "\x1b" not in tui._clean("\x1b]52;c;x\x07")
+    assert "\x1b" not in tui._clean("\x1b[2J")
+    assert "\x07" not in tui._clean("\x1b]52;c;x\x07")
+    # C1 range goes too, including its ESC-adjacent CSI intermediates.
+    assert tui._clean("ok\x9b2J") == "ok2J"
+    # The renderer still wants these.
+    assert tui._clean("line one\nline two\ttabbed") == "line one\nline two\ttabbed"
+    assert tui._clean("plain text, punctuation and émoji ☺") == (
+        "plain text, punctuation and émoji ☺"
+    )
+
+
+async def test_an_event_payload_with_escape_sequences_serializes_cleanly(config) -> None:
+    """A model delta or tool notice carrying terminal escapes must reach the
+    frontend as inert text: the serialized protocol carries no ESC bytes."""
+    nasty = "\x1b]52;c;x\x07 and \x1b[2J wipe"
+    async with Frontend(config, make_agent(config, [make_reply(nasty)])) as fe:
+        await fe.start()
+        fe.push({"cmd": "submit", "text": "hi"})
+        await fe.wait_for("turn_done")
+
+        serialized = json.dumps(fe.events)
+        assert "\x1b" not in serialized
+        assert "\x07" not in serialized
+        result = next(e for e in fe.events if e["ev"] == "result")
+        assert "and [2J wipe" in result["text"]
+        # Newlines survive — only control characters are gone.
+        assert tui._clean("a\nb") == "a\nb"

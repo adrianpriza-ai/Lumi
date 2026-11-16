@@ -2753,10 +2753,12 @@ async def test_photo_in_group_without_mention_is_silent(config) -> None:
 # --------------------------------------------------------------------------- #
 
 
-async def test_a_model_written_file_is_delivered_as_a_document(config) -> None:
+async def test_a_model_written_file_is_delivered_as_a_document(config, monkeypatch) -> None:
     """The full out path: the model writes with upload:true, the chat gets a file."""
     # Pre-existing and empty, so the session-freshness gate (finding 3b) is not
     # what this test is exercising — it would stop the turn for an owner tap.
+    # ctime cannot be backdated, so shift the gate instead (see test_tools.predate_session).
+    monkeypatch.setattr("lumi.tools.files.SESSION_START", time.time() + 60)
     report = config.shell_cwd / "report.md"
     report.write_text("", encoding="utf-8")
     backdate(report)
@@ -3638,11 +3640,26 @@ async def test_env_reports_unset_variables_honestly(config, monkeypatch) -> None
 
 
 async def test_env_lists_lumi_overrides(config, monkeypatch) -> None:
-    monkeypatch.setenv("LUMI__LLM__MODEL", "override-model")
+    """The override name is shown plainly; its value is masked like any other
+    credential — an override such as a proxy URL carries a password in it."""
+    value = "http://dummy-user:dummy-pass@proxy.example:3128"
+    monkeypatch.setenv("LUMI__BOT__PROXY_URL", value)
     bot, _ = await send(config, [], "/env")
     body = texts(bot)
-    assert "LUMI__LLM__MODEL" in body
-    assert "override-model" in body
+    assert "LUMI__BOT__PROXY_URL" in body
+    assert "dummy-pass" not in body  # headed for Telegram's servers
+    assert value not in body
+
+
+def test_redact_url_masks_userinfo_credentials() -> None:
+    from lumi.bot import _redact_url
+
+    shown = _redact_url("https://user:secretpw@host/x")
+    assert "secretpw" not in shown
+    assert shown.startswith("https://")
+    assert "@host/x" in shown
+    # Without userinfo and without secret query params the URL passes through.
+    assert _redact_url("https://host/x") == "https://host/x"
 
 
 async def test_env_says_keys_need_a_restart(config) -> None:

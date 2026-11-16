@@ -74,7 +74,10 @@ def scrubbed_env(
     rather than by whether its name looks secret. *home* pins ``HOME`` when the
     caller wants it (the shell keeps it inside the project); *overrides* are
     values the owner configured explicitly, such as an MCP server's ``env``
-    block, and are applied last.
+    block, and are applied last. An override is trusted for what its *name*
+    says, not for what its value contains: a value that itself matches
+    :data:`SECRET_PATTERN` reads as a pasted credential (``DIST_ID`` pointing
+    at a token), so it is dropped rather than inherited.
     """
     env = {
         key: value
@@ -84,7 +87,10 @@ def scrubbed_env(
     if home is not None:
         env["HOME"] = str(home)
     if overrides:
-        env.update(overrides)
+        # Owner-configured by name, secret-screened by value: a value that
+        # looks like a credential never reaches a child process, whatever
+        # the key it was filed under.
+        env.update({k: v for k, v in overrides.items() if not SECRET_PATTERN.search(v)})
     return env
 
 

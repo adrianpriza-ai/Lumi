@@ -649,6 +649,54 @@ async def test_approval_in_a_parallel_set_answers_every_tool_call(config) -> Non
     assert "Not executed" not in by_id["c3"]
 
 
+async def test_duplicate_tool_call_ids_get_distinct_pending_ids(config) -> None:
+    """Two tool_calls sharing one id must not produce two indistinguishable
+    pendings: a duplicate id would let one resolve() answer both."""
+    agent = make_agent(
+        config,
+        [
+            make_reply(
+                "",
+                [
+                    ("c1", "run_shell", {"command": "rm x.txt"}),
+                    ("c1", "run_shell", {"command": "rm y.txt"}),
+                ],
+            )
+        ],
+    )
+    result = await agent.handle(CHAT, "tidy up")
+
+    assert result.needs_approval
+    assert len(result.pending) == 2
+    assert result.pending[0].id != result.pending[1].id
+    assert all(action.id for action in result.pending)
+
+    # The tool replies still carry the model's original id — one per call.
+    messages = agent.conversation(CHAT).messages
+    answered = [m["tool_call_id"] for m in messages if m["role"] == "tool"]
+    assert answered == ["c1", "c1"]
+
+
+async def test_the_bulk_sentinel_id_is_never_used_as_a_pending_id(config) -> None:
+    """A call id of "all" collides with the Telegram bulk-approve callback
+    (bot.CB_ALL): one tap would answer the whole queue."""
+    agent = make_agent(config, [make_reply("", [("all", "run_shell", {"command": "rm x.txt"})])])
+    result = await agent.handle(CHAT, "tidy up")
+
+    assert result.needs_approval
+    assert len(result.pending) == 1
+    assert result.pending[0].id != "all"
+    assert result.pending[0].id
+
+
+async def test_normal_unique_tool_call_ids_pass_through_unchanged(config) -> None:
+    agent = make_agent(config, [make_reply("", [("c9", "run_shell", {"command": "rm x.txt"})])])
+    result = await agent.handle(CHAT, "tidy up")
+
+    assert result.needs_approval
+    assert result.pending[0].id == "c9"
+
+
 async def test_seal_dangling_tool_calls_closes_only_the_unanswered(config) -> None:
     """The repair after a cancel: every call id needs exactly one tool reply."""
     agent = make_agent(config, [])
