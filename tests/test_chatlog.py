@@ -32,6 +32,35 @@ def test_the_log_keeps_only_the_newest_messages() -> None:
     ]
 
 
+def test_growing_the_log_keeps_the_messages_already_held() -> None:
+    log = ChatLog(maxlen=2)
+    for i in range(2):
+        log.record(1, LogEntry(message_id=i, author="Other", text=f"m{i}", clock="12:00"))
+
+    log.set_maxlen(6)
+    for i in range(2, 4):
+        log.record(1, LogEntry(message_id=i, author="Other", text=f"m{i}", clock="12:00"))
+
+    assert log.maxlen == 6
+    assert [entry.text for entry in log.entries(1)] == ["m0", "m1", "m2", "m3"]
+
+
+def test_shrinking_the_log_keeps_the_newest_messages() -> None:
+    log = ChatLog(maxlen=6)
+    for i in range(6):
+        log.record(1, LogEntry(message_id=i, author="Other", text=f"m{i}", clock="12:00"))
+
+    log.set_maxlen(2)
+
+    assert [entry.text for entry in log.entries(1)] == ["m4", "m5"]
+    log.record(1, LogEntry(message_id=6, author="Other", text="m6", clock="12:00"))
+    assert [entry.text for entry in log.entries(1)] == ["m5", "m6"]
+
+
+def test_maxlen_is_never_below_one() -> None:
+    assert ChatLog(maxlen=0).maxlen == 1
+
+
 def test_a_text_message_is_loggable() -> None:
     entry = entry_from(message(text="the deploy is broken"))
 

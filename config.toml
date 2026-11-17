@@ -18,6 +18,9 @@ proxy_url = ""
 connect_timeout = 15.0
 # Extra startup attempts after network failure. 0 = once, -1 = retry forever.
 bootstrap_retries = -1
+# Messages kept in the in-memory room log per chat — the window
+# more_context reads back from a group. Raise it in a busy room.
+chatlog_max_messages = 10
 # Max document size sent to chat (MB). Telegram's own limit is 50.
 max_upload_mb = 20
 # Retention for uploaded files in group and channel chats in days (0 = disabled).

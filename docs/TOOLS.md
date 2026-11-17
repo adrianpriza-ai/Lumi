@@ -10,7 +10,7 @@
 | `list_files` | List one directory, like `ls` |
 | `grep` | Multi-word content search across the project |
 | `memory` | Remember and recall, scoped to the chat it is used in; forgetting is human-only by design |
-| `more_context` | Up to 10 messages of room chatter the bot never answered (`offset` ≤ 9, ~30k-token cap), dropped media included with its saved path |
+| `more_context` | Keyword-searchable room chatter the bot never answered, up to `bot.chatlog_max_messages` per read (10 by default) with ~30k-token cap, dropped media included with its saved path |
 | `ocr` | Extract text from PDFs, scans, and document images |
 | `image_gen` | Generate an image from a text prompt (OpenAI Images wire format); the file lands in `workspace/images/` and is sent to the chat |
 | `web` | Search and fetch, across three interchangeable providers |
@@ -88,16 +88,27 @@ sent *to* the bot lands) and the log line names the path, so the model can
 `read_file` it — PDFs and images included. An attachment that cannot be saved
 still shows, marked "not saved".
 
-- `offset` (0-9): skip this many of the newest messages before reading — use
-  it to walk further back.
-- `limit` (1-10, default 10): how many messages to return, oldest first.
+- `query` (optional): only messages containing every word in it, in any order
+  and case-insensitive — `grep`'s AND rule applied to the log. The author is
+  searched too, so `query: "Dana deploy"` finds Dana's messages about it. A
+  query that matches nothing says so and points back at reading unfiltered.
+- `offset`: skip this many of the newest messages before reading — use it to
+  walk further back; up to one less than the log's size.
+- `limit` (default: the whole log): how many messages to return, oldest first.
 
-One call is capped at 10 messages and ~30k tokens; a result over the cap is
-**refused with the remedy** — "call again with a smaller `limit`" — never
-truncated, the same rule `read_file` follows: a cut-off answer reads like the
-whole truth to the model that asked.
+`offset` and `limit` page the messages that match `query`, not the whole log.
 
-The log is in memory (10 messages per chat) and starts fresh on a restart;
+One call is capped at the log's size (`bot.chatlog_max_messages`, 10 by
+default) and ~30k tokens; a result over the cap is
+**refused with the remedy** — the exact `limit` that fits — never truncated,
+the same rule `read_file` follows: a cut-off answer reads like the whole truth
+to the model that asked. When older messages are left out of a page, the head
+line and the result's `next_offset` name the exact `offset` that reads them,
+so paging back is one call rather than a guess (and `offset=0` returns to the
+newest).
+
+The log is in memory (`bot.chatlog_max_messages` per chat, 10 by default) and
+starts fresh on a restart;
 long-term memory is still `MEMORY.md`, and the transcript is still the bot's
 own conversation. Reading the room at all needs Telegram's group privacy
 setting disabled — see [TELEGRAM.md](TELEGRAM.md). Remove `"more_context"`

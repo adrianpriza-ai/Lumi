@@ -33,7 +33,7 @@ from lumi.bot import (
     build_handlers,
     stop_signal_handler,
 )
-from lumi.chatlog import CHATLOG
+from lumi.chatlog import CHATLOG, CHATLOG_MAXLEN
 from lumi.memory import History
 from lumi.personality import Personality
 from lumi.tools import build_registry
@@ -331,10 +331,17 @@ def photos(bot: FakeBot) -> list[dict[str, Any]]:
 
 @pytest.fixture(autouse=True)
 def empty_room():
-    """The room log is process-wide; every test starts with it empty."""
+    """The room log is process-wide; every test starts with it empty.
+
+    ``build_application`` also resizes it from ``bot.chatlog_max_messages``, so
+    the fixture restores the default size as well — otherwise one test's
+    larger log would leak into every test after it.
+    """
     CHATLOG.clear()
+    CHATLOG.set_maxlen(CHATLOG_MAXLEN)
     yield
     CHATLOG.clear()
+    CHATLOG.set_maxlen(CHATLOG_MAXLEN)
 
 
 # --------------------------------------------------------------------------- #
@@ -1445,6 +1452,12 @@ async def test_unsupported_media_is_explained(config) -> None:
 # --------------------------------------------------------------------------- #
 # wiring
 # --------------------------------------------------------------------------- #
+
+
+def test_application_sizes_the_room_log_from_config(config) -> None:
+    config.bot.chatlog_max_messages = 25
+    build_application(config, bot=FakeBot())
+    assert CHATLOG.maxlen == 25
 
 
 def test_application_registers_every_handler(config) -> None:

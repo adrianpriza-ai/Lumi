@@ -53,6 +53,12 @@ class BotConfig:
     #: the outbox from filling with one runaway export. The artifact harness
     #: refuses anything larger with a model-readable reason.
     max_upload_mb: int = 20
+    #: How many dropped messages the in-memory room log keeps per chat — the
+    #: window ``more_context`` can read back. 10 is enough for "as they said
+    #: above"; a busy room that often points further back can raise it. The
+    #: log lives in memory only, so this costs nothing but RAM while the bot
+    #: runs, and the tool's own ``offset``/``limit`` caps follow this value.
+    chatlog_max_messages: int = 10
     #: Retention for uploaded files in group and channel chats, in days.
     #: Files under ``workspace/uploads/<chat>/`` for groups and channels older
     #: than this are automatically deleted. 0 or negative disables cleanup.
@@ -1774,6 +1780,11 @@ def validate(config: Config) -> list[str]:
 
     if config.bot.max_upload_mb <= 0:
         problems.append("bot.max_upload_mb must be a positive number of megabytes")
+    if config.bot.chatlog_max_messages <= 0:
+        problems.append(
+            "bot.chatlog_max_messages must be a positive number of messages the "
+            "room log keeps per chat"
+        )
 
     providers = [
         p

@@ -1894,12 +1894,114 @@ async def test_more_context_returns_the_newest_ten_oldest_first(config) -> None:
     assert result.text.index("m3") < result.text.index("m12")
 
 
+async def test_more_context_reads_a_log_bigger_than_the_default(config) -> None:
+    """A raised ``bot.chatlog_max_messages`` must reach the tool's caps, not
+    just the buffer: retaining messages nobody can page to would be pointless."""
+    config.bot.chatlog_max_messages = 25
+    log = ChatLog(maxlen=25)
+    for i in range(25):
+        log.record(CHAT_ID, LogEntry(message_id=i, author="Other", text=f"m{i}", clock="12:00"))
+    tool = MoreContextTool(config, log=log)
+
+    assert tool.parameters["properties"]["offset"]["maximum"] == 24
+    assert tool.parameters["properties"]["limit"]["maximum"] == 25
+    assert "(1-25)" in tool.description
+
+    result = await tool.invoke({"offset": 20}, ctx(chat_id=CHAT_ID))
+    assert result.ok
+    assert result.data["count"] == 5
+    assert "m0" in result.text and "m4" in result.text
+    assert "m5" not in result.text
+
+    whole = await tool.invoke({}, ctx(chat_id=CHAT_ID))
+    assert whole.ok
+    assert whole.data["count"] == 25
+
+
 async def test_more_context_offset_skips_the_newest(config) -> None:
     log = room("m1", "m2", "m3", "m4", "m5", "m6", "m7")
     result = await MoreContextTool(config, log=log).invoke({"offset": 2}, ctx(chat_id=CHAT_ID))
     assert result.ok
     assert "m1" in result.text and "m5" in result.text
     assert "m6" not in result.text and "m7" not in result.text
+
+
+async def test_more_context_names_the_offset_that_reads_older_messages(config) -> None:
+    """Paging back is spelled out: the head line and `next_offset` say where
+    the older messages start, instead of the vague "raise the offset"."""
+    log = room("m1", "m2", "m3", "m4", "m5", "m6", "m7")
+    result = await MoreContextTool(config, log=log).invoke({"limit": 4}, ctx(chat_id=CHAT_ID))
+    assert result.ok
+    assert result.data["older_left"] == 3
+    assert result.data["next_offset"] == 4
+    assert "offset=4" in result.text
+
+    older = await MoreContextTool(config, log=log).invoke(
+        {"offset": result.data["next_offset"], "limit": 3}, ctx(chat_id=CHAT_ID)
+    )
+    assert older.ok
+    assert [line for line in ("m1", "m2", "m3") if line in older.text]
+    assert "m4" not in older.text
+    assert older.data["next_offset"] is None
+
+
+async def test_more_context_query_is_a_case_insensitive_and(config) -> None:
+    log = room(
+        "the deploy is broken",
+        "Deploy looks fine to me",
+        "lunch?",
+        "broken deploy? yes",
+    )
+    result = await MoreContextTool(config, log=log).invoke(
+        {"query": "DEPLOY broken"}, ctx(chat_id=CHAT_ID)
+    )
+    assert result.ok
+    assert result.data["matched"] == 2
+    assert result.data["logged"] == 4
+    assert result.data["query"] == "DEPLOY broken"
+    assert "the deploy is broken" in result.text
+    assert "broken deploy? yes" in result.text
+    assert "Deploy looks fine" not in result.text
+    assert "lunch?" not in result.text
+
+
+async def test_more_context_query_searches_the_author_too(config) -> None:
+    log = ChatLog()
+    log.record(CHAT_ID, LogEntry(message_id=1, author="Dana", text="on it", clock="12:00"))
+    log.record(CHAT_ID, LogEntry(message_id=2, author="Sam", text="Dana is right", clock="12:01"))
+    result = await MoreContextTool(config, log=log).invoke(
+        {"query": "dana"}, ctx(chat_id=CHAT_ID)
+    )
+    assert result.ok
+    assert result.data["matched"] == 2
+    assert "on it" in result.text and "Dana is right" in result.text
+
+
+async def test_more_context_query_pages_through_only_matches(config) -> None:
+    log = room("keep one", "noise", "keep two", "noise", "keep three")
+    tool = MoreContextTool(config, log=log)
+    page = await tool.invoke({"query": "keep", "limit": 2}, ctx(chat_id=CHAT_ID))
+    assert page.ok
+    assert page.data["matched"] == 3
+    assert page.data["next_offset"] == 2
+    assert "keep two" in page.text and "keep three" in page.text
+    older = await tool.invoke(
+        {"query": "keep", "offset": page.data["next_offset"], "limit": 2},
+        ctx(chat_id=CHAT_ID),
+    )
+    assert older.ok
+    assert "keep one" in older.text
+    assert "keep two" not in older.text and "keep three" not in older.text
+
+
+async def test_more_context_says_so_when_a_query_matches_nothing(config) -> None:
+    result = await MoreContextTool(config, log=room("lunch?", "lunch!")).invoke(
+        {"query": "deploy"}, ctx(chat_id=CHAT_ID)
+    )
+    assert not result.ok
+    assert "deploy" in result.text
+    assert "2 logged" in result.text
+    assert "without `query`" in result.text
 
 
 async def test_more_context_refuses_an_offset_above_the_cap(config) -> None:

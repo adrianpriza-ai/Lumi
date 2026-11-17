@@ -3065,6 +3065,11 @@ def build_application(
     if problems:
         log.error("configuration problems:\n  - %s", "\n  - ".join(problems))
 
+    # The room log is a process-wide singleton, so its size is applied here —
+    # before the agent (and with it ``more_context``) is built, so the tool's
+    # offset/limit caps match the log the bot will actually fill.
+    CHATLOG.set_maxlen(config.bot.chatlog_max_messages)
+
     store = agent.memory if agent else config.build_memory_store()
     personality = agent.personality if agent else Personality.load(config.personality_file)
     history = agent.history if agent else History(config.history_dir)

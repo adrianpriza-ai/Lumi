@@ -92,10 +92,11 @@ pretending the quote started there.
 Mention mode means the bot only joins a conversation it is addressed in — so
 the model's history is a series of interruptions with the talk between them
 missing. Every group message the bot *drops* is therefore kept in a small
-in-memory log (`lumi/chatlog.py`, 10 messages per chat) that the
-`more_context` tool reads back: up to 10 messages per call, `offset` up to 9,
-and a call that would exceed ~30k tokens is refused with the remedy ("call
-again with a smaller limit") instead of being truncated.
+in-memory log (`lumi/chatlog.py`, 10 messages per chat by default, raised with
+`bot.chatlog_max_messages`) that the `more_context` tool reads back: up to the
+log's size per call with `offset` reaching one less than that, and a call that
+would exceed ~30k tokens is refused with the remedy ("call again with a
+smaller limit") instead of being truncated.
 
 What goes in: text, from anyone, when the bot chose not to answer — the
 mention rule and the stranger gate both log before they stay silent. What

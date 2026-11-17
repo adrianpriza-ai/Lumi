@@ -22,9 +22,11 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
-#: How many dropped messages are kept per chat. Deliberately short: the log
-#: answers "what is happening right now", not "what was said last month" —
-#: the transcript and MEMORY.md own the long view.
+#: Default for how many dropped messages are kept per chat. Deliberately
+#: short: the log answers "what is happening right now", not "what was said
+#: last month" — the transcript and MEMORY.md own the long view. A busy room
+#: can raise it with ``bot.chatlog_max_messages``, which resizes the shared
+#: log at startup; nothing else needs to change.
 CHATLOG_MAXLEN = 10
 
 
@@ -69,6 +71,28 @@ class ChatLog:
     def __init__(self, maxlen: int = CHATLOG_MAXLEN) -> None:
         self._maxlen = max(1, int(maxlen))
         self._logs: dict[int | str, deque[LogEntry]] = {}
+
+    @property
+    def maxlen(self) -> int:
+        """Messages kept per chat before the oldest are dropped."""
+        return self._maxlen
+
+    def set_maxlen(self, maxlen: int) -> None:
+        """Retune the per-chat cap, keeping the newest messages already held.
+
+        Called at startup from ``bot.chatlog_max_messages``. Shrinking trims
+        each chat to its newest ``maxlen`` entries rather than starting over:
+        the point of the setting is how far back the room is visible, not a
+        reason to forget the talk that just happened. Readers take their caps
+        from the same configuration, so the log and the tools that page it are
+        sized by one number.
+        """
+        maxlen = max(1, int(maxlen))
+        if maxlen == self._maxlen:
+            return
+        self._maxlen = maxlen
+        for chat_id, old in list(self._logs.items()):
+            self._logs[chat_id] = deque(old, maxlen=maxlen)
 
     def record(self, chat_id: int | str, entry: LogEntry) -> None:
         """Append one message for *chat_id*, dropping the oldest past the cap."""
@@ -158,4 +182,5 @@ def media_entry_from(message: Any, kind: str, path: str = "") -> LogEntry | None
 #: singleton is the whole wiring: the Telegram layer records into it and the
 #: ``more_context`` tool reads from it, with no plumbing between them to get
 #: out of sync. Tests build their own :class:`ChatLog` or clear this one.
+#: ``build_application`` resizes it to ``bot.chatlog_max_messages`` at startup.
 CHATLOG = ChatLog()
