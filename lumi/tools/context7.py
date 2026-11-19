@@ -28,6 +28,7 @@ intervention.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from typing import Any
 
@@ -108,8 +109,6 @@ class Context7Client:
     async def aclose(self) -> None:
         """Close every cached client. Called at shutdown via the tool registry
         (:meth:`ToolRegistry.aclose` → :meth:`Context7Tool.aclose`)."""
-        import contextlib
-
         for client in self._clients.values():
             with contextlib.suppress(Exception):  # shutdown is best-effort
                 await client.aclose()
@@ -491,7 +490,11 @@ def _render_library_matches(library_name: str, matches: list[LibraryMatch]) -> s
     for index, match in enumerate(matches, start=1):
         head = f"[{index}] {match.title or match.id}  ({match.id})"
         if match.score is not None:
-            head += f"  score={match.score:.2f}"
+            # The score comes straight from the registry's JSON; some servers
+            # send it as a string. Coerce or drop it rather than let one odd
+            # field fail the whole resolve.
+            with contextlib.suppress(TypeError, ValueError):
+                head += f"  score={float(match.score):.2f}"
         lines.append(head)
         if match.description:
             lines.append(truncate(match.description, 240, "…"))

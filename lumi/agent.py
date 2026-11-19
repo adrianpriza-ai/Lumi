@@ -1014,13 +1014,27 @@ class Agent:
         used: list[str] = []
         artifacts: list[Artifact] = []
         outcomes: list[tuple[PendingAction, str]] = []
+        reapproval: NeedsApproval | None = None
         for action in actions:
             if approved:
                 log.info("owner approved %s: %s", action.tool, action.preview[:120])
                 await self._step(
                     hooks, "tool", self.registry.step_detail(action.tool, action.arguments)
                 )
-                tool_result = await self.registry.invoke_approved(action, ctx)
+                try:
+                    tool_result = await self.registry.invoke_approved(action, ctx)
+                except NeedsApproval as exc:
+                    # The overwrite-digest check in files.py re-raises even on a
+                    # confirmed run when the file changed since the approval was
+                    # captured — and an earlier member of this batch may be the
+                    # one that changed it. Letting the exception escape here
+                    # skips the settle-down below: earlier actions already ran
+                    # but stay pending (another tap would re-run them) and the
+                    # fresh approval never becomes a card. Settle what ran,
+                    # queue the fresh request, and end the turn there.
+                    reapproval = exc
+                    log.info("approved %s needs a fresh approval: %s", action.tool, exc.reason)
+                    break
                 outcomes.append(
                     (
                         action,
@@ -1032,6 +1046,39 @@ class Agent:
                 artifacts.extend(tool_result.artifacts)
             else:
                 log.info("owner declined %s: %s", action.tool, action.preview[:120])
+
+        if reapproval is not None:
+            # A fresh uuid4 cannot collide with the queue or with the Telegram
+            # bulk sentinel "all" — the raised action's own id is retired with
+            # the settled batch.
+            pending_id = uuid.uuid4().hex
+            # Every action through the one that raised is settled: the raised
+            # one's approval is superseded by the fresh request below.
+            for done in actions[: len(outcomes) + 1]:
+                conv.pending = [p for p in conv.pending if p.id != done.id]
+            for done_action, outcome in outcomes:
+                conv.messages.append({"role": "user", "content": outcome})
+                self.history.append(
+                    conv.chat_id, "user", outcome, session=conv.session, tool=done_action.tool
+                )
+            fresh = PendingAction(
+                id=pending_id,
+                tool=reapproval.tool,
+                arguments=reapproval.arguments,
+                reason=reapproval.reason,
+                preview=reapproval.preview,
+            )
+            conv.pending.append(fresh)
+            note = (
+                "[The owner approved this run, but what it would write changed "
+                "since the approval was captured, so the owner is asked again "
+                "below.]"
+            )
+            conv.messages.append({"role": "user", "content": note})
+            self.history.append(
+                conv.chat_id, "user", note, session=conv.session, tool=reapproval.tool
+            )
+            return TurnResult(pending=list(conv.pending), tools_used=used)
 
         for action in actions:
             conv.pending = [p for p in conv.pending if p.id != action.id]

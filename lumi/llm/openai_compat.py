@@ -154,7 +154,11 @@ class _Pieces:
     def add_tool(self, raw: Any) -> None:
         index = getattr(raw, "index", None)
         if not isinstance(index, int):
-            index = len(self.tools)
+            # A provider that omits `index` is streaming one tool call at a
+            # time on the wire; slotting every fragment into its own new slot
+            # (the old fallback) yielded one broken call per delta instead of
+            # one joined call.
+            index = 0
         slot = self.tools.setdefault(index, ["", "", []])
         call_id = getattr(raw, "id", "") or ""
         if call_id and not slot[0]:
@@ -561,19 +565,28 @@ class OpenAICompatClient(LLMClient):
                 if raw_error is None:
                     if completion is None:
                         error = LLMError("the model returned no completion")
+                        empty = True
                     else:
-                        parsed = self._parse(completion)
-                        if parsed.wants_tools or parsed.text.strip():
-                            self._pool.report(key, ok=True)
-                            return parsed
+                        try:
+                            parsed = self._parse(completion)
+                        except LLMError as parse_error:
+                            # A 200 with no choices (seen on some proxies mid-
+                            # degradation) must go through the same ladder as
+                            # any other failure, not abort the whole call.
+                            parsed = None
+                            error = parse_error
+                        else:
+                            if parsed.wants_tools or parsed.text.strip():
+                                self._pool.report(key, ok=True)
+                                return parsed
 
-                        # A successful HTTP response is not necessarily a usable
-                        # model response. Reasoning-capable Ollama Cloud models
-                        # can spend the whole response budget thinking and leave
-                        # content empty. Treat it as transient, but never rotate
-                        # the key.
-                        error = LLMError("the model returned an empty response")
-                    empty = True
+                            # A successful HTTP response is not necessarily a usable
+                            # model response. Reasoning-capable Ollama Cloud models
+                            # can spend the whole response budget thinking and leave
+                            # content empty. Treat it as transient, but never rotate
+                            # the key.
+                            error = LLMError("the model returned an empty response")
+                            empty = True
                     retryable = True
                 else:
                     error = raw_error

@@ -215,9 +215,12 @@ Use it when the owner asks for something that lives in an external service: crea
                 trail.append(f"✗ attempt {attempt}: {last}")
             except Exception as exc:  # noqa: BLE001 - the failure *is* the report
                 # The exception can carry text the server wrote, so it is fenced
-                # like any other server-authored output before it reaches chat.
+                # like any other server-authored output before it reaches chat —
+                # the trail entries too, not just the summary line.
                 last = fence_untrusted(truncate(f"{type(exc).__name__}: {exc}", 400, " …"))
-                trail.append(f"✗ attempt {attempt}: {truncate(str(exc), 200, ' …')}")
+                trail.append(
+                    f"✗ attempt {attempt}: " + fence_untrusted(truncate(str(exc), 200, " …"))
+                )
             else:
                 elapsed = time.monotonic() - started
                 trail.append(f"✓ attempt {attempt}: connected, {len(tools)} tool(s)")

@@ -1649,6 +1649,12 @@ def _is_allowed(user: Any, config: Config, chat: Any = None) -> bool:
     owner = config.owner_id
     if owner is not None and user.id == owner:
         return True
+    # Another bot account is never a member: bots do receive other bots'
+    # messages in groups, so a bot added to a whitelisted room could otherwise
+    # @mention this one and drive the whole agent loop. The bot's own messages
+    # never arrive through getUpdates, so this only filters third-party bots.
+    if getattr(user, "is_bot", False):
+        return False
     if str(user.id) in config.bot.whitelisted_users:
         return True
     # A whitelisted group opens the bot to every member of that room.
@@ -3014,14 +3020,27 @@ def build_handlers(config: Config) -> list[Any]:
         ChatMemberHandler(on_my_chat_member),
         # Keyword arguments on purpose: MessageHandler's parameter order changed
         # between python-telegram-bot v20 and v22, and the keyword form is stable.
-        MessageHandler(callback=on_text, filters=filters.TEXT & ~filters.COMMAND & allowed_filter),
+        # UpdateType.MESSAGE keeps edits out: without it an edited message is
+        # delivered again (effective_message is the edited one) and the agent
+        # would run a whole second turn nobody asked for. Channel posts are
+        # dropped with it — they have no effective_user, so every one of them
+        # would otherwise end up in on_stranger posting NOT_AUTHORISED into
+        # the channel.
         MessageHandler(
-            callback=on_non_text, filters=~filters.TEXT & ~filters.COMMAND & allowed_filter
+            callback=on_text,
+            filters=filters.UpdateType.MESSAGE & filters.TEXT & ~filters.COMMAND & allowed_filter,
+        ),
+        MessageHandler(
+            callback=on_non_text,
+            filters=filters.UpdateType.MESSAGE & ~filters.TEXT & ~filters.COMMAND & allowed_filter,
         ),
         # An unrecognised command from the owner still deserves an answer.
-        MessageHandler(callback=on_unknown_command, filters=filters.COMMAND & allowed_filter),
+        MessageHandler(
+            callback=on_unknown_command,
+            filters=filters.UpdateType.MESSAGE & filters.COMMAND & allowed_filter,
+        ),
         # Everyone else. Last, so an owner's message is never caught here.
-        MessageHandler(callback=on_stranger, filters=~allowed_filter),
+        MessageHandler(callback=on_stranger, filters=filters.UpdateType.MESSAGE & ~allowed_filter),
     ]
 
 

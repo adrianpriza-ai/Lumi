@@ -122,11 +122,22 @@ class TavilyProvider(WebProvider):
         while (key := self._pool.pick(exclude=tried)) is not None:
             tried.append(key)
             page = await self._fetch_with(key, url)
-            if page.markdown.strip() and not page.markdown.startswith("extract failed"):
+            if page.markdown.strip() and not page.markdown.startswith(
+                ("extract failed", "extraction failed")
+            ):
                 self._pool.report(key, ok=True)
                 return page
+            # A transport error ("extract failed: ...") can be the key's fault —
+            # worth another attempt on the next key. A page with nothing to
+            # extract ("(no content returned)", "extraction failed: ..." when
+            # the API says so) is the site's fault: the key stays unparked,
+            # like jina's no-content handling, instead of cooling down over
+            # content it cannot extract.
+            content_fault = not page.markdown.strip() or page.markdown.startswith(
+                ("(no content returned)", "extraction failed")
+            )
             last_error = page.markdown
-            self._pool.report(key, ok=False, retryable=bool(page.markdown))
+            self._pool.report(key, ok=False, retryable=not content_fault)
         return Page(url=url, markdown=last_error or "every tavily key failed")
 
     # -- single-call helpers ---------------------------------------------- #
@@ -215,7 +226,10 @@ def _time_range(days: int | None) -> str | None:
     for bucket in TAVILY_TIME_RANGES:
         if days <= bucket[0]:
             return bucket[1]
-    return "month"
+    # Tavily has no bucket past a year; "month" would *narrow* a multi-year
+    # window, the opposite of what was asked. The MCP provider's equivalent
+    # mapping falls back to "year" for the same reason.
+    return "year"
 
 
 __all__ = ["TavilyProvider"]

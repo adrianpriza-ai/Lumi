@@ -20,6 +20,7 @@ change.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from typing import Any
 
@@ -136,7 +137,7 @@ class ImageGenClient:
         the endpoint is — so it is guarded like a web fetch: refused when the
         guard names a reason, and re-checked on the final URL in case the
         redirect chain ended somewhere the start did not."""
-        if reason := validate_fetch_url(url):
+        if reason := await asyncio.to_thread(validate_fetch_url, url):
             raise LLMError(f"the image host was refused: {reason} ({url})")
         try:
             import httpx
@@ -147,29 +148,44 @@ class ImageGenClient:
             async with httpx.AsyncClient(
                 timeout=self.config.timeout_seconds, follow_redirects=True
             ) as http:
-                response = await http.get(url)
+                # Streamed and cut off as soon as the cap is passed. Reading
+                # the whole body first (httpx buffers by default) would let a
+                # hostile host stream gigabytes before the check ran — the cap
+                # would bound nothing but the allocation it already made.
+                chunks: list[bytes] = []
+                total = 0
+                async with http.stream("GET", url) as response:
+                    # follow_redirects=True means response.url is where the
+                    # chain ended — re-run the guard on it, exactly as web
+                    # fetch does for its providers.
+                    final = str(response.url)
+                    if final != url and (
+                        reason := await asyncio.to_thread(validate_fetch_url, final)
+                    ):
+                        raise LLMError(
+                            f"the image host was refused after redirecting: {reason} ({final})"
+                        )
+                    if response.status_code >= 400:
+                        raise LLMError(
+                            f"the image host returned HTTP {response.status_code} "
+                            "for the generated image"
+                        )
+                    mime = response.headers.get("content-type", "image/png").split(";")[0].strip()
+                    if not mime.startswith("image/"):
+                        raise LLMError(f"the image host returned {mime!r}, not an image")
+                    async for chunk in response.aiter_bytes():
+                        total += len(chunk)
+                        if total > MAX_DOWNLOAD_BYTES:
+                            raise LLMError(
+                                "the generated image is over the "
+                                f"{MAX_DOWNLOAD_BYTES / (1024 * 1024):.0f} MB download cap"
+                            )
+                        chunks.append(chunk)
         except httpx.HTTPError as exc:
             raise LLMError(
                 f"could not download the generated image from {url}: {format_error(exc)}"
             ) from exc
-        # follow_redirects=True means response.url is where the chain ended —
-        # re-run the guard on it, exactly as web fetch does for its providers.
-        final = str(response.url)
-        if final != url and (reason := validate_fetch_url(final)):
-            raise LLMError(f"the image host was refused after redirecting: {reason} ({final})")
-        if response.status_code >= 400:
-            raise LLMError(
-                f"the image host returned HTTP {response.status_code} for the generated image"
-            )
-        if len(response.content) > MAX_DOWNLOAD_BYTES:
-            raise LLMError(
-                f"the generated image is {len(response.content) / (1024 * 1024):.1f} MB, "
-                "over the download cap"
-            )
-        mime = response.headers.get("content-type", "image/png").split(";")[0].strip()
-        if not mime.startswith("image/"):
-            raise LLMError(f"the image host returned {mime!r}, not an image")
-        return mime, response.content
+        return mime, b"".join(chunks)
 
 
 __all__ = ["ImageGenClient", "MAX_DOWNLOAD_BYTES"]

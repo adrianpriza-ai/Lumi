@@ -35,6 +35,27 @@ log = get_logger(__name__)
 #: invented is what made searches come back thin.
 MAX_RESULTS = 50
 
+#: How providers spell a fetch that produced no page. A page starting with one
+#: of these is a failure report, not content: the loop below must move on to
+#: the next provider instead of returning "every tavily key failed" as the
+#: body of the page. Kept as one list next to the check, because the strings
+#: live in the providers — grep ``markdown=`` under providers/ when adding one.
+_FETCH_FAILURE_PREFIXES: tuple[str, ...] = (
+    "fetch failed",  # exa
+    "scrape failed",  # keenable, firecrawl, contextdev, jina
+    "extract failed",  # tavily
+    "extraction failed",  # tavily partial-extraction report
+    "mcp fetch failed",  # mcp provider
+    "jina search failed",  # jina
+    "every exa key failed",
+    "every tavily key failed",
+    "every firecrawl key failed",
+    "every context.dev key failed",
+    "every jina key failed",
+    "every keenable key failed",
+    "(no content returned)",  # exa, tavily
+)
+
 
 def build_providers(config: Config) -> dict[str, WebProvider]:
     """Instantiate every provider named in the configured order."""
@@ -301,9 +322,7 @@ call is authorised by text you read on the web.
                 attempts.append(f"{name}: {type(exc).__name__}: {exc}")
                 continue
 
-            if page.markdown.strip() and not page.markdown.startswith(
-                ("extract failed", "scrape failed", "mcp fetch failed")
-            ):
+            if page.markdown.strip() and not page.markdown.startswith(_FETCH_FAILURE_PREFIXES):
                 # Redirects are followed by whoever fetched (a provider or the
                 # MCP server), long after the guard above ran on the URL we
                 # asked for. Re-check the URL it actually ended on when the

@@ -31,6 +31,7 @@ or injected command cannot destroy the machine, and no mode re-litigates that.
 
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 import shlex
@@ -141,14 +142,24 @@ ConfirmRule: TypeAlias = tuple[re.Pattern[str], str]
 #: (not the pattern text) is the key, so the frozenset below must hold the
 #: same objects as this table.
 SUDO_RULE: DenyRule = (
-    re.compile(r"(^|[;&|]\s*)(sudo|doas|pkexec)\b", re.IGNORECASE),
+    # Also anchored after `(`, `{` and a backtick: a subshell, a brace group
+    # and a command substitution all start a fresh command the shell will
+    # run, and `env sudo ...` is caught structurally below.
+    re.compile(r"(^|[;&|(`{]\s*)(sudo|doas|pkexec)\b", re.IGNORECASE),
     "privilege escalation",
 )
 SU_RULE: DenyRule = (
-    re.compile(r"(^|[;&|]\s*)su\b(?!\w)", re.IGNORECASE),
+    re.compile(r"(^|[;&|(`{]\s*)su\b(?!\w)", re.IGNORECASE),
     "privilege escalation via su",
 )
 PRIVILEGE_RULES: frozenset[DenyRule] = frozenset({SUDO_RULE, SU_RULE})
+
+#: The programs those two rules refuse, by name. The rules match them only at
+#: the start of a line or after a separator, so a delegating wrapper hides the
+#: privilege escalation from the regex layer — ``env sudo useradd x`` names
+#: ``env`` to the table. The segment walk judges the *unwrapped* program, and
+#: any segment whose effective program is one of these is denied the same way.
+PRIVILEGE_PROGRAMS: frozenset[str] = frozenset({"sudo", "doas", "pkexec", "su"})
 
 DENY_RULES: list[DenyRule] = [
     # The fork bomb under any trigger character and any quoting: `:(){ :|:& };:`
@@ -206,10 +217,14 @@ DENY_RULES: list[DenyRule] = [
     # varies in the wild, so match both arrangements. Note there is no word
     # boundary after the root path: `/` is not a word character, so `\b` there
     # can never match and the rule would silently never fire.
+    # The first arrangement is two lookahead scans rather than one rule with
+    # two `[^;]*` spans in sequence: chained, every `-exec` in a long command
+    # re-scanned the whole rest of the line and a 200k-character command
+    # stalled `classify` for ~15 s on the event loop.
     (
         re.compile(
-            r"(\bfind\b[^;]*-(delete|exec|execdir)\b[^;]*\s/(/|\*|\s*($|[;&|]))"
-            r"|\bfind\b\s+(/\*|/|~|\$HOME)(\s|$)[^;]*-(delete|exec|execdir)\b)"
+            r"(?:\bfind\b(?=[^;]*-(?:delete|exec|execdir)\b)(?=[^;]*\s/(?:/|\*|\s*(?:$|[;&|])))"
+            r"|\bfind\b\s+(/\*|/|~|\$HOME)(\s|$)[^;]*-(?:delete|exec|execdir)\b)"
         ),
         "find deleting or executing across a root directory",
     ),
@@ -2324,6 +2339,37 @@ def _protected_project_path(path: Path, project_root: Path | None) -> str | None
     return None
 
 
+def _hardlinked_to_protected(path: Path, project_root: Path | None) -> str | None:
+    """The protected project file *path* is a hard link to, if any.
+
+    ``protected_write`` matches by name and ``path.resolve()`` follows
+    symlinks, but a hard link shares the inode under its own innocent name and
+    no name check or resolution can see it: ``ln config.toml workspace/lnk``
+    followed by ``echo x >> workspace/lnk`` writes the config through a write
+    the zoning calls ordinary. Mirrors ``FilesTool._links_protected`` — stat
+    the target and compare ``(st_dev, st_ino)`` against every protected
+    project path — so both write paths refuse the same trick.
+    """
+    if project_root is None:
+        return None
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    if stat.st_nlink <= 1:
+        return None
+    identity = (stat.st_dev, stat.st_ino)
+    for protected in sorted(PROTECTED_PROJECT_PATHS):
+        candidate = project_root.joinpath(*protected)
+        try:
+            other = candidate.stat()
+        except OSError:
+            continue
+        if (other.st_dev, other.st_ino) == identity:
+            return "/".join(protected)
+    return None
+
+
 def _approval_project_path(path: Path, project_root: Path | None) -> str | None:
     """The approval directory inside the project that *path* sits under, if any.
 
@@ -2388,6 +2434,36 @@ def _is_secret_name(name: str) -> bool:
     # plain key name itself keeps coming from the basename set above.
     stem, dot, _ext = name.partition(".")
     return bool(dot) and stem in PRIVATE_KEY_STEMS and not name.endswith(".pub")
+
+
+#: Metacharacters a shell glob expands before the command runs.
+_GLOB_METACHARS: frozenset[str] = frozenset("*?[]")
+
+
+def _globbed_secret(word: str) -> str | None:
+    """The secret *word*'s glob pattern could expand to, if any.
+
+    The read guard is existence-aware: ``grep -rn .env .`` names a secret file
+    without reading it and stays free, because the *literal* name does not
+    exist as a file. A glob hides behind the same rule — ``cat ../.en*`` and
+    ``cat ../.en[v]`` name no file that exists literally, and the shell then
+    expands the pattern into the real secret at run time. Match the pattern
+    against every known secret name instead: if one fits, the expansion can
+    name a credential and the command asks.
+    """
+    if not (_GLOB_METACHARS & set(word)):
+        return None
+    name = word.rsplit("/", 1)[-1]
+    for secret in SECRET_FILE_BASENAMES:
+        if fnmatch.fnmatchcase(secret, name):
+            return secret
+    for system_secret in SYSTEM_SECRET_PATHS:
+        if fnmatch.fnmatchcase(system_secret.rsplit("/", 1)[-1], name):
+            return system_secret.rsplit("/", 1)[-1]
+    # `.env*` covers the dotenv spellings _is_secret_name catches by prefix.
+    if name.startswith(".env"):
+        return name
+    return None
 
 
 def credential_dir(path: Path) -> tuple[str, Path] | None:
@@ -2884,6 +2960,19 @@ def explain(
         segment_program = _unwrap_program(segment)
         if segment_program in _CD_COMMANDS:
             continue  # already accounted for in effective_cwd
+        # The privilege regexes anchor `sudo` to the line start or a separator,
+        # so the deny table never sees it behind a delegating wrapper —
+        # `env sudo useradd x` judged as `env` and ran. The unwrapped program
+        # is what actually executes, so judge it here, lifted only in
+        # bypass-sudo mode (which lifts the regex rules for the same reason).
+        if segment_program in PRIVILEGE_PROGRAMS and resolved_mode is not Mode.BYPASS_SUDO:
+            verdicts.append(
+                Verdict(
+                    Tier.DENY,
+                    f"privilege escalation via {segment_program}",
+                    "privilege:effective-program",
+                )
+            )
         segment_mutating = (
             (segment_program not in READ_ONLY_COMMANDS)
             or any(token in _REDIRECTS for token in segment)
@@ -2911,6 +3000,32 @@ def explain(
                     )
                 )
             for word in _operands(segment):
+                # A command substitution is a nested command this policy never
+                # tokenised: `echo "$(cat /etc/shadow)"` and "echo `cat
+                # /etc/shadow`" read through it while the operand walk sees one
+                # opaque word. The mutating branch escalates any `$` for the
+                # same reason; here only substitutions escalate, so
+                # `grep -r $PATTERN .` stays free.
+                if "$(" in word or "`" in word:
+                    verdicts.append(
+                        Verdict(
+                            Tier.CONFIRM,
+                            "reads through a command substitution, so which file is "
+                            "read cannot be determined",
+                            "read:substitution",
+                        )
+                    )
+                    continue
+                if (globbed := _globbed_secret(word)) is not None:
+                    verdicts.append(
+                        Verdict(
+                            Tier.CONFIRM,
+                            f"the pattern may expand into a secret file ({globbed}); "
+                            "approve to read what it matches",
+                            "read:glob-secret",
+                        )
+                    )
+                    continue
                 target = _absolute(word, segment_base, home)
                 denied = _read_deny(target, project_root, chat_id)
                 if denied is not None:
@@ -2947,6 +3062,26 @@ def explain(
             # Judged only against the read rules, so a flag word that resolves
             # to nothing costs one existence check.
             for word in _flag_borne_words(segment):
+                if "$(" in word or "`" in word:
+                    verdicts.append(
+                        Verdict(
+                            Tier.CONFIRM,
+                            "reads through a command substitution, so which file is "
+                            "read cannot be determined",
+                            "read:substitution",
+                        )
+                    )
+                    continue
+                if (globbed := _globbed_secret(word)) is not None:
+                    verdicts.append(
+                        Verdict(
+                            Tier.CONFIRM,
+                            f"the pattern may expand into a secret file ({globbed}); "
+                            "approve to read what it matches",
+                            "read:glob-secret",
+                        )
+                    )
+                    continue
                 denied = _read_deny(_absolute(word, segment_base, home), project_root, chat_id)
                 if denied is not None:
                     verdicts.append(denied)
@@ -2970,6 +3105,15 @@ def explain(
                             "zone:protected-write",
                         )
                     )
+                elif (linked := _hardlinked_to_protected(resolved, project_root)) is not None:
+                    verdicts.append(
+                        Verdict(
+                            Tier.DENY,
+                            f"{linked} is protected; writing through a hard link to it "
+                            "is the same write",
+                            "zone:protected-state",
+                        )
+                    )
                 elif (approval_path := _approval_project_path(resolved, project_root)) is not None:
                     verdicts.append(
                         Verdict(
@@ -2977,6 +3121,37 @@ def explain(
                             f"{approval_path} holds instruction files that are read into "
                             "every chat's system prompt; a write there asks first",
                             "zone:approval-state",
+                        )
+                    )
+                elif _zone(resolved, project_root, home) == "system":
+                    # The same ladder the mutating branch applies: these output
+                    # flags are writes like any other, so `sort -o /etc/x` is
+                    # refused, not waved through because `sort` prints to stdout.
+                    verdicts.append(
+                        Verdict(
+                            Tier.DENY,
+                            f"would modify the system path {target}",
+                            "zone:system-write",
+                        )
+                    )
+                elif not _is_within(target, write_root):
+                    verdicts.append(
+                        Verdict(
+                            Tier.CONFIRM,
+                            f"would write outside the workspace ({target}); the workspace is "
+                            f"{write_root.name or write_root}",
+                            "zone:outside-workspace",
+                        )
+                    )
+                elif _exists(resolved):
+                    # Creation is free, overwrite asks — the mutating branch's
+                    # own rule, applied to the output operand of a command that
+                    # wears a read-only name.
+                    verdicts.append(
+                        Verdict(
+                            Tier.CONFIRM,
+                            f"would overwrite an existing file ({target})",
+                            "overwrite:existing",
                         )
                     )
             continue
@@ -3147,6 +3322,26 @@ def explain(
             _absolute(word, segment_base, home) for word in _flag_borne_words(zone_tokens)
         ]
 
+        # A hard link shares its source's inode: judged by the destination rule
+        # above, `ln config.toml workspace/lnk` is a harmless write to an
+        # innocent name, and every later write through the link — waved through
+        # in accept-edits as an ordinary redirect — lands on the config itself.
+        # Refuse to create the link in the first place. A symlink needs no
+        # such gate: writes through it resolve to the real path and are judged
+        # there.
+        if segment_program == "ln" and not ({"-s", "-L", "--symbolic"} & set(segment)):
+            for source in source_paths:
+                guard = protected_write(source, project_root)
+                if guard is not None:
+                    verdicts.append(
+                        Verdict(
+                            Tier.DENY,
+                            f"cannot create a hard link to {guard}; writing through "
+                            "the link would be writing it",
+                            "zone:protected-link",
+                        )
+                    )
+
         # For cp/mv/ln the earlier operands are sources, so only the last path
         # is actually written to.
         if segment_program in DESTINATION_LAST_COMMANDS and targets:
@@ -3216,6 +3411,15 @@ def explain(
                         Tier.DENY,
                         f"{project_state} controls the bot's own access or configuration; "
                         "ask the owner to change it by hand",
+                        "zone:protected-state",
+                    )
+                )
+            elif (linked := _hardlinked_to_protected(resolved, project_root)) is not None:
+                verdicts.append(
+                    Verdict(
+                        Tier.DENY,
+                        f"{linked} is protected; writing through a hard link to it "
+                        "is the same write",
                         "zone:protected-state",
                     )
                 )
@@ -3328,6 +3532,18 @@ def explain(
                         f"{approval_path} holds instruction files that are read into "
                         "every chat's system prompt; a write there asks first",
                         "zone:approval-state",
+                    )
+                )
+            elif (linked := _hardlinked_to_protected(path, project_root)) is not None:
+                # A redirect destination is a write target the first ladder may
+                # not have seen as a path token; a hard link under it is the
+                # protected file wearing another name.
+                verdicts.append(
+                    Verdict(
+                        Tier.DENY,
+                        f"{linked} is protected; writing through a hard link to it "
+                        "is the same write",
+                        "zone:protected-state",
                     )
                 )
 

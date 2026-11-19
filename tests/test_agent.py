@@ -1308,3 +1308,67 @@ async def test_the_format_prompt_forbids_double_asterisk_bold(config) -> None:
     content = agent.system_prompt()
     assert "**bold**" in content
     assert "Never write" in content
+
+
+async def test_a_reapproval_mid_batch_settles_what_ran(config, monkeypatch) -> None:
+    """An approved batch whose later member raises NeedsApproval anyway — the
+    overwrite-digest check in files.py re-raises even on a confirmed run —
+    must not leave the earlier actions pending: another tap on the old card
+    would re-run commands that already executed. The fresh approval becomes a
+    new card instead of dying as an unhandled exception."""
+    from lumi.tools import NeedsApproval
+
+    first_target = config.shell_cwd / "one.txt"
+    second_target = config.shell_cwd / "two.txt"
+    first_target.write_text("a", encoding="utf-8")
+    second_target.write_text("b", encoding="utf-8")
+
+    agent = make_agent(
+        config,
+        [
+            make_reply(
+                "",
+                [
+                    ("c1", "run_shell", {"command": "rm one.txt"}),
+                    ("c2", "run_shell", {"command": "rm two.txt"}),
+                ],
+            )
+        ],
+    )
+    batch = await agent.handle(CHAT, "clean both up")
+    assert len(batch.pending) == 2
+
+    real_invoke = agent.registry.invoke_approved
+    ran: list[str] = []
+
+    async def re_raises(pending, ctx):
+        ran.append(pending.id)
+        if len(ran) > 1:
+            # The digest check refuses BEFORE anything runs again.
+            raise NeedsApproval(
+                tool=pending.tool,
+                arguments=pending.arguments,
+                reason="changed since this overwrite was approved",
+                preview=pending.preview,
+            )
+        return await real_invoke(pending, ctx)
+
+    monkeypatch.setattr(agent.registry, "invoke_approved", re_raises)
+
+    second = await agent.resolve_all(CHAT, [p.id for p in batch.pending], approved=True)
+
+    assert ran == [batch.pending[0].id, batch.pending[1].id], (
+        "the batch stopped at the second action, whose approval re-asked"
+    )
+    assert not first_target.exists(), "the approved first command really ran"
+    assert second_target.exists(), "the re-asked command never ran"
+    assert len(second.pending) == 1, "the fresh approval is one new card"
+    old_ids = {p.id for p in batch.pending}
+    live = {p.id for p in agent.conversation(CHAT).pending}
+    assert live == {second.pending[0].id}
+    assert not (old_ids & live), "the settled actions are no longer pending"
+    notes = [str(m.get("content") or "") for m in agent.conversation(CHAT).messages]
+    assert any("Approved by the owner" in note for note in notes), (
+        "the outcome of the action that ran is recorded for the model"
+    )
+    assert any("asked again" in note for note in notes), "the fresh ask is explained"

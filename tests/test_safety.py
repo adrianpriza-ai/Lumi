@@ -1992,3 +1992,118 @@ def test_parse_mode_falls_back_to_default() -> None:
     assert safety.parse_mode(" accept-edits ") is safety.Mode.ACCEPT_EDITS
     assert safety.parse_mode("BYPASS") is safety.Mode.BYPASS
     assert safety.parse_mode("nope") is safety.Mode.DEFAULT
+
+
+# --------------------------------------------------------------------------- #
+# regressions: the seams between the regex layer and the structural layer
+# --------------------------------------------------------------------------- #
+
+
+def test_privilege_escalation_behind_a_wrapper_is_denied() -> None:
+    """SUDO_RULE anchors to a separator, so `env sudo` named `env` to the deny
+    table and ran. The segment walk judges the unwrapped program."""
+    for command in [
+        "env sudo useradd eviluser",
+        "env su root -c whoami",
+        "timeout 5 sudo systemctl stop ssh",
+        "nice doas mount -o remount,rw /",
+    ]:
+        result = verdict(command)
+        assert result.tier is safety.Tier.DENY, f"{command!r} -> {result}"
+
+
+def test_privilege_escalation_in_a_subshell_is_denied() -> None:
+    """`(`, `{` and a backtick start a fresh command too."""
+    for command in [
+        "(sudo useradd evil)",
+        "{ sudo useradd evil; }",
+        "`sudo useradd evil`",
+    ]:
+        result = verdict(command)
+        assert result.tier is safety.Tier.DENY, f"{command!r} -> {result}"
+
+
+def test_bypass_sudo_still_lifts_a_wrapped_sudo() -> None:
+    """The structural check lifts with the mode, like the regex rules it mirrors."""
+    assert verdict("env sudo useradd eviluser", mode="bypass-sudo").tier is safety.Tier.ALLOW
+
+
+def test_read_only_output_flag_cannot_write_the_system(tmp_path: Path) -> None:
+    """`sort -o /etc/cron.d/evil` was an allow: the output operand skipped the
+    zone ladder that every real write target goes through."""
+    root, home = _project(tmp_path)
+    for command in [
+        "sort -o /etc/cron.d/evil /dev/null",
+        "sort --output=/etc/cron.d/evil x",
+        "uniq /dev/null /etc/cron.d/evil",
+        "xxd -r /dev/null /etc/cron.d/evil",
+        "tree -o /etc/cron.d/evil .",
+    ]:
+        result = _verdict(command, root, home)
+        assert result.blocked, f"{command!r} -> {result}"
+
+
+def test_read_only_output_flag_cannot_clobber_a_project_file(tmp_path: Path) -> None:
+    root, home = _project(tmp_path)
+    (root / "README.md").write_text("original\n", encoding="utf-8")
+    result = _verdict("sort -o ../README.md /dev/null", root, home)
+    assert result.needs_approval, result
+
+
+def test_quoted_command_substitution_cannot_read_secrets() -> None:
+    """`echo "$(cat /etc/shadow)"` is one opaque token and `echo `cat
+    /etc/shadow`` glues the backticks to the path; the unquoted spelling was
+    already caught, these were not."""
+    for command in ['echo "$(cat /etc/shadow)"', "echo `cat /etc/shadow`"]:
+        result = verdict(command)
+        assert result.tier is safety.Tier.CONFIRM, f"{command!r} -> {result}"
+
+
+def test_a_glob_operand_that_fits_a_secret_name_asks() -> None:
+    """The read guard is existence-aware, so `cat ../.en[v]` named no file that
+    exists and ran; the shell then expanded it into the real secret."""
+    for command in ["cat ../.env*", "cat ../.en[v]", "head -100 ../.en?", "grep x ../.en[v]"]:
+        result = verdict(command)
+        assert result.tier is safety.Tier.CONFIRM, f"{command!r} -> {result}"
+
+
+def test_a_glob_that_fits_no_secret_stays_free() -> None:
+    assert verdict("grep -rn TODO *.py").tier is safety.Tier.ALLOW
+
+
+def test_a_hard_link_to_protected_state_is_refused(tmp_path: Path) -> None:
+    """`ln ../config.toml lnk` judged the config as a read source; every later
+    write through `lnk` — waved through in accept-edits as an ordinary
+    redirect — landed on the config itself."""
+    root, home = _with_bot_state(tmp_path)
+    result = _verdict("ln ../config.toml lnk", root, home)
+    assert result.blocked, result
+    # A symlink is judged by resolution at write time and needs no such gate.
+    assert _verdict("ln -s ../config.toml lnk", root, home).tier is not safety.Tier.DENY
+
+
+def test_a_write_through_an_existing_hard_link_is_denied(tmp_path: Path) -> None:
+    """A link made before this session shares the inode under an innocent
+    name; matching (st_dev, st_ino) against the protected list is the only
+    name-independent way to see it (mirrors FilesTool._links_protected)."""
+    import os
+
+    root, home = _with_bot_state(tmp_path)
+    link = root / "workspace" / "lnk"
+    os.link(root / "config.toml", link)
+    for command in ["echo pwned >> lnk", "cp payload.txt lnk"]:
+        result = _verdict(command, root, home)
+        assert result.blocked, f"{command!r} -> {result}"
+    link.unlink()
+
+
+def test_the_long_find_command_classifies_quickly() -> None:
+    """Every `-exec` used to re-scan the rest of the line: ~15 s for a 200k
+    command, on the event loop. The lookahead form scans it twice, once."""
+    import time
+
+    command = "find x " + "-exec " * 33000
+    started = time.monotonic()
+    result = verdict(command)
+    assert result.tier is not safety.Tier.ALLOW
+    assert time.monotonic() - started < 2.0

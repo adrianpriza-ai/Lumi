@@ -3889,3 +3889,19 @@ async def test_startup_cleans_expired_personal_uploads(config) -> None:
     finally:
         await _post_shutdown(application)
         await application.shutdown()
+
+
+def test_another_bot_account_is_never_a_member(config) -> None:
+    """Bots receive other bots' group messages, so a third-party bot added to a
+    whitelisted room could otherwise @mention this one and drive the agent
+    loop. `_record_room` already skips bot lines; the handler gate does too."""
+    from types import SimpleNamespace
+
+    from lumi.bot import _is_allowed
+
+    chat = SimpleNamespace(id=WHITELISTED_GROUP, type="supergroup")
+    config.bot.whitelisted_groups = [str(WHITELISTED_GROUP)]
+    human = SimpleNamespace(id=999, is_bot=False)
+    robot = SimpleNamespace(id=888, is_bot=True)
+    assert _is_allowed(human, config, chat), "a human member still gets in"
+    assert not _is_allowed(robot, config, chat), "another bot account never does"

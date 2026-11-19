@@ -1268,6 +1268,32 @@ def fake_http(monkeypatch: pytest.MonkeyPatch, *, post_data: dict, get_reply=Non
                 raise AssertionError(f"GET {url} must never be issued by this test")
             return get_reply
 
+        def stream(self, method, url):
+            # Downloads go through client.stream() so the size cap can cut a
+            # hostile body off mid-flight; the stub streams the scripted
+            # reply as a single chunk.
+            requests.append(("get", url))
+            if get_reply is None:
+                raise AssertionError(f"GET {url} must never be issued by this test")
+
+            class FakeStreamResponse:
+                def __init__(self, reply):
+                    self.status_code = reply.status_code
+                    self.url = reply.url
+                    self.headers = reply.headers
+                    self._content = reply.content
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *args):
+                    return False
+
+                async def aiter_bytes(self):
+                    yield self._content
+
+            return FakeStreamResponse(get_reply)
+
     monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
     return requests
 

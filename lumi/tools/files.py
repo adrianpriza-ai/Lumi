@@ -440,8 +440,14 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         if media := media_kind(path):
             return await self._read_media(path, *media, ctx=ctx)
 
-        # 0 (from the argument or the setting) means "no cap".
-        cap = int(arguments.get("max_bytes") or 0) or self.settings.max_read_chars
+        # 0 (from the argument or the setting) means "no cap". A negative value
+        # from the model must not disable the cap by sliding through the `or`
+        # chain — treat anything below 1 as "use the default".
+        try:
+            requested_cap = int(arguments.get("max_bytes") or 0)
+        except (TypeError, ValueError):
+            requested_cap = 0
+        cap = requested_cap if requested_cap >= 1 else self.settings.max_read_chars
         try:
             size = path.stat().st_size
             with path.open("r", encoding="utf-8", errors="replace") as handle:

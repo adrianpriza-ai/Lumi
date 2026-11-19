@@ -258,8 +258,20 @@ class FirecrawlProvider(WebProvider):
         ]
         # Search results are someone else's index: a hit whose URL the tool
         # itself would refuse to fetch is not scraped behind its back either
-        # (finding K).
-        thin = [hit for hit in thin if validate_fetch_url(hit.url) is None]
+        # (finding K). validate_fetch_url resolves DNS, which blocks — so it
+        # runs in a thread, like the web tool's own guard, instead of stalling
+        # the event loop once per thin hit.
+        thin = [
+            hit
+            for hit, reason in zip(
+                thin,
+                await asyncio.gather(
+                    *(asyncio.to_thread(validate_fetch_url, hit.url) for hit in thin)
+                ),
+                strict=True,
+            )
+            if reason is None
+        ]
         if not thin:
             return
         log.debug("scraping %d firecrawl hit(s) for body text", len(thin))

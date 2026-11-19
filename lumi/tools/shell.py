@@ -155,7 +155,10 @@ Rules:
             return False, "no bash or sh on PATH — there is no shell to run commands in"
         return True, ""
 
-    def _resolve_cwd(self, requested: str | None) -> Path:
+    def _resolve_cwd(self, requested: Any) -> Path:
+        # The model sometimes sends a number or an object; `command` is
+        # coerced the same way before use.
+        requested = str(requested) if requested is not None else None
         if not requested or requested in {".", "./"}:
             return self.cwd
         candidate = (self.root / requested).resolve()
@@ -227,7 +230,10 @@ Rules:
 
         cwd = self._resolve_cwd(arguments.get("cwd"))
         timeout = self._timeout(arguments.get("timeout_seconds"))
-        verdict = self.classify(command, cwd, ctx.chat_id)
+        # classify stats the filesystem and runs a large rule table; a slow
+        # verdict must not freeze the event loop (and with it every chat),
+        # so it runs in a thread.
+        verdict = await asyncio.to_thread(self.classify, command, cwd, ctx.chat_id)
 
         log.info(
             "shell verdict=%s mode=%s cwd=%s cmd=%s",
