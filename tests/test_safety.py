@@ -551,13 +551,17 @@ def test_normalize_multiline_stays_linear_on_a_newline_dense_command() -> None:
     # continuation() used to re-join the whole folded output for every
     # newline, which made a command of N lines cost O(N^2): a few hundred
     # kilobytes of line continuations stalled the event loop. Folding the same
-    # text now has to stay in well under a second, and the fold must still
-    # treat a newline after `&&` as a continuation, not a separator.
+    # text now has to stay linear, and the fold must still treat a newline
+    # after `&&` as a continuation, not a separator.
+    #
+    # CPU time, not wall time: a loaded CI box deschedules the process without
+    # making the fold slower. The old quadratic form took ~86 s of CPU here,
+    # so the generous bound still fails it by a wide margin.
     command = "echo a &&\n" * 26_000  # ~260 KiB, one continuation per line
-    started = time.perf_counter()
+    started = time.process_time()
     rewritten, heredocs = safety._normalize_multiline(command)
-    elapsed = time.perf_counter() - started
-    assert elapsed < 1.0, elapsed
+    elapsed = time.process_time() - started
+    assert elapsed < 5.0, elapsed
     assert rewritten == "echo a && " * 26_000
     assert heredocs == []
 
@@ -2071,6 +2075,21 @@ def test_a_glob_that_fits_no_secret_stays_free() -> None:
     assert verdict("grep -rn TODO *.py").tier is safety.Tier.ALLOW
 
 
+def test_a_non_dot_glob_does_not_match_a_dotfile_secret() -> None:
+    """fnmatch lets `*` eat a leading dot; a shell does not, so `*.env` could
+    never expand to `.env` and must not ask."""
+    assert verdict("cat *.env").tier is safety.Tier.ALLOW
+    assert verdict("cat *env").tier is safety.Tier.ALLOW
+    # A literal dot still reaches the dotfile, as before.
+    assert verdict("cat .env*").tier is safety.Tier.CONFIRM
+
+
+def test_a_broad_glob_still_matches_non_dot_credentials() -> None:
+    """`*` can expand to `id_rsa` in the working directory, so the broad glob
+    keeps asking; only the dotfile match it could never produce is gone."""
+    assert verdict("cat *").tier is safety.Tier.CONFIRM
+
+
 def test_a_hard_link_to_protected_state_is_refused(tmp_path: Path) -> None:
     """`ln ../config.toml lnk` judged the config as a read source; every later
     write through `lnk` — waved through in accept-edits as an ordinary
@@ -2080,6 +2099,15 @@ def test_a_hard_link_to_protected_state_is_refused(tmp_path: Path) -> None:
     assert result.blocked, result
     # A symlink is judged by resolution at write time and needs no such gate.
     assert _verdict("ln -s ../config.toml lnk", root, home).tier is not safety.Tier.DENY
+
+
+def test_a_bundled_symbolic_flag_is_not_a_hard_link(tmp_path: Path) -> None:
+    """Short flags are usually bundled; the exact-token `-s` check missed
+    `-sf` and refused a plain symlink as if it were a hard link."""
+    root, home = _with_bot_state(tmp_path)
+    for command in ["ln -sf ../config.toml lnk", "ln -rsf ../config.toml lnk"]:
+        result = _verdict(command, root, home)
+        assert result.tier is not safety.Tier.DENY, f"{command!r} -> {result}"
 
 
 def test_a_write_through_an_existing_hard_link_is_denied(tmp_path: Path) -> None:
@@ -2098,12 +2126,16 @@ def test_a_write_through_an_existing_hard_link_is_denied(tmp_path: Path) -> None
 
 
 def test_the_long_find_command_classifies_quickly() -> None:
-    """Every `-exec` used to re-scan the rest of the line: ~15 s for a 200k
-    command, on the event loop. The lookahead form scans it twice, once."""
-    import time
+    """Every `-exec` used to re-scan the rest of the line, turning classify
+    into an event-loop stall. The lookahead form scans it twice, once.
 
+    CPU time, not wall time: the old chained-span regex took minutes of CPU
+    here (and the fixed one ~1 s), so 5 s separates them by orders of
+    magnitude without failing whenever the box is busy with something else.
+    """
     command = "find x " + "-exec " * 33000
-    started = time.monotonic()
+    started = time.process_time()
     result = verdict(command)
+    elapsed = time.process_time() - started
     assert result.tier is not safety.Tier.ALLOW
-    assert time.monotonic() - started < 2.0
+    assert elapsed < 5.0, elapsed

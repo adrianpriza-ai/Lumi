@@ -1191,6 +1191,34 @@ async def test_streamed_tool_calls_assemble_their_arguments(config) -> None:
     assert seen == [], "tool-call plumbing is not answer text"
 
 
+async def test_streamed_tool_calls_without_index_keep_separate_calls(config) -> None:
+    """Some providers omit `index`. A fresh id must start a new call instead
+    of appending the second call's arguments to the first and dropping its id
+    and name."""
+    stream = StreamCompletions(
+        [
+            chunk(tool=(None, "c1", "run_shell", '{"comm')),
+            chunk(tool=(None, None, None, 'and": "ls"}')),
+            chunk(tool=(None, "c2", "read_file", '{"pa')),
+            chunk(tool=(None, None, None, 'th": "a.md"}')),
+            chunk(finish="tool_calls"),
+        ]
+    )
+    seen: list[tuple[str, str]] = []
+
+    result = await client_with(config, stream).complete(
+        [{"role": "user", "content": "q"}], on_delta=collector(seen)
+    )
+
+    assert [(call.id, call.name) for call in result.tool_calls] == [
+        ("c1", "run_shell"),
+        ("c2", "read_file"),
+    ]
+    assert result.tool_calls[0].arguments == {"command": "ls"}
+    assert result.tool_calls[1].arguments == {"path": "a.md"}
+    assert seen == [], "tool-call plumbing is not answer text"
+
+
 async def test_the_vision_route_forwards_on_delta(config) -> None:
     main = client_with(config, StubCompletions(reply("unused")))
     seen: dict[str, Any] = {}

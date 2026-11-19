@@ -140,7 +140,7 @@ class _Pieces:
     so the two can never disagree about what the model said.
     """
 
-    __slots__ = ("text", "reasoning", "tools", "finish", "usage")
+    __slots__ = ("text", "reasoning", "tools", "finish", "usage", "_last_tool")
 
     def __init__(self) -> None:
         self.text: list[str] = []
@@ -150,17 +150,35 @@ class _Pieces:
         self.tools: dict[int, list[Any]] = {}
         self.finish = ""
         self.usage: Any = None
+        #: The slot the previous delta went to, so a fragment without `index`
+        #: can continue the call it belongs to.
+        self._last_tool: int | None = None
+
+    def _slot_without_index(self, call_id: str) -> int:
+        """Pick the slot for a delta that carries no ``index``.
+
+        Providers that omit it stream one call at a time: a delta with no id
+        continues the previous slot. A non-empty id that is not already known
+        starts a new call. Reusing slot 0 for both merged two calls into one,
+        appending the second call's arguments to the first and dropping its id
+        and name.
+        """
+        if call_id:
+            for index, slot in self.tools.items():
+                if slot[0] == call_id:
+                    return index
+            last = self.tools.get(self._last_tool) if self._last_tool is not None else None
+            if last is not None and last[0]:
+                return max(self.tools) + 1
+        return self._last_tool if self._last_tool is not None else 0
 
     def add_tool(self, raw: Any) -> None:
         index = getattr(raw, "index", None)
-        if not isinstance(index, int):
-            # A provider that omits `index` is streaming one tool call at a
-            # time on the wire; slotting every fragment into its own new slot
-            # (the old fallback) yielded one broken call per delta instead of
-            # one joined call.
-            index = 0
-        slot = self.tools.setdefault(index, ["", "", []])
         call_id = getattr(raw, "id", "") or ""
+        if not isinstance(index, int):
+            index = self._slot_without_index(call_id)
+        self._last_tool = index
+        slot = self.tools.setdefault(index, ["", "", []])
         if call_id and not slot[0]:
             slot[0] = call_id
         function = getattr(raw, "function", None)

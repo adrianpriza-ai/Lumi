@@ -1049,6 +1049,12 @@ def tokenize(command: str) -> list[str]:
     checks need. Unparseable input (unbalanced quotes) falls back to whitespace
     splitting, and the caller still gets the regex verdicts.
     """
+    # With no quoting, escaping, comments or shell punctuation, shlex's
+    # whitespace split is exactly `str.split`. Skipping the lexer keeps a long
+    # but ordinary command (thousands of `find -exec` words) from spending most
+    # of classify in shlex, without changing a character of the result.
+    if not any(char in command for char in "'\"\\#()<>|&;"):
+        return command.split()
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
         lexer.whitespace_split = True
@@ -1108,6 +1114,12 @@ def _normalize_multiline(command: str) -> tuple[str, list[_Heredoc]]:
     the body. Quotes left unbalanced at the end of input leave the command
     untouched, matching the fallback :func:`tokenize` already has.
     """
+    # Without a newline, a heredoc or a comment, every branch below emits the
+    # characters it reads unchanged: line folding, continuation, comment
+    # stripping and heredoc bodies all need one of those three. A 200k
+    # single-line command therefore skips a character-by-character walk.
+    if "\n" not in command and "#" not in command and "<<" not in command:
+        return command, []
     out: list[str] = []
     heredocs: list[_Heredoc] = []
     # Delimiters introduced but not yet fed their body: ``cat <<A <<B`` opens
@@ -2272,6 +2284,22 @@ def _flag_values(tokens: list[str], flags: tuple[str, ...]) -> list[str]:
     return values
 
 
+def _ln_creates_symlink(tokens: list[str]) -> bool:
+    """Whether this ``ln`` invocation makes a symlink.
+
+    Short flags are often bundled (``ln -sf target link``), so the exact-token
+    test the hard-link guard used missed them and refused a plain symlink as
+    if it were a hard link to the protected target.
+    """
+    for token in tokens:
+        if token == "--symbolic":
+            return True
+        # `-S` is --suffix and takes a value; only lowercase `s` means symbolic.
+        if token.startswith("-") and not token.startswith("--") and "s" in token[1:]:
+            return True
+    return False
+
+
 def _readonly_write_targets(tokens: list[str], base: Path, home: Path | None) -> list[Path]:
     """Files a *read-only* command still writes, under its output flags.
 
@@ -2440,6 +2468,28 @@ def _is_secret_name(name: str) -> bool:
 _GLOB_METACHARS: frozenset[str] = frozenset("*?[]")
 
 
+def _glob_can_match_leading_dot(pattern: str) -> bool:
+    """Whether a shell would let *pattern* match a name beginning with a dot.
+
+    ``fnmatch`` lets ``*`` and ``?`` match a leading dot; a shell does not.
+    Only a literal ``.`` at the start of the pattern does (plus a brace
+    expansion or bracket expression that can produce one, and an escaped
+    lead this layer cannot see through). Without this, ``cat *.env`` reported
+    a match with ``.env`` that the shell would never produce.
+    """
+    if not pattern:
+        return False
+    first = pattern[0]
+    if first == ".":
+        return True
+    if first in "*?":
+        return False
+    # Conservative: `[.]env` may name a period on some shells, and an escaped
+    # lead is opaque to this layer. `fnmatch` does not expand braces, so a
+    # leading `{` cannot reach a dotfile through this check anyway.
+    return first in "[\\"
+
+
 def _globbed_secret(word: str) -> str | None:
     """The secret *word*'s glob pattern could expand to, if any.
 
@@ -2450,11 +2500,20 @@ def _globbed_secret(word: str) -> str | None:
     expands the pattern into the real secret at run time. Match the pattern
     against every known secret name instead: if one fits, the expansion can
     name a credential and the command asks.
+
+    Dotfile secrets are matched only by patterns a shell would let reach a
+    leading dot; ``*.env`` does not match ``.env`` in a shell and does not ask
+    here either. A broad pattern such as ``*`` still matches non-dot
+    credential names (``id_rsa``, ``credentials.json``), because it really can
+    expand to one of those.
     """
     if not (_GLOB_METACHARS & set(word)):
         return None
     name = word.rsplit("/", 1)[-1]
+    dot_allowed = _glob_can_match_leading_dot(name)
     for secret in SECRET_FILE_BASENAMES:
+        if secret.startswith(".") and not dot_allowed:
+            continue
         if fnmatch.fnmatchcase(secret, name):
             return secret
     for system_secret in SYSTEM_SECRET_PATHS:
@@ -3329,7 +3388,7 @@ def explain(
         # Refuse to create the link in the first place. A symlink needs no
         # such gate: writes through it resolve to the real path and are judged
         # there.
-        if segment_program == "ln" and not ({"-s", "-L", "--symbolic"} & set(segment)):
+        if segment_program == "ln" and not _ln_creates_symlink(segment):
             for source in source_paths:
                 guard = protected_write(source, project_root)
                 if guard is not None:
