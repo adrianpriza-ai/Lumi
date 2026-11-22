@@ -163,6 +163,16 @@ async def test_max_results_is_guarded_not_capped(config) -> None:
     assert provider.search_calls == [("hi", MAX_RESULTS, None)]
 
 
+async def test_a_zero_config_ceiling_means_the_ceiling_not_one(config) -> None:
+    """``max_results = 0`` is documented as unlimited; an omitted ask used to
+    collapse to a single hit."""
+    config.tools.web.max_results = 0
+    provider = StubProvider("tavily")
+    tool = make_tool(config, provider)
+    await tool.invoke({"action": "search", "query": "hi"}, None)
+    assert provider.search_calls == [("hi", MAX_RESULTS, None)]
+
+
 async def test_no_content_cap_by_default(config) -> None:
     """No teaser snippets: a hit the model cannot read is a search it repeats."""
     assert config.tools.web.max_content_chars == 0

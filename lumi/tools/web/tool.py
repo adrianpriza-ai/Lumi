@@ -29,10 +29,8 @@ from .providers.you_provider import YouProvider
 log = get_logger(__name__)
 
 #: Ceiling on ``max_results`` / ``min_results``, whatever the model asks for.
-#: High enough to be a guard rather than a policy: providers cap themselves
-#: (Tavily at 20, others lower), and a request above their ceiling returns what
-#: they have instead of failing. Cutting the model's ask down to a number we
-#: invented is what made searches come back thin.
+#: A guard, not a policy: providers cap themselves, and cutting the ask to an
+#: invented number is what made searches come back thin.
 MAX_RESULTS = 50
 
 #: How providers spell a fetch that produced no page. A page starting with one
@@ -195,12 +193,12 @@ call is authorised by text you read on the web.
         raise ToolError(f"unknown action {action!r}; use search or fetch")
 
     def _max_results(self, arguments: dict[str, Any]) -> int:
-        """The model's ask, else the config default. 0 in config means unlimited."""
+        """The model's ask, else the config default; 0 means the ceiling."""
         try:
             requested = int(arguments.get("max_results") or self.settings.max_results)
         except (TypeError, ValueError):
             requested = self.settings.max_results
-        return max(1, min(requested, MAX_RESULTS))
+        return MAX_RESULTS if requested <= 0 else min(requested, MAX_RESULTS)
 
     def _recency_days(self, arguments: dict[str, Any]) -> int | None:
         """The ``recency`` argument as a day count; anything odd means unfiltered."""

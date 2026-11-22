@@ -1,21 +1,14 @@
 """The ``run_shell`` tool: execute a command, with the guardrails in place.
 
-Three layers, in order:
+Three layers: :mod:`lumi.tools.safety` decides allow / confirm / deny; this
+module runs the command with a scrubbed environment, a hard timeout, a killed
+process group and a capped output buffer; the caller turns a ``confirm`` into
+an approval prompt and re-invokes with ``ctx.confirmed = True``.
 
-1. :mod:`lumi.tools.safety` decides allow / confirm / deny.
-2. This module runs the command with a scrubbed environment, a hard timeout, a
-   killed process group, and a capped output buffer.
-3. The caller (:class:`lumi.agent.Agent`) turns a ``confirm`` into a Telegram
-   prompt and re-invokes with ``ctx.confirmed = True``.
-
-Environment scrubbing is the part people forget: the process would otherwise
-inherit ``OPENAI_API_KEY`` and ``TELEGRAM_BOT_TOKEN``, and any command the model
-runs could post them to the internet. Everything that looks like a secret is
-stripped before ``execve``. Scrubbing the environment is only half the
-control, though: the same values sit in ``.env`` in the project root, so the
-classifier also denies read-only commands that name a secret file (see
-:func:`lumi.tools.safety.protected_read`) — ``cat ../.env`` is refused the same
-way ``cat`` of any other credential file is.
+The environment is scrubbed because a child would otherwise inherit
+``OPENAI_API_KEY`` and ``TELEGRAM_BOT_TOKEN``. The same values also sit in
+``.env``, so the classifier refuses read-only commands that name a secret file
+(:func:`lumi.tools.safety.protected_read`).
 """
 
 from __future__ import annotations
@@ -67,6 +60,9 @@ project's workspace folder.
 
 Rules:
 - `cwd` is optional and must stay inside the project directory.
+- Write inside the project. Use the scratch directory `tmp/` under the working
+  directory (`TMPDIR` points there) instead of `/tmp`; anything outside the
+  project is refused or needs approval.
 - Commands that destroy data, change permissions, or write outside the project
   are refused outright, and commands that merely change state need the owner's
   approval first. If you get "needs approval", say what the command does and
@@ -119,24 +115,23 @@ Rules:
         self.shell_config = config.tools.shell
         self.root = config.root
         self.cwd = config.shell_cwd
-        # The write boundary is configurable and defaults to the whole project,
-        # which is the behaviour people expect from a coding bot that has to be
-        # able to edit the code it is working on.
+        # Writes default to the whole project: a coding bot must be able to
+        # edit its own code. Config can narrow them to the workspace.
         self.workspace = (
             self.shell_config.writable_roots()[0] if self.shell_config.writable else config.root
         )
-        # The working directory is part of the layout, not something the user has
-        # to create by hand. A fresh clone should be runnable immediately.
-        try:
-            self.cwd.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            log.warning("could not create the shell working directory %s: %s", self.cwd, exc)
+        # The working directory and its scratch area are part of the layout, so
+        # a fresh clone is runnable immediately.
+        self.tmp = self.cwd / "tmp"
+        for directory in (self.cwd, self.tmp):
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                log.warning("could not create the shell directory %s: %s", directory, exc)
         if self.shell_config.home == "inherit":
-            # The child process gets the owner's real HOME, so a stray command
-            # can reach every file the owner can read. The read and write zones
-            # still apply, but the blast radius is wider than the default
-            # "project" setting, and that deserves a word at startup rather
-            # than a line in a config file nobody reads.
+            # A real HOME widens the blast radius: the zones still apply, but
+            # the child can read everything the owner can. Say so at startup,
+            # not only in a config file nobody reads.
             log.warning(
                 "tools.shell.home = inherit: shell commands run with HOME=%s, so they "
                 'can read the owner\'s home directory. The default "project" keeps '
@@ -197,6 +192,10 @@ Rules:
         env.setdefault("TERM", "dumb")
         env["LUMI_PROJECT_ROOT"] = str(self.root)
         env["LUMI_SHELL_CWD"] = str(self.cwd)
+        # Keep mktemp, tempfile and compiler spill files in the project instead
+        # of /tmp, which is outside it.
+        if self.tmp.is_dir():
+            env["TMPDIR"] = env["TMP"] = env["TEMP"] = str(self.tmp)
         return env
 
     def classify(self, command: str, cwd: Path, chat_id: int | str | None = None) -> safety.Verdict:
