@@ -71,6 +71,9 @@ pub enum AgentEvent {
         host: String,
         search: String,
     },
+    /// The chat's model changed via the `/model` command. Same payload as
+    /// `ready`'s header fields, so the status bar updates in place.
+    Model { model: String, host: String },
     /// An exchange ended and the conversation state is settled. Busy is not
     /// cleared while an approval is still unanswered: the wait is part of the
     /// turn, not the end of it.
@@ -187,6 +190,10 @@ pub fn map_event(v: &Value, st: &mut MapState) -> Vec<AgentEvent> {
             model: str_field(v, "model"),
             host: mask_host(&str_field(v, "host")),
             search: str_field(v, "search"),
+        }),
+        "model" => out.push(AgentEvent::Model {
+            model: str_field(v, "model"),
+            host: mask_host(&str_field(v, "host")),
         }),
         "step" => match str_field(v, "kind").as_str() {
             // A tool step means every earlier step — and its tool — is over.
@@ -348,11 +355,10 @@ pub fn translate(text: &str) -> Translation {
         // Empty arg reports the current mode; a name switches it. The backend
         // validates the name, so an unknown one comes back as an error event.
         "mode" => Translation::Command(json!({"cmd": "mode", "value": arg})),
-        // §10: no frontend-side model switch — a `config.llm.model_of()` in
-        // Python would contradict it one command later.
-        "model" => notice(
-            "the model comes from the backend's config; edit config.toml and restart".into(),
-        ),
+        // Empty arg reports; `list` lists; an id switches (the backend
+        // validates it against the catalog and answers with `notice` plus a
+        // `model` event for the status bar).
+        "model" => Translation::Command(json!({"cmd": "model", "value": arg})),
         // Not a known command: the whole line goes to the model verbatim,
         // exactly like the REPL treats "/whatever" as a message.
         _ => Translation::Command(json!({"cmd": "submit", "text": text})),
@@ -575,6 +581,8 @@ mod tests {
             ("/tools", "tools"),
             ("/context", "context"),
             ("/memory", "memory"),
+            ("/model", "model"),
+            ("/model list", "model"),
         ] {
             let Translation::Command(value) = translate(line) else {
                 panic!("{line} must reach the backend");
@@ -588,6 +596,11 @@ mod tests {
         let Translation::Command(search) = translate("/search rust tokio") else { panic!() };
         assert_eq!(search["cmd"], "search");
         assert_eq!(search["query"], "rust tokio");
+        let Translation::Command(switch) = translate("/model zen/space-bunny-free") else { panic!() };
+        assert_eq!(switch["cmd"], "model");
+        assert_eq!(switch["value"], "zen/space-bunny-free");
+        let Translation::Command(report) = translate("/MODEL") else { panic!() };
+        assert_eq!(report["value"], "");
     }
 
     #[test]
@@ -601,8 +614,6 @@ mod tests {
     fn frontend_side_commands_never_reach_the_stream() {
         let Translation::Local(events) = translate("/help") else { panic!() };
         assert!(matches!(&events[..], [AgentEvent::System(h), AgentEvent::TurnDone] if h.contains("/help")));
-        let Translation::Local(events) = translate("/model gpt-5") else { panic!() };
-        assert!(matches!(&events[..], [AgentEvent::Notice(n), AgentEvent::TurnDone] if n.contains("backend")));
         let Translation::Local(events) = translate("/reasoning") else { panic!() };
         assert!(matches!(&events[..], [AgentEvent::Notice(n), AgentEvent::TurnDone] if n.contains("on|off")));
     }
@@ -623,6 +634,22 @@ mod tests {
             [AgentEvent::Delta(t), AgentEvent::AssistantDone, AgentEvent::Busy(false), AgentEvent::TurnDone]
             if t == "hi"));
         assert!(st.outstanding.is_empty() && !st.tool_open);
+    }
+
+    #[test]
+    fn a_model_event_updates_the_header_fields() {
+        let (got, _) = map(&[
+            r#"{"ev":"ready","model":"a","host":"https://one.example/v1","tools":[],"search":"on","turns":0}"#,
+            r#"{"ev":"model","model":"zen/space-bunny-free","host":"https://opencode.example/v1"}"#,
+        ]);
+        assert!(matches!(
+            &got[..],
+            [
+                AgentEvent::Ready { .. },
+                AgentEvent::Model { model, host }
+            ]
+            if model == "zen/space-bunny-free" && host == "opencode.example/v1"
+        ));
     }
 
     #[test]

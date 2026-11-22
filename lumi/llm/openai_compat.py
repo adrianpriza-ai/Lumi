@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from types import SimpleNamespace
 from typing import Any
 
@@ -246,14 +246,23 @@ def request_model(messages: list[dict[str, Any]], config: LLMConfig) -> str:
 class OpenAICompatClient(LLMClient):
     name = "openai-compatible"
 
-    def __init__(self, config: LLMConfig, vision: OpenAICompatClient | None = None) -> None:
+    def __init__(
+        self,
+        config: LLMConfig,
+        vision: OpenAICompatClient | None = None,
+        keys: Sequence[str] | None = None,
+    ) -> None:
         self.config = config
         #: A second provider for image-bearing requests, wired by
         #: :func:`lumi.llm.build_llm` from ``[llm.vision]`` — its own
         #: endpoint, key pool and model. None when the route is unset, in
         #: which case this client answers every request itself.
         self.vision = vision
-        self._pool = KeyPool(config.api_keys(), config.strategy_of())
+        # *keys* is the catalog's literal pool (a ``models.json`` provider
+        # carries its own); None keeps the usual ``api_key_env`` lookup.
+        self._pool = KeyPool(
+            list(keys) if keys is not None else config.api_keys(), config.strategy_of()
+        )
         self._clients: dict[str, Any] = {}
         #: (model id, carried an image) for the call in flight, for error text.
         self._last_request: tuple[str, bool] = (config.model_of(), False)
@@ -274,14 +283,16 @@ class OpenAICompatClient(LLMClient):
                 raise LLMError("the openai package is not installed") from exc
 
             # Local servers ignore the key but the SDK insists on one being set.
+            headers = dict(self.config.extra_headers) if self.config.extra_headers else None
             client = AsyncOpenAI(
                 api_key=key,
                 base_url=self.config.base_url_of(),
+                default_headers=headers,
                 # The adapter owns the retry budget so empty responses and SDK
                 # transport errors follow the same policy instead of multiplying
                 # two independent retry loops.
                 max_retries=0,
-                timeout=120.0,
+                timeout=self.config.timeout if self.config.timeout > 0 else 120.0,
             )
             self._clients[key] = client
             log.info(

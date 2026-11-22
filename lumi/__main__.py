@@ -31,6 +31,7 @@ from typing import Any
 
 from . import __version__
 from .config import Config, ConfigError, load_config, validate
+from .llm.catalog import CatalogError
 from .paths import ui_binary
 from .tools.safety import MODES, parse_mode
 from .util.log import get_logger, setup_logging
@@ -143,7 +144,7 @@ async def _prompt(message: str) -> str:
 async def _chat(config: Config) -> int:
     agent = _build_agent(config)
     print(BANNER)
-    print(f"model: {config.llm.model_of()} via {config.llm.base_url_of()}")
+    print(f"model: {agent.model_report('cli')} via {agent.model_endpoint_of('cli')}")
     print(f"tools: {', '.join(agent.registry.names()) or 'none'}\n")
     try:
         return await _repl(agent, config)
@@ -197,7 +198,10 @@ async def _repl(agent: Any, config: Config) -> int:
             continue
         if lowered in {"/help", "/?"}:
             print(BANNER)
-            print("/quit  /reset  /context  /tools  /memory  /personality  /reasoning  /mode\n")
+            print(
+                "/quit  /reset  /context  /tools  /memory  /personality  /reasoning"
+                "  /mode  /model\n"
+            )
             continue
         if lowered == "/tools":
             print(agent.registry.describe(), "\n")
@@ -239,6 +243,32 @@ async def _repl(agent: Any, config: Config) -> int:
                     f"  temperature: {temp}\n"
                     f"  live steps: {'on' if llm.show_reasoning else 'off'}\n"
                 )
+            continue
+
+        if lowered.startswith("/model"):
+            # Before /mode, which "/model …" would otherwise match first.
+            parts = line.split(maxsplit=1)
+            arg = parts[1].strip() if len(parts) > 1 else ""
+            try:
+                if arg.lower() == "list":
+                    print("\n".join(agent.model_list_lines("cli")), "\n")
+                elif arg.lower() in {"default", "reset"}:
+                    agent.reset_model("cli")
+                    print(f"model: {agent.model_report('cli')} (configured default, persists)\n")
+                elif arg:
+                    model = agent.set_model("cli", arg)
+                    print(
+                        f"model: {model.label} ({model.id}) via "
+                        f"{agent.model_endpoint_of('cli')} — persists; /model list for the rest\n"
+                    )
+                else:
+                    print(
+                        f"model: {agent.model_report('cli')} via "
+                        f"{agent.model_endpoint_of('cli')}\n"
+                        "switch: /model <id> · list: /model list · back: /model default\n"
+                    )
+            except CatalogError as exc:
+                print(f"{exc}\n")
             continue
 
         if lowered.startswith("/mode"):

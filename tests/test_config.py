@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ from lumi.config import (
     load_config,
     validate,
 )
+from lumi.paths import user_config_dir
 
 
 def test_loads_the_committed_config(project) -> None:
@@ -889,3 +891,92 @@ def test_the_shipped_config_enables_ocr(project) -> None:
     loaded = load_config(project)
     assert loaded.tools.is_enabled("ocr")
     assert loaded.tools.ocr.enabled
+
+
+# --------------------------------------------------------------------------- #
+# the user config layer (~/.config/lumi) and its .env
+# --------------------------------------------------------------------------- #
+
+
+def test_lumi_user_config_beats_the_xdg_spelling(project, monkeypatch) -> None:
+    monkeypatch.setenv("LUMI_USER_CONFIG", str(project / "explicit"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(project / "xdg"))
+    assert user_config_dir() == (project / "explicit").resolve()
+
+
+def test_user_config_dir_follows_xdg_config_home(project, monkeypatch) -> None:
+    """Without $LUMI_USER_CONFIG the XDG spelling stands — that redirect is
+    also how tests isolate the real user layer."""
+    monkeypatch.delenv("LUMI_USER_CONFIG", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(project / "xdg"))
+    assert user_config_dir() == (project / "xdg" / "lumi").resolve()
+
+
+def test_the_user_layer_loads_under_the_project(project, monkeypatch) -> None:
+    """The user home fills in what the project does not set, and user_dir
+    records where the layer was found so the frontends can point at it."""
+    user = project / "user-config"
+    user.mkdir()
+    (user / "config.toml").write_text("[llm]\ntemperature = 0.3\n", encoding="utf-8")
+    monkeypatch.setenv("LUMI_USER_CONFIG", str(user))
+
+    config = load_config(project)
+    assert config.llm.temperature == pytest.approx(0.3)  # the project never sets it
+    assert config.user_dir == user
+
+
+def test_the_project_layer_beats_the_user_layer(project, monkeypatch) -> None:
+    """The repo carries the behaviour, the user home carries the person —
+    a personal default must not silently redefine a checked-in project."""
+    user = project / "user-config"
+    user.mkdir()
+    (user / "config.toml").write_text('[llm]\nmodel = "user-model"\n', encoding="utf-8")
+    monkeypatch.setenv("LUMI_USER_CONFIG", str(user))
+
+    assert load_config(project).llm.model == "test-model"
+
+
+def test_env_beats_both_layers(project, monkeypatch) -> None:
+    """The shell is the most explicit statement of intent there is."""
+    user = project / "user-config"
+    user.mkdir()
+    (user / "config.toml").write_text("[llm]\ntemperature = 0.3\n", encoding="utf-8")
+    monkeypatch.setenv("LUMI_USER_CONFIG", str(user))
+    monkeypatch.setenv("LUMI__LLM__TEMPERATURE", "0.9")
+
+    assert load_config(project).llm.temperature == pytest.approx(0.9)
+
+
+def test_the_user_env_file_is_loaded(project, monkeypatch) -> None:
+    """Secrets may live in the user home's .env; it is read before the
+    project's, and neither clobbers a variable the shell already set."""
+    user = project / "user-config"
+    user.mkdir()
+    (user / ".env").write_text("LUMI__LLM__MAX_TOKENS=777\n", encoding="utf-8")
+    monkeypatch.setenv("LUMI_USER_CONFIG", str(user))
+    os.environ.pop("LUMI__LLM__MAX_TOKENS", None)  # a leak from an earlier load must not stand in for the file
+    try:
+        assert load_config(project).llm.max_tokens == 777
+    finally:
+        # load_dotenv writes straight into os.environ, outside monkeypatch's
+        # ledger — pop the override so it cannot leak into later tests.
+        os.environ.pop("LUMI__LLM__MAX_TOKENS", None)
+
+
+def test_user_dir_is_none_without_a_user_layer(project) -> None:
+    assert load_config(project).user_dir is None
+
+
+def test_unknown_top_level_keys_in_the_user_layer_are_dropped(project, monkeypatch) -> None:
+    """A user config written for a newer version must not keep the bot from
+    booting — the same tolerance the project layer gets."""
+    user = project / "user-config"
+    user.mkdir()
+    (user / "config.toml").write_text(
+        "[llm]\ntemperature = 0.3\n\n[alien]\nfoo = 'bar'\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("LUMI_USER_CONFIG", str(user))
+
+    config = load_config(project)
+    assert config.llm.temperature == pytest.approx(0.3)
+    assert not hasattr(config, "alien")

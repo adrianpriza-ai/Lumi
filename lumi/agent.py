@@ -23,6 +23,7 @@ and picks the conversation back up.
 
 from __future__ import annotations
 
+import os
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -31,10 +32,11 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .artifacts import Artifact
-from .config import Config
+from .config import MODEL_ENV_VARS, Config
 from .context import ContextReport, ContextWindow
-from .llm import LLMClient, ToolCall, build_llm
+from .llm import LLMClient, OpenAICompatClient, ToolCall, build_llm
 from .llm.base import DELTA_TEXT, USAGE_REASONING, LLMError, LLMReply
+from .llm.catalog import CatalogError, ModelCatalog, ModelInfo, ModelSelections
 from .memory import History, MemoryFile, MemoryStore
 from .paths import relative_to_root
 from .personality import Personality
@@ -57,6 +59,7 @@ These are facts about right now, not instructions. Use them, do not restate them
 - Current time: {now} ({timezone})
 - Project root: {root}
 - Shell working directory: {cwd}
+- Scratch directory: {scratch} (TMPDIR points here)
 - Today is {day}, {date}.
 
 This date is authoritative. Your training data ends earlier than today, so
@@ -66,11 +69,9 @@ When you answer such a question, say "as of {date}" rather than an unqualified
 claim.
 """
 
-#: Behaviour and boundaries, as opposed to the voice in PERSONALITY.md. These
-#: live in the code on purpose: the owner edits the voice file freely, but a
-#: rule that keeps the bot from doing something irreversible should not be one
-#: edit away from disappearing — and it should hold even if PERSONALITY.md is
-#: missing and the fallback voice is in use.
+#: Behaviour and boundaries, as opposed to the voice in PERSONALITY.md:
+#: hardcoded so editing the voice cannot remove a safety rule, and so they
+#: still hold when PERSONALITY.md is missing.
 CONDUCT_PREAMBLE = """\
 ## How you work
 
@@ -78,6 +79,10 @@ CONDUCT_PREAMBLE = """\
   command worked without having seen it work.
 - Ask once, plainly, when a tool needs approval — then wait for the owner's
   answer. Never rephrase a refused action to sneak it past the check.
+- Work inside the project. Files you create go under the workspace, and
+  temporary output goes in the scratch directory (see Runtime) — never
+  `/tmp`, `~`, or another absolute path outside the project. Writes there are
+  refused or need the owner's approval.
 - Don't guess at file contents or command output: read them. When you are
   unsure whether something is true, say so and go check.
 - Use the web tools whenever a question depends on anything current or
@@ -163,9 +168,7 @@ one never needs approval.
 """
 
 #: The format block for the Telegram frontend, which parses HTML and nothing
-#: else. Only :meth:`Agent.system_prompt` picks it, and only for
-#: ``source == "chat"`` — every terminal frontend gets
-#: :data:`MARKDOWN_FORMAT_PREAMBLE` instead.
+#: else. Every terminal frontend gets :data:`MARKDOWN_FORMAT_PREAMBLE` instead.
 FORMAT_PREAMBLE = """\
 ## Formatting (important)
 
@@ -206,10 +209,9 @@ paste **double asterisks**, # headings or [links](https://example.com) raw —
 say the link's text and put the URL in <code></code>, or just describe it.
 """
 
-#: The format block for every terminal frontend — ``lumi chat``, ``lumi ask``
-#: and the Rust TUI. They render Markdown (or print it verbatim), so the HTML
-#: dialect above would arrive as literal angle brackets in the owner's
-#: terminal. Same job as :data:`FORMAT_PREAMBLE`, opposite dialect.
+#: The format block for every terminal frontend (``lumi chat``, ``lumi ask``,
+#: the Rust TUI): they render Markdown, so the HTML block would arrive as
+#: literal angle brackets.
 MARKDOWN_FORMAT_PREAMBLE = """\
 ## Formatting (important)
 
@@ -385,6 +387,14 @@ class Conversation:
     #: system prompt — Telegram gets HTML, a terminal gets Markdown — so it is
     #: recorded here rather than passed to every refresh by hand.
     source: str = "chat"
+    #: This chat's model override from ``/model``: the catalog id and the
+    #: client built for it, with the limits the context budget follows. None
+    #: means the configured ``[llm]`` model; the fields ride the conversation
+    #: so eviction drops the client with the chat.
+    model_id: str = ""
+    llm_client: LLMClient | None = None
+    model_context: int = 0
+    model_output: int = 0
 
 
 class Agent:
@@ -405,7 +415,22 @@ class Agent:
         self.history = history
         self.registry = registry if registry is not None else build_registry(config, memory)
         self.llm = llm if llm is not None else build_llm(config)
-        self.context = ContextWindow(config, llm=self.llm, history=history)
+        #: The model catalog from ``~/.config/lumi/models.json`` and the
+        #: project's ``.models.json`` — empty when neither exists, and then
+        #: every chat simply uses the configured ``[llm]`` model.
+        self.model_catalog = ModelCatalog.load(config)
+        if self.model_catalog.problems:
+            log.warning("model catalog problems: %s", "; ".join(self.model_catalog.problems))
+        #: Per-chat model choices, persisted in ``data/chat-models.json``.
+        self.model_selections = ModelSelections(config.data_dir / "chat-models.json")
+        #: The ``[llm.vision]`` route client, built on first need: a chat
+        #: switched to a text-only catalog model still wants its photos read.
+        #: The flag separates "not tried yet" from "tried, no route".
+        self._vision_route: LLMClient | None = None
+        self._vision_route_checked = False
+        self.context = ContextWindow(
+            config, llm=self.llm, history=history, client_of=self._client_of
+        )
         self._conversations: dict[int | str, Conversation] = {}
         self._max_conversations = max(1, int(config.llm.max_conversations or MAX_CONVERSATIONS))
 
@@ -462,6 +487,7 @@ class Agent:
                 timezone=now.tzname() or "UTC",
                 root=self.config.root,
                 cwd=relative_to_root(self.config.shell_cwd),
+                scratch=relative_to_root(self.config.shell_cwd / "tmp"),
                 day=now.strftime("%A"),
                 date=now.strftime("%d %B %Y"),
             ),
@@ -507,6 +533,7 @@ class Agent:
             )
             self._conversations[chat_id] = conv
             self._evict_quietest(keep=chat_id)
+            self._restore_model(conv)
         elif source is not None:
             conv.source = source
         conv.touched = time.monotonic()
@@ -517,6 +544,213 @@ class Agent:
             )
             self.context.replay(conv)
         return conv
+
+    # -- model selection ----------------------------------------------------- #
+
+    def _client_of(self, conv: Any) -> LLMClient | None:
+        """The client this conversation runs on, or None for the default.
+
+        Handed to the context window so a switched chat summarises with its
+        own model too — a local endpoint that only that chat can reach still
+        has to be the one condensing its history.
+        """
+        return getattr(conv, "llm_client", None)
+
+    def _base_model(self) -> ModelInfo | None:
+        """The catalog model a chat runs on before any ``/model`` switch.
+
+        ``defaultModel`` fills the "unset" slot only: a model pinned in
+        ``[llm]`` — or reached through the env fallbacks ``model_of`` honours —
+        outranks the catalog, the same way the project config outranks the
+        user config layer. With no pin and no default, None means ``[llm]``'s
+        resolved model stands.
+        """
+        if self.config.llm.model.strip():
+            return None
+        if any((os.environ.get(name) or "").strip() for name in MODEL_ENV_VARS):
+            return None
+        return self.model_catalog.default_model()
+
+    def _restore_model(self, conv: Conversation) -> None:
+        """Put a fresh conversation on its chat's model: the persisted switch,
+        or the catalog default when ``[llm]`` leaves the slot open."""
+        saved = self.model_selections.get(conv.chat_id)
+        if saved:
+            try:
+                self._attach_model(conv, self.model_catalog.resolve(saved))
+            except CatalogError as exc:
+                log.warning(
+                    "chat %s: saved model %r is no longer in the catalog (%s); "
+                    "using the default model",
+                    conv.chat_id,
+                    saved,
+                    exc,
+                )
+                self.model_selections.clear(conv.chat_id)
+            return
+        base = self._base_model()
+        if base is not None:
+            self._attach_model(conv, base)
+
+    def _attach_model(self, conv: Conversation, model: ModelInfo) -> None:
+        conv.model_id = model.id
+        conv.llm_client = self.model_catalog.build_client(
+            model, self.config.llm, vision=self._vision_client_for(model)
+        )
+        conv.model_context = model.context
+        conv.model_output = model.output
+
+    def _vision_client_for(self, model: ModelInfo) -> LLMClient | None:
+        """The ``[llm.vision]`` route client, when the chat's model cannot see.
+
+        A switched model that takes images answers photo turns itself. A
+        text-only switch falls back to the configured vision route when there
+        is one — the same fallback ``[llm]`` gets — and to the model itself
+        when there is not, which is the pre-route behaviour.
+        """
+        if model.vision_capable:
+            return None
+        if not self._vision_route_checked:
+            self._vision_route_checked = True
+            route = self.config.llm.vision_route_of()
+            if route is not None:
+                self._vision_route = OpenAICompatClient(route)
+        return self._vision_route
+
+    def model_of(self, chat_id: int | str | None) -> str:
+        """The model id *chat_id* runs on: the ``/model`` switch if one is
+        live, else the catalog default, else the configured ``[llm]`` model."""
+        if chat_id is not None:
+            conv = self._conversations.get(chat_id)
+            if conv is not None and conv.model_id:
+                return conv.model_id
+            saved = self.model_selections.get(chat_id)
+            if saved:
+                try:
+                    self.model_catalog.resolve(saved)
+                    return saved
+                except CatalogError:
+                    pass
+        base = self._base_model()
+        if base is not None:
+            return base.id
+        return self.config.llm.model_of()
+
+    def current_model(self, chat_id: int | str | None) -> ModelInfo | None:
+        """The chat's model as a catalog entry, or None when it is the plain
+        ``[llm]`` model — there is no catalog record of that one.
+
+        The ``"/" not in model_id`` guard is a heuristic, not a rule: a
+        catalog id always carries a provider prefix, while a bare ``[llm]``
+        model never does. A ``[llm]`` model pinned to a provider-shaped id
+        that also matches the catalog resolves as a catalog entry — cosmetic
+        only, it drives status lines, not routing.
+        """
+        model_id = self.model_of(chat_id)
+        if model_id == self.config.llm.model_of() and "/" not in model_id:
+            return None
+        try:
+            return self.model_catalog.resolve(model_id)
+        except CatalogError:
+            return None
+
+    def set_model(self, chat_id: int | str, model_id: str) -> ModelInfo:
+        """Switch *chat_id* to the catalog model *model_id* and persist it.
+
+        Raises :class:`~lumi.llm.catalog.CatalogError` with a human-readable
+        reason when the id is unknown, ambiguous, or not a chat model. The
+        switch survives restarts (``data/chat-models.json``) and applies to
+        live conversations immediately; a conversation that does not exist
+        yet picks the switch up on its first message.
+        """
+        model = self.model_catalog.resolve(model_id)
+        if model.kind != "chat":
+            raise CatalogError(
+                f"{model.id} is a {model.kind} model; /model switches chat models only"
+            )
+        self.model_selections.set(chat_id, model.id)
+        conv = self._conversations.get(chat_id)
+        if conv is not None:
+            self._attach_model(conv, model)
+        log.info("chat %s switched to model %s", chat_id, model.id)
+        return model
+
+    def reset_model(self, chat_id: int | str) -> None:
+        """Drop *chat_id*'s switch: back to the configured default model."""
+        self.model_selections.clear(chat_id)
+        conv = self._conversations.get(chat_id)
+        if conv is not None:
+            conv.model_id = ""
+            conv.llm_client = None
+            conv.model_context = 0
+            conv.model_output = 0
+            self._restore_model(conv)
+
+    def model_report(self, chat_id: int | str | None) -> str:
+        """One-line description of the chat's model, for status commands."""
+        info = self.current_model(chat_id)
+        if info is None:
+            return self.config.llm.model_of()
+        limits = f"{info.context:,}-token context" if info.context else "context size unknown"
+        return f"{info.label} ({info.id}) — {limits}"
+
+    def model_endpoint_of(self, chat_id: int | str | None) -> str:
+        """The endpoint the chat's model is served from, for status lines."""
+        conv = self._conversations.get(chat_id) if chat_id is not None else None
+        if conv is not None and conv.llm_client is not None:
+            return conv.llm_client.config.base_url_of()
+        # No live conversation: the saved switch still names its endpoint.
+        if chat_id is not None:
+            saved = self.model_selections.get(chat_id)
+            if saved:
+                try:
+                    model = self.model_catalog.resolve(saved)
+                    return (
+                        self.model_catalog.provider_of(model).base_url
+                        or self.config.llm.base_url_of()
+                    )
+                except CatalogError:
+                    pass
+        configured = getattr(self.llm, "config", None)
+        # A client without a config (the test fakes) leaves the endpoint to
+        # the same resolution the real client was built from.
+        return configured.base_url_of() if configured is not None else self.config.llm.base_url_of()
+
+    def model_list_lines(self, chat_id: int | str | None = None) -> list[str]:
+        """The catalog as plain lines, for every frontend's ``/model list``.
+
+        Chat models only, sorted by id: id, marks, display name, context
+        size, description. Non-chat models are counted, not listed — they are
+        for the media tools, not for ``/model``.
+        """
+        current = self.model_of(chat_id)
+        default = self.model_catalog.default
+        if self.model_catalog.is_empty():
+            return [
+                "no model catalog found",
+                f"current model: {self.config.llm.model_of()} (from [llm] config)",
+                "add models to ~/.config/lumi/models.json (or the project's "
+                ".models.json) to enable switching",
+            ]
+        lines = []
+        for model in self.model_catalog.list_models(kind="chat"):
+            marks = []
+            if model.id == current:
+                marks.append("current")
+            if model.id == default:
+                marks.append("default")
+            mark = f" [{', '.join(marks)}]" if marks else ""
+            size = f" · {model.context:,} ctx" if model.context else ""
+            note = f" — {model.description}" if model.description else ""
+            lines.append(f"{model.id}{mark} · {model.label}{size}{note}")
+        others = [m for m in self.model_catalog.list_models(kind=None) if m.kind != "chat"]
+        if others:
+            lines.append("")
+            lines.append(f"also in the catalog: {len(others)} non-chat model(s) — for the media tools, not /model")
+        if self.model_catalog.problems:
+            lines.append("")
+            lines.append("catalog problems: " + "; ".join(self.model_catalog.problems))
+        return lines
 
     def _evict_quietest(self, *, keep: int | str) -> None:
         """Forget the quietest conversation once there are too many in memory.
@@ -735,6 +969,11 @@ class Agent:
         if not specs:
             log.warning("no tools available; the model can only answer from the prompt")
 
+        # One client per turn, bound before the loop: a /model that lands
+        # mid-turn applies from the next turn — re-reading it per iteration
+        # would send iteration 2's request, transcript included, to a
+        # different provider than the one the tool calls came from.
+        client = conv.llm_client or self.llm
         for iteration in range(1, self.config.llm.max_tool_iterations + 1):
             result.iterations = iteration
             await self.context.prepare(conv)
@@ -745,7 +984,7 @@ class Agent:
                 # Fresh per model call: `streamed` must describe the reply
                 # that is about to come back, not the whole turn.
                 on_delta, streamed = _delta_sink(hooks)
-                reply = await self.llm.complete(
+                reply = await client.complete(
                     conv.messages, tools=specs or None, on_delta=on_delta
                 )
             except LLMError as exc:

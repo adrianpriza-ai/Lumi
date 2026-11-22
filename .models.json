@@ -1,0 +1,209 @@
+{
+  // Each provider is one upstream API with its own auth, models and options.
+  "provider": {
+
+    "Zen": {
+      "id": "zen",              // alias for "<id>/<model>" namespaced lookups
+      "aliases": ["opencode"],
+      "options": {
+        "baseURL": "https://opencode.ai/zen/v1",
+        "apiKey": "",           // single key, "file:/path", or "keyless" to pass the client's own key through
+        "apiKeys": [],          // key pool: array, space-separated string, or "file:/path"
+        // "apiKeyHeader": "api-key",  // raw key in a header of its own (Azure, Google); default is Authorization: Bearer
+        "headers": {},
+        "userAgent": "",        // empty forwards the client's
+        "timeoutSecs": 300,
+        // Caps concurrent forwards to this provider - retries and the
+        // streaming answer included. Free and shared upstreams often answer
+        // a burst with a wave of 429s no retry budget outlasts; the cap
+        // queues the burst instead. A request past the cap waits up to 10s
+        // for a slot, then gets an OpenAI-shaped 429 with a Retry-After.
+        // 0 = unlimited.
+        // "maxInFlight": 4,
+        // Custom error retry: retry on custom error substrings or non-standard status codes
+        // "retryStatuses": [400, 402, 403],
+        // "retryErrors": ["insufficient quota", "credit balance", "broke"],
+        "insecureSkipVerify": false
+        // "streamUsage": false  // stop asking chat upstreams for stream usage (powers the status token counts)
+      },
+      "models": {
+        "space-bunny-free": {
+          "name": "Space Bunny",
+          // "prompt": "prompts/space-bunny.txt",  // per-model system prompt, max 1 MiB
+          "limit": { "context": 1000000, "output": 128000 },
+          "description": "An LLM model from Minimax",
+          "modalities": { "input": ["text"], "output": ["text"] }
+          // "thinking": ["low", "high", "xhigh"]  // reasoning efforts, lowest first
+        },
+        "nemotron-3.5-lightning-free": {
+          "name": "Nemotron 3.5 Lightning",
+          "limit": { "context": 1000000, "output": 128000 },
+          "description": "A LLM model from Nvidia",
+          "modalities": { "input": ["text", "image"], "output": ["text"] },
+          "thinking": ["low", "high", "xhigh"]
+        }
+      }
+    },
+
+    "LLM Povider": {
+      "id": "llm",
+      "aliases": [],
+      "options": {
+        "baseURL": "http://example.com/v1",
+        "apiKeys": "sk-...91 sk-...92",
+        "keyStrategy": "rotate",  // "rotate" | "first" | "random" | "sticky" (sticky pins one conversation to one key for prompt-cache hits)
+        // "baseURLs": ["http://mirror-a/v1", "http://mirror-b/v1"],  // endpoint pool, wins over baseURL
+        // "endpointStrategy": "rotate",
+        "headers": { "X-Tenant": "lab" },
+        "timeoutSecs": 300,
+        "insecureSkipVerify": false
+      },
+      "models": {
+        "minimax-m2.7": {
+          "name": "LLM/Minimax M2.7",
+          "upstreamName": "minimax-m2.7-preview",  // id sent upstream instead of the key
+          "limit": { "context": 180000, "output": 64000 },
+          "description": "An LLM model from Minimax",
+          "modalities": { "input": ["text", "image"], "output": ["text"] }
+        },
+        "minimax-m3": {
+          "name": "LLM/Minimax M3",
+          "as": "llm-mini-m3",  // advertised id; needed when two providers claim the same one
+          "limit": { "context": 1000000, "output": 128000 },
+          "description": "An LLM model from Minimax",
+          "modalities": { "input": ["text", "image"], "output": ["text"] }
+        }
+      }
+    },
+
+    // kind "image" routes to /v1/images/generations; "kinds": ["image_edit"]
+    // also accepts multipart edits at /v1/images/edits.
+    "ImageGen": {
+      "id": "imagegen",
+      "aliases": ["img", "dalle"],
+      "options": {
+        "baseURL": "https://api.example.com/v1",
+        "apiKey": "",
+        "apiKeys": [],
+        "headers": {},
+        "timeoutSecs": 120,
+        "insecureSkipVerify": false
+      },
+      "models": {
+        "flux-schnell": {
+          "name": "FLUX.1 Schnell",
+          "kind": "image",
+          "limit": { "context": 0, "output": 0 },
+          "description": "Fast text-to-image model by Black Forest Labs",
+          "modalities": { "input": ["text"], "output": ["image"] }
+        },
+        "sdxl-turbo": {
+          "name": "SDXL Turbo",
+          "kind": "image",
+          "limit": { "context": 0, "output": 0 },
+          "description": "Real-time image generation by Stability AI",
+          "modalities": { "input": ["text"], "output": ["image"] }
+        },
+        "flux-edit": {
+          "name": "FLUX.1 Edit",
+          "kind": "image",
+          "kinds": ["image_edit"],
+          "limit": { "context": 0, "output": 0 },
+          "description": "Image generation and editing model",
+          "modalities": { "input": ["text", "image"], "output": ["image"] }
+        }
+      }
+    },
+
+    // kind "video" routes to /v1/videos/generations and opens the larger
+    // media body ceiling on its own - a clip is the payload.
+    "VideoGen": {
+      "id": "videogen",
+      "aliases": ["video", "veo"],
+      "options": {
+        "baseURL": "https://api.example.com/v1",
+        "apiKey": "",
+        "apiKeys": [],
+        "headers": {},
+        "timeoutSecs": 600,
+        "insecureSkipVerify": false
+      },
+      "models": {
+        "veo-3.1-generate": {
+          "name": "Veo 3.1",
+          "kind": "video",
+          "limit": { "context": 0, "output": 0 },
+          "description": "Text-to-video model by Google DeepMind, with native audio",
+          "modalities": { "input": ["text"], "output": ["video"] }
+        },
+        "kling-v2.5-turbo": {
+          "name": "Kling 2.5 Turbo",
+          // No kind needed: output ["video"] classifies it already.
+          "limit": { "context": 0, "output": 0 },
+          "description": "Image-to-video model by Kuaishou, fast enough to preview with",
+          "modalities": { "input": ["text", "image"], "output": ["video"] }
+        }
+      }
+    },
+
+    // kind "tts" routes to /v1/audio/speech, "stt" to /v1/audio/transcriptions
+    // (multipart upload: curl -F file=@audio.mp3 -F model=whisper-1).
+    "Speech": {
+      "id": "speech",
+      "aliases": ["tts", "whisper"],
+      "options": {
+        "baseURL": "https://api.example.com/v1",
+        "apiKey": "",
+        "apiKeys": [],
+        "headers": {},
+        "timeoutSecs": 300,
+        "insecureSkipVerify": false
+      },
+      "models": {
+        "gpt-4o-mini-tts": {
+          "name": "GPT-4o mini TTS",
+          "kind": "tts",
+          "limit": { "context": 0, "output": 0 },
+          "description": "Text-to-speech model from OpenAI, six voices plus instruction following",
+          "modalities": { "input": ["text"], "output": ["audio"] }
+        },
+        "whisper-1": {
+          "name": "Whisper",
+          "kind": "stt",
+          "limit": { "context": 0, "output": 0 },
+          "description": "General-purpose speech-to-text model from OpenAI",
+          "modalities": { "input": ["audio", "file"], "output": ["text"] }
+        }
+      }
+    },
+
+    // kind "ocr" routes to /v1/ocr (only Mistral is known to serve it);
+    // "moderation" to /v1/moderations (also OpenAI, same shape).
+    "Mistral": {
+      "id": "mistral",
+      "aliases": ["mistral"],
+      "options": {
+        "baseURL": "https://api.mistral.ai/v1",
+        "apiKey": ""
+      },
+      "models": {
+        "mistral-ocr-latest": {
+          "name": "Mistral OCR Latest",
+          "kind": "ocr",
+          // Input modalities matter beyond the site: they are what opens the
+          // larger body ceiling, so a base64 PDF is not refused at maxBodyMb.
+          "limit": { "context": 16384, "output": 4096 },
+          "description": "OCR model from Mistral for document parsing",
+          "modalities": { "input": ["image", "file"], "output": ["text"] }
+        },
+        "mistral-moderation-latest": {
+          "name": "Mistral Moderation Latest",
+          "kind": "moderation",
+          "limit": { "context": 131072, "output": 0 },
+          "description": "Content moderation model from Mistral",
+          "modalities": { "input": ["text"], "output": ["text"] }
+        }
+      }
+    }
+  }
+}

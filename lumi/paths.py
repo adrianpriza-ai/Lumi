@@ -27,6 +27,26 @@ def project_root() -> Path:
     return DEFAULT_PROJECT_ROOT
 
 
+def user_config_dir() -> Path:
+    """The user-level Lumi config home: ``~/.config/lumi`` by default.
+
+    This is where personal configuration lives: ``config.toml`` (the base
+    layer under the project's), ``models.json`` (the model catalog),
+    ``skills/`` (a user skill root) and, later, ``agents/``. The project's
+    own files win over anything here — the repo stays self-contained, this
+    directory fills in the owner's personal setup.
+
+    ``$LUMI_USER_CONFIG`` relocates it outright (tests, sandboxes); without
+    it the XDG spelling is honoured, so a redirected ``$XDG_CONFIG_HOME``
+    moves it too — which is also how tests isolate it.
+    """
+    override = os.environ.get("LUMI_USER_CONFIG")
+    if override:
+        return Path(override).expanduser().resolve()
+    xdg = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return (Path(xdg).expanduser() / "lumi").resolve()
+
+
 def ui_binary() -> Path | None:
     """The Rust UI binary, or None when it has not been built.
 

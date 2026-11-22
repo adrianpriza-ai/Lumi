@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from conftest import FakeLLM, make_reply, make_store
 
 from lumi.agent import APPROVAL_TTL_SECONDS, Agent, TurnHooks
 from lumi.llm.base import LLMError
+from lumi.llm.catalog import CatalogError
 from lumi.memory import History
 from lumi.personality import Personality
 from lumi.tools import build_registry
@@ -1372,3 +1375,179 @@ async def test_a_reapproval_mid_batch_settles_what_ran(config, monkeypatch) -> N
         "the outcome of the action that ran is recorded for the model"
     )
     assert any("asked again" in note for note in notes), "the fresh ask is explained"
+
+
+# --------------------------------------------------------------------------- #
+# the model catalog: per-chat switching
+# --------------------------------------------------------------------------- #
+
+
+def write_catalog(config, default: str = "", extra: dict | None = None) -> None:
+    """Write the project's catalog: one provider with a small chat model and a
+    vision one, plus whatever a test adds. It must run before the agent is
+    built — the catalog loads in ``Agent.__init__`` — and it hides at the
+    project root because literal API keys live in the real one."""
+    models: dict = {
+        "mini": {
+            "name": "Mini",
+            "limit": {"context": 100000, "output": 8000},
+            "modalities": {"input": ["text"], "output": ["text"]},
+        },
+        "vision": {
+            "name": "Vision",
+            "modalities": {"input": ["text", "image"], "output": ["text"]},
+        },
+    }
+    if extra:
+        models.update(extra)
+    catalog: dict = {
+        "provider": {
+            "Zen": {
+                "id": "zen",
+                "options": {"baseURL": "https://zen.example/v1"},
+                "models": models,
+            }
+        }
+    }
+    if default:
+        catalog["defaultModel"] = default
+    (config.root / ".models.json").write_text(json.dumps(catalog), encoding="utf-8")
+
+
+async def test_set_model_switches_the_live_conversation(config) -> None:
+    """``/model`` re-aims the chat that is already open, not only the next one:
+    the conversation carries the catalog id, a client built for the provider's
+    endpoint, and the limits the context budget follows — and the choice lands
+    in ``data/chat-models.json`` so a restart keeps it."""
+    write_catalog(config)
+    agent = make_agent(config, [])
+    agent.conversation(CHAT)
+
+    agent.set_model(CHAT, "zen/mini")
+
+    conv = agent.conversation_state(CHAT)
+    assert agent.model_of(CHAT) == "zen/mini"
+    assert conv.model_id == "zen/mini"
+    assert conv.llm_client.config.model_of() == "mini"  # the wire id, not the catalog id
+    assert conv.model_context == 100000
+    assert conv.model_output == 8000
+    saved = json.loads((config.data_dir / "chat-models.json").read_text(encoding="utf-8"))
+    assert saved == {str(CHAT): "zen/mini"}
+
+
+async def test_a_turn_runs_on_the_chats_own_client(config) -> None:
+    """The switched model must be the one answering: ``_turn`` picks
+    ``conv.llm_client`` over the configured client, so a chat moved to another
+    provider never leaks its messages to the default endpoint."""
+    write_catalog(config)
+    agent = make_agent(config, [])
+    conv = agent.conversation(CHAT)
+    own = FakeLLM([make_reply("own model")])
+    conv.llm_client = own
+
+    result = await agent.handle(CHAT, "hi")
+
+    assert result.text == "own model"
+    assert len(own.calls) == 1
+    assert agent.llm.calls == []
+
+
+async def test_a_fresh_agent_restores_the_saved_choice(config) -> None:
+    """The switch survives a restart: a second agent over the same project
+    re-attaches the saved model the first time the chat's conversation is
+    built — the same code path a rebooted bot takes."""
+    write_catalog(config)
+    first = make_agent(config, [])
+    first.conversation(CHAT)
+    first.set_model(CHAT, "zen/mini")
+
+    restarted = make_agent(config, [])
+    conv = restarted.conversation(CHAT)
+
+    assert conv.model_id == "zen/mini"
+    assert restarted.model_of(CHAT) == "zen/mini"
+    assert conv.model_context == 100000
+
+
+async def test_an_unknown_saved_model_is_dropped(config) -> None:
+    """A model id that left the catalog must not wedge the chat: the stale
+    choice is dropped with a warning and the configured model stands, both
+    live and on disk."""
+    write_catalog(config)
+    config.data_dir.mkdir(parents=True, exist_ok=True)
+    (config.data_dir / "chat-models.json").write_text(
+        json.dumps({str(CHAT): "ghost"}), encoding="utf-8"
+    )
+
+    agent = make_agent(config, [])
+    conv = agent.conversation(CHAT)
+
+    assert conv.model_id == ""
+    assert agent.model_of(CHAT) == "test-model"
+    saved = json.loads((config.data_dir / "chat-models.json").read_text(encoding="utf-8"))
+    assert saved == {}
+
+
+async def test_a_non_chat_model_is_refused(config) -> None:
+    """Only chat models are selectable: the media kinds belong to the image
+    and audio tools, and ``/model`` must refuse them rather than switch."""
+    write_catalog(config, extra={"pic": {"name": "Pic", "kind": "image"}})
+    agent = make_agent(config, [])
+
+    with pytest.raises(CatalogError, match="chat"):
+        agent.set_model(CHAT, "zen/pic")
+    assert agent.model_selections.get(CHAT) == ""
+
+
+async def test_the_catalog_default_applies_when_the_config_has_no_model(config) -> None:
+    """``defaultModel`` fills the unset slot only: with ``[llm].model`` empty —
+    and no env pin, the fixture scrubs OPENAI_MODEL — a fresh conversation
+    comes up on the catalog's default instead of the raw ``[llm]`` client."""
+    write_catalog(config, default="zen/mini")
+    config.llm.model = ""
+
+    agent = make_agent(config, [])
+    conv = agent.conversation(CHAT)
+
+    assert agent.model_of(CHAT) == "zen/mini"
+    assert conv.model_id == "zen/mini"
+    assert conv.llm_client is not None
+
+
+async def test_reset_model_clears_the_override_and_the_saved_choice(config) -> None:
+    """Back to the configured model means both places at once: the live
+    conversation loses its client, and the persisted file loses the chat's
+    entry — so a restart cannot resurrect the switch."""
+    write_catalog(config)
+    agent = make_agent(config, [])
+    agent.conversation(CHAT)
+    agent.set_model(CHAT, "zen/mini")
+
+    agent.reset_model(CHAT)
+
+    conv = agent.conversation_state(CHAT)
+    assert agent.model_of(CHAT) == "test-model"
+    assert conv.model_id == ""
+    assert conv.llm_client is None
+    assert conv.model_context == 0
+    saved = json.loads((config.data_dir / "chat-models.json").read_text(encoding="utf-8"))
+    assert saved == {}
+
+
+async def test_a_switched_chat_budgets_its_own_window(config) -> None:
+    """The context budget follows the chat's model: a 100k-token model must
+    start condensing at 100k even though the config allows 200k, because the
+    provider rejects what the configured window would have allowed."""
+    write_catalog(config)
+    config.llm.context_window = 200000
+    agent = make_agent(config, [])
+    plain = agent.conversation(CHAT)
+    switched = agent.conversation(5678)
+    agent.set_model(5678, "zen/mini")
+
+    assert agent.context.window_for(switched) == 100000
+    assert agent.context.window_for(plain) == 200000
+    # The reply headroom follows too: 8k of declared output caps the 16k
+    # configured headroom, and only for the switched chat.
+    assert agent.context.headroom_for(switched) == 8000
+    assert agent.context.headroom_for(plain) == 16000

@@ -92,14 +92,11 @@ class Mode(StrEnum):
 
 MODES: tuple[Mode, ...] = (Mode.DEFAULT, Mode.ACCEPT_EDITS, Mode.BYPASS, Mode.BYPASS_SUDO)
 
-#: The CONFIRM rules :class:`Mode.ACCEPT_EDITS` waves through, named by their
-#: ``rule`` field. All three mean "this command writes a file inside the
-#: project" — overwriting one, redirecting into one, or writing just outside
-#: the workspace but still inside it — and nothing else. Everything else that
-#: asks (deleting, signalling, git history, package management, the
-#: write-then-run gate, an unfollowable target) still asks, and skill files
-#: keep their tap through the files tool, because their text lands in every
-#: chat's system prompt and "accept edits" was not said about instructions.
+#: The CONFIRM rules :class:`Mode.ACCEPT_EDITS` waves through: writes inside
+#: the project (overwrite, redirect, or just outside the workspace). Deleting,
+#: signalling, git history, package management, the write-then-run gate and
+#: unfollowable targets still ask, as do writes into the home directory or
+#: outside the project.
 ACCEPT_EDITS_RULES: frozenset[str] = frozenset(
     {"redirect-write", "overwrite:existing", "zone:outside-workspace"}
 )
@@ -479,14 +476,10 @@ PROTECTED_SUBPATHS: frozenset[tuple[str, ...]] = frozenset(
     }
 )
 
-#: Project-relative files that grant access or change what the bot will run.
-#: They sit inside the shell's default write root (the whole project), so the
-#: zone check waves them through, and unlike ``.env`` they are not credentials:
-#: writing one is privilege escalation. ``data/whitelist.json`` awards the
-#: bot's tools to whoever it lists, ``.mcp.json`` names a local command the web
-#: provider will spawn, ``data/mcp-trust.json`` is the approvals that let a
-#: cloned ``.mcp.json`` entry do exactly that (writing one is self-approval),
-#: and ``config.toml`` decides the write roots and deny rules themselves.
+#: Project files that change what the bot will run. They are inside the default
+#: write root, so only this list stops a write: whitelist.json hands out tools,
+#: .mcp.json names a local command to spawn, mcp-trust.json approves it (writing
+#: one is self-approval), and config.toml decides the write roots and deny rules.
 PROTECTED_PROJECT_PATHS: frozenset[tuple[str, ...]] = frozenset(
     {
         ("data", "whitelist.json"),
@@ -494,6 +487,12 @@ PROTECTED_PROJECT_PATHS: frozenset[tuple[str, ...]] = frozenset(
         (".mcp.json",),
         ("config.toml",),
         ("config.local.toml",),
+        # The model catalogs: literal provider keys live in them (the read
+        # side is the secret-read deny below). The write tap keeps the model
+        # from planting or replacing one — a catalog it wrote could point a
+        # later /model switch at an endpoint of its choosing.
+        (".models.json",),
+        ("models.json",),
         # OAuth bearer tokens for the owner's MCP-connected accounts, one file
         # per server. Writing one plants a token the web provider will send on
         # the owner's behalf; matched as a prefix so every file under the
@@ -502,16 +501,10 @@ PROTECTED_PROJECT_PATHS: frozenset[tuple[str, ...]] = frozenset(
     }
 )
 
-#: Project paths that stay writable on purpose but whose contents are read
-#: back into the bot later, so a write asks first instead of running silently.
-#: ``data/skills`` is the one: every ``SKILL.md`` catalogued there lands in the
-#: system prompt of every chat, which makes a silent write a persistent
-#: prompt-injection sink — the same consequence that made ``data/memory`` a
-#: hard deny. Skills differ in intent: they are the model's to maintain, so the
-#: owner taps once instead of the write being refused. ``PERSONALITY.md`` is
-#: the same shape at the project root: one file whose text is rendered into
-#: every chat's system prompt, so a silent write is a persistent
-#: prompt-injection sink too. See lumi/tools/skills.py.
+#: Writable on purpose, but read back into every chat's system prompt, so a
+#: silent write would be a persistent prompt-injection sink. Skills are the
+#: model's to maintain, so the first write asks instead of being refused.
+#: PERSONALITY.md is the same shape at the project root. See tools/skills.py.
 APPROVAL_SUBPATHS: frozenset[tuple[str, ...]] = frozenset(
     {("data", "skills"), ("PERSONALITY.md",)}
 )
@@ -529,6 +522,11 @@ SECRET_FILE_BASENAMES: frozenset[str] = frozenset(
         ".mcp.json",
         "config.local.toml",
         "whitelist.json",
+        # The model catalogs carry literal API keys (a provider entry's
+        # apiKey/apiKeys), in the project's hidden file and the owner's
+        # ~/.config/lumi — reading one is reading a credential store.
+        "models.json",
+        ".models.json",
         ".netrc",
         ".npmrc",
         ".pypirc",
@@ -3155,6 +3153,7 @@ def explain(
                     resolved = target.resolve()
                 except OSError:  # pragma: no cover - broken symlink loop
                     resolved = target
+                zone = _zone(resolved, project_root, home)
                 guard = protected_write(resolved, project_root)
                 if guard is not None:
                     verdicts.append(
@@ -3182,7 +3181,7 @@ def explain(
                             "zone:approval-state",
                         )
                     )
-                elif _zone(resolved, project_root, home) == "system":
+                elif zone == "system":
                     # The same ladder the mutating branch applies: these output
                     # flags are writes like any other, so `sort -o /etc/x` is
                     # refused, not waved through because `sort` prints to stdout.
@@ -3193,15 +3192,35 @@ def explain(
                             "zone:system-write",
                         )
                     )
-                elif not _is_within(target, write_root):
-                    verdicts.append(
-                        Verdict(
-                            Tier.CONFIRM,
-                            f"would write outside the workspace ({target}); the workspace is "
-                            f"{write_root.name or write_root}",
-                            "zone:outside-workspace",
+                elif not _is_within(resolved, write_root):
+                    # Name the zone that applies, so a symlink out of the
+                    # workspace keeps its tap under accept-edits: that rule
+                    # only waves through edits that stay inside the project.
+                    if zone == "home":
+                        verdicts.append(
+                            Verdict(
+                                Tier.CONFIRM,
+                                f"would write inside your home directory ({target})",
+                                "zone:home-write",
+                            )
                         )
-                    )
+                    elif zone == "outside":
+                        verdicts.append(
+                            Verdict(
+                                Tier.CONFIRM,
+                                f"would write outside the project ({target})",
+                                "zone:outside-write",
+                            )
+                        )
+                    else:
+                        verdicts.append(
+                            Verdict(
+                                Tier.CONFIRM,
+                                f"would write outside the workspace ({target}); the workspace "
+                                f"is {write_root.name or write_root}",
+                                "zone:outside-workspace",
+                            )
+                        )
                 elif _exists(resolved):
                     # Creation is free, overwrite asks — the mutating branch's
                     # own rule, applied to the output operand of a command that
@@ -3443,15 +3462,15 @@ def explain(
                 )
                 continue
             zone = _zone(path, project_root, home)
-            protected_subpath = _has_protected_subpath(path)
-            # The protected-name check runs against the *resolved* path as well
-            # as the literal one. A symlink called `notes` pointing at
-            # `~/.bashrc` is a write to a login file wearing an innocent name,
-            # and only resolution can tell the difference.
+            # The protected checks run against the *resolved* path as well as
+            # the literal one. A symlink called `notes` pointing at `~/.bashrc`
+            # is a write to a login file wearing an innocent name, and only
+            # resolution can tell the difference.
             try:
                 resolved = path.resolve()
             except OSError:  # pragma: no cover - broken symlink loop
                 resolved = path
+            protected_subpath = _has_protected_subpath(path) or _has_protected_subpath(resolved)
             protected_name = next(
                 (name for name in (path.name, resolved.name) if name in PROTECTED_BASENAMES),
                 None,
@@ -3510,9 +3529,44 @@ def explain(
                     )
                 )
             elif not _is_within(path, write_root):
-                # Inside the project but outside the workspace. Escalated to a
-                # deny for a recursive delete, which is the irreversible case.
-                if recursive_delete:
+                # Name the reason that actually applies. Home and outside-the-
+                # project writes used to fall into the workspace branch, whose
+                # rule accept-edits waves through.
+                if zone == "home":
+                    if recursive_delete:
+                        verdicts.append(
+                            Verdict(
+                                Tier.DENY,
+                                f"recursive delete inside your home directory ({path})",
+                                "zone:home-recursive-delete",
+                            )
+                        )
+                    else:
+                        verdicts.append(
+                            Verdict(
+                                Tier.CONFIRM,
+                                f"would write inside your home directory ({path})",
+                                "zone:home-write",
+                            )
+                        )
+                elif zone == "outside":
+                    if recursive_delete:
+                        verdicts.append(
+                            Verdict(
+                                Tier.DENY,
+                                f"recursive delete outside the project ({path})",
+                                "zone:outside-delete",
+                            )
+                        )
+                    else:
+                        verdicts.append(
+                            Verdict(
+                                Tier.CONFIRM,
+                                f"would write outside the project ({path})",
+                                "zone:outside-write",
+                            )
+                        )
+                elif recursive_delete:
                     verdicts.append(
                         Verdict(
                             Tier.DENY,
@@ -3529,31 +3583,6 @@ def explain(
                             "zone:outside-workspace",
                         )
                     )
-            elif zone == "home":
-                if recursive_delete:
-                    verdicts.append(
-                        Verdict(
-                            Tier.DENY,
-                            f"recursive delete inside your home directory ({path})",
-                            "zone:home-recursive-delete",
-                        )
-                    )
-                else:
-                    verdicts.append(
-                        Verdict(
-                            Tier.CONFIRM,
-                            f"would write inside your home directory ({path})",
-                            "zone:home-write",
-                        )
-                    )
-            elif zone == "outside":
-                verdicts.append(
-                    Verdict(
-                        Tier.CONFIRM,
-                        f"would write outside the project ({path})",
-                        "zone:outside-write",
-                    )
-                )
 
         # A redirect names its destination on the other side of `>`, where the
         # per-segment target walk above only sees it when it looks like a path:

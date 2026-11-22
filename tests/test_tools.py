@@ -10,6 +10,7 @@ import pytest
 from conftest import backdate
 
 from lumi.chatlog import ChatLog, LogEntry
+from lumi.paths import user_config_dir
 from lumi.tools.base import NeedsApproval, Tool, ToolContext, ToolError, ToolResult
 from lumi.tools.explore import GREP_MAX_RESULTS, GrepTool, ListFilesTool, ReadFileTool
 from lumi.tools.files import FilesTool
@@ -2319,6 +2320,45 @@ async def test_skills_read_missing_file_fails_cleanly(skills: SkillsTool, config
 async def test_skills_unknown_action(skills: SkillsTool) -> None:
     with pytest.raises(ToolError, match="unknown action"):
         await skills.invoke({"action": "install"}, ctx())
+
+
+def test_the_config_dir_skills_root_shadows_the_agents_root(config, monkeypatch) -> None:
+    """Three roots, most specific first: a skill installed in the owner's Lumi
+    config home beats the shared ``~/.agents`` copy of the same name, and the
+    project's own skill beats both — the one written for this code is the one
+    that runs. The tool reads both env vars in ``__init__``, so they are pinned
+    before it is built."""
+    config_home = config.root / "lumi-config"
+    agent_home = config.root / "agent-home"
+    monkeypatch.setenv("LUMI_USER_CONFIG", str(config_home))
+    monkeypatch.setenv("HOME", str(agent_home))
+    _skill(
+        user_config_dir() / "skills",
+        "docs",
+        "---\nname: docs\ndescription: How this project documents things.\n---\n# Docs\nWrite it down.\n",
+    )
+    _skill(agent_home / ".agents" / "skills", "docs", "# Docs\nA stale copy.\n")
+    tool = SkillsTool(config)
+
+    docs = {skill["name"]: skill for skill in tool.catalog()}["docs"]
+
+    # Both non-project roots report as "user"; the path (and the description)
+    # is what shows the config home won.
+    assert docs["source"] == "user"
+    assert "lumi-config/skills/docs" in docs["path"]
+    assert ".agents" not in docs["path"]
+    assert docs["description"] == "How this project documents things."
+    assert docs["shadowed"]  # the ~/.agents copy of the same name lost
+
+    # The project root still wins over the config home for the same name.
+    _skill(
+        config.data_dir / "skills",
+        "docs",
+        "---\ndescription: The project's own.\n---\nbody\n",
+    )
+    docs = {skill["name"]: skill for skill in tool.catalog()}["docs"]
+    assert docs["source"] == "project"
+    assert docs["path"] == "data/skills/docs/SKILL.md"
 
 
 async def test_data_skills_is_writable_with_the_files_tool(files: FilesTool, config) -> None:

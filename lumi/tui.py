@@ -28,6 +28,7 @@ out. Both sides test against this block.
 | ``tools`` | ``agent.registry.describe()`` → ``notice`` |
 | ``memory`` | ``agent.memory_for("cli").for_prompt(limit)`` → ``notice`` |
 | ``reasoning {on}`` | ``config.llm.show_reasoning = on`` → ``notice`` (the REPL's ``/reasoning``) |
+| ``model {value}`` | show (``""``), list, switch or reset this chat's model → ``notice``, plus a ``model`` event when it changed |
 | ``search {query, limit}`` | ``WebTool`` invoked directly, as ``lumi search`` does → ``notice`` |
 | ``quit`` | close the loop, ``await agent.registry.aclose()`` |
 
@@ -36,6 +37,7 @@ out. Both sides test against this block.
 | ev | source |
 |---|---|
 | ``ready {model, host, tools[], search, turns}`` | once, before the first command |
+| ``model {model, host}`` | the chat's model changed via the ``model`` command — same payload as ``ready``'s, so the status bar updates without a reconnect |
 | ``step {kind, detail}`` | ``TurnHooks.on_step`` — ``("thinking", "")`` and ``("tool", detail)`` |
 | ``message {text}`` | ``TurnHooks.on_message`` — the ``send`` tool, mid-turn |
 | ``delta {text}`` | ``TurnHooks.on_delta`` — one piece of the answer as the model produces it |
@@ -79,6 +81,7 @@ from typing import Any
 
 from .config import Config
 from .llm.base import DELTA_THINKING
+from .llm.catalog import CatalogError
 from .tools.base import ToolContext
 from .tools.safety import MODES, parse_mode
 from .tools.web import WebTool
@@ -216,8 +219,8 @@ def _ready(agent: Any, config: Config, web: Any) -> dict[str, Any]:
     """The header the frontend renders instead of parsing config itself."""
     return {
         "ev": "ready",
-        "model": config.llm.model_of(),
-        "host": config.llm.base_url_of(),
+        "model": agent.model_of(CHAT_ID),
+        "host": agent.model_endpoint_of(CHAT_ID),
         "tools": agent.registry.names(),
         "search": _search_status(web),
         "turns": 0,
@@ -386,6 +389,55 @@ async def serve(
                     return True
                 config.llm.show_reasoning = on
                 send({"ev": "notice", "text": f"live steps {'on' if on else 'off'}"})
+                return True
+
+            if cmd == "model":
+                # This chat's model, from the catalog: "" reports, "list"
+                # lists, "default" resets, anything else is an id to switch
+                # to. Unlike the reasoning/mode toggles this survives a
+                # restart — it is per chat, persisted in data/chat-models.json.
+                value = message.get("value")
+                value = value.strip() if isinstance(value, str) else ""
+                # The keywords fold case, matching the REPL and Telegram;
+                # model ids pass through as written (resolution is
+                # case-insensitive anyway).
+                keyword = value.lower()
+                switched = False
+                try:
+                    if keyword == "list":
+                        text = "\n".join(agent.model_list_lines(CHAT_ID))
+                    elif keyword in ("default", "reset"):
+                        agent.reset_model(CHAT_ID)
+                        switched = True
+                        text = (
+                            f"model: {agent.model_report(CHAT_ID)}\n"
+                            "back to the configured default (persists)"
+                        )
+                    elif value:
+                        model = agent.set_model(CHAT_ID, value)
+                        switched = True
+                        text = (
+                            f"model: {model.label} ({model.id})\n"
+                            f"endpoint: {agent.model_endpoint_of(CHAT_ID)} · persists "
+                            "for this chat; /model list to see the rest"
+                        )
+                    else:
+                        text = (
+                            f"model: {agent.model_report(CHAT_ID)}\n"
+                            "switch: /model <id> · list: /model list · back: /model default"
+                        )
+                except CatalogError as exc:
+                    send({"ev": "error", "text": str(exc)})
+                    return True
+                if switched:
+                    send(
+                        {
+                            "ev": "model",
+                            "model": agent.model_of(CHAT_ID),
+                            "host": agent.model_endpoint_of(CHAT_ID),
+                        }
+                    )
+                send({"ev": "notice", "text": text})
                 return True
 
             if cmd == "mode":

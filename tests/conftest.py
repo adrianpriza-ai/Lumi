@@ -64,6 +64,11 @@ def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    # The user config home (~/.config/lumi) derives from XDG_CONFIG_HOME when
+    # set; pin it under the throwaway HOME so the real user layer — and an
+    # exported XDG_CONFIG_HOME — can never leak into a test.
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    monkeypatch.delenv("LUMI_USER_CONFIG", raising=False)
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
     monkeypatch.setenv("TELEGRAM_OWNER_ID", "42")
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")

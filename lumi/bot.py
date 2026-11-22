@@ -45,6 +45,7 @@ from .artifacts import Artifact, ArtifactError, ArtifactStore
 from .chatlog import CHATLOG, entry_from, media_entry_from
 from .config import Config, ConfigError, validate
 from .doctor import platform_line, run_checks
+from .llm.catalog import CatalogError
 from .memory import History, MemoryFile, MemoryStore
 from .personality import Personality
 from .tools.docread import DocumentReader
@@ -136,6 +137,7 @@ OWNER_HELP_TEXT = """\
 <code>/forget [n]</code> — drop the newest n saved facts (erasing memory is a human decision, and yours)
 <code>/mcp help|list|check|auth|approve|revoke</code> — the configured MCP servers: what they are, whether one answers, browser login for OAuth ones, and which project entries you have approved to connect
 <code>/mode [name]</code> — show or switch the permission mode (default, accept-edits, bypass, bypass-sudo)
+<code>/model [list|&lt;id&gt;|default]</code> — show, switch or reset this chat's model from the catalog (persists)
 <code>/reload</code> — re-read personality, memory and config
 <code>/reset</code> — forget this conversation (keeps long-term memory)
 <code>/whitelist</code> — show whitelisted users and groups
@@ -2035,6 +2037,54 @@ def build_handlers(config: Config) -> list[Any]:
             "(a restart returns to config.toml / <code>LUMI__TOOLS__MODE</code>)",
         )
 
+    async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Show, list, switch or reset this chat's model.
+
+        ``/model`` reports; ``/model list`` shows the catalog's chat models;
+        ``/model <id>`` switches this chat and persists the choice in
+        data/chat-models.json, so a restart keeps it; ``/model default``
+        returns to the configured model. Owner-only, like /mode: a switch
+        points the chat at another endpoint with another key pool, and which
+        keys get spent is not a room's decision.
+        """
+        if not await authorised(update):
+            return
+        user = update.effective_user
+        if user is None or not _is_owner(user, config):
+            await reply(update, NOT_OWNER_SENSITIVE)
+            return
+        agent = agent_of(context)
+        chat_id = chat_of(update)
+        argument = context.args[0].strip() if context.args else ""
+        try:
+            if argument.lower() == "list":
+                listing = "\n".join(agent.model_list_lines(chat_id))
+                await reply(update, f"<b>models</b>\n{sanitize_html(listing)}")
+            elif argument.lower() in ("default", "reset"):
+                agent.reset_model(chat_id)
+                await reply(
+                    update,
+                    f"<b>model</b>: {sanitize_html(agent.model_report(chat_id))}\n"
+                    "back to the configured default — this chat keeps it across restarts",
+                )
+            elif argument:
+                model = agent.set_model(chat_id, argument)
+                await reply(
+                    update,
+                    f"<b>model</b>: {sanitize_html(f'{model.label} ({model.id})')}\n"
+                    f"endpoint: {sanitize_html(agent.model_endpoint_of(chat_id))}\n"
+                    "persists for this chat · <code>/model list</code> shows the rest",
+                )
+            else:
+                await reply(
+                    update,
+                    f"<b>model</b>: {sanitize_html(agent.model_report(chat_id))}\n"
+                    "switch: <code>/model &lt;id&gt;</code> · list: <code>/model list</code>"
+                    " · back: <code>/model default</code>",
+                )
+        except CatalogError as exc:
+            await reply(update, sanitize_html(str(exc)))
+
     async def context_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """What the model is actually holding for this chat right now.
 
@@ -2975,6 +3025,7 @@ def build_handlers(config: Config) -> list[Any]:
         CommandHandler("personality", gated(personality_command), filters=allowed_filter),
         CommandHandler("reasoning", gated(reasoning_command), filters=allowed_filter),
         CommandHandler("mode", gated(mode_command), filters=allowed_filter),
+        CommandHandler("model", gated(model_command), filters=allowed_filter),
         CommandHandler("context", gated(context_command), filters=allowed_filter),
         CommandHandler("status", gated(status_command), filters=allowed_filter),
         CommandHandler("doctor", gated(doctor_command), filters=allowed_filter),

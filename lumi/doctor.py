@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 from . import __version__
 from .config import Config
-from .paths import relative_to_root, ui_binary
+from .paths import relative_to_root, ui_binary, user_config_dir
 from .tools import safety
 from .tools.registry import ToolRegistry
 from .tools.shell import shell_binary
@@ -101,6 +101,15 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
             str(config.config_path)
             if config.config_path
             else "no config.toml; using built-in defaults",
+        )
+    )
+    checks.append(
+        Check(
+            "user config",
+            OK,
+            f"{config.user_dir / 'config.toml'} (layered under the project's)"
+            if config.user_dir
+            else f"none at {user_config_dir() / 'config.toml'} — the project layer only",
         )
     )
     checks.append(
@@ -201,6 +210,38 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
             + _reasoning_note(config),
         )
     )
+    # -- model catalog ------------------------------------------------------- #
+    # /model switching runs on this; a broken file is a warning, not a
+    # failure — the [llm] model answers regardless.
+    try:
+        from .llm.catalog import ModelCatalog
+
+        catalog = ModelCatalog.load(config)
+        chat = catalog.list_models(kind="chat")
+        if catalog.sources:
+            detail = f"{len(chat)} chat model(s) from " + ", ".join(
+                str(path) for path in catalog.sources
+            )
+            status = OK
+            if catalog.default:
+                detail += f", default {catalog.default}"
+            if catalog.problems:
+                detail += " — " + "; ".join(catalog.problems)
+                status = WARN
+            checks.append(Check("model catalog", status, detail))
+        elif catalog.problems:
+            checks.append(Check("model catalog", WARN, "; ".join(catalog.problems)))
+        else:
+            checks.append(
+                Check(
+                    "model catalog",
+                    OK,
+                    f"none ({user_config_dir() / 'models.json'} or the project's "
+                    ".models.json) — /model switching off, [llm] config stands",
+                )
+            )
+    except Exception as exc:  # noqa: BLE001
+        checks.append(Check("model catalog", WARN, format_error(exc)))
     ocr_cfg = config.tools.ocr
     if not config.tools.is_enabled("ocr") or not ocr_cfg.enabled:
         checks.append(Check("ocr", WARN, "disabled in config"))

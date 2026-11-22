@@ -236,10 +236,16 @@ class ContextWindow:
     store for replay and for persisting what was condensed.
     """
 
-    def __init__(self, config: Any, *, llm: Any = None, history: Any = None) -> None:
+    def __init__(
+        self, config: Any, *, llm: Any = None, history: Any = None, client_of: Any = None
+    ) -> None:
         self.config = config
         self.llm = llm
         self.history = history
+        #: Optional ``conv -> LLMClient`` callback. A chat switched to its own
+        #: model by ``/model`` summarises with that model too, and its budget
+        #: follows the model's declared limits (see ``*_for``).
+        self.client_of = client_of
         #: Chars per token, corrected by :meth:`observe` once the provider has
         #: reported a real prompt size.
         self._chars_per_token = max(1.0, float(config.llm.chars_per_token))
@@ -254,6 +260,25 @@ class ContextWindow:
     @property
     def headroom(self) -> int:
         return max(0, int(self.config.llm.context_headroom))
+
+    def window_for(self, conv: Any) -> int:
+        """The window *conv* is budgeted against: its own model's declared
+        ``limit.context`` when the chat switched to one, else the configured
+        window. A smaller model must start condensing earlier, or the provider
+        rejects a request the configured window would have allowed."""
+        override = int(getattr(conv, "model_context", 0) or 0)
+        return override if override > 0 else self.window
+
+    def headroom_for(self, conv: Any) -> int:
+        """The reply headroom for *conv*: the configured value, capped by the
+        model's declared output ceiling — headroom must fit inside what the
+        model can actually emit."""
+        headroom = self.headroom
+        output = int(getattr(conv, "model_output", 0) or 0)
+        return output if 0 < output < headroom else headroom
+
+    def budget_for(self, conv: Any) -> int:
+        return max(256, self.window_for(conv) - self.headroom_for(conv))
 
     @property
     def target(self) -> int:
@@ -273,13 +298,19 @@ class ContextWindow:
         the system prompt and its tail, which is the one outcome a bad setting
         should not be able to cause.
         """
+        return self._target_from(self.budget)
+
+    def target_for(self, conv: Any) -> int:
+        return self._target_from(self.budget_for(conv))
+
+    def _target_from(self, budget: int) -> int:
         try:
             fraction = float(getattr(self.config.llm, "context_target", 1.0))
         except (TypeError, ValueError):
             fraction = 1.0
         if not 0.0 < fraction <= 1.0:
             fraction = 1.0
-        return max(256, int(self.budget * fraction))
+        return max(256, int(budget * fraction))
 
     @property
     def budget(self) -> int:
@@ -296,6 +327,9 @@ class ContextWindow:
         """What the conversation is actually trimmed to: the target, which is
         never above the hard budget. Every trim pass measures against this."""
         return self.target
+
+    def effective_budget_for(self, conv: Any) -> int:
+        return self.target_for(conv)
 
     def tokens_for(self, text: str) -> int:
         return int(len(text) / self._chars_per_token)
@@ -381,7 +415,7 @@ class ContextWindow:
         """
         if self.history is None:
             return
-        budget = self.effective_budget - self.estimate(conv.messages)
+        budget = self.effective_budget_for(conv) - self.estimate(conv.messages)
         if budget <= 0:
             return
 
@@ -411,7 +445,7 @@ class ContextWindow:
             len(replayed.messages),
             conv.chat_id,
             self.estimate(conv.messages),
-            self.effective_budget,
+            self.effective_budget_for(conv),
             " after a condensed record" if replayed.summary else "",
         )
 
@@ -422,7 +456,9 @@ class ContextWindow:
         the question in front of it, so a seeded conversation is exactly as
         well-formed as a live one.
         """
-        while self.estimate(conv.messages) > self.effective_budget and first < len(conv.messages):
+        while self.estimate(conv.messages) > self.effective_budget_for(conv) and first < len(
+            conv.messages
+        ):
             del conv.messages[first]
             if (
                 first < len(conv.messages)
@@ -477,21 +513,21 @@ class ContextWindow:
             nonlocal target_warning_logged
             head, _, tail = self._split(conv)
             protected = self.estimate(flatten([*head, *tail]))
-            if protected > self.target and not target_warning_logged:
+            if protected > self.target_for(conv) and not target_warning_logged:
                 log.warning(
                     "context target %d is unreachable for chat %s: protected prompt "
                     "and recent turns need ~%d tokens; using that as the fill line",
-                    self.target,
+                    self.target_for(conv),
                     conv.chat_id,
                     protected,
                 )
                 target_warning_logged = True
-            return max(self.target, protected)
+            return max(self.target_for(conv), protected)
 
         effective_budget = trim_budget()
         estimated = self.estimate(conv.messages)
         trim_over = estimated - effective_budget
-        hard_over = estimated - self.budget
+        hard_over = estimated - self.budget_for(conv)
         if trim_over <= 0 and hard_over <= 0:
             return
 
@@ -509,7 +545,7 @@ class ContextWindow:
         effective_budget = trim_budget()
         if self.estimate(conv.messages) > effective_budget:
             self._drop_oldest(conv, budget=effective_budget)
-        if self.estimate(conv.messages) > self.budget:
+        if self.estimate(conv.messages) > self.budget_for(conv):
             self._shrink_largest(conv)
 
         self._refresh_note(conv)
@@ -644,7 +680,7 @@ class ContextWindow:
         head, middle, _ = parts
         if not middle:
             return
-        budget = self.effective_budget if budget is None else budget
+        budget = self.effective_budget_for(conv) if budget is None else budget
 
         # The oldest turns, up to a third of the effective budget: enough to be
         # worth a call, small enough that the record is cheap to carry
@@ -713,8 +749,11 @@ class ContextWindow:
             {"role": "system", "content": instructions},
             {"role": "user", "content": body},
         ]
+        # The chat's own model when /model switched it — a summariser the
+        # switched chat cannot reach is a summariser that never runs.
+        client = self.client_of(conv) if self.client_of is not None else None
         try:
-            reply = await self.llm.complete(request, tools=None)
+            reply = await (client or self.llm).complete(request, tools=None)
         except LLMError as exc:
             log.warning("could not condense the conversation for chat %s: %s", conv.chat_id, exc)
             return ""
@@ -740,7 +779,7 @@ class ContextWindow:
         # otherwise the hard floor. Either way this only ever removes from the
         # middle — the head (system prompt: personality, instructions, memory)
         # and the protected tail are never candidates.
-        budget = self.effective_budget if budget is None else budget
+        budget = self.effective_budget_for(conv) if budget is None else budget
         before = len(middle)
         while middle and self.estimate(flatten([*head, *middle, *tail])) > budget:
             conv.dropped += len(middle[0])
@@ -763,7 +802,7 @@ class ContextWindow:
         """
         skipped: set[int] = set()
         for _ in range(24):
-            if self.estimate(conv.messages) <= self.budget:
+            if self.estimate(conv.messages) <= self.budget_for(conv):
                 return
             # Everything except the system prompt, the message being answered,
             # and the record (which is capped against the window already, and
@@ -783,7 +822,7 @@ class ContextWindow:
                 # character count cannot see, so leave it be.
                 skipped.add(id(biggest))
                 continue
-            overage = self.estimate(conv.messages) - self.budget
+            overage = self.estimate(conv.messages) - self.budget_for(conv)
             keep = max(400, len(biggest["content"]) - self.chars_for(overage) - 200)
             if keep >= len(biggest["content"]):
                 break
@@ -793,7 +832,7 @@ class ContextWindow:
             biggest[ELIDED_FLAG] = True
             conv.elided += 1
 
-        if self.estimate(conv.messages) > self.budget:
+        if self.estimate(conv.messages) > self.budget_for(conv):
             log.warning(
                 "chat %s needs ~%d tokens of context and the window allows %d: the "
                 "system prompt and the newest turn alone exceed it. Raise "
@@ -801,8 +840,8 @@ class ContextWindow:
                 "(currently %d).",
                 conv.chat_id,
                 self.estimate(conv.messages),
-                self.budget,
-                self.window,
+                self.budget_for(conv),
+                self.window_for(conv),
                 int(self.config.llm.context_keep_recent),
             )
             conv.truncated = True
@@ -820,9 +859,9 @@ class ContextWindow:
     def report(self, conv: Any) -> ContextReport:
         return ContextReport(
             tokens=self.estimate(conv.messages),
-            budget=self.budget,
-            target=self.target,
-            window=self.window,
+            budget=self.budget_for(conv),
+            target=self.target_for(conv),
+            window=self.window_for(conv),
             messages=len(conv.messages),
             chars=sum(content_chars(m) for m in conv.messages),
             summarised=conv.summarised,

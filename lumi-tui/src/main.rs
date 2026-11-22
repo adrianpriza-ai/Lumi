@@ -34,6 +34,7 @@ pub fn help_text() -> String {
 ## Commands
 - `/help` — this list
 - `/search <query>` — run a web search now, through the backend
+- `/model [list|<id>|default]` — show, switch or reset this chat's model (persists)
 - `/reasoning on|off` — show the model's thinking steps live
 - `/mode [name]` — show or switch the permission mode (default, accept-edits, bypass, bypass-sudo)
 - `/trace` — same as `ctrl+t`: open or close every step trace

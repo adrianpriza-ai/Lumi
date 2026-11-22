@@ -547,3 +547,98 @@ async def test_an_event_payload_with_escape_sequences_serializes_cleanly(config)
         assert "and [2J wipe" in result["text"]
         # Newlines survive — only control characters are gone.
         assert tui._clean("a\nb") == "a\nb"
+
+
+# --------------------------------------------------------------------------- #
+# model
+# --------------------------------------------------------------------------- #
+
+MODEL_CATALOG = """\
+{
+  "provider": {
+    "Zen": {
+      "id": "zen",
+      "options": { "baseURL": "https://zen.example/v1", "apiKey": "sk-zen" },
+      "models": {
+        "mini": { "name": "Mini", "limit": { "context": 100000, "output": 8000 } },
+        "vision": { "name": "Vision", "modalities": { "input": ["text", "image"], "output": ["text"] } }
+      }
+    }
+  }
+}
+"""
+
+
+async def test_model_reports_the_configured_model(config) -> None:
+    async with Frontend(config, make_agent(config, [])) as fe:
+        await fe.start()
+        fe.push({"cmd": "model"})
+        notice = (await fe.wait_for("notice"))[0]
+        assert "test-model" in notice["text"]
+        assert "/model <id>" in notice["text"]
+
+
+async def test_model_list_without_a_catalog_says_where_to_put_one(config) -> None:
+    async with Frontend(config, make_agent(config, [])) as fe:
+        await fe.start()
+        fe.push({"cmd": "model", "value": "list"})
+        notice = (await fe.wait_for("notice"))[0]
+        assert "no model catalog" in notice["text"]
+        assert "models.json" in notice["text"]
+
+
+async def test_model_switch_persists_and_updates_the_header(config) -> None:
+    (config.root / ".models.json").write_text(MODEL_CATALOG, encoding="utf-8")
+    async with Frontend(config, make_agent(config, [make_reply("ok")])) as fe:
+        ready = await fe.start()
+        assert ready["model"] == "test-model"
+
+        fe.push({"cmd": "model", "value": "zen/mini"})
+        changed = (await fe.wait_for("model"))[0]
+        assert changed["model"] == "zen/mini"
+        # The event carries the full URL; the Rust frontend masks it for display.
+        assert changed["host"] == "https://zen.example/v1"
+        notice = (await fe.wait_for("notice"))[0]
+        assert "Mini" in notice["text"] and "zen/mini" in notice["text"]
+
+        # The switch is per chat and outlives the process.
+        saved = json.loads((config.root / "data" / "chat-models.json").read_text())
+        assert saved["cli"] == "zen/mini"
+
+        fe.push({"cmd": "model"})
+        report = (await fe.wait_for("notice", count=2))[1]
+        assert "zen/mini" in report["text"]
+
+
+async def test_model_list_shows_the_catalog(config) -> None:
+    (config.root / ".models.json").write_text(MODEL_CATALOG, encoding="utf-8")
+    async with Frontend(config, make_agent(config, [])) as fe:
+        await fe.start()
+        fe.push({"cmd": "model", "value": "list"})
+        notice = (await fe.wait_for("notice"))[0]
+        assert "zen/mini" in notice["text"]
+        assert "100,000 ctx" in notice["text"]
+
+
+async def test_model_default_returns_to_the_configured_model(config) -> None:
+    (config.root / ".models.json").write_text(MODEL_CATALOG, encoding="utf-8")
+    async with Frontend(config, make_agent(config, [])) as fe:
+        await fe.start()
+        fe.push({"cmd": "model", "value": "zen/mini"})
+        await fe.wait_for("model")
+        fe.push({"cmd": "model", "value": "default"})
+        await fe.wait_for("model", count=2)
+        notice = (await fe.wait_for("notice", count=2))[1]
+        assert "test-model" in notice["text"]
+        assert json.loads((config.root / "data" / "chat-models.json").read_text()) == {}
+
+
+async def test_an_unknown_model_id_is_an_error_not_a_shutdown(config) -> None:
+    (config.root / ".models.json").write_text(MODEL_CATALOG, encoding="utf-8")
+    async with Frontend(config, make_agent(config, [])) as fe:
+        await fe.start()
+        fe.push({"cmd": "model", "value": "nope"})
+        error = (await fe.wait_for("error"))[0]
+        assert "no model named 'nope'" in error["text"]
+        fe.push({"cmd": "context"})
+        await fe.wait_for("notice")

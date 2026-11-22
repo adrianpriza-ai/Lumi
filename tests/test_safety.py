@@ -1352,6 +1352,30 @@ def test_read_only_writers_with_ordinary_outputs_still_run(tmp_path: Path) -> No
         assert _verdict(command, root, home).tier is safety.Tier.ALLOW, command
 
 
+def test_read_only_output_through_a_symlink_keeps_its_tap(tmp_path: Path) -> None:
+    """The output of `sort --output=link` lands where the link points. A home
+    target used to be filed as ``zone:outside-workspace``, a rule accept-edits
+    waves through, so the write ran without a tap."""
+    root, home = _project(tmp_path)
+    (home / "notes.txt").write_text("owner data\n", encoding="utf-8")
+    (root / "workspace" / "link").symlink_to(home / "notes.txt")
+    result = _verdict("sort --output=link", root, home, mode="accept-edits")
+    assert result.tier is safety.Tier.CONFIRM, result
+    assert result.rule == "zone:home-write", result
+
+
+def test_protected_subpath_through_a_symlink_is_denied(tmp_path: Path) -> None:
+    """`hook` -> `.git/hooks/pre-commit`: writing the link writes the hook.
+    The subpath check used to see only the link's innocent name."""
+    root, home = _project(tmp_path)
+    (root / ".git" / "hooks").mkdir(parents=True)
+    (root / ".git" / "hooks" / "pre-commit").write_text("#!/bin/sh\n", encoding="utf-8")
+    (root / "workspace" / "notes.txt").write_text("x\n", encoding="utf-8")
+    (root / "workspace" / "hook").symlink_to(root / ".git" / "hooks" / "pre-commit")
+    for command in ("echo pwned > hook", "cp notes.txt hook"):
+        assert _verdict(command, root, home, mode="accept-edits").blocked, command
+
+
 def test_user_level_mcp_config_is_denied(tmp_path: Path) -> None:
     root, home = _with_bot_state(tmp_path)
     (home / ".agents").mkdir()
@@ -1488,6 +1512,57 @@ def test_credential_shaped_basenames_are_read_denied(tmp_path: Path) -> None:
     # The public half of a key is published by definition; it stays readable.
     (root / "id_rsa.pub").write_text("ssh-ed25519 AAAA", encoding="utf-8")
     assert _verdict("cat ../id_rsa.pub", root, home).tier is safety.Tier.ALLOW
+
+
+def _with_catalog(tmp_path: Path) -> tuple[Path, Path]:
+    """A project whose model catalogs exist: the hidden project file, the
+    user-layer name, and the per-chat selections file (ids only, no keys)."""
+    root, home = _project(tmp_path)
+    (root / ".models.json").write_text(
+        '{"provider": {"Zen": {"options": {"apiKey": "sk-zen-1"}}}}\n', encoding="utf-8"
+    )
+    (root / "models.json").write_text('{"provider": {"Zen": {}}}\n', encoding="utf-8")
+    (root / "chat-models.json").write_text('{"1234": "zen/mini"}\n', encoding="utf-8")
+    return root, home
+
+
+def test_model_catalog_files_are_read_denied(tmp_path: Path) -> None:
+    """The catalogs carry literal API keys (a provider's apiKey/apiKeys), so
+    reading one hands over the credential store the env scrub exists to hide —
+    the project's hidden file and the user-layer name are both secret files."""
+    root, home = _with_catalog(tmp_path)
+    for command in [
+        "cat ../.models.json",
+        "head -1 ../.models.json",
+        "grep KEY ../.models.json",
+        "cat ../models.json",
+        "head -1 ../models.json",
+        "grep KEY ../models.json",
+    ]:
+        assert _verdict(command, root, home).blocked, command
+
+
+def test_the_catalog_read_deny_is_reported_as_zone_secret_read(tmp_path: Path) -> None:
+    root, home = _with_catalog(tmp_path)
+    rules = {
+        v.rule
+        for v in safety.explain(
+            "cat ../.models.json",
+            cwd=root / "workspace",
+            project_root=root,
+            home=home,
+            write_root=root / "workspace",
+        )
+    }
+    assert "zone:secret-read" in rules
+
+
+def test_the_chat_model_selections_file_is_still_readable(tmp_path: Path) -> None:
+    """``chat-models.json`` holds model ids, never keys — one name apart from
+    the catalogs it must stay readable, or every ``/model`` status line would
+    cost the owner a tap for no secret at all."""
+    root, home = _with_catalog(tmp_path)
+    assert _verdict("cat ../chat-models.json", root, home).tier is safety.Tier.ALLOW
 
 
 # --------------------------------------------------------------------------- #
@@ -1960,6 +2035,19 @@ def test_accept_edits_still_asks_before_running_a_fresh_script(tmp_path: Path) -
     script = root / "workspace" / "fresh.sh"
     script.write_text("echo hi", encoding="utf-8")
     assert _verdict("./fresh.sh", root, home, mode="accept-edits").tier is safety.Tier.CONFIRM
+
+
+def test_writes_outside_the_project_are_zoned_and_keep_their_tap(tmp_path: Path) -> None:
+    """A home or /tmp target used to be filed as ``zone:outside-workspace``,
+    which accept-edits waves through. It is outside the project, not an edit."""
+    root, home = _project(tmp_path)
+    outside = _verdict("cp a /tmp/out", root, home)
+    at_home = _verdict(f"cp a {home / 'notes'}", root, home)
+    assert outside.rule == "zone:outside-write"
+    assert at_home.rule == "zone:home-write"
+    for command in ("cp a /tmp/out", f"cp a {home / 'notes'}"):
+        result = _verdict(command, root, home, mode="accept-edits")
+        assert result.tier is safety.Tier.CONFIRM, f"{command!r} -> {result}"
 
 
 def test_bypass_runs_what_used_to_ask() -> None:

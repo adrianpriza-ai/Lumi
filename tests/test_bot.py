@@ -3905,3 +3905,95 @@ def test_another_bot_account_is_never_a_member(config) -> None:
     robot = SimpleNamespace(id=888, is_bot=True)
     assert _is_allowed(human, config, chat), "a human member still gets in"
     assert not _is_allowed(robot, config, chat), "another bot account never does"
+
+
+# --------------------------------------------------------------------------- #
+# /model (the multi-provider catalog)
+# --------------------------------------------------------------------------- #
+
+
+CATALOG = json.dumps(
+    {
+        "provider": {
+            "Zen": {
+                "id": "zen",
+                "options": {"baseURL": "https://zen.example/v1"},
+                "models": {
+                    "mini": {"name": "Mini", "limit": {"context": 100000}},
+                    "vision": {"name": "Vision", "limit": {"context": 200000}},
+                },
+            }
+        }
+    }
+)
+
+
+def write_catalog(config) -> None:
+    """The catalog must exist before the Agent is built — every send() builds a
+    fresh one, which is when ModelCatalog.load() reads the files."""
+    (config.root / ".models.json").write_text(CATALOG, encoding="utf-8")
+
+
+async def test_model_reports_the_configured_model_without_a_catalog(config) -> None:
+    bot, _ = await send(config, [], "/model")
+    body = texts(bot)
+    assert "test-model" in body
+    assert "/model list" in body  # the report names the other verbs
+
+
+async def test_model_list_without_a_catalog_says_where_to_put_one(config) -> None:
+    """The empty case is an instruction, not an error: the catalog is optional."""
+    bot, _ = await send(config, [], "/model list")
+    body = texts(bot)
+    assert "no model catalog" in body
+    assert "models.json" in body
+
+
+async def test_model_switches_and_persists_the_choice(config) -> None:
+    write_catalog(config)
+    bot, agent = await send(config, [], "/model zen/mini")
+    body = texts(bot)
+    assert "Mini" in body  # the display name, not just the id
+    assert "zen/mini" in body
+    assert "zen.example" in body  # the endpoint moved with the model
+    assert agent.model_selections.get(CHAT) == "zen/mini"
+    saved = json.loads((config.root / "data" / "chat-models.json").read_text(encoding="utf-8"))
+    assert saved == {str(CHAT): "zen/mini"}
+
+
+async def test_model_rejects_an_unknown_id(config) -> None:
+    """A typo must name the ids the catalog actually has, or the owner is
+    left guessing at the spelling."""
+    write_catalog(config)
+    bot, _ = await send(config, [], "/model nope")
+    body = texts(bot)
+    assert "no model named" in body
+    assert "zen/mini" in body  # the suggestion list comes from the catalog
+
+
+async def test_model_default_returns_to_the_configured_model(config) -> None:
+    """Reset must undo both the live switch and the persisted file — verified
+    within one application, since a fresh build() would mask whether the
+    state actually moved."""
+    write_catalog(config)
+    application, bot, agent = build(config, [])
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "/model zen/mini"))
+        await application.process_update(make_update(bot, "/model default", message_id=2))
+    finally:
+        await application.shutdown()
+    body = texts(bot)
+    assert "test-model" in body
+    assert "back to the configured default" in body
+    assert agent.model_selections.get(CHAT) == ""
+    saved = json.loads((config.root / "data" / "chat-models.json").read_text(encoding="utf-8"))
+    assert saved == {}
+
+
+async def test_model_is_owner_only(config) -> None:
+    """A switch points the chat at another endpoint and key pool — which keys
+    get spent is not a room's decision, the same gate /mode sits behind."""
+    config.bot.whitelisted_users = [str(WHITELISTED_USER)]
+    bot, _ = await send(config, [], "/model", user_id=WHITELISTED_USER)
+    assert "only the owner can see that" in texts(bot).lower()

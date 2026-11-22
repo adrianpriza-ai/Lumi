@@ -661,6 +661,10 @@ impl App {
                 self.host = host;
                 self.search_status = search;
             }
+            AgentEvent::Model { model, host } => {
+                self.model = model;
+                self.host = host;
+            }
             AgentEvent::TurnDone => {
                 self.turns = self
                     .blocks

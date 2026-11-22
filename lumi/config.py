@@ -3,13 +3,18 @@
 Order of precedence, lowest to highest:
 
 1. the dataclass defaults in this module
-2. ``config.toml`` in the project root (committed; behaviour only)
-3. ``config.local.toml`` in the project root (gitignored; personal overrides)
-4. environment variables named ``LUMI__<SECTION>__<KEY>``
-5. ``.env`` in the project root, loaded for interpolation of the above
+2. ``config.toml`` in the user config home (``~/.config/lumi/``; the owner's
+   personal base layer — see :func:`lumi.paths.user_config_dir`)
+3. ``config.toml`` in the project root (committed; behaviour only)
+4. ``config.local.toml`` in the project root (gitignored; personal overrides)
+5. environment variables named ``LUMI__<SECTION>__<KEY>``
+6. ``.env`` — the user config home's first, then the project root's — loaded
+   for interpolation of the above
 
-``config.toml`` is parsed with :mod:`tomllib` from the standard library, so
-there is no YAML/TOML dependency to install.
+The project wins over the user home on purpose: a repo stays
+self-contained, and the user directory supplies what a machine-wide install
+needs. ``config.toml`` is parsed with :mod:`tomllib` from the standard
+library, so there is no YAML/TOML dependency to install.
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ from typing import Any, Union, get_args, get_origin, get_type_hints
 from urllib.parse import urlsplit
 
 from .memory import MemoryStore
-from .paths import project_root, resolve
+from .paths import project_root, resolve, user_config_dir
 from .util.keys import parse_env_var
 from .util.log import get_logger
 
@@ -206,6 +211,12 @@ class LLMConfig:
     api_key_env: str = "OPENAI_API_KEY"
     #: How to spend the keys in ``api_key_env``. See :meth:`api_keys`.
     key_strategy: str = "fallback"
+    #: Extra headers sent with every request to this endpoint. Catalog
+    #: providers use them for tenant/auth headers the Bearer default misses.
+    extra_headers: dict[str, str] = field(default_factory=dict)
+    #: Request timeout in seconds. 0 = the adapter's default (120s). A catalog
+    #: provider's ``timeoutSecs`` lands here; media endpoints want more room.
+    timeout: float = 0.0
     #: Extra attempts after the first inference request when the provider
     #: reports a transient failure or returns no final answer. 4 means at most
     #: five requests for one key; 0 disables the outer retry loop.
@@ -1309,6 +1320,9 @@ class Config:
 
     # Runtime-only, filled in by load_config().
     root: Path = field(default_factory=project_root)
+    #: The user config home (``~/.config/lumi``), when one was found on disk.
+    #: None means no user layer exists — every setting came from this project.
+    user_dir: Path | None = None
     personality_file: Path = field(default_factory=lambda: project_root() / "PERSONALITY.md")
     #: Legacy single-file memory at the project root. Since memory became
     #: per-chat, its content is copied once into the default scope's file
@@ -1397,7 +1411,8 @@ class Config:
 
 
 def load_dotenv(root: Path) -> None:
-    """Load ``.env`` from the project root without clobbering real env vars."""
+    """Load ``.env`` from *root* — the user config home or the project —
+    without clobbering real environment variables."""
     path = root / ENV_FILENAME
     if not path.is_file():
         return
@@ -1593,17 +1608,30 @@ def _hoist_web_providers(merged: dict[str, Any]) -> dict[str, Any]:
 
 
 def load_config(root: Path | None = None) -> Config:
-    """Build a :class:`Config` from disk plus environment overrides."""
+    """Build a :class:`Config` from disk plus environment overrides.
+
+    Three file layers, each optional, later winning: the user config home's
+    ``config.toml`` (``~/.config/lumi``), then the project's ``config.toml``
+    and ``config.local.toml``. The project wins over the user home — the
+    repo carries the behaviour, the user home carries the person. Both
+    ``.env`` files are loaded first (user, then project; neither clobbers a
+    real environment variable) so secrets can live in either.
+    """
     root = (root or project_root()).resolve()
+    user_dir = user_config_dir()
+    load_dotenv(user_dir)
     load_dotenv(root)
 
     merged: dict[str, Any] = {}
     config_path: Path | None = None
-    for name in (CONFIG_FILENAME, LOCAL_CONFIG_FILENAME):
-        path = root / name
+    layers = (user_dir / CONFIG_FILENAME, root / CONFIG_FILENAME, root / LOCAL_CONFIG_FILENAME)
+    for path in layers:
         if path.is_file():
             merged = _merge(merged, _read_toml(path))
-            config_path = config_path or path
+            # The highest layer loaded is the one that decided: with a user
+            # base under a project file, the project path is what /status and
+            # the doctor should name.
+            config_path = path
 
     if config_path is None:
         log.info("no %s found; using built-in defaults", CONFIG_FILENAME)
@@ -1625,6 +1653,7 @@ def load_config(root: Path | None = None) -> Config:
     config = _build(Config, data)
     config.root = root
     config.config_path = config_path
+    config.user_dir = user_dir if (user_dir / CONFIG_FILENAME).is_file() else None
 
     data_dir = resolve(config.data_dir, base=root)
     config.data_dir = data_dir
