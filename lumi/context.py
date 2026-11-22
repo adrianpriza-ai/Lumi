@@ -358,6 +358,20 @@ class ContextWindow:
             return cap
         return self.chars_for(self.effective_budget // MEMORY_WINDOW_SHARE)
 
+    def memory_limit_for(self, conv: Any) -> int:
+        """The same cap, sized for *conv*'s model.
+
+        A chat switched to a smaller catalog model must shrink this block
+        too — it is the one thing nothing can condense away, so an allowance
+        sized for the configured window would squeeze the conversation below
+        its own budget on every turn. An explicit ``llm.max_memory_chars``
+        wins over any window, as in :meth:`memory_limit`.
+        """
+        cap = int(self.config.llm.max_memory_chars or 0)
+        if cap > 0:
+            return cap
+        return self.chars_for(self.target_for(conv) // MEMORY_WINDOW_SHARE)
+
     def estimate(self, messages: list[dict[str, Any]]) -> int:
         """Tokens for *messages*, to the nearest token.
 

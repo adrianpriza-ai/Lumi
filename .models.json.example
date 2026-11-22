@@ -1,7 +1,8 @@
 // The model catalog template. Copy it to ~/.config/lumi/models.json (the
 // personal layer) or to .models.json at the project root — which is
 // gitignored, because a catalog can carry literal provider keys. Both are
-// read- and write-denied to the model's own tools.
+// read-denied to the model's own tools; writes to the project copy are
+// denied outright, and writes to the user copy ask first.
 //
 // Only these providers are used here: OpenAI for chat and image, Mistral for
 // OCR, MiniMax for video, Fish Audio for TTS. Model ids and context limits

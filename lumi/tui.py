@@ -377,7 +377,7 @@ async def serve(
                 send(
                     {
                         "ev": "notice",
-                        "text": agent.memory_for(CHAT_ID).for_prompt(agent.memory_limit()),
+                        "text": agent.memory_for(CHAT_ID).for_prompt(agent.memory_limit(CHAT_ID)),
                     }
                 )
                 return True
@@ -402,6 +402,11 @@ async def serve(
                 # model ids pass through as written (resolution is
                 # case-insensitive anyway).
                 keyword = value.lower()
+                if value and keyword != "list":
+                    # A switch rewrites the live conversation's client and
+                    # budgets — including the memory cap the in-flight turn's
+                    # next condense pass would use. Wait it out first.
+                    await settle()
                 switched = False
                 try:
                     if keyword == "list":

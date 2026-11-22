@@ -1970,9 +1970,7 @@ async def test_more_context_query_searches_the_author_too(config) -> None:
     log = ChatLog()
     log.record(CHAT_ID, LogEntry(message_id=1, author="Dana", text="on it", clock="12:00"))
     log.record(CHAT_ID, LogEntry(message_id=2, author="Sam", text="Dana is right", clock="12:01"))
-    result = await MoreContextTool(config, log=log).invoke(
-        {"query": "dana"}, ctx(chat_id=CHAT_ID)
-    )
+    result = await MoreContextTool(config, log=log).invoke({"query": "dana"}, ctx(chat_id=CHAT_ID))
     assert result.ok
     assert result.data["matched"] == 2
     assert "on it" in result.text and "Dana is right" in result.text

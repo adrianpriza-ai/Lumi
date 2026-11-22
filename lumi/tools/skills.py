@@ -1,15 +1,17 @@
 """The ``skills`` tool: list and read the owner's skills.
 
 A skill is a directory holding a ``SKILL.md`` — a name, a one-line description
-and the instructions that go with a job the owner does more than once. Two
+and the instructions that go with a job the owner does more than once. Three
 roots are scanned, in this order:
 
 * ``data/skills/<name>/SKILL.md`` — the project's own skills, committed next
   to the code they describe, and writable through the ``files`` tool;
+* ``~/.config/lumi/skills/<name>/SKILL.md`` — the owner's Lumi config home,
+  the personal layer that follows them across projects;
 * ``~/.agents/skills/<name>/SKILL.md`` — the standard user-level directory
   the agent harnesses read, so a skill installed once is available in every
   project. A project skill of the same name wins, because it is the one
-  written for *this* code.
+  written for *this* code, and the config home's beats the shared one.
 
 Reading is all this tool does, so it never asks for approval — the same
 contract as ``read_file``, which also hands back project files with no tap.
@@ -342,6 +344,7 @@ Reading never asks for approval — it only reads, like `read_file`. Creating or
                     "No skills found. A skill is a directory with a "
                     f"{SKILL_FILE} in it:\n"
                     f"- project: {self._display(self.project_root)}/<name>/{SKILL_FILE}\n"
+                    f"- config home: {self._display(self.config_root)}/<name>/{SKILL_FILE}\n"
                     f"- user: {self._display(self.user_root)}/<name>/{SKILL_FILE}\n"
                     "Create one with the files tool (data/skills is writable), or ask the "
                     "owner to install one."
@@ -352,7 +355,10 @@ Reading never asks for approval — it only reads, like `read_file`. Creating or
 
         lines = []
         for skill in skills:
-            note = " (project shadows user)" if skill["shadowed"] else ""
+            # Any root can be the shadower now — project over config home
+            # over ~/.agents — so the note names the relationship, and the
+            # [source: path] beside it points at the winner.
+            note = " (shadows a same-named skill in a later root)" if skill["shadowed"] else ""
             description = truncate(skill["description"], DESCRIPTION_CHARS) or "(no description)"
             lines.append(
                 f"- {skill['name']} — {description} [{skill['source']}: {skill['path']}]{note}"

@@ -837,13 +837,11 @@ def test_routes_can_come_from_toml(project, monkeypatch) -> None:
 def test_a_route_provider_key_is_ignored_not_an_error(project) -> None:
     """``provider`` used to be a route field; old configs must still boot."""
     (project / "config.toml").write_text(
-        "[llm]\nprovider = 'openai'\n"
-        "[llm.vision]\nprovider = 'openrouter'\nmodel = 'm'\n",
+        "[llm]\nprovider = 'openai'\n[llm.vision]\nprovider = 'openrouter'\nmodel = 'm'\n",
         encoding="utf-8",
     )
     loaded = load_config(project)
     assert loaded.llm.vision_route_of() is not None
-
 
 
 def test_an_unknown_route_key_strategy_is_reported(config) -> None:
@@ -948,13 +946,16 @@ def test_env_beats_both_layers(project, monkeypatch) -> None:
 
 
 def test_the_user_env_file_is_loaded(project, monkeypatch) -> None:
-    """Secrets may live in the user home's .env; it is read before the
-    project's, and neither clobbers a variable the shell already set."""
+    """Secrets may live in the user home's .env; on a conflict the project's
+    .env wins (the same project-over-user rule the toml layers follow), and
+    neither clobbers a variable the shell already set."""
     user = project / "user-config"
     user.mkdir()
     (user / ".env").write_text("LUMI__LLM__MAX_TOKENS=777\n", encoding="utf-8")
     monkeypatch.setenv("LUMI_USER_CONFIG", str(user))
-    os.environ.pop("LUMI__LLM__MAX_TOKENS", None)  # a leak from an earlier load must not stand in for the file
+    os.environ.pop(
+        "LUMI__LLM__MAX_TOKENS", None
+    )  # a leak from an earlier load must not stand in for the file
     try:
         assert load_config(project).llm.max_tokens == 777
     finally:
@@ -980,3 +981,32 @@ def test_unknown_top_level_keys_in_the_user_layer_are_dropped(project, monkeypat
     config = load_config(project)
     assert config.llm.temperature == pytest.approx(0.3)
     assert not hasattr(config, "alien")
+
+
+def test_the_project_env_file_wins_a_conflict(project, monkeypatch) -> None:
+    """Project-over-user, matching the toml layers: a project-specific secret
+    must not lose to a machine-wide one. load_dotenv loads the project's file
+    first, and with override=False the first loader wins the conflict."""
+    user = project / "user-config"
+    user.mkdir()
+    (project / ".env").write_text("LUMI__LLM__MAX_TOKENS=111\n", encoding="utf-8")
+    (user / ".env").write_text("LUMI__LLM__MAX_TOKENS=777\n", encoding="utf-8")
+    monkeypatch.setenv("LUMI_USER_CONFIG", str(user))
+    os.environ.pop("LUMI__LLM__MAX_TOKENS", None)
+    try:
+        assert load_config(project).llm.max_tokens == 111
+    finally:
+        os.environ.pop("LUMI__LLM__MAX_TOKENS", None)
+
+
+def test_the_user_env_file_fills_the_gaps_the_project_leaves(project, monkeypatch) -> None:
+    """No conflict, no winner: a key only the user layer carries still lands."""
+    user = project / "user-config"
+    user.mkdir()
+    (user / ".env").write_text("LUMI__LLM__MAX_TOKENS=777\n", encoding="utf-8")
+    monkeypatch.setenv("LUMI_USER_CONFIG", str(user))
+    os.environ.pop("LUMI__LLM__MAX_TOKENS", None)
+    try:
+        assert load_config(project).llm.max_tokens == 777
+    finally:
+        os.environ.pop("LUMI__LLM__MAX_TOKENS", None)

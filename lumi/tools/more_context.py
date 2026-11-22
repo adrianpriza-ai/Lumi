@@ -184,9 +184,7 @@ class MoreContextTool(Tool):
     async def invoke(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
         offset = _as_int(arguments.get("offset"), 0)
         if offset is None:
-            return ToolResult.failure(
-                f"`offset` must be a whole number 0-{self._max_offset}."
-            )
+            return ToolResult.failure(f"`offset` must be a whole number 0-{self._max_offset}.")
         if not 0 <= offset <= self._max_offset:
             return ToolResult.failure(
                 f"`offset` must be between 0 and {self._max_offset} — got {offset}. "
@@ -195,9 +193,7 @@ class MoreContextTool(Tool):
 
         limit = _as_int(arguments.get("limit"), self._max_messages)
         if limit is None:
-            return ToolResult.failure(
-                f"`limit` must be a whole number 1-{self._max_messages}."
-            )
+            return ToolResult.failure(f"`limit` must be a whole number 1-{self._max_messages}.")
         if not 1 <= limit <= self._max_messages:
             return ToolResult.failure(
                 f"`limit` must be between 1 and {self._max_messages} — got {limit}. "
@@ -214,7 +210,9 @@ class MoreContextTool(Tool):
 
         query = str(arguments.get("query") or "").strip()
         needles = [word.casefold() for word in query.split()]
-        entries = [entry for entry in logged if _entry_matches(entry, needles)] if needles else logged
+        entries = (
+            [entry for entry in logged if _entry_matches(entry, needles)] if needles else logged
+        )
         if not entries:
             return ToolResult.failure(
                 f"none of the {len(logged)} logged message(s) in this chat match "

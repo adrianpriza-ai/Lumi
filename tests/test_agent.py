@@ -1550,3 +1550,73 @@ async def test_a_switched_chat_budgets_its_own_window(config) -> None:
     # configured headroom, and only for the switched chat.
     assert agent.context.headroom_for(switched) == 8000
     assert agent.context.headroom_for(plain) == 16000
+
+
+async def test_a_saved_non_chat_model_is_dropped_on_restore(config) -> None:
+    """``set_model`` refuses media kinds, but ``data/chat-models.json`` is a
+    plain file a hand edit can point anywhere — restore must enforce the same
+    gate instead of routing a chat's ordinary turns at an image endpoint."""
+    write_catalog(config, extra={"pic": {"name": "Pic", "kind": "image"}})
+    agent = make_agent(config, [])
+    # Plant the switch behind set_model's back, the way a hand edit would.
+    agent.model_selections.set(CHAT, "zen/pic")
+
+    conv = agent.conversation(CHAT)
+
+    assert conv.model_id == ""
+    assert conv.llm_client is None
+    assert agent.model_of(CHAT) == "test-model"
+    assert agent.model_selections.get(CHAT) == ""
+
+
+def test_the_status_endpoint_follows_the_catalog_default(config) -> None:
+    """With ``defaultModel`` set and ``[llm].model`` empty, the ready/model
+    status must pair the default's id with the default's endpoint — the same
+    fallback ``model_of`` applies — not the ``[llm]`` host a raw client would
+    have used."""
+    write_catalog(config, default="zen/mini")
+    config.llm.model = ""
+    agent = make_agent(config, [])
+
+    assert agent.model_of(CHAT) == "zen/mini"
+    assert agent.model_endpoint_of(CHAT) == "https://zen.example/v1"
+
+
+def test_the_status_endpoint_falls_back_to_the_configured_host(config) -> None:
+    """No catalog default (and no switch): the ``[llm]`` client's endpoint
+    stands, as before."""
+    agent = make_agent(config, [])
+    assert agent.model_endpoint_of(CHAT) == agent.config.llm.base_url_of()
+
+
+def test_a_switched_chat_sizes_the_memory_block_for_its_own_window(config) -> None:
+    """The memory block is the one part of the prompt nothing can condense
+    away, so its allowance follows the chat's window — a chat on a 100k model
+    gets half the allowance of the configured 200k window, or every turn would
+    squeeze the conversation below its own budget."""
+    write_catalog(config)
+    config.llm.context_window = 200000
+    agent = make_agent(config, [])
+    agent.conversation(CHAT)
+    switched = agent.conversation(5678)
+    agent.set_model(5678, "zen/mini")
+
+    assert agent.memory_limit(5678) == agent.context.memory_limit_for(switched)
+    assert agent.memory_limit(5678) < agent.memory_limit(CHAT)
+    # The no-arg form keeps the configured window's cap — status displays.
+    assert agent.memory_limit() == agent.context.memory_limit()
+
+
+def test_reload_picks_up_catalog_edits(config) -> None:
+    """``/reload`` rebuilds the catalog, so an edited models.json reaches
+    /model without a restart — the command re-reads config-driven state."""
+    write_catalog(config)
+    agent = make_agent(config, [])
+    with pytest.raises(CatalogError):
+        agent.model_catalog.resolve("zen/extra")
+
+    write_catalog(config, extra={"extra": {"name": "Extra", "kind": "chat"}})
+    notes = agent.reload()
+
+    assert any("model catalog" in note for note in notes)
+    assert agent.model_catalog.resolve("zen/extra").kind == "chat"

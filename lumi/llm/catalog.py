@@ -62,6 +62,7 @@ from typing import Any
 
 from ..config import LLMConfig, _merge
 from ..paths import user_config_dir
+from ..util.keys import parse_key_list
 from ..util.log import get_logger
 from .openai_compat import OpenAICompatClient
 
@@ -238,7 +239,8 @@ class ProviderInfo:
     #: Where the keys came from, for listings: ``literal``, ``file:<path>``
     #: or ``env`` (the inherited pool).
     keys_from: str = "env"
-    key_strategy: str = "fallback"
+    #: Key-pool strategy, or ``""`` to inherit the ``[llm]`` pool's.
+    key_strategy: str = ""
     headers: dict[str, str] = field(default_factory=dict)
     #: Request timeout in seconds; 0 = the adapter default.
     timeout: float = 0.0
@@ -286,19 +288,27 @@ def _read_key_file(path: str) -> list[str]:
 def _resolve_keys(options: dict[str, Any]) -> tuple[tuple[str, ...] | None, str]:
     """The provider's literal keys, or ``None`` to use the ``[llm]`` env pool.
 
-    ``apiKey`` is one key, ``apiKeys`` a pool (array, space-separated string,
-    or ``file:`` path). Both may name files; every value gets ``${VAR}``
-    expansion. ``"keyless"`` — the proxy's pass-the-client's-key-through —
-    means nothing to a direct client, so it counts as unset.
+    ``apiKey`` is one key, ``apiKeys`` a pool (array, or a string with the
+    env-pool spelling — commas, semicolons, whitespace — or ``file:`` path).
+    Both may name files; every value gets ``${VAR}`` expansion. ``"keyless"``
+    — the proxy's pass-the-client's-key-through — means nothing to a direct
+    client, so it counts as unset.
+
+    Keys *declared* but resolving to nothing (an unset ``${VAR}``, an empty
+    key file) raise: the fallback would hand this provider's endpoint the
+    ``[llm]`` pool's credentials — one provider's key sent to another's host,
+    silently.
     """
     keys: list[str] = []
     source = ""
+    declared = False
 
     def add(spec: str, label: str) -> None:
-        nonlocal source
+        nonlocal source, declared
         text = spec.strip()
         if not text or text == "keyless":
             return
+        declared = True
         if text.startswith("file:"):
             path_part = text[5:].strip()
             keys.extend(_read_key_file(path_part))
@@ -306,17 +316,17 @@ def _resolve_keys(options: dict[str, Any]) -> tuple[tuple[str, ...] | None, str]
                 source = f"file:{path_part}"
             return
         expanded = _expand_env(text)
-        # A pool written as one string splits on whitespace — including one
-        # that arrives through ${VAR} ("KEY_POOL=sk-a sk-b").
-        for part in expanded.split() if (" " in text or "${" in text) else (expanded,):
-            if part:
-                keys.append(part)
+        # The env-pool spelling everywhere else in the codebase: comma,
+        # semicolon and newline separate (parse_key_list), and so does
+        # whitespace — including a pool that arrives through ${VAR}
+        # ("KEY_POOL=sk-a sk-b").
+        keys.extend(part for chunk in parse_key_list(expanded) for part in chunk.split() if part)
         if not source:
             source = label
 
     api_keys = options.get("apiKeys")
     if isinstance(api_keys, str) and api_keys.strip() and not api_keys.strip().startswith("file:"):
-        # A space-separated pool written as one string.
+        # A pool written as one string.
         add(api_keys, "literal")
     elif api_keys:
         for item in _string_list(api_keys):
@@ -327,6 +337,12 @@ def _resolve_keys(options: dict[str, Any]) -> tuple[tuple[str, ...] | None, str]
     if keys:
         seen: set[str] = set()
         return tuple(key for key in keys if not (key in seen or seen.add(key))), source or "literal"
+    if declared:
+        raise CatalogError(
+            "apiKey/apiKeys are declared but resolve to no keys (an unset ${VAR} or an "
+            "empty key file); refusing to fall back to the [llm] key pool — it would send "
+            "those credentials to this provider's endpoint"
+        )
     return None, "env"
 
 
@@ -378,7 +394,9 @@ def _build_provider(name: str, raw: dict[str, Any]) -> ProviderInfo:
         base_url=_expand_env(str(options.get("baseURL") or "")).strip(),
         keys=keys,
         keys_from=keys_from,
-        key_strategy=KEY_STRATEGY_MAP.get(strategy, "fallback"),
+        # Unset — not "fallback" — so build_client can inherit the [llm]
+        # pool's strategy when the provider does not name one.
+        key_strategy=KEY_STRATEGY_MAP.get(strategy, ""),
         headers=headers,
         timeout=timeout,
     )
@@ -394,10 +412,14 @@ def _build_provider(name: str, raw: dict[str, Any]) -> ProviderInfo:
 def _build_model(provider: ProviderInfo, key: str, raw: dict[str, Any]) -> ModelInfo:
     modalities = raw.get("modalities") if isinstance(raw.get("modalities"), dict) else {}
     inputs = tuple(
-        str(item).strip().lower() for item in _string_list(modalities.get("input")) if str(item).strip()
+        str(item).strip().lower()
+        for item in _string_list(modalities.get("input"))
+        if str(item).strip()
     )
     outputs = tuple(
-        str(item).strip().lower() for item in _string_list(modalities.get("output")) if str(item).strip()
+        str(item).strip().lower()
+        for item in _string_list(modalities.get("output"))
+        if str(item).strip()
     )
     limit = raw.get("limit") if isinstance(raw.get("limit"), dict) else {}
     aliases = [str(raw["as"]).strip()] if raw.get("as") else []
@@ -613,8 +635,16 @@ class ModelCatalog:
         if len(matches) == 1:
             return next(iter(matches.values()))
         if not matches:
-            known = ", ".join(sorted(model.id for provider in self.providers.values() for model in provider.models.values()))
-            raise CatalogError(f"no model named {query!r}; models: {known or 'none — the catalog is empty'}")
+            known = ", ".join(
+                sorted(
+                    model.id
+                    for provider in self.providers.values()
+                    for model in provider.models.values()
+                )
+            )
+            raise CatalogError(
+                f"no model named {query!r}; models: {known or 'none — the catalog is empty'}"
+            )
         raise CatalogError(f"{query!r} is ambiguous: {', '.join(sorted(matches))}")
 
     def provider_of(self, model: ModelInfo) -> ProviderInfo:
@@ -622,7 +652,9 @@ class ModelCatalog:
 
     def list_models(self, kind: str | None = "chat") -> list[ModelInfo]:
         """Every model, optionally one kind, in a stable display order."""
-        models = [model for provider in self.providers.values() for model in provider.models.values()]
+        models = [
+            model for provider in self.providers.values() for model in provider.models.values()
+        ]
         if kind is not None:
             models = [model for model in models if model.kind == kind]
         return sorted(models, key=lambda model: (model.provider_id.lower(), model.key.lower()))
@@ -703,9 +735,17 @@ class ModelSelections:
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self._data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        os.replace(tmp, self.path)
+        # The tmp name carries the pid: the Telegram bot and the TUI are two
+        # processes on one project, and two /model writes interleaving on one
+        # fixed tmp file could publish garbled JSON.
+        tmp = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+        try:
+            tmp.write_text(
+                json.dumps(self._data, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            os.replace(tmp, self.path)
+        finally:
+            tmp.unlink(missing_ok=True)
 
     def get(self, chat_id: int | str) -> str:
         """The model id saved for *chat_id*, or ``""``."""

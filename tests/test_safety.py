@@ -1761,11 +1761,9 @@ def test_an_interpreter_span_cannot_write_protected_state(tmp_path: Path) -> Non
     assert result.rule == "zone:protected-state", result
 
     # An ordinary bare name in the same script is nobody's state file.
-    assert (
-        v('python3 -c \'open("notes.txt","w")\'').tier is safety.Tier.ALLOW
-    )
+    assert v('python3 -c \'open("notes.txt","w")\'').tier is safety.Tier.ALLOW
     # And a span that names the approval subpath keeps its tap, not a deny.
-    skill = v('cd ../data/skills/evil && python3 -c "open(\'SKILL.md\',\'w\').write(\'x\')"')
+    skill = v("cd ../data/skills/evil && python3 -c \"open('SKILL.md','w').write('x')\"")
     assert skill.needs_approval
     assert skill.rule == "zone:approval-state"
 
@@ -1991,8 +1989,7 @@ def test_writes_into_another_chats_uploads_are_refused(tmp_path: Path) -> None:
 
     # The owning chat writes its own uploads creation-free, as before.
     assert (
-        _verdict("echo own > uploads/43/own.md", root, home, chat_id=43).tier
-        is safety.Tier.ALLOW
+        _verdict("echo own > uploads/43/own.md", root, home, chat_id=43).tier is safety.Tier.ALLOW
     )
     # And the other spellings — an append onto an existing foreign file, a
     # move into the foreign directory — are refused too.

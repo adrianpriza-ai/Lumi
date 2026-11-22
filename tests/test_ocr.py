@@ -313,9 +313,7 @@ async def test_routing_matrix_through_file_dispatch(
     # an image file always reads (the vision model, else the default).
     assert (await tool.invoke({"path": str(pdf)}, ctx())).ok == bool(file_model)
     assert (await tool.invoke({"path": str(image)}, ctx())).ok
-    assert used_models == ([file_model] if file_model else []) + [
-        vision_model or "test-model"
-    ]
+    assert used_models == ([file_model] if file_model else []) + [vision_model or "test-model"]
     assert request_model([{"role": "user", "content": "text"}], config.llm) == "test-model"
 
 
@@ -400,9 +398,7 @@ async def test_a_url_goes_to_the_api_as_a_document_url(config, monkeypatch) -> N
     assert "arxiv text" in result.text
 
 
-async def test_max_pages_asks_the_api_for_a_zero_based_page_window(
-    config, monkeypatch
-) -> None:
+async def test_max_pages_asks_the_api_for_a_zero_based_page_window(config, monkeypatch) -> None:
     """An explicit max_pages is the documented pages param; without one the
     endpoint pages itself — the config default must not silently cap it."""
     monkeypatch.setenv("MISTRAL_API_KEY", "mk-1")

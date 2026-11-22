@@ -436,13 +436,17 @@ class Agent:
 
     # -- prompt ------------------------------------------------------------ #
 
-    def memory_limit(self) -> int:
+    def memory_limit(self, chat_id: int | str | None = None) -> int:
         """Characters of MEMORY.md to put in the system prompt.
 
         Delegated to the context window, which is where the rule lives: the
         memory file is the one part of the prompt nothing can condense away, so
-        it is the one part that has to be bounded up front.
+        it is the one part that has to be bounded up front. A chat that
+        switched models is bounded by *its* window, not the configured one.
         """
+        conv = self._conversations.get(chat_id) if chat_id is not None else None
+        if conv is not None:
+            return self.context.memory_limit_for(conv)
         return self.context.memory_limit()
 
     def memory_for(self, chat_id: int | str | None) -> MemoryFile:
@@ -477,7 +481,7 @@ class Agent:
 
     def system_prompt(self, chat_id: int | str | None = None, *, source: str = "chat") -> str:
         now = datetime.now(UTC)
-        limit = self.memory_limit()
+        limit = self.memory_limit(chat_id)
         memory_block = self.memory_for(chat_id).for_prompt(limit)
         parts = [
             self.personality.text,
@@ -577,7 +581,7 @@ class Agent:
         saved = self.model_selections.get(conv.chat_id)
         if saved:
             try:
-                self._attach_model(conv, self.model_catalog.resolve(saved))
+                model = self.model_catalog.resolve(saved)
             except CatalogError as exc:
                 log.warning(
                     "chat %s: saved model %r is no longer in the catalog (%s); "
@@ -587,6 +591,21 @@ class Agent:
                     exc,
                 )
                 self.model_selections.clear(conv.chat_id)
+                return
+            if model.kind != "chat":
+                # The same gate set_model applies: data/chat-models.json is a
+                # hand-editable file, and a media kind there would route the
+                # chat's ordinary turns at an image or TTS endpoint.
+                log.warning(
+                    "chat %s: saved model %r is a %s model, not a chat model; "
+                    "using the default model",
+                    conv.chat_id,
+                    saved,
+                    model.kind,
+                )
+                self.model_selections.clear(conv.chat_id)
+                return
+            self._attach_model(conv, model)
             return
         base = self._base_model()
         if base is not None:
@@ -711,6 +730,13 @@ class Agent:
                     )
                 except CatalogError:
                     pass
+        # No live conversation and no saved switch: model_of reports the
+        # catalog default when ``[llm]`` leaves the model slot open, so the
+        # endpoint named here must be the default's too — otherwise the
+        # status line pairs one id with another provider's host.
+        base = self._base_model()
+        if base is not None:
+            return self.model_catalog.provider_of(base).base_url or self.config.llm.base_url_of()
         configured = getattr(self.llm, "config", None)
         # A client without a config (the test fakes) leaves the endpoint to
         # the same resolution the real client was built from.
@@ -746,7 +772,9 @@ class Agent:
         others = [m for m in self.model_catalog.list_models(kind=None) if m.kind != "chat"]
         if others:
             lines.append("")
-            lines.append(f"also in the catalog: {len(others)} non-chat model(s) — for the media tools, not /model")
+            lines.append(
+                f"also in the catalog: {len(others)} non-chat model(s) — for the media tools, not /model"
+            )
         if self.model_catalog.problems:
             lines.append("")
             lines.append("catalog problems: " + "; ".join(self.model_catalog.problems))
@@ -984,9 +1012,7 @@ class Agent:
                 # Fresh per model call: `streamed` must describe the reply
                 # that is about to come back, not the whole turn.
                 on_delta, streamed = _delta_sink(hooks)
-                reply = await client.complete(
-                    conv.messages, tools=specs or None, on_delta=on_delta
-                )
+                reply = await client.complete(conv.messages, tools=specs or None, on_delta=on_delta)
             except LLMError as exc:
                 result.error = str(exc)
                 result.elapsed = time.monotonic() - started
@@ -1095,8 +1121,10 @@ class Agent:
             # let one resolve() answer two pendings, and "all" would let a
             # single tap approve or cancel the whole queue.
             pending_id = call.id or ""
-            if not pending_id or pending_id == "all" or any(
-                action.id == pending_id for action in conv.pending
+            if (
+                not pending_id
+                or pending_id == "all"
+                or any(action.id == pending_id for action in conv.pending)
             ):
                 pending_id = uuid.uuid4().hex
             pending = PendingAction(
@@ -1420,6 +1448,15 @@ class Agent:
         notes = [self.personality.reload()]
         scopes = self.memory.reload()
         notes.append(f"memory reloaded ({scopes} scope(s) in use)")
+        # The catalog too: /model resolves against the instance loaded at
+        # startup, so an edited models.json otherwise needs a restart to
+        # take. Live conversations keep their attached client — a switch
+        # applies from the next /model, like any other live config change.
+        catalog = ModelCatalog.load(self.config)
+        if catalog.problems:
+            log.warning("model catalog problems: %s", "; ".join(catalog.problems))
+        self.model_catalog = catalog
+        notes.append(f"model catalog reloaded ({len(catalog.list_models(kind=None))} model(s))")
         for chat_id, conv in self._conversations.items():
             self._refresh_system_prompt(conv)
             self.history.append(chat_id, "system", "reloaded personality and memory")

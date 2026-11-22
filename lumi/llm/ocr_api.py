@@ -196,8 +196,7 @@ class OCRDocumentClient:
 
         if response.status_code >= 400:
             raise LLMError(
-                f"{self.endpoint} returned HTTP {response.status_code}: "
-                f"{error_body(response.text)}"
+                f"{self.endpoint} returned HTTP {response.status_code}: {error_body(response.text)}"
             )
 
         try:

@@ -1614,13 +1614,15 @@ def load_config(root: Path | None = None) -> Config:
     ``config.toml`` (``~/.config/lumi``), then the project's ``config.toml``
     and ``config.local.toml``. The project wins over the user home — the
     repo carries the behaviour, the user home carries the person. Both
-    ``.env`` files are loaded first (user, then project; neither clobbers a
-    real environment variable) so secrets can live in either.
+    ``.env`` files are loaded first, the project's before the user home's:
+    with ``override=False`` the first loader wins a conflict, so the project
+    value beats the machine-wide one — the same rule the toml layers follow —
+    and a real environment variable beats both.
     """
     root = (root or project_root()).resolve()
     user_dir = user_config_dir()
-    load_dotenv(user_dir)
     load_dotenv(root)
+    load_dotenv(user_dir)
 
     merged: dict[str, Any] = {}
     config_path: Path | None = None

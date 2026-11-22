@@ -508,9 +508,7 @@ PROTECTED_PROJECT_PATHS: frozenset[tuple[str, ...]] = frozenset(
 #: silent write would be a persistent prompt-injection sink. Skills are the
 #: model's to maintain, so the first write asks instead of being refused.
 #: PERSONALITY.md is the same shape at the project root. See tools/skills.py.
-APPROVAL_SUBPATHS: frozenset[tuple[str, ...]] = frozenset(
-    {("data", "skills"), ("PERSONALITY.md",)}
-)
+APPROVAL_SUBPATHS: frozenset[tuple[str, ...]] = frozenset({("data", "skills"), ("PERSONALITY.md",)})
 
 #: Files whose *contents* are credentials. The write guards above protect
 #: files because changing them changes what the machine does; this list

@@ -56,7 +56,7 @@ ONE_PROVIDER = """\
 
 
 def test_strip_jsonc_removes_line_and_block_comments() -> None:
-    text = "{\n  // line\n  /* block\n   spanning */\n  \"a\": 1 // trailing\n}\n"
+    text = '{\n  // line\n  /* block\n   spanning */\n  "a": 1 // trailing\n}\n'
     assert json.loads(strip_jsonc(text)) == {"a": 1}
 
 
@@ -320,8 +320,9 @@ def test_keyless_and_empty_fall_back_to_the_env_pool(catalog_env: Path) -> None:
 
 def test_an_unreadable_key_file_is_a_problem(catalog_env: Path) -> None:
     catalog = make_catalog(
-        catalog_env, '{ "provider": { "P": { "id": "p", "options": { "apiKey": "file:/nope/keys.txt" }, '
-        '"models": { "m": { "name": "M" } } } } }'
+        catalog_env,
+        '{ "provider": { "P": { "id": "p", "options": { "apiKey": "file:/nope/keys.txt" }, '
+        '"models": { "m": { "name": "M" } } } } }',
     )
     assert any("unreadable" in problem for problem in catalog.problems)
     assert "p" not in catalog.providers
@@ -478,3 +479,92 @@ def test_a_non_chat_defaultModel_is_refused(catalog_env: Path) -> None:
     catalog = make_catalog(catalog_env)
     assert catalog.default == ""
     assert any("not a chat model" in problem for problem in catalog.problems)
+
+
+# --------------------------------------------------------------------------- #
+# Declared keys that resolve to nothing
+# --------------------------------------------------------------------------- #
+
+
+def _provider_with(options: dict[str, Any]) -> str:
+    return json.dumps(
+        {
+            "provider": {
+                "P": {
+                    "id": "p",
+                    "options": {"baseURL": "https://p.example/v1", **options},
+                    "models": {"m": {"name": "M"}},
+                }
+            }
+        }
+    )
+
+
+def test_a_declared_but_unset_key_var_refuses_the_env_pool(catalog_env: Path) -> None:
+    """``apiKey: "${UNSET_VAR}"`` resolving to nothing must drop the provider,
+    not silently inherit the ``[llm]`` pool — that fallback sends the
+    configured provider's credentials to this provider's endpoint."""
+    write(catalog_env / ".models.json", _provider_with({"apiKey": "${P_KEY}"}))
+
+    catalog = make_catalog(catalog_env)
+
+    assert "p" not in catalog.providers
+    assert any("refusing to fall back" in problem for problem in catalog.problems)
+
+
+def test_an_empty_key_file_is_declared_but_resolves_to_nothing(
+    catalog_env: Path, tmp_path: Path
+) -> None:
+    """A ``file:`` reference that yields no keys — comments only, or an empty
+    file — is the same declared-but-empty trap as an unset ${VAR}."""
+    key_file = write(tmp_path / "keys" / "empty.txt", "# nothing but comments\n")
+    write(catalog_env / ".models.json", _provider_with({"apiKey": f"file:{key_file}"}))
+
+    catalog = make_catalog(catalog_env)
+
+    assert "p" not in catalog.providers
+    assert any("refusing to fall back" in problem for problem in catalog.problems)
+
+
+def test_keys_split_on_the_env_pool_spelling(catalog_env: Path) -> None:
+    # The comma/semicolon spelling every other key pool in the codebase takes
+    # (OPENAI_API_KEY and friends), not just whitespace.
+    assert keys_of(catalog_env, {"apiKeys": "sk-a,sk-b"}) == ("sk-a", "sk-b")
+    assert keys_of(catalog_env, {"apiKeys": "sk-a; sk-b"}) == ("sk-a", "sk-b")
+
+
+def test_a_provider_without_a_key_strategy_inherits_the_pool(
+    catalog_env: Path,
+) -> None:
+    """``keyStrategy`` unset means inherit, not a silent ``fallback``: a
+    ``[llm]`` pool configured to rotate keeps rotating after a /model switch
+    instead of pinning to the first key."""
+    write(
+        catalog_env / ".models.json",
+        _provider_with({"apiKey": "sk-a", "apiKeys": ["sk-a", "sk-b"]}),
+    )
+    catalog = make_catalog(catalog_env)
+
+    base = LLMConfig(
+        model="test-model",
+        api_key_env="OPENAI_API_KEY",
+        key_strategy="round_robin",
+    )
+    client = catalog.build_client(catalog.resolve("p/m"), base)
+    assert client.config.key_strategy == "round_robin"
+
+    # And with nothing configured, the pool's default stands as before.
+    client = catalog.build_client(catalog.resolve("p/m"), LLMConfig(model="test-model"))
+    assert client.config.key_strategy == "fallback"
+
+
+def test_selections_save_leaves_no_tmp_behind(catalog_env: Path) -> None:
+    """The persisted-selections tmp file is pid-suffixed and removed: the bot
+    and the TUI are two processes writing one file, and a fixed tmp name lets
+    interleaved writes publish garbled JSON."""
+    selections = ModelSelections(catalog_env / "data" / "chat-models.json")
+    selections.set("1", "p/m")
+    selections.clear("1")
+
+    assert selections.get("1") == ""
+    assert list((catalog_env / "data").glob("*tmp*")) == []

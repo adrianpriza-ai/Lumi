@@ -163,6 +163,10 @@ venv.bak/
 # shell tool runs in. All of it is regenerated; none of it belongs in git.
 data/
 workspace/
+# The shell tool's scratch directory (TMPDIR points here). workspace/ already
+# covers the default cwd; this catches a tools.shell.cwd that points at the
+# project root.
+/tmp/
 # Working notes from a review pass — useful locally, not part of the project.
 handoff.md
 handoff_*.md

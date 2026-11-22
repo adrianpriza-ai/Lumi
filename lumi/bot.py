@@ -1883,7 +1883,7 @@ def build_handlers(config: Config) -> list[Any]:
         # The chat view is a window onto the file, so it shows what the model
         # actually gets — including the part that did not fit, which is the one
         # worth knowing about.
-        limit = agent_of(context).memory_limit()
+        limit = agent_of(context).memory_limit(chat_of(update))
         size = memory.prompt_size(limit)
         body = memory.for_prompt(limit)
         lines = [
@@ -2055,7 +2055,10 @@ def build_handlers(config: Config) -> list[Any]:
             return
         agent = agent_of(context)
         chat_id = chat_of(update)
-        argument = context.args[0].strip() if context.args else ""
+        # Joined, not the first token: an id is one string, and a model key
+        # may itself carry a space. Extra words then fail resolution loudly
+        # instead of being dropped silently.
+        argument = " ".join(context.args).strip() if context.args else ""
         try:
             if argument.lower() == "list":
                 listing = "\n".join(agent.model_list_lines(chat_id))
@@ -2084,6 +2087,12 @@ def build_handlers(config: Config) -> list[Any]:
                 )
         except CatalogError as exc:
             await reply(update, sanitize_html(str(exc)))
+        except OSError as exc:
+            # set_model persists the switch before answering; a failing write
+            # (read-only data dir, disk full) must reach the owner, not just
+            # the error handler's log.
+            log.warning("chat %s: /model switch could not be persisted: %s", chat_id, exc)
+            await reply(update, sanitize_html(f"could not save the model choice: {exc}"))
 
     async def context_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """What the model is actually holding for this chat right now.
