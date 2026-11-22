@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 
 import pytest
-
 from conftest import FakeLLM, make_reply, make_store
 
 from lumi.agent import APPROVAL_TTL_SECONDS, Agent, TurnHooks

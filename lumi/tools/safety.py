@@ -493,6 +493,9 @@ PROTECTED_PROJECT_PATHS: frozenset[tuple[str, ...]] = frozenset(
         # later /model switch at an endpoint of its choosing.
         (".models.json",),
         ("models.json",),
+        # The tracked example template: no real keys by design, but a pasted
+        # credential is one lazy edit away, so it stays behind the same tap.
+        (".models.json.example",),
         # OAuth bearer tokens for the owner's MCP-connected accounts, one file
         # per server. Writing one plants a token the web provider will send on
         # the owner's behalf; matched as a prefix so every file under the
@@ -524,9 +527,13 @@ SECRET_FILE_BASENAMES: frozenset[str] = frozenset(
         "whitelist.json",
         # The model catalogs carry literal API keys (a provider entry's
         # apiKey/apiKeys), in the project's hidden file and the owner's
-        # ~/.config/lumi — reading one is reading a credential store.
+        # ~/.config/lumi — reading one is reading a credential store. The
+        # tracked example template is denied too: placeholders by design,
+        # but a real key pasted into it must not become readable.
         "models.json",
         ".models.json",
+        "models.example.json",
+        ".models.json.example",
         ".netrc",
         ".npmrc",
         ".pypirc",

@@ -1,0 +1,93 @@
+// The model catalog template. Copy it to ~/.config/lumi/models.json (the
+// personal layer) or to .models.json at the project root — which is
+// gitignored, because a catalog can carry literal provider keys. Both are
+// read- and write-denied to the model's own tools.
+//
+// Only these providers are used here: OpenAI for chat and image, Mistral for
+// OCR, MiniMax for video, Fish Audio for TTS. Model ids and context limits
+// drift — check the provider's current numbers before trusting a limit.
+// Only kind "chat" entries are switchable with /model; the media kinds are
+// what the media tools (image_gen, ocr, and the future video/tts tools) name.
+{
+  "defaultModel": "openai/gpt-4.1-mini",
+
+  "provider": {
+    "OpenAI": {
+      "id": "openai",
+      "options": {
+        "baseURL": "https://api.openai.com/v1",
+        "apiKey": "${OPENAI_API_KEY}"
+      },
+      "models": {
+        "gpt-4.1-mini": {
+          "name": "GPT-4.1 mini",
+          "limit": { "context": 1000000, "output": 32000 },
+          "description": "Fast cheap workhorse for chat and tool use",
+          "modalities": { "input": ["text", "image"], "output": ["text"] }
+        },
+        "gpt-4.1": {
+          "name": "GPT-4.1",
+          "limit": { "context": 1000000, "output": 32000 },
+          "description": "Stronger chat model, also image-capable",
+          "modalities": { "input": ["text", "image"], "output": ["text"] }
+        },
+        "gpt-image-1": {
+          "name": "GPT Image 1",
+          "kind": "image",
+          "description": "Text-to-image over the Images wire format",
+          "modalities": { "input": ["text"], "output": ["image"] }
+        }
+      }
+    },
+
+    "Mistral": {
+      "id": "mistral",
+      "options": {
+        "baseURL": "https://api.mistral.ai/v1",
+        "apiKey": "${MISTRAL_API_KEY}"
+      },
+      "models": {
+        "mistral-ocr-latest": {
+          "name": "Mistral OCR",
+          "kind": "ocr",
+          "limit": { "context": 16384, "output": 4096 },
+          "description": "Document and scan parsing, per-page markdown back",
+          "modalities": { "input": ["image", "file"], "output": ["text"] }
+        }
+      }
+    },
+
+    "MiniMax": {
+      "id": "minimax",
+      "options": {
+        "baseURL": "https://api.minimax.io/v1",
+        "apiKey": "${MINIMAX_API_KEY}"
+      },
+      "models": {
+        "video-01": {
+          "name": "MiniMax Video 01",
+          "kind": "video",
+          "description": "Text-to-video; check the model id your account serves",
+          "modalities": { "input": ["text"], "output": ["video"] }
+        }
+      }
+    },
+
+    "Fish Audio": {
+      "id": "fish",
+      "aliases": ["fishaudio"],
+      "options": {
+        "baseURL": "https://api.fish.audio/v1",
+        "apiKey": "${FISH_API_KEY}"
+      },
+      "models": {
+        "s1": {
+          "name": "Fish Audio S1",
+          "kind": "tts",
+          "description": "Text-to-speech; pick a voice/model id from fish.audio",
+          "modalities": { "input": ["text"], "output": ["audio"] }
+        }
+      }
+    }
+  }
+}

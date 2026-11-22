@@ -173,6 +173,9 @@ handoff-*.md
 lumi/_bin/
 # config.toml IS tracked (no secrets). config.local.toml, if you use it, is not.
 config.local.toml
+# The model catalog can hold literal provider keys. The tracked template is
+# .models.json.example; a real .models.json stays local.
+/.models.json
 # Remote MCP servers embed API keys in their URLs. This file is tracked with
 # ${VAR} placeholders only; if you inline a real key, keep it out of git.
 

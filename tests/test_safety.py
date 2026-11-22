@@ -1516,12 +1516,14 @@ def test_credential_shaped_basenames_are_read_denied(tmp_path: Path) -> None:
 
 def _with_catalog(tmp_path: Path) -> tuple[Path, Path]:
     """A project whose model catalogs exist: the hidden project file, the
-    user-layer name, and the per-chat selections file (ids only, no keys)."""
+    user-layer name, the tracked example template, and the per-chat
+    selections file (ids only, no keys)."""
     root, home = _project(tmp_path)
     (root / ".models.json").write_text(
         '{"provider": {"Zen": {"options": {"apiKey": "sk-zen-1"}}}}\n', encoding="utf-8"
     )
     (root / "models.json").write_text('{"provider": {"Zen": {}}}\n', encoding="utf-8")
+    (root / ".models.json.example").write_text('{"provider": {}}\n', encoding="utf-8")
     (root / "chat-models.json").write_text('{"1234": "zen/mini"}\n', encoding="utf-8")
     return root, home
 
@@ -1538,6 +1540,8 @@ def test_model_catalog_files_are_read_denied(tmp_path: Path) -> None:
         "cat ../models.json",
         "head -1 ../models.json",
         "grep KEY ../models.json",
+        # The tracked template: placeholders by design, denied all the same.
+        "cat ../.models.json.example",
     ]:
         assert _verdict(command, root, home).blocked, command
 
