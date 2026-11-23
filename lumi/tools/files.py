@@ -94,9 +94,12 @@ class FilesTool(Tool):
 Read, write, edit, list, search and upload files inside this project.
 
 Paths are relative to the project root. Reads work anywhere in the project
-except secret files (.env, keys, credentials), which are refused; writes only
-work inside the project's workspace directory, and overwriting an existing
-file needs the owner's approval. PDFs are read through OCR (page-marked text)
+except secret files (.env, keys, credentials), which are refused. Writes work
+anywhere in the project too (narrow it with tools.files.writable) — except the
+protected files run_shell refuses as well (config.toml, .env, whitelist.json,
+.mcp.json, the model catalogs), which are refused outright. Creating a new
+file is free; `edit` never asks; replacing a file's whole contents asks the
+owner once in default mode unless `overwrite: true` says you mean it. PDFs are read through OCR (page-marked text)
 and image files are attached as pictures the model can look at directly —
 prefer `read_file` for reading either.
 
@@ -110,9 +113,10 @@ One exception: a file that was created or changed *during this session* gets
 one owner approval on its first write, append or edit, then goes on normally.
 That is the write half of the write-then-run chain — a file this session
 authored may come from fetched content, so its authorship is shown to the
-owner once before it changes. Skill files under `data/skills/` always get
-that one approval, even when they predate the session: their text is put in
-front of every chat, so the owner always sees the first change.
+owner once before it changes. Skill files under `data/skills/` and
+PERSONALITY.md always get that one approval, even when they predate the
+session: their text is put in front of every chat, so the owner always sees
+the first change.
 
 Set `upload: true` on a write or an edit to also send the finished file to the
 chat as a document — use it whenever the owner asked for "a file" they can
@@ -296,6 +300,16 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         """Whether *path* is a skill file the system prompt will read back."""
         return is_within(path, self.config.data_dir / "skills")
 
+    def _is_prompt_source(self, path: Path) -> bool:
+        """Whether *path*'s text lands in every chat's system prompt.
+
+        Skills and PERSONALITY.md are instruction files the model can write
+        and every chat then reads — the same persistent-injection shape, so
+        both keep their first-write tap in every mode, whatever the writable
+        roots say.
+        """
+        return self._is_project_skill(path) or path == self.config.personality_file
+
     def _links_protected(self, path: Path) -> str | None:
         """The protected project file *path* is a hard link to, if any.
 
@@ -348,15 +362,16 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         the files tool now agrees with it instead of charging a tap for a
         brand-new file.
 
-        A file under ``data/skills`` is always True until approved, whatever
-        its timestamps or existence. Skill text is catalogued into the system
-        prompt of every chat, so nothing about a skill path is "free": the
-        model can edit it, and an edit made after reading a hostile page
-        would otherwise reach every future turn with no tap (R8).
+        A file under ``data/skills`` — and PERSONALITY.md — is always True
+        until approved, whatever its timestamps or existence. Their text is
+        catalogued into the system prompt of every chat, so nothing about
+        such a path is "free": the model can edit it, and an edit made after
+        reading a hostile page would otherwise reach every future turn with
+        no tap (R8).
         """
         if str(path) in self._approved:
             return False
-        if self._is_project_skill(path):
+        if self._is_prompt_source(path):
             return True
         try:
             st = path.stat()
@@ -377,11 +392,11 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         mode = self._mode()
         if ctx.confirmed or mode in (Mode.BYPASS, Mode.BYPASS_SUDO):
             return
-        if mode is Mode.ACCEPT_EDITS and not self._is_project_skill(path):
-            # accept-edits accepts edits: content files stop asking. Skill
-            # files keep their tap even here — their text lands in every
-            # chat's system prompt, and this mode was chosen for a coding
-            # session, not as a licence over instruction files.
+        if mode is Mode.ACCEPT_EDITS and not self._is_prompt_source(path):
+            # accept-edits accepts edits: content files stop asking. Skills
+            # and PERSONALITY.md keep their tap even here — their text lands
+            # in every chat's system prompt, and this mode was chosen for a
+            # coding session, not as a licence over instruction files.
             return
         if not self._session_authored(path):
             return
@@ -390,6 +405,11 @@ it validates the path, caps the size, and shows a diff before it overwrites.
                 f"{self._display(path)} is a skill file, and its text is read into "
                 "every chat's system prompt, so the owner approves the first write to "
                 "it this session"
+            )
+        elif path == self.config.personality_file:
+            reason = (
+                f"{self._display(path)} is the voice every chat's system prompt is "
+                "built from, so the owner approves the first write to it this session"
             )
         else:
             reason = (

@@ -506,12 +506,15 @@ class ShellConfig:
 @dataclass(slots=True)
 class FilesConfig:
     enabled: bool = True
-    #: ``data/skills`` is here so the owner's skills can be written and edited
-    #: with this tool: a directory of instruction files the model maintains.
-    #: It stays writable, but the first write to a skill file in a session
-    #: always asks the owner (and the shell asks on each write there), because
-    #: skill text is read into every chat's system prompt (lumi/tools/skills.py).
-    writable: list[str] = field(default_factory=lambda: ["workspace", "data/skills"])
+    #: Where the model may write with the files tool, relative to the project
+    #: root. The default is the whole project — the same boundary run_shell's
+    #: writes default to — so changing the code it runs on goes through the
+    #: surgical ``edit`` action instead of shell redirection. Protected files
+    #: (config.toml, .env, the catalogs) are refused underneath this list
+    #: either way, PERSONALITY.md and data/skills keep their first-write tap
+    #: because their text lands in every chat's system prompt, and a narrower
+    #: install can pin this to ``["workspace"]``.
+    writable: list[str] = field(default_factory=lambda: ["."])
     #: Characters of a file handed to the model on read. Generous by default
     #: because a read is usually done to look at the whole thing; 0 means no
     #: cap, and the model's own ``max_bytes`` argument is there for the files

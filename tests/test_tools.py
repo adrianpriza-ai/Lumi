@@ -347,7 +347,7 @@ async def test_write_into_the_workspace(files: FilesTool, config) -> None:
     assert (config.shell_cwd / "notes.md").read_text(encoding="utf-8") == "hello"
 
 
-async def test_write_outside_the_workspace_is_refused(files: FilesTool) -> None:
+async def test_writing_a_protected_file_is_refused(files: FilesTool) -> None:
     # The registry turns this into a failed ToolResult for the model; called
     # directly it surfaces as ToolError.
     with pytest.raises(ToolError, match="not allowed"):
@@ -375,6 +375,68 @@ async def test_write_escaping_with_dotdot_is_refused(files: FilesTool) -> None:
     with pytest.raises(ToolError, match="not allowed"):
         await files.invoke(
             {"action": "write", "path": "workspace/../../escape.md", "content": "x"}, ctx()
+        )
+
+
+async def test_write_and_edit_reach_the_whole_project_by_default(
+    files: FilesTool, config, monkeypatch
+) -> None:
+    """``tools.files.writable`` defaults to the project — the same boundary
+    run_shell's writes use — so changing repo source goes through the surgical
+    `edit` instead of shell redirection. The taps ride along: a new file is
+    free, a wholesale overwrite of a predating file asks in default mode."""
+    source = config.root / "README.md"
+    source.write_text("hello\n", encoding="utf-8")
+    predate_session(monkeypatch)  # the fixture file must count as predating
+
+    edit = await files.invoke(
+        {"action": "edit", "path": "README.md", "old_string": "hello", "new_string": "hi"},
+        ctx(),
+    )
+    assert edit.ok
+    assert source.read_text(encoding="utf-8") == "hi\n"
+
+    made = await files.invoke({"action": "write", "path": "docs/made.md", "content": "x"}, ctx())
+    assert made.ok
+    assert (config.root / "docs" / "made.md").read_text(encoding="utf-8") == "x"
+
+    with pytest.raises(NeedsApproval):
+        await files.invoke({"action": "write", "path": "README.md", "content": "gone"}, ctx())
+    assert source.read_text(encoding="utf-8") == "hi\n"  # nothing was written
+
+
+async def test_the_personality_file_keeps_its_first_write_tap(files: FilesTool, config) -> None:
+    """PERSONALITY.md is the same persistent-prompt sink as a skill: widening
+    the writable roots to the project must not make its edits silent, in
+    default mode or under accept-edits."""
+    personality = config.personality_file
+    personality.write_text("You are Lumi. Terse.\n", encoding="utf-8")  # predates the session
+    args = {
+        "action": "edit",
+        "path": "PERSONALITY.md",
+        "old_string": "Terse",
+        "new_string": "Verbose",
+    }
+
+    with pytest.raises(NeedsApproval):
+        await files.invoke(args, ctx())
+    assert "Terse" in personality.read_text(encoding="utf-8")  # refused, not applied
+    await files.invoke(args, ctx(confirmed=True))
+    assert "Verbose" in personality.read_text(encoding="utf-8")
+
+    # Under accept-edits the tap holds too — until this session approved it
+    # once (a fresh tool instance has not).
+    config.tools.mode = "accept-edits"
+    fresh = FilesTool(config)
+    with pytest.raises(NeedsApproval):
+        await fresh.invoke(
+            {
+                "action": "edit",
+                "path": "PERSONALITY.md",
+                "old_string": "Verbose",
+                "new_string": "Loud",
+            },
+            ctx(),
         )
 
 
