@@ -298,6 +298,11 @@ class LLMConfig:
     #: Show the live step list in chat (🧠 Thinking / 💻 Run Bash …) while a
     #: turn runs. The thinking trace itself is never shown — only the steps.
     show_reasoning: bool = True
+    #: Automatically retry with sanitized/neutralized prompt when the model
+    #: provider rejects the request for security or content moderation reasons
+    #: (such as SenseNova / MiniMax code 18 "Inappropriate input/output rejected
+    #: for security reasons").
+    content_filter_fallback: bool = True
 
     def effort_of(self) -> str:
         """The reasoning effort to send, normalised.

@@ -84,6 +84,9 @@ reasoning_effort = ""
 reasoning_tokens = 0
 # Show live step list (thinking + tools) in chat.
 show_reasoning = true
+# Auto-fallback to sanitized safe prompt when provider rejects input for security/content
+# reasons (e.g. error code 18 on anime/roleplay system prompts).
+content_filter_fallback = true
 
 [tools]
 # Remove a tool from this list to disable it everywhere.

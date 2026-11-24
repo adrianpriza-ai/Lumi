@@ -725,6 +725,92 @@ async def test_a_context_overflow_without_a_quoted_limit_still_explains(config) 
     assert "llm.context_window" in str(caught.value)
 
 
+async def test_a_security_rejection_retries_original_prompt_first(config) -> None:
+    code_18_err = status_error(
+        400,
+        "Error code: 400 - {'error': {'message': 'Inappropriate input/output rejected for security reasons', 'type': 'invalid_request_error', 'code': '18'}}",
+    )
+    completions = StubCompletions(
+        reply("success with original prompt"),
+        error=[code_18_err],
+    )
+    messages = [
+        {"role": "system", "content": "You are Astolfo, a cheerful anime companion.\n\n## How you work\n- Say what you ran"},
+        {"role": "user", "content": "hi"},
+    ]
+    result = await client_with(config, completions).complete(messages)
+
+    assert result.text == "success with original prompt"
+    assert len(completions.requests) == 2
+    # The first retry sends the original prompt untouched so output moderation flags can pass
+    assert "Astolfo" in completions.requests[1]["messages"][0]["content"]
+
+
+async def test_a_security_rejection_falls_back_to_sanitized_prompt(config) -> None:
+    code_18_err = status_error(
+        400,
+        "Error code: 400 - {'error': {'message': 'Inappropriate input/output rejected for security reasons', 'type': 'invalid_request_error', 'code': '18'}}",
+    )
+    # Fail original prompt (1 initial + 2 retries) and detrigger (1 attempt) so it reaches neutral_system
+    completions = StubCompletions(
+        reply("hello from safe mode"),
+        error=[code_18_err, code_18_err, code_18_err, code_18_err],
+    )
+    messages = [
+        {"role": "system", "content": "You are Astolfo, a cheerful anime companion.\n\n## How you work\n- Say what you ran"},
+        {"role": "user", "content": "hi"},
+    ]
+    result = await client_with(config, completions).complete(messages)
+
+    assert result.text == "hello from safe mode"
+    last_request = completions.requests[-1]
+    last_sys = last_request["messages"][0]["content"]
+    assert "Astolfo" not in last_sys
+    assert "## How you work" in last_sys
+
+
+async def test_a_security_rejection_explains_code_18_when_all_fallbacks_fail(config) -> None:
+    code_18_err = status_error(
+        400,
+        "Error code: 400 - {'error': {'message': 'Inappropriate input/output rejected for security reasons', 'type': 'invalid_request_error', 'code': '18'}}",
+    )
+    completions = StubCompletions(error=code_18_err)
+    messages = [{"role": "user", "content": "bad query"}]
+    with pytest.raises(LLMError) as caught:
+        await client_with(config, completions).complete(messages)
+
+    message = str(caught.value)
+    assert "security reasons" in message
+    assert "error code 18" in message
+    assert "content_filter_fallback" in message
+
+
+async def test_a_security_rejection_does_not_fallback_when_disabled(config) -> None:
+    config.llm.content_filter_fallback = False
+    code_18_err = status_error(
+        400,
+        "Error code: 400 - {'error': {'message': 'Inappropriate input/output rejected for security reasons', 'type': 'invalid_request_error', 'code': '18'}}",
+    )
+    completions = StubCompletions(error=code_18_err)
+    messages = [
+        {"role": "system", "content": "You are Astolfo.\n\n## How you work\n- test"},
+        {"role": "user", "content": "hi"},
+    ]
+    with pytest.raises(LLMError):
+        await client_with(config, completions).complete(messages)
+    assert len(completions.requests) == 1
+
+
+def test_de_trigger_text_softens_flagged_character_names() -> None:
+    from lumi.llm.openai_compat import _de_trigger_text
+
+    text = "Act as Astolfo the anime character. Speak like astolfo."
+    detriggered = _de_trigger_text(text)
+    assert "Astolfo" not in detriggered
+    assert "astolfo" not in detriggered
+    assert "cheerful knight companion" in detriggered
+
+
 async def test_the_ladder_does_not_apply_without_reasoning_mode(config) -> None:
     """A non-reasoning request sends one variant, so an endpoint that dislikes
     the message shape is told once rather than three times."""

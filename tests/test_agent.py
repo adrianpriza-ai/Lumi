@@ -1620,3 +1620,28 @@ def test_reload_picks_up_catalog_edits(config) -> None:
 
     assert any("model catalog" in note for note in notes)
     assert agent.model_catalog.resolve("zen/extra").kind == "chat"
+
+
+async def test_agent_switches_to_safe_mode_on_security_rejection(config) -> None:
+    class FlakySecurityLLM(FakeLLM):
+        def __init__(self):
+            super().__init__([])
+            self.attempt = 0
+
+        async def complete(self, messages, *, tools=None, on_delta=None):
+            self.calls.append([dict(m) for m in messages])
+            self.attempt += 1
+            if self.attempt == 1:
+                raise LLMError("Inappropriate input/output rejected for security reasons: code 18")
+            return make_reply("safe response")
+
+    llm = FlakySecurityLLM()
+    agent = make_agent(config, [], llm=llm)
+    result = await agent.handle(CHAT, "hello")
+
+    assert result.ok
+    assert result.text == "safe response"
+    assert len(llm.calls) == 2
+    conv = agent.conversation(CHAT)
+    assert conv.safe_mode
+    assert "Who I am" in llm.calls[1][0]["content"]

@@ -37,6 +37,7 @@ from .context import ContextReport, ContextWindow
 from .llm import LLMClient, OpenAICompatClient, ToolCall, build_llm
 from .llm.base import DELTA_TEXT, USAGE_REASONING, LLMError, LLMReply
 from .llm.catalog import CatalogError, ModelCatalog, ModelInfo, ModelSelections
+from .llm.reasoning import is_security_rejection
 from .memory import History, MemoryFile, MemoryStore
 from .paths import relative_to_root
 from .personality import Personality
@@ -399,6 +400,9 @@ class Conversation:
     llm_client: LLMClient | None = None
     model_context: int = 0
     model_output: int = 0
+    #: True when an upstream security rejection forces the chat into a safe,
+    #: neutral persona so subsequent turns don't repeatedly fail on custom prompts.
+    safe_mode: bool = False
 
 
 class Agent:
@@ -483,12 +487,23 @@ class Agent:
             provenance=SKILL_PROVENANCE, catalog=fence_skill("\n".join(lines))
         )
 
-    def system_prompt(self, chat_id: int | str | None = None, *, source: str = "chat") -> str:
+    def system_prompt(
+        self,
+        chat_id: int | str | None = None,
+        *,
+        source: str = "chat",
+        safe_mode: bool = False,
+    ) -> str:
         now = datetime.now(UTC)
         limit = self.memory_limit(chat_id)
-        memory_block = self.memory_for(chat_id).for_prompt(limit)
+        memory_block = "" if safe_mode else self.memory_for(chat_id).for_prompt(limit)
+        personality_text = (
+            "## Who I am\n\nI'm Lumi, a helpful assistant."
+            if safe_mode
+            else self.personality.text
+        )
         parts = [
-            self.personality.text,
+            personality_text,
             CONDUCT_PREAMBLE,
             RUNTIME_PREAMBLE.format(
                 now=now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -505,20 +520,23 @@ class Agent:
             # renders HTML, a terminal renders Markdown, and a terminal told to
             # emit <b> shows the owner literal angle brackets.
             FORMAT_PREAMBLE if source == "chat" else MARKDOWN_FORMAT_PREAMBLE,
-            "## Long-term memory\n\n"
-            + (
-                "This is the long-term memory for this chat. It persists across "
-                "conversations; other chats have their own memories that you cannot "
-                "see. Anything marked as elided below is still on disk, just too old "
-                "to send — say so rather than pretending you were never told.\n\n"
-                if "[older remembered fact" in memory_block
-                or "[older memory elided]" in memory_block
-                else "This is the long-term memory for this chat. It persists across "
-                "conversations; other chats have their own memories that you cannot see.\n\n"
-            )
-            + (MEMORY_PROVENANCE_NOTE if "lumi:model-notes" in memory_block else "")
-            + memory_block,
         ]
+        if memory_block:
+            parts.append(
+                "## Long-term memory\n\n"
+                + (
+                    "This is the long-term memory for this chat. It persists across "
+                    "conversations; other chats have their own memories that you cannot "
+                    "see. Anything marked as elided below is still on disk, just too old "
+                    "to send — say so rather than pretending you were never told.\n\n"
+                    if "[older remembered fact" in memory_block
+                    or "[older memory elided]" in memory_block
+                    else "This is the long-term memory for this chat. It persists across "
+                    "conversations; other chats have their own memories that you cannot see.\n\n"
+                )
+                + (MEMORY_PROVENANCE_NOTE if "lumi:model-notes" in memory_block else "")
+                + memory_block
+            )
         return "\n\n".join(part.strip() for part in parts if part.strip())
 
     # -- conversation plumbing --------------------------------------------- #
@@ -927,7 +945,9 @@ class Agent:
     def _refresh_system_prompt(self, conv: Conversation) -> None:
         """Keep the system prompt current without losing the message history."""
         if conv.messages and conv.messages[0].get("role") == "system":
-            conv.messages[0]["content"] = self.system_prompt(conv.chat_id, source=conv.source)
+            conv.messages[0]["content"] = self.system_prompt(
+                conv.chat_id, source=conv.source, safe_mode=conv.safe_mode
+            )
 
     # -- the loop ---------------------------------------------------------- #
 
@@ -1018,12 +1038,37 @@ class Agent:
                 on_delta, streamed = _delta_sink(hooks)
                 reply = await client.complete(conv.messages, tools=specs or None, on_delta=on_delta)
             except LLMError as exc:
-                result.error = str(exc)
-                result.elapsed = time.monotonic() - started
-                self.history.append(
-                    conv.chat_id, "assistant", f"[error] {exc}", session=conv.session
-                )
-                return result
+                if (
+                    is_security_rejection(exc)
+                    and getattr(self.config.llm, "content_filter_fallback", True)
+                    and not conv.safe_mode
+                    and conv.messages
+                    and conv.messages[0].get("role") == "system"
+                ):
+                    conv.safe_mode = True
+                    conv.messages[0]["content"] = self.system_prompt(
+                        conv.chat_id, source=conv.source, safe_mode=True
+                    )
+                    log.warning(
+                        "chat %s received security rejection; retrying iteration with safe system prompt",
+                        conv.chat_id,
+                    )
+                    try:
+                        reply = await client.complete(
+                            conv.messages, tools=specs or None, on_delta=on_delta
+                        )
+                    except LLMError as retry_exc:
+                        exc = retry_exc
+                    else:
+                        exc = None
+
+                if exc is not None:
+                    result.error = str(exc)
+                    result.elapsed = time.monotonic() - started
+                    self.history.append(
+                        conv.chat_id, "assistant", f"[error] {exc}", session=conv.session
+                    )
+                    return result
             result.thinking_seconds += time.monotonic() - asked
             # The provider's own prompt count is the only exact figure available,
             # so it is fed straight back into the estimator for the next call.
@@ -1462,6 +1507,7 @@ class Agent:
         self.model_catalog = catalog
         notes.append(f"model catalog reloaded ({len(catalog.list_models(kind=None))} model(s))")
         for chat_id, conv in self._conversations.items():
+            conv.safe_mode = False
             self._refresh_system_prompt(conv)
             self.history.append(chat_id, "system", "reloaded personality and memory")
         return notes

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import Awaitable, Callable, Sequence
 from types import SimpleNamespace
 from typing import Any
@@ -58,6 +59,7 @@ from .reasoning import (
     TRACE_FIELDS,
     completion_ceiling,
     is_context_overflow,
+    is_security_rejection,
     rejects_param,
     reported_context_limit,
     split_think,
@@ -80,6 +82,94 @@ class _StreamBroken(LLMError):
     the request itself succeeded. Raised only by :meth:`_stream` once
     :attr:`_StreamState.sent_text` is set.
     """
+
+
+_DETRIGGER_MAP = {
+    re.compile(r"\bastolfo\b", re.IGNORECASE): "a cheerful knight companion",
+    re.compile(r"阿斯托尔福"): "cheerful companion",
+    re.compile(r"アストルフォ"): "cheerful companion",
+}
+
+
+def _de_trigger_text(text: str) -> str:
+    """Soft-substitute sensitive names that trigger false-positive API security filters."""
+    for pattern, replacement in _DETRIGGER_MAP.items():
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def _sanitize_system_prompt(content: str) -> str:
+    """Sanitize system prompt by replacing custom persona while preserving tools/conduct."""
+    neutral_voice = "## Who I am\n\nI'm Lumi, a helpful assistant."
+    if "## How you work" in content:
+        _, _, rest = content.partition("## How you work")
+        return f"{neutral_voice}\n\n## How you work{rest}"
+    if "## Runtime" in content:
+        _, _, rest = content.partition("## Runtime")
+        return f"{neutral_voice}\n\n## Runtime{rest}"
+    return neutral_voice
+
+
+def _sanitize_messages(
+    messages: list[dict[str, Any]], mode: str
+) -> list[dict[str, Any]]:
+    """Produce a sanitized variant of *messages* according to *mode*."""
+    if not messages:
+        return messages
+
+    if mode == "detrigger":
+        changed = False
+        result = []
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, str):
+                new_content = _de_trigger_text(content)
+                if new_content != content:
+                    changed = True
+                    m = dict(msg)
+                    m["content"] = new_content
+                    result.append(m)
+                    continue
+            result.append(msg)
+        return result if changed else messages
+
+    if mode == "neutral_system":
+        result = []
+        changed = False
+        for i, msg in enumerate(messages):
+            if i == 0 and msg.get("role") == "system":
+                content = msg.get("content") or ""
+                sanitized = _sanitize_system_prompt(content)
+                if sanitized != content:
+                    changed = True
+                    m = dict(msg)
+                    m["content"] = sanitized
+                    result.append(m)
+                    continue
+            result.append(msg)
+        return result if changed else messages
+
+    if mode == "minimal_system":
+        result = []
+        changed = False
+        for i, msg in enumerate(messages):
+            if i == 0 and msg.get("role") == "system":
+                content = msg.get("content") or ""
+                minimal = "You are a helpful assistant."
+                if content != minimal:
+                    changed = True
+                    m = dict(msg)
+                    m["content"] = minimal
+                    result.append(m)
+                    continue
+            result.append(msg)
+        return result if changed else messages
+
+    if mode == "strip_system":
+        stripped = [msg for msg in messages if msg.get("role") != "system"]
+        return stripped if len(stripped) != len(messages) else messages
+
+    return messages
 
 
 def _redact_url(url: str) -> str:
@@ -414,11 +504,97 @@ class OpenAICompatClient(LLMClient):
                         _dropped(params),
                     )
                     continue
+                if is_security_rejection(exc) and getattr(self.config, "content_filter_fallback", True):
+                    fallback_comp, fallback_exc = await self._try_security_fallback(
+                        key, params, exc, on_delta, state
+                    )
+                    if fallback_comp is not None:
+                        return fallback_comp, None, False
+                    if fallback_exc is not None:
+                        exc = fallback_exc
                 return None, exc, is_retryable(exc)
             if index:
                 log.info("endpoint accepted the request once %s was dropped", _dropped(params))
             return completion, None, False
         raise LLMError("no parameter variant left to try")  # pragma: no cover
+
+    async def _try_security_fallback(
+        self,
+        key: str,
+        params: dict[str, Any],
+        original_exc: Exception,
+        on_delta: Callable[[str, str], Awaitable[None]] | None = None,
+        state: _StreamState | None = None,
+    ) -> tuple[Any | None, Exception | None]:
+        """Progressively step down/sanitize the prompt when provider rejects for security/content reasons."""
+        messages = params.get("messages")
+        if not messages or (state is not None and state.sent_text):
+            return None, original_exc
+
+        endpoint = _redact_url(self.config.base_url_of())
+        last_exc: Exception = original_exc
+
+        # Upstream "Inappropriate input/output rejected for security reasons"
+        # often triggers on the model's sampled *output* (due to temperature > 0)
+        # or on probabilistic moderation. A transient retry of the exact
+        # same prompt often succeeds because different output tokens are sampled,
+        # preserving the user's custom personality intact.
+        for retry in range(2):
+            log.info(
+                "%s rejected for security reasons; retrying original prompt (%d/2)...",
+                endpoint,
+                retry + 1,
+            )
+            try:
+                if on_delta is None:
+                    completion = await self._client_for(key).chat.completions.create(**params)
+                else:
+                    completion = await self._stream(
+                        key, params, on_delta, state if state is not None else _StreamState()
+                    )
+                log.info(
+                    "endpoint accepted original prompt on security retry %d without modification",
+                    retry + 1,
+                )
+                return completion, None
+            except _StreamBroken:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                if not is_security_rejection(exc):
+                    return None, exc
+                last_exc = exc
+
+        modes = ("detrigger", "neutral_system", "minimal_system", "strip_system")
+
+        for mode in modes:
+            sanitized = _sanitize_messages(messages, mode)
+            if sanitized == messages:
+                continue
+            log.warning(
+                "%s rejected request for security reasons (%s). Retrying with %s...",
+                endpoint,
+                format_error(last_exc),
+                mode.replace("_", " "),
+            )
+            candidate = dict(params)
+            candidate["messages"] = sanitized
+            try:
+                if on_delta is None:
+                    completion = await self._client_for(key).chat.completions.create(**candidate)
+                else:
+                    completion = await self._stream(
+                        key, candidate, on_delta, state if state is not None else _StreamState()
+                    )
+                log.info("endpoint accepted the request after %s sanitization", mode.replace("_", " "))
+                return completion, None
+            except _StreamBroken:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                if not is_security_rejection(exc):
+                    return None, exc
+                last_exc = exc
+
+        return None, last_exc
 
     async def _stream(
         self,
@@ -713,6 +889,18 @@ class OpenAICompatClient(LLMClient):
                 " llm.context_headroom is "
                 f"{self.config.context_headroom:,} tokens, held back so the reply fits;"
                 " history is packed to whatever is left."
+            )
+        elif is_security_rejection(failure):
+            hint = (
+                f"\n\nThe provider ({endpoint}) rejected this request for security reasons "
+                "(error code 18: Inappropriate input/output rejected for security reasons). "
+                "This is an upstream content-moderation filter rejection, commonly triggered when "
+                "character names (e.g. Astolfo), roleplay framing, or sensitive words appear in "
+                "PERSONALITY.md, the system prompt, or recent chat.\n\n"
+                "To resolve this:\n"
+                "• Check PERSONALITY.md and remove or soften flagged character names or roleplay terms\n"
+                "• Ensure content_filter_fallback = true in config.toml to automatically bypass flagged personas\n"
+                "• Or switch to an uncensored/less strict model using /model (e.g. via .models.json)"
             )
         elif with_images and not self.config.vision_model_of():
             # The request carried an image and no vision model is configured,

@@ -14,6 +14,7 @@ import pytest
 
 from lumi.llm.reasoning import (
     completion_ceiling,
+    is_security_rejection,
     rejects_param,
     split_think,
     trace_of,
@@ -154,3 +155,44 @@ def test_unknown_parameter_phrasings_are_recognised(message: str) -> None:
 )
 def test_value_problems_are_not_mistaken_for_unknown_parameters(message: str) -> None:
     assert not rejects_param(RuntimeError(message))
+
+
+# --------------------------------------------------------------------------- #
+# is_security_rejection
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "BadRequestError: Error code: 400 - {'error': {'message': 'Inappropriate input/output rejected for security reasons', 'type': 'invalid_request_error', 'code': '18'}}",
+        "Inappropriate input/output rejected for security reasons",
+        "Request was rejected for security reasons",
+        "Triggered content_filter policy",
+        "Error: content_policy_violation: sensitive content detected",
+        "Your request was flagged by moderation system",
+        "Blocked by security reasons risk control",
+        "Code 400 with 'code': '18' in response body",
+    ],
+)
+def test_security_rejections_are_recognised(message: str) -> None:
+    assert is_security_rejection(RuntimeError(message))
+
+
+def test_security_rejection_from_structured_body() -> None:
+    err = RuntimeError("bad request")
+    err.body = {
+        "error": {
+            "message": "Inappropriate input/output rejected for security reasons",
+            "type": "invalid_request_error",
+            "code": "18",
+        }
+    }
+    assert is_security_rejection(err)
+
+
+def test_normal_errors_are_not_mistaken_for_security_rejection() -> None:
+    assert not is_security_rejection(RuntimeError("Invalid API key"))
+    assert not is_security_rejection(RuntimeError("Rate limit exceeded"))
+    assert not is_security_rejection(RuntimeError("temperature is only supported when set to 1"))
+    assert not is_security_rejection(RuntimeError("context_length_exceeded"))

@@ -187,10 +187,61 @@ def reported_context_limit(exc: BaseException) -> int:
     return int(match.group(1).replace("_", "")) if match else 0
 
 
+#: Substrings and codes that mean an upstream provider rejected the request
+#: due to content moderation, sensitive words, or safety policy (such as
+#: SenseNova / MiniMax code 18, OpenAI content_policy_violation, etc.).
+_SECURITY_REJECTION_HINTS = (
+    "inappropriate input/output rejected",
+    "rejected for security reasons",
+    "security reasons",
+    "content_filter",
+    "content filter",
+    "content_policy_violation",
+    "content policy",
+    "sensitive content",
+    "safety policy",
+    "safety filter",
+    "flagged by moderation",
+    "moderation system",
+    "risk control",
+    "'code': '18'",
+    "'code': 18",
+    '"code": "18"',
+    '"code": 18',
+)
+
+
+def is_security_rejection(exc: BaseException) -> bool:
+    """Whether *exc* looks like an upstream content moderation or safety rejection.
+
+    Matches SenseNova / MiniMax code 18 ('Inappropriate input/output rejected
+    for security reasons'), OpenAI content_policy_violation, and similar
+    provider-level safety/moderation filters.
+    """
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            code = str(err.get("code") or "")
+            if code == "18" or "content_filter" in code or "policy" in code:
+                return True
+            msg = str(err.get("message") or "").lower()
+            if any(hint in msg for hint in _SECURITY_REJECTION_HINTS):
+                return True
+
+    code = getattr(exc, "code", None)
+    if code is not None and str(code) in ("18", "content_filter"):
+        return True
+
+    message = str(exc).lower()
+    return any(hint in message for hint in _SECURITY_REJECTION_HINTS)
+
+
 __all__ = [
     "TRACE_FIELDS",
     "completion_ceiling",
     "is_context_overflow",
+    "is_security_rejection",
     "rejects_param",
     "reported_context_limit",
     "split_think",
