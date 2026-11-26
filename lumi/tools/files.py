@@ -55,6 +55,11 @@ READABLE_SYSTEM_PATHS: tuple[str, ...] = (
 
 MAX_LIST_ENTRIES = 500
 
+#: Most files one `upload` call may send. Small enough that a confused model
+#: cannot dump the whole project into the chat, large enough for the normal
+#: "here are the outputs" batch.
+MAX_UPLOAD_FILES = 10
+
 
 def foreign_uploads(path: Path, root: Path, chat_id: int | str | None) -> str | None:
     """The *other* chat whose per-chat area *path* sits in, if any.
@@ -107,7 +112,14 @@ prefer `read_file` for reading either.
 found and the `new_string` that replaces it. It needs no approval (it can
 only touch the text it names), shows a diff, and leaves the rest of the file
 alone — prefer it over `write` whenever you are changing less than the whole
-file. The `old_string` must match exactly once unless `replace_all` is true.
+file. The `old_string` must match exactly once unless `replace_all` is true;
+when it does not match, the error says where the closest text is and what
+differs, so a misremembered indent costs one retry instead of a re-read.
+
+`write` replaces the whole file. It refuses to overwrite binary or non-UTF-8
+data (use run_shell if that is really what you mean), and writing the exact
+content a file already has returns "unchanged" instead of asking for an
+approval that could not change anything.
 
 One exception: a file that was created or changed *during this session* gets
 one owner approval on its first write, append or edit, then goes on normally.
@@ -121,8 +133,9 @@ the first change.
 Set `upload: true` on a write or an edit to also send the finished file to the
 chat as a document — use it whenever the owner asked for "a file" they can
 download. The `upload` action sends a file that already exists (e.g. one a
-shell command produced) without modifying it. Delivery is handled for you:
-just say which file, and it arrives in the chat.
+shell command produced) without modifying it; pass `paths` to send several in
+one call instead of one call per file. Delivery is handled for you: just say
+which files, and they arrive in the chat.
 
 Prefer this over shell redirection for anything that involves file contents:
 it validates the path, caps the size, and shows a diff before it overwrites.
@@ -138,22 +151,41 @@ it validates the path, caps the size, and shows a diff before it overwrites.
             },
             "path": {
                 "type": "string",
-                "description": "File or directory, relative to the project root.",
+                "description": (
+                    "File or directory, relative to the project root. Missing parent "
+                    "directories are created for write and append."
+                ),
+            },
+            "paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "upload: several files to send in one call, relative to the "
+                    f"project root. Use instead of `path`; up to {MAX_UPLOAD_FILES} "
+                    "at a time."
+                ),
             },
             "content": {
                 "type": "string",
-                "description": "New file contents. Required for write and append.",
+                "description": (
+                    "write and append: the text to store. For write this is the entire "
+                    "file, not a fragment — use edit for a partial change. End text "
+                    "files with a trailing newline."
+                ),
             },
             "old_string": {
                 "type": "string",
                 "description": (
-                    "edit: the exact text to replace, copied verbatim from the file. "
-                    "Required for edit."
+                    "edit: the exact text to replace, copied verbatim from the file — "
+                    "indentation and whitespace included. Include a line or two of "
+                    "surrounding context so it matches exactly once."
                 ),
             },
             "new_string": {
                 "type": "string",
-                "description": "edit: the replacement text. Required for edit.",
+                "description": (
+                    "edit: the replacement text. An empty string deletes old_string."
+                ),
             },
             "replace_all": {
                 "type": "boolean",
@@ -528,7 +560,56 @@ it validates the path, caps the size, and shows a diff before it overwrites.
             raise ToolError(f"{self._display(path)} is a directory")
 
         existed = path.exists()
-        previous = path.read_text(encoding="utf-8", errors="replace") if existed else ""
+        previous = ""
+        if existed:
+            limit = self.settings.max_write_chars
+            try:
+                raw = path.read_bytes()
+            except OSError as exc:
+                return ToolResult.failure(f"could not read {self._display(path)}: {exc}")
+            if len(raw) > limit:
+                raise ToolError(
+                    f"{self._display(path)} is {len(raw)} bytes, over the {limit}-byte "
+                    "limit for the files tool (tools.files.max_write_chars). Change it "
+                    "with a shell command, or ask the owner to raise the limit."
+                )
+            # read_text(errors="replace") used to mangle any existing bytes it
+            # could not decode, then overwrite them with a text diff computed
+            # from the mangled copy. Refusing is the honest answer: `write` is
+            # for text, and a binary file is not that.
+            if b"\x00" in raw:
+                return ToolResult.failure(
+                    f"{self._display(path)} looks like a binary file, and write only "
+                    "replaces text. Use run_shell if you really mean to overwrite it."
+                )
+            try:
+                previous = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                return ToolResult.failure(
+                    f"{self._display(path)} is not valid UTF-8 text, and write only "
+                    "replaces text. Use run_shell if you really mean to overwrite it."
+                )
+            # Nothing to approve and nothing to write: the owner is being asked
+            # to confirm a change that would not change a byte, and a rewrite
+            # would only bump the file's timestamps.
+            if previous == content:
+                result = ToolResult(
+                    text=(
+                        f"{self._display(path)} already has exactly that content; "
+                        "left it unchanged"
+                    ),
+                    ok=True,
+                    data={
+                        "path": str(path),
+                        "bytes": len(content),
+                        "created": False,
+                        "unchanged": True,
+                    },
+                    summary=f"unchanged {self._display(path)}",
+                )
+                if arguments.get("upload") and self.settings.uploads:
+                    await self._attach(result, path, ctx.chat_id)
+                return result
         overwrite = bool(arguments.get("overwrite"))
 
         self._require_owner(path, ctx, arguments, _short_diff(previous, content))
@@ -618,25 +699,66 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         result.text += f"\n(will be sent to the chat as a document: {artifact.path})"
 
     async def _upload(self, arguments: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        """Send an existing project file to the chat as a document.
+        """Send existing project files to the chat as documents.
 
-        The file itself is not modified; this only stages it for delivery. Use
-        it after generating something with the shell, or when the owner asks
-        for a file that already exists.
+        The files themselves are not modified; this only stages them for
+        delivery. Use it after generating something with the shell, or when the
+        owner asks for files that already exist. ``paths`` sends several in one
+        call — one message per file on the frontend, one result here — so a
+        build that produced five outputs does not need five round trips.
+
+        Path resolution happens for the whole batch up front: a path the guards
+        refuse (a secret, another chat's upload, outside the project) raises
+        instead of being skipped, so a batch is never quietly partial in a way
+        the model would report as complete. Missing or undeliverable files are
+        ordinary per-file notes, exactly as they are for a single upload.
         """
         if not self.settings.uploads:
             return ToolResult.failure(
                 "file delivery is disabled in config (tools.files.uploads = false)"
             )
-        raw = arguments.get("path")
-        if not raw or not str(raw).strip():
-            raise ToolError("path is required for an upload")
-        path = self._resolve(arguments.get("path"), for_write=False, chat_id=ctx.chat_id)
-        if not path.is_file():
-            return ToolResult.failure(f"no such file: {self._display(path)}")
+        requested: list[str] = []
+        raw_paths = arguments.get("paths")
+        if isinstance(raw_paths, list):
+            requested = [str(item).strip() for item in raw_paths if str(item).strip()]
+        if not requested:
+            raw = arguments.get("path")
+            if not raw or not str(raw).strip():
+                raise ToolError("path or paths is required for an upload")
+            requested = [str(raw).strip()]
+        # A repeated name would stage the same file twice; keeping the first
+        # occurrence preserves the order the model asked for.
+        requested = list(dict.fromkeys(requested))
+        if len(requested) > MAX_UPLOAD_FILES:
+            raise ToolError(
+                f"{len(requested)} paths is more than the {MAX_UPLOAD_FILES}-file limit "
+                "for one upload call. Send the most important files now and the rest "
+                "in another call."
+            )
 
-        result = ToolResult(text="", ok=True, summary=f"upload {self._display(path)}")
-        await self._attach(result, path, ctx.chat_id)
+        paths = [
+            self._resolve(raw, for_write=False, chat_id=ctx.chat_id) for raw in requested
+        ]
+        missing = [self._display(path) for path in paths if not path.is_file()]
+        deliverable = [path for path in paths if path.is_file()]
+
+        count = len(paths)
+        summary = (
+            f"upload {self._display(paths[0])}" if count == 1 else f"upload {count} files"
+        )
+        result = ToolResult(text="", ok=True, summary=summary)
+        for path in deliverable:
+            await self._attach(result, path, ctx.chat_id)
+
+        # A partial batch is a failure the model must see: some of what it
+        # promised the owner is not arriving.
+        if missing or len(result.artifacts) != len(deliverable):
+            result.ok = False
+            if missing:
+                prefix = "\n".join(f"no such file: {name}" for name in missing)
+                result.text = (
+                    prefix + "\n" + result.text.strip() if result.text.strip() else prefix
+                )
         if not result.artifacts:
             result.ok = False
             result.text = result.text.strip() or "could not stage that file for delivery"
@@ -735,8 +857,7 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         count = previous.count(old)
         if count == 0:
             return ToolResult.failure(
-                f"old_string not found in {self._display(path)}. Read the file first and "
-                "copy the exact text — character for character, whitespace included."
+                f"old_string not found in {self._display(path)}. " + _near_match(previous, old)
             )
         if count > 1 and not replace_all:
             return ToolResult.failure(
@@ -890,6 +1011,57 @@ def _ignored(path: Path) -> bool:
     parts = set(path.parts)
     return bool(
         parts & {".git", "__pycache__", ".venv", "node_modules", ".pytest_cache", ".ruff_cache"}
+    )
+
+
+def _near_match(previous: str, old: str) -> str:
+    """Explain a failed ``old_string`` match in terms the model can act on.
+
+    The common miss is whitespace: the model re-indents the block it means to
+    copy, or remembers the line but not the spaces around it. Naming the line
+    that matches once whitespace is ignored turns a dead end into one corrected
+    call. When nothing matches even loosely, the closest line is still a
+    landmark, and either way the instructions name the way out: re-read, copy
+    exactly.
+
+    The quote is bounded like any other tool output; a hint that floods the
+    context would cost more than the re-read it is trying to save.
+    """
+    old_lines = old.splitlines()
+    if not old_lines:
+        return "Read the file first (action: read) and copy the exact text, whitespace included."
+    target = [" ".join(line.split()) for line in old_lines]
+    lines = previous.splitlines()
+    flat = [" ".join(line.split()) for line in lines]
+    span = len(target)
+
+    for start in range(0, len(flat) - span + 1):
+        if flat[start : start + span] == target:
+            block = "\n".join(lines[start : start + span])
+            return (
+                f"A block at line {start + 1} matches once whitespace is ignored, so "
+                "the text is there but the indentation differs. Copy it exactly:\n"
+                + truncate(block, 1200)
+            )
+
+    if span == 1:
+        wanted = target[0]
+        best_ratio, best_at = 0.0, -1
+        for index, line in enumerate(flat):
+            ratio = difflib.SequenceMatcher(None, wanted, line).ratio()
+            if ratio > best_ratio:
+                best_ratio, best_at = ratio, index
+        if best_at >= 0 and best_ratio >= 0.6:
+            return (
+                f"The closest line is {best_at + 1}, but it is not an exact match:\n"
+                f"{truncate(lines[best_at], 400)}\n"
+                "Read the file (action: read, same path) and copy the exact text — "
+                "character for character, whitespace included."
+            )
+
+    return (
+        "Read the file first (action: read, same path) and copy the exact text — "
+        "character for character, whitespace included."
     )
 
 

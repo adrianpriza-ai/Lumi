@@ -282,6 +282,68 @@ async def test_upload_action_sends_an_existing_file(files: FilesTool, config) ->
     assert (config.shell_cwd / "made-by-shell.csv").read_text(encoding="utf-8") == "a,b\n1,2\n"
 
 
+async def test_upload_action_sends_several_files_in_one_call(files: FilesTool, config) -> None:
+    """A build with several outputs is one call, not one call per file."""
+    for name in ("a.csv", "b.txt", "c.md"):
+        (config.shell_cwd / name).write_text(name, encoding="utf-8")
+
+    result = await files.invoke(
+        {
+            "action": "upload",
+            "paths": [
+                "workspace/a.csv",
+                "workspace/b.txt",
+                "workspace/c.md",
+                "workspace/a.csv",  # a repeat is not sent twice
+            ],
+        },
+        ctx(),
+    )
+    assert result.ok
+    assert [artifact.path for artifact in result.artifacts] == [
+        "workspace/a.csv",
+        "workspace/b.txt",
+        "workspace/c.md",
+    ]
+    assert result.summary == "upload 3 files"
+
+
+async def test_multi_upload_keeps_the_good_files_and_names_the_bad_ones(
+    files: FilesTool, config
+) -> None:
+    (config.shell_cwd / "good.md").write_text("# ok", encoding="utf-8")
+
+    result = await files.invoke(
+        {"action": "upload", "paths": ["workspace/good.md", "workspace/ghost.md"]}, ctx()
+    )
+    # Some of the batch went out, so it is a failure the model has to say
+    # out loud rather than a silent partial delivery.
+    assert not result.ok
+    assert len(result.artifacts) == 1
+    assert "no such file: workspace/ghost.md" in result.text
+
+
+async def test_multi_upload_refuses_a_refused_path_in_the_batch(files: FilesTool) -> None:
+    """A guard refusal is not a per-file note: the whole batch stops."""
+    with pytest.raises(ToolError, match="holds credentials"):
+        await files.invoke(
+            {"action": "upload", "paths": ["workspace/ok.md", ".env"]}, ctx()
+        )
+
+
+async def test_multi_upload_caps_the_batch(files: FilesTool) -> None:
+    from lumi.tools.files import MAX_UPLOAD_FILES
+
+    with pytest.raises(ToolError, match="limit"):
+        await files.invoke(
+            {
+                "action": "upload",
+                "paths": [f"workspace/f{i}.md" for i in range(MAX_UPLOAD_FILES + 1)],
+            },
+            ctx(),
+        )
+
+
 async def test_another_chats_uploads_are_out_of_reach(files: FilesTool, config) -> None:
     """Incoming documents are stored per chat; every read inside the project
     used to be allowed from any chat, so chat B could list and upload chat A's

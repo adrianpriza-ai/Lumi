@@ -664,6 +664,33 @@ async def test_bypass_skips_the_file_gates(files: FilesTool, config) -> None:
     assert (config.data_dir / "skills" / "demo" / "SKILL.md").exists()
 
 
+async def test_write_refuses_to_clobber_a_binary_file(files: FilesTool, config) -> None:
+    """Overwriting bytes the tool cannot decode used to garble them silently."""
+    target = config.shell_cwd / "blob.bin"
+    target.write_bytes(b"\x89PNG\x00\x01")
+
+    result = await files.invoke(
+        {"action": "write", "path": "workspace/blob.bin", "content": "text"}, ctx()
+    )
+    assert not result.ok
+    assert "binary" in result.text
+    assert target.read_bytes() == b"\x89PNG\x00\x01"
+
+
+async def test_write_of_identical_content_is_a_no_op(files: FilesTool, config) -> None:
+    """Asking to confirm a write that changes nothing teaches blind taps."""
+    target = config.shell_cwd / "same.md"
+    target.write_text("same text\n", encoding="utf-8")
+
+    result = await files.invoke(
+        {"action": "write", "path": "workspace/same.md", "content": "same text\n"}, ctx()
+    )
+    assert result.ok
+    assert result.data["unchanged"] is True
+    assert "unchanged" in result.text
+    assert target.read_text(encoding="utf-8") == "same text\n"
+
+
 async def test_write_creates_parent_directories(files: FilesTool, config) -> None:
     result = await files.invoke(
         {"action": "write", "path": "workspace/deep/nested/file.md", "content": "x"},
@@ -1044,6 +1071,44 @@ async def test_edit_reports_a_match_that_is_not_there(files: FilesTool, config) 
     assert not result.ok
     assert "not found" in result.text
     assert target.read_text(encoding="utf-8") == "hello world\n"  # untouched
+
+
+async def test_edit_points_at_a_whitespace_only_mismatch(files: FilesTool, config) -> None:
+    """The usual miss is re-indentation: name the line instead of saying "no"."""
+    target = config.shell_cwd / "code.py"
+    target.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+
+    result = await files.invoke(
+        {
+            "action": "edit",
+            "path": "workspace/code.py",
+            "old_string": "def add(a, b):\nreturn a + b\n",
+            "new_string": "def add(a, b):\n    return a - b\n",
+        },
+        ctx(),
+    )
+    assert not result.ok
+    assert "line 1" in result.text
+    assert "whitespace is ignored" in result.text
+    assert target.read_text(encoding="utf-8") == "def add(a, b):\n    return a + b\n"
+
+
+async def test_edit_names_the_closest_line_when_nothing_matches(files: FilesTool, config) -> None:
+    target = config.shell_cwd / "note.md"
+    target.write_text("hello world\n", encoding="utf-8")
+
+    result = await files.invoke(
+        {
+            "action": "edit",
+            "path": "workspace/note.md",
+            "old_string": "helo world",
+            "new_string": "hi",
+        },
+        ctx(),
+    )
+    assert not result.ok
+    assert "closest line is 1" in result.text
+    assert "hello world" in result.text
 
 
 async def test_edit_needs_old_and_new_strings(files: FilesTool) -> None:

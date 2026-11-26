@@ -27,11 +27,12 @@ class SendTool(Tool):
     name = "send"
     description = (
         "Send a message to the owner right now, mid-turn, and keep working. "
-        'Use for progress updates during long work ("done with phase 1, '
-        'starting phase 2") or to deliver the answer in parts across several '
-        "messages. One call sends one message. Do NOT use it for your final "
-        "answer — that is your normal reply text — and keep it to a handful "
-        "of messages per turn."
+        "Use it only for long jobs the owner cannot watch: a short line when "
+        'you start ("reading the parser now"), then about one per phase — every '
+        "handful of steps, not every step — plus one if the plan changes, or to "
+        "deliver the answer in parts. One call sends one message. Do NOT use it "
+        "for your final answer, that is your normal reply text, and a quick "
+        "task gets none at all."
     )
     parameters = {
         "type": "object",
