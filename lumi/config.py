@@ -1132,6 +1132,9 @@ class YouConfig:
 
 @dataclass(slots=True)
 class MCPConfig:
+    #: The standalone tool's own gate. False leaves the tool registered but
+    #: ``available()`` reports it disabled; removing ``mcp`` from
+    #: ``tools.enabled`` unregisters it altogether, including ``/mcp``.
     enabled: bool = True
     #: The project's own file. A relative path resolves against the project root.
     config_file: str = ".mcp.json"
@@ -1141,18 +1144,18 @@ class MCPConfig:
     #: turns the user-level file off.
     user_config_file: str = "~/.agents/mcp.json"
     timeout_seconds: int = 60
-    #: Every ``call`` through the standalone ``mcp`` tool asks the owner first
-    #: (the Confirm/Cancel prompt): an MCP tool reaches an external service the
-    #: owner configured, and no tool name tells a read from a write. Set false
-    #: for a hands-off agent. The ``list`` action never asks either way — it
-    #: only reads what the server already advertised.
+    #: Every ``execute`` through the ``mcp`` tool asks the owner first: a
+    #: Code Mode script runs on this machine and calls external services the
+    #: owner configured, and no tool name tells a read from a write. The owner
+    #: sees the script before it runs. Set false for a hands-off agent. The
+    #: ``search`` action never asks — it only reads what the servers advertise.
     ask_before_call: bool = True
-    search_tools: list[str] = field(
-        default_factory=lambda: ["tavily_search", "firecrawl_search", "search"]
-    )
-    fetch_tools: list[str] = field(
-        default_factory=lambda: ["tavily_extract", "firecrawl_scrape", "scrape", "extract"]
-    )
+    #: Wall-clock budget for one Code Mode script, seconds. The sandbox is
+    #: killed when it runs over, so a loop cannot hold the turn forever.
+    code_timeout_seconds: float = 30.0
+    #: Most MCP calls one script may make. A guard against a runaway loop that
+    #: would otherwise hammer an external service for the whole budget.
+    max_code_calls: int = 40
 
 
 #: Documented ways of spending several keys in one env var. Mirrors the LLM
@@ -1233,7 +1236,6 @@ class WebConfig:
             "keenable",
             "jina",
             "you",
-            "mcp",
         ]
     )
     #: How many hits a search returns. The ceiling is the provider's, not ours:
@@ -1264,6 +1266,29 @@ class WebConfig:
 #: was the key before the tool was reachable as ``run_shell``; a config written
 #: against either name keeps working.
 TOOL_ALIASES = {"shell": "run_shell"}
+
+#: ``mcp`` used to be a web provider before MCP became a standalone tool. An
+#: old ``provider_order`` still boots, but the name is dropped from the
+#: effective order rather than becoming a provider that can never answer.
+LEGACY_WEB_PROVIDERS = {
+    "mcp": "servers are now reached with the standalone mcp tool (tools.enabled)",
+}
+
+
+def _without_legacy_web_providers(order: list[str]) -> list[str]:
+    """Strip retired names from a provider order, warning about the migration."""
+    kept: list[str] = []
+    for name in order:
+        if name in LEGACY_WEB_PROVIDERS:
+            log.warning(
+                "tools.web.provider_order: %r is no longer a web provider (%s); "
+                "ignoring it — please remove it from provider_order",
+                name,
+                LEGACY_WEB_PROVIDERS[name],
+            )
+            continue
+        kept.append(name)
+    return kept
 
 
 def canonical_tool_name(name: str) -> str:
@@ -1661,6 +1686,9 @@ def load_config(root: Path | None = None) -> Config:
     data = {k: v for k, v in merged.items() if k in known}
 
     config = _build(Config, data)
+    # A legacy "mcp" entry in provider_order still loads: warn once and drop it
+    # so every consumer sees the effective order, not the historical spelling.
+    config.tools.web.provider_order = _without_legacy_web_providers(config.tools.web.provider_order)
     config.root = root
     config.config_path = config_path
     config.user_dir = user_dir if (user_dir / CONFIG_FILENAME).is_file() else None
@@ -1735,6 +1763,12 @@ def validate(config: Config) -> list[str]:
         problems.append(
             "tools.web.providers.mcp.timeout_seconds must be a positive number of seconds"
         )
+    if config.tools.web.mcp.code_timeout_seconds <= 0:
+        problems.append(
+            "tools.web.providers.mcp.code_timeout_seconds must be a positive number of seconds"
+        )
+    if config.tools.web.mcp.max_code_calls <= 0:
+        problems.append("tools.web.providers.mcp.max_code_calls must be a positive number")
     if problem := config.tools.ocr.endpoint_problem():
         problems.append(problem)
     if problem := config.tools.image_gen.endpoint_problem():
@@ -1827,7 +1861,7 @@ def validate(config: Config) -> list[str]:
 
     providers = [
         p
-        for p in config.tools.web.provider_order
+        for p in _without_legacy_web_providers(config.tools.web.provider_order)
         if p
         not in {
             "tavily",
@@ -1837,7 +1871,6 @@ def validate(config: Config) -> list[str]:
             "keenable",
             "jina",
             "you",
-            "mcp",
         }
     ]
     if providers:

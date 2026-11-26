@@ -30,7 +30,7 @@ class SendTool(Tool):
         "Use it only for long jobs the owner cannot watch: a short line when "
         'you start ("reading the parser now"), then about one per phase — every '
         "handful of steps, not every step — plus one if the plan changes, or to "
-        "deliver the answer in parts. One call sends one message. Do NOT use it "
+        "deliver a long answer in parts. One call sends one message. Do NOT use it "
         "for your final answer, that is your normal reply text, and a quick "
         "task gets none at all."
     )

@@ -8,7 +8,8 @@
 LUMI__LLM__MODEL=qwen3:8b
 LUMI__TOOLS__MODE=bypass
 LUMI__TOOLS__SHELL__TIMEOUT_SECONDS=10
-LUMI__TOOLS__WEB__PROVIDER_ORDER=mcp,tavily
+LUMI__TOOLS__WEB__PROVIDER_ORDER=you,tavily
+LUMI__TOOLS__WEB__PROVIDERS__MCP__CODE_TIMEOUT_SECONDS=30
 ```
 
 Precedence: dataclass defaults < `config.toml` < `config.local.toml` (gitignored)

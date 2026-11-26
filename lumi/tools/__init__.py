@@ -20,7 +20,7 @@ from .context7 import Context7Tool
 from .explore import GrepTool, ListFilesTool, ReadFileTool
 from .files import FilesTool
 from .imagegen import ImageGenTool
-from .mcp_tool import MCPTool
+from .mcp import MCPTool
 from .memory_tool import MemoryTool
 from .more_context import MoreContextTool
 from .ocr import OCRTool

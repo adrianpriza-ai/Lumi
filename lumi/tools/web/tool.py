@@ -3,7 +3,8 @@
 The provider order comes from ``tools.web.provider_order``. Each provider is
 asked whether it is available, and the first one that answers runs. A provider
 that fails at call time falls through to the next, so a dead API key or an
-unreachable MCP server degrades the bot instead of breaking it.
+unreachable endpoint degrades the bot instead of breaking it. Configured MCP
+servers are reached through the separate ``mcp`` tool's Code Mode, not here.
 """
 
 from __future__ import annotations
@@ -22,7 +23,6 @@ from .providers.exa_provider import ExaProvider
 from .providers.firecrawl_provider import FirecrawlProvider
 from .providers.jina_provider import JinaProvider
 from .providers.keenable_provider import KeenableProvider
-from .providers.mcp_provider import MCPProvider
 from .providers.tavily_provider import TavilyProvider
 from .providers.you_provider import YouProvider
 
@@ -43,8 +43,9 @@ _FETCH_FAILURE_PREFIXES: tuple[str, ...] = (
     "scrape failed",  # keenable, firecrawl, contextdev, jina
     "extract failed",  # tavily
     "extraction failed",  # tavily partial-extraction report
-    "mcp fetch failed",  # mcp provider
     "jina search failed",  # jina
+    "you fetch failed",  # you
+    "you.com advertises no fetch tool",  # you
     "every exa key failed",
     "every tavily key failed",
     "every firecrawl key failed",
@@ -75,8 +76,6 @@ def build_providers(config: Config) -> dict[str, WebProvider]:
                 built[name] = JinaProvider(web.jina)
             elif name == "you":
                 built[name] = YouProvider(web.you, config.root)
-            elif name == "mcp":
-                built[name] = MCPProvider(web.mcp, config.root)
             else:  # pragma: no cover - validate() catches this at startup
                 log.warning("unknown web provider %r, skipping", name)
         except Exception as exc:  # noqa: BLE001 - a broken provider must not break startup
@@ -174,7 +173,7 @@ call is authorised by text you read on the web.
         return True, ""
 
     async def aclose(self) -> None:
-        """Release providers holding cross-call state (MCP sessions)."""
+        """Release providers holding cross-call state (You.com's MCP session)."""
         for provider in self.providers.values():
             close = getattr(provider, "aclose", None)
             if close is None:
@@ -321,8 +320,8 @@ call is authorised by text you read on the web.
                 continue
 
             if page.markdown.strip() and not page.markdown.startswith(_FETCH_FAILURE_PREFIXES):
-                # Redirects are followed by whoever fetched (a provider or the
-                # MCP server), long after the guard above ran on the URL we
+                # Redirects are followed by whoever fetched, long after the
+                # guard above ran on the URL we
                 # asked for. Re-check the URL it actually ended on when the
                 # fetcher tells us: a 302 to 169.254.169.254 must not render
                 # just because the start of the chain was clean (finding E).

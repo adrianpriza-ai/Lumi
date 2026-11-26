@@ -128,7 +128,7 @@ auto_remember = true
 [tools.web]
 enabled = true
 # Providers tried in order; the first available one answers.
-provider_order = ["firecrawl", "exa", "tavily", "contextdev", "keenable", "jina", "you", "mcp"]
+provider_order = ["firecrawl", "exa", "tavily", "contextdev", "keenable", "jina", "you"]
 # Hits per search. 0 = whatever the model asks for.
 max_results = 10
 # Top up from the next provider below this many hits.
@@ -227,17 +227,21 @@ url = "https://api.you.com/mcp?profile=free"
 api_key_env = "YOU_API_KEY"
 
 [tools.web.providers.mcp]
+# Configures the standalone `mcp` tool, not a web provider: `mcp` in
+# provider_order is ignored with a warning. Two kill switches: remove `mcp`
+# from tools.enabled to unregister the tool (and its /mcp commands), or set
+# false here to leave it registered but unavailable to the model.
 enabled = true
 # Project file merged with the user-level file. "" disables the latter.
 config_file = ".mcp.json"
 user_config_file = "~/.agents/mcp.json"
 timeout_seconds = 60
-# Every `mcp` tool call asks the owner first; false = hands-off agent.
-# (The `list` action never asks — it only reads.)
+# Every `mcp` Code Mode script asks the owner before it runs; false = hands-off.
+# (The `search` action never asks — it only reads what servers advertise.)
 ask_before_call = true
-# Tool name patterns; first match wins.
-search_tools = ["web_search_exa", "tavily_search", "firecrawl_search", "search"]
-fetch_tools = ["crawl_urls", "tavily_extract", "firecrawl_scrape", "scrape", "extract"]
+# Wall-clock budget for one script (s) and its MCP call cap.
+code_timeout_seconds = 30.0
+max_code_calls = 40
 
 [tools.context7]
 # Auto-enables when CONTEXT7_API_KEY is set.

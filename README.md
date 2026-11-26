@@ -47,9 +47,9 @@ expected, and it is why the two steps above are always both needed.
 
 **The safety layer is a file you can audit.** `lumi/tools/safety.py` is one screen of `(regex, tier, reason)` triples. `lumi shell "rm -rf /"` prints the verdict and the reason, so you can check the policy without provoking it.
 
-**Web access is pluggable five ways.** The Firecrawl SDK, the Exa SDK, the Tavily SDK, You.com's keyless MCP search, and a generic MCP client that reads `.mcp.json` (plus `~/.agents/mcp.json`, for servers shared across every project). They normalise to the same interface, so adding another is one file. The MCP path means a Tavily, Firecrawl, or Exa MCP server works with no code change at all — just add it to `.mcp.json`.
+**Web access is pluggable.** The Firecrawl SDK, the Exa SDK, the Tavily SDK, Context.dev, Keenable, Jina Reader, and You.com's keyless MCP search. They normalise to the same interface, so adding another is one file. `.mcp.json` servers are not search providers any more; they are reached through the `mcp` tool below.
 
-**MCP is also a standalone tool.** The web provider only borrows a server's search and fetch tools; the `mcp` tool exposes *every* tool a configured server advertises, so an MCP server becomes an agent capability — create a Linear issue, drive GitHub, list models on Hugging Face — not just another search backend. `list` shows the servers and their schemas, `call` runs one, and each call waits for the owner's Confirm unless `ask_before_call = false`. Servers that only speak OAuth (Linear, Notion, Atlassian) get `"auth": "oauth"` in their entry; the owner runs `/mcp auth <name>` once, approves in the browser, and the tokens live under `.mcp-tokens/` (gitignored, mode 0600) and refresh on their own from then on.
+**MCP runs in Code Mode.** Every tool on every server in `.mcp.json` (plus `~/.agents/mcp.json`, for servers shared across every project) is converted into a Python API. The model calls `mcp search` to find the helper names, then writes one script — loops, filters, chained calls — for `mcp execute`. The script runs in a sandbox with no filesystem or network access, the MCP calls are routed back to the host where the sessions and tokens live, and only what the script prints returns. This follows [Cloudflare's Code Mode](https://blog.cloudflare.com/code-mode), in Python instead of TypeScript. Each script waits for the owner's Confirm unless `ask_before_call = false`. Servers that only speak OAuth (Linear, Notion, Atlassian) get `"auth": "oauth"` in their entry; the owner runs `/mcp auth <name>` once, approves in the browser, and the tokens live under `.mcp-tokens/` (gitignored, mode 0600) and refresh on their own from then on.
 
 ## Commands
 
@@ -79,7 +79,7 @@ In group chats the bot only answers when **mentioned** (`@Lumi_a_bot ...`), **re
 | Document | Covers |
 |-|-|
 | [CONFIGURATION.md](docs/CONFIGURATION.md) | `config.toml` and precedence, picking an endpoint, reasoning models and thinking traces, key pools and rotation |
-| [TOOLS.md](docs/TOOLS.md) | The tools, shell safety and its threat model, web providers (Firecrawl / Exa / Tavily / MCP), the standalone `mcp` tool, Context7, mid-turn messages, and how to add a tool |
+| [TOOLS.md](docs/TOOLS.md) | The tools, shell safety and its threat model, web providers (Firecrawl / Exa / Tavily / You.com), MCP Code Mode, Context7, mid-turn messages, and how to add a tool |
 | [TELEGRAM.md](docs/TELEGRAM.md) | Group chats and when the bot answers, and getting past `api.telegram.org` timeouts |
 | [DEPLOYMENT.md](docs/DEPLOYMENT.md) | What the safety controls assume about the machine: unprivileged user, protected state files, egress, systemd |
 
@@ -112,8 +112,8 @@ lumi/
 │   ├── memory_tool.py
 │   ├── context7.py    version-specific library docs
 │   ├── send.py        mid-turn owner messages
-│   ├── mcp_tool.py    call any tool an MCP server exposes
-│   └── web/           tool + providers/{firecrawl,exa,tavily,you,mcp}
+│   ├── mcp/           Code Mode tool, server sessions, trust, OAuth, sandbox
+│   └── web/           tool + providers/{firecrawl,exa,tavily,you,...}
 ├── util/
 │   ├── keys.py        comma-separated key parsing
 │   ├── log.py         logging setup

@@ -86,9 +86,17 @@ def test_env_overrides_toml(project, monkeypatch) -> None:
     assert config.bot.require_owner is False
 
 
-def test_env_override_of_a_list(project, monkeypatch) -> None:
+def test_env_override_of_a_list(project, monkeypatch, caplog) -> None:
+    """A legacy ``mcp`` entry still parses, but is dropped with a migration hint."""
     monkeypatch.setenv("LUMI__TOOLS__WEB__PROVIDER_ORDER", "mcp, tavily ,firecrawl")
-    assert load_config(project).tools.web.provider_order == ["mcp", "tavily", "firecrawl"]
+    with caplog.at_level(logging.WARNING, logger="lumi.config"):
+        config = load_config(project)
+
+    assert config.tools.web.provider_order == ["tavily", "firecrawl"]
+    assert any(
+        "provider_order" in r.getMessage() and "mcp" in r.getMessage() for r in caplog.records
+    )
+    assert not [p for p in validate(config) if "provider_order" in p]
 
 
 def test_permission_mode_comes_from_the_environment(project, monkeypatch) -> None:
@@ -292,6 +300,18 @@ def test_validate_flags_unknown_tools(config) -> None:
 def test_validate_flags_unknown_providers(config) -> None:
     config.tools.web.provider_order = ["tavily", "askjeeves"]
     assert any("askjeeves" in p for p in validate(config))
+
+
+def test_validate_accepts_the_retired_mcp_provider(config, caplog) -> None:
+    """A programmatic config with the old web provider warns but still validates."""
+    config.tools.web.provider_order = ["mcp", "tavily"]
+    with caplog.at_level(logging.WARNING, logger="lumi.config"):
+        problems = validate(config)
+
+    assert not [p for p in problems if "provider_order" in p]
+    assert any(
+        "provider_order" in r.getMessage() and "mcp" in r.getMessage() for r in caplog.records
+    )
 
 
 def test_validate_accepts_the_old_shell_name(config) -> None:

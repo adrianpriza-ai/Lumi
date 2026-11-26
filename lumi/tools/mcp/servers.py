@@ -1,20 +1,23 @@
-"""Any MCP server as a web provider.
+"""The MCP server client: config files, transports, sessions and discovery.
 
-This is what makes ``.mcp.json`` meaningful for Lumi. Two files are read: the
-project's ``.mcp.json``, and the user-level ``~/.agents/mcp.json`` for servers
-configured once for every project. ``${VAR}`` placeholders are expanded from the
-environment, and the server is spoken to over MCP proper — so a Tavily or
-Firecrawl MCP server dropped into either file works immediately, with no code
-change. A locally spawned server (``npx -y some-mcp-server``) works the same
-way. When a server name appears in both files, the project file wins.
+This is the machinery behind the ``mcp`` tool's Code Mode. Two files are read:
+the project's ``.mcp.json``, and the user-level ``~/.agents/mcp.json`` for
+servers configured once for every project. ``${VAR}`` placeholders are expanded
+from the environment, and the server is spoken to over MCP proper — so any
+server dropped into either file works immediately, with no code change. A
+locally spawned server (``npx -y some-mcp-server``) works the same way. When a
+server name appears in both files, the project file wins.
 
 One asymmetry between the two files: the user-level one is written by the
 owner's own hand, but the project one arrives by ``git clone`` exactly as it
 does by editing, so its entries connect only after the owner approved that
-exact entry — see :mod:`~lumi.tools.web.providers.mcp_trust`. The gate sits in
-:meth:`MCPProvider._open`, which every trigger flows through, so a fresh entry
-costs a ``/mcp approve`` before ``mcp list``, a web search or a call spawns or
-dials it.
+exact entry — see :mod:`~lumi.tools.mcp.trust`. The gate sits in
+:meth:`MCPServers._open`, which every trigger flows through, so a fresh entry
+costs a ``/mcp approve`` before discovery or a call can spawn or dial it.
+
+There is no search/fetch role here. An MCP server is exposed to the model as
+one generated API inside the sandboxed ``mcp`` tool (see
+:mod:`~lumi.tools.mcp.codemode`), never as a web-search fallback.
 
 Two transport kinds are supported, under either spelling of ``"type"``:
 
@@ -29,10 +32,10 @@ the config names one — so a relative path in ``args`` means what it looks like
 relative to the project that configured it, rather than to wherever Lumi
 ehappened to be launched from.
 
-Tool names are not hardcoded. The provider asks each server what it offers and
-picks the first tool matching the configured preference list, then reads that
-tool's own input schema to work out whether it wants ``query``, ``q`` or
-something else. That is what lets one implementation front an arbitrary server.
+Tool names are not hardcoded. Discovery asks each configured server for every
+tool it advertises and reads each tool's own input schema, so Code Mode can
+generate a helper for an arbitrary server without a per-server preference list
+or a guess about how that server names its parameters.
 
 The provider spans the whole ``mcp`` package line the dependency allows
 (``mcp>=1.2``): the places where the SDK renamed things between major
@@ -55,13 +58,12 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from ....config import MCPConfig
-from ....paths import resolve
-from ....util.env import SECRET_PATTERN, scrubbed_env
-from ....util.log import get_logger
-from .base import Page, SearchHit, SearchResult, WebProvider, final_url, recent_cutoff
-from .mcp_oauth import MCPOAuthLoginRequired
-from .mcp_trust import MCPTrustError, MCPTrustStore, entry_digest, trust_path
+from ...config import MCPConfig
+from ...paths import resolve
+from ...util.env import SECRET_PATTERN, scrubbed_env
+from ...util.log import get_logger
+from .oauth import MCPOAuthLoginRequired
+from .trust import MCPTrustError, MCPTrustStore, entry_digest, trust_path
 
 log = get_logger(__name__)
 
@@ -75,7 +77,7 @@ _KIND_ALIASES = {"stdio": "local", "http": "remote"}
 #: How long a discovered tool list stays valid before we re-ask the server.
 TOOL_CACHE_TTL = 300.0
 
-#: Cap on the cursor walk in :meth:`MCPProvider._list_tools`. Servers paginate
+#: Cap on the cursor walk in :meth:`MCPServers._list_tools`. Servers paginate
 #: at their own discretion, and one that hands the same cursor back forever
 #: must not be able to keep us paging.
 LIST_PAGES_MAX = 10
@@ -258,7 +260,7 @@ class ServerSpec:
     #: the expansions that pulled a credential out of the environment.
     env_sourced: set[str] = field(default_factory=set)
     #: ``"auth": "oauth"`` in the server's entry: the server wants the *owner's*
-    #: authorization, negotiated per :mod:`~lumi.tools.web.providers.mcp_oauth`
+    #: authorization, negotiated per :mod:`~lumi.tools.mcp.oauth`
     #: (browser login, stored tokens) rather than a static header token.
     oauth: bool = False
     #: Scopes the authorization request asks for (``"scopes"`` in the dict
@@ -400,14 +402,14 @@ def _http_transport(spec: ServerSpec, root: Path):
     factory takes the auth handler directly (``auth=``), the legacy
     transport takes it as its own kwarg. Both factories exist across the
     supported range, so the handler is built once in
-    :func:`~lumi.tools.web.providers.mcp_oauth.oauth_provider_for` and handed
+    :func:`~lumi.tools.mcp.oauth.oauth_provider_for` and handed
     to whichever transport the installed SDK answers with.
     """
     from mcp.client import streamable_http
 
     auth = None
     if spec.oauth:
-        from .mcp_oauth import oauth_provider_for
+        from .oauth import oauth_provider_for
 
         auth = oauth_provider_for(spec, root)
 
@@ -501,14 +503,14 @@ class DiscoveredTool:
         return strings[0] if len(strings) == 1 else None
 
 
-class MCPProvider(WebProvider):
-    name = "mcp"
+class MCPServers:
+    """The configured servers, their sessions, and their advertised tools."""
 
     def __init__(self, config: MCPConfig, project_root: Path) -> None:
         self.config = config
         self.root = project_root
         #: Owner approvals for project-file entries — the gate :meth:`_open`
-        #: enforces. See :mod:`~lumi.tools.web.providers.mcp_trust`.
+        #: enforces. See :mod:`~lumi.tools.mcp.trust`.
         self.trust = MCPTrustStore(trust_path(project_root))
         self._tool_cache: dict[str, tuple[float, list[DiscoveredTool]]] = {}
         #: Live session per server name: (stack owning the transport, session).
@@ -643,9 +645,9 @@ class MCPProvider(WebProvider):
         spawn or HTTP, until the owner approved that exact entry. User-level
         entries are the owner's own writing and skip the gate; so does a spec
         built in code without a digest (the tests' stubs, mostly). The check
-        lives here rather than at each caller because every trigger — the web
-        tool's ``_pick``, the ``mcp`` tool's ``list`` and ``call``, ``check``
-        — funnels through :meth:`_open`.
+        lives here rather than at each caller because every trigger — tool
+        discovery, the ``mcp`` tool's ``search`` and ``execute``, ``check`` —
+        funnels through :meth:`_open`.
         """
         if spec.origin != "project" or not spec.digest:
             return None
@@ -791,7 +793,7 @@ class MCPProvider(WebProvider):
                 raise
 
     async def aclose(self) -> None:
-        """Close every cached session. Called at shutdown via the web tool."""
+        """Close every cached session. Called at shutdown via the mcp tool."""
         # Reverse open order: each transport entered an anyio scope in this
         # task, and anyio requires scopes to unwind last-in-first-out.
         for name in reversed(list(self._sessions)):
@@ -884,50 +886,49 @@ class MCPProvider(WebProvider):
         )
         return tools
 
-    async def _pick(
-        self, preferences: list[str], predicate, reasons: list[str] | None = None
-    ) -> tuple[ServerSpec, DiscoveredTool] | None:
-        """Find the first (server, tool) pair matching the preference order.
+    async def discover(
+        self, *, reasons: list[str] | None = None
+    ) -> list[tuple[ServerSpec, DiscoveredTool]]:
+        """Every advertised tool on every configured server, flattened.
 
-        When *reasons* is a list, it collects one short reason per server
-        that was skipped — unresolved variables, unreachable, awaiting
-        approval, or alive but offering no matching tool — so a web
-        search/fetch failure can say *which* server died and why, instead of
-        the bare "no tool found" whose per-server detail used to be
-        log-only.
+        One dead or unapproved server must not hide the rest, so a failure is
+        recorded in *reasons* (when given) and skipped. Discovery never calls a
+        server tool; the trust gate still refuses a project entry before it is
+        spawned or dialled.
         """
-        recorded: set[str] = set()
+        found: list[tuple[ServerSpec, DiscoveredTool]] = []
+        for spec in self.servers():
+            if missing := spec.unresolved():
+                if reasons is not None:
+                    reasons.append(f"{spec.name}: needs ${{{missing}}} set in the environment")
+                continue
+            try:
+                tools = await self._list_tools(spec)
+            except MCPTrustError as exc:
+                if reasons is not None:
+                    reasons.append(f"{spec.name}: awaiting approval ({exc})")
+                continue
+            except Exception as exc:  # noqa: BLE001 - one dead server must not hide the rest
+                if reasons is not None:
+                    reasons.append(f"{spec.name}: unreachable ({type(exc).__name__}: {exc})")
+                continue
+            if not tools and reasons is not None:
+                reasons.append(f"{spec.name}: no tools advertised")
+            found.extend((spec, tool) for tool in tools)
+        return found
 
-        def skip(name: str, why: str) -> None:
-            if reasons is not None and name not in recorded:
-                recorded.add(name)
-                reasons.append(f"{name}: {why}")
+    async def call_tool(
+        self,
+        spec: ServerSpec,
+        tool: DiscoveredTool,
+        arguments: dict[str, Any],
+    ) -> str:
+        """Call *tool* on *spec*, flattened to text, under the configured budget.
 
-        for wanted in preferences:
-            lowered = wanted.lower()
-            for spec in self.servers():
-                if spec.unresolved():
-                    log.debug("skipping mcp server %r: unresolved variables", spec.name)
-                    skip(spec.name, "unresolved ${VAR} placeholders")
-                    continue
-                try:
-                    tools = await self._list_tools(spec)
-                except MCPTrustError as exc:
-                    # Distinct from unreachable: the server may be perfectly
-                    # healthy, the owner just has not approved the entry. The
-                    # search still fails closed — this server is skipped.
-                    log.info("mcp server %r awaits approval: %s", spec.name, exc)
-                    skip(spec.name, f"awaits approval ({exc})")
-                    continue
-                except Exception as exc:  # noqa: BLE001
-                    log.info("mcp server %r is unreachable: %s", spec.name, exc)
-                    skip(spec.name, f"unreachable ({exc})")
-                    continue
-                for tool in tools:
-                    if tool.name.lower() == lowered or predicate(tool.name.lower()):
-                        return spec, tool
-                skip(spec.name, f"no tool matching {wanted!r}")
-        return None
+        A call may already have run on the server by the time a dead transport
+        surfaces, so it is never re-sent (see :meth:`_reuse`).
+        """
+        return await self._call(spec, tool, arguments, float(self.config.timeout_seconds))
 
     async def _call(
         self,
@@ -936,7 +937,13 @@ class MCPProvider(WebProvider):
         arguments: dict[str, Any],
         timeout: float,  # noqa: ASYNC109 - a configured budget, not a per-call API knob
     ) -> str:
-        """Call *tool* and flatten the result to text."""
+        """Call *tool* and flatten the result to text.
+
+        A server that flags its own result as an error raises
+        :class:`MCPCallError` instead of returning the text: a failure must
+        read as a failure on every surface, and Code Mode lets the script
+        catch it as ``ToolError``.
+        """
         result = await self._reuse(
             spec,
             lambda session: session.call_tool(
@@ -944,153 +951,10 @@ class MCPProvider(WebProvider):
             ),
             repeatable=False,  # a call may already have run; never re-send it
         )
-        return _flatten(result)
-
-    # -- WebProvider ------------------------------------------------------- #
-
-    async def search(self, query: str, max_results: int, days: int | None = None) -> SearchResult:
-        result = SearchResult(query=query, provider=self.name)
-        skipped: list[str] = []
-        chosen = await self._pick(
-            self.config.search_tools, lambda name: "search" in name, reasons=skipped
-        )
-        if chosen is None:
-            detail = "; ".join(skipped)
-            result.error = (
-                f"no search tool found in {', '.join(self.sources)} "
-                f"(looked for {', '.join(self.config.search_tools)} or any tool containing 'search')"
-                + (f"; skipped: {detail}" if detail else "")
-            )
-            return result
-
-        spec, tool = chosen
-        key = tool.arg_for(("query", "q", "search", "question")) or "query"
-        arguments: dict[str, Any] = {key: query}
-        if "max_results" in tool.properties:
-            arguments["max_results"] = max_results
-        elif "limit" in tool.properties:
-            arguments["limit"] = max_results
-        elif "count" in tool.properties:
-            arguments["count"] = max_results
-        # Tavily-shaped servers understand a coarse bucket; anything that takes
-        # an ISO date gets the exact cutoff instead. Servers that accept
-        # neither simply ignore both keys.
-        if days and days > 0:
-            if "freshness" in tool.properties:
-                arguments["freshness"] = _mcp_freshness(days, tool.properties["freshness"])
-            elif "time_range" in tool.properties:
-                arguments["time_range"] = _mcp_time_range(days)
-            elif "start_published_date" in tool.properties:
-                arguments["start_published_date"] = recent_cutoff(days)
-
-        try:
-            text = await self._call(spec, tool, arguments, float(self.config.timeout_seconds))
-        except Exception as exc:  # noqa: BLE001
-            log.warning("mcp search via %s.%s failed: %s", spec.name, tool.name, exc)
-            result.error = f"{type(exc).__name__}: {exc}"
-            return result
-
-        _parse_search_payload(text, result)
-        log.info("mcp %s/%s returned %d hit(s)", spec.name, tool.name, len(result.hits))
-        return result
-
-    async def fetch(self, url: str) -> Page:
-        skipped: list[str] = []
-        chosen = await self._pick(
-            self.config.fetch_tools,
-            lambda name: any(k in name for k in ("scrape", "extract", "fetch")),
-            reasons=skipped,
-        )
-        if chosen is None:
-            detail = "; ".join(skipped)
-            return Page(
-                url=url,
-                markdown=(
-                    f"mcp fetch failed: no fetch tool found in {', '.join(self.sources)}"
-                    + (f"; skipped: {detail}" if detail else "")
-                ),
-            )
-
-        spec, tool = chosen
-        key = tool.arg_for(("url", "urls", "link")) or "url"
-        arguments: dict[str, Any] = {key: url}
-
-        try:
-            text = await self._call(spec, tool, arguments, float(self.config.timeout_seconds))
-        except Exception as exc:  # noqa: BLE001
-            return Page(url=url, markdown=f"mcp fetch failed: {type(exc).__name__}: {exc}")
-
-        payload = _try_json(text)
-        if isinstance(payload, dict):
-            for item in payload.get("results") or []:
-                item = item if isinstance(item, dict) else {}
-                if item.get("raw_content") or item.get("markdown") or item.get("content"):
-                    reported_url = final_url(item.get("url"), requested="")
-                    if not reported_url:
-                        return Page(
-                            url=url,
-                            markdown="mcp fetch failed: server returned content without a final URL",
-                        )
-                    return Page(
-                        # A tavily-shaped server reports the page it landed on
-                        # after its own redirects; that URL is what the tool
-                        # layer re-checks against the private-host rules.
-                        url=reported_url,
-                        title=str(item.get("title") or ""),
-                        markdown=str(
-                            item.get("raw_content") or item.get("markdown") or item.get("content")
-                        ),
-                    )
-            # Some servers answer with the page at the top level. The text
-            # below is whatever the server flattened; the URL is upgraded only
-            # when the payload names one.
-            reported_url = final_url(payload.get("url"), payload.get("sourceURL"), requested="")
-            if not reported_url:
-                return Page(
-                    url=url,
-                    markdown="mcp fetch failed: server returned content without a final URL",
-                )
-            return Page(
-                url=reported_url,
-                markdown=text,
-            )
-        return Page(
-            url=url,
-            markdown="mcp fetch failed: server returned content without a final URL",
-        )
-
-    def summary_line(self) -> str:
-        ok, reason = self.available()
-        if not ok:
-            return f"- `{self.name}` _(unavailable: {reason})_"
-        names = [s.name for s in self.servers() if not s.unresolved()]
-        sources = " + ".join(self.sources)
-        return f"- `{self.name}` — {len(names)} server(s) from {sources}: {', '.join(names)}"
-
-
-# --------------------------------------------------------------------------- #
-# Result flattening
-# --------------------------------------------------------------------------- #
-
-
-def _mcp_time_range(days: int) -> str:
-    """Coarse bucket for servers that mirror Tavily's ``time_range`` shape."""
-    for ceiling, name in ((1, "day"), (7, "week"), (31, "month"), (365, "year")):
-        if days <= ceiling:
-            return name
-    return "year"
-
-
-def _mcp_freshness(days: int, schema: Any) -> str:
-    """Format *days* for MCP tools that expose You.com's ``freshness`` field."""
-    if isinstance(schema, dict):
-        pattern = str(schema.get("pattern") or "").lower()
-        description = str(schema.get("description") or "").lower()
-        if "yyyy-mm-ddtoyyyy-mm-dd" in description or "date range" in description:
-            return f"{recent_cutoff(days)}to{recent_cutoff(0)}"
-        if "yyyy-mm-dd" in pattern and "to" in pattern:
-            return f"{recent_cutoff(days)}to{recent_cutoff(0)}"
-    return _mcp_time_range(days)
+        text = _flatten(result)
+        if _is_error(result):
+            raise MCPCallError(text or f"{spec.name}.{tool.name} reported an error")
+        return text
 
 
 async def _list_page(session: Any, cursor: str | None) -> Any:
@@ -1146,6 +1010,29 @@ def _next_cursor(response: Any) -> str | None:
     else:
         cursor = getattr(response, "nextCursor", None) or getattr(response, "next_cursor", None)
     return str(cursor) if cursor else None
+
+
+class MCPCallError(RuntimeError):
+    """A server answered, and its answer was an error.
+
+    Distinct from a dead transport: the request ran, the server replied, and
+    nothing is retried. Code Mode surfaces it as ``ToolError`` inside the
+    script; the web provider turns it into its own failure result.
+    """
+
+
+def _is_error(result: Any) -> bool:
+    """Whether the server flagged its own result as an error.
+
+    The SDK answers with a ``CallToolResult`` object; a dict-shaped result
+    (raw JSON over a custom transport, and what the tests hand back) counts
+    too. Both field spellings count as well: the SDK renamed ``isError`` to
+    ``is_error`` in 2.x, and on a real 2.x server the old reading alone would
+    present a "Forbidden" as a successful result.
+    """
+    if isinstance(result, dict):
+        return bool(result.get("isError") or result.get("is_error"))
+    return bool(getattr(result, "isError", None) or getattr(result, "is_error", None))
 
 
 def _structured(result: Any) -> Any:
@@ -1216,72 +1103,15 @@ def _try_json(text: str) -> Any:
         return None
 
 
-def _highlights(item: dict[str, Any]) -> str:
-    """You.com's page text: a list under ``contents.highlights``."""
-    contents = item.get("contents")
-    if not isinstance(contents, dict):
-        return ""
-    highlights = contents.get("highlights")
-    if isinstance(highlights, list):
-        return "\n".join(str(h) for h in highlights if h)
-    return str(highlights or "")
-
-
-def _parse_search_payload(text: str, result: SearchResult) -> None:
-    """Best-effort normalisation of whatever shape the server returned."""
-    payload = _try_json(text)
-
-    if isinstance(payload, list):
-        payload = {"results": payload}
-
-    if isinstance(payload, dict):
-        result.answer = str(payload.get("answer") or payload.get("summary") or "")
-        items = payload.get("results") or payload.get("data") or []
-        # Grouped by source rather than a flat list — You.com answers with
-        # ``{"results": {"web": [...]}}`` — so flatten the groups first.
-        if isinstance(items, dict):
-            items = [item for group in items.values() if isinstance(group, list) for item in group]
-        elif not isinstance(items, list):
-            items = []
-        for item in items:
-            if not isinstance(item, dict):
-                result.hits.append(SearchHit(title="", url="", content=str(item)))
-                continue
-            url = str(item.get("url") or item.get("link") or "")
-            if not url:
-                continue
-            # Tavily puts the snippet in "content" and the full page in
-            # "raw_content"; firecrawl puts markdown in "markdown"; You.com
-            # nests highlights under "contents". Accept all.
-            body = str(
-                item.get("raw_content")
-                or item.get("markdown")
-                or item.get("content")
-                or _highlights(item)
-            )
-            result.hits.append(
-                SearchHit(
-                    title=str(item.get("title") or ""),
-                    url=url,
-                    snippet=str(
-                        item.get("content") or item.get("description") or item.get("snippet") or ""
-                    ),
-                    content=body,
-                    score=item.get("score"),
-                    published=str(
-                        item.get("published_date")
-                        or item.get("publishedDate")
-                        or item.get("page_age")
-                        or ""
-                    ),
-                )
-            )
-        if result.hits or result.answer:
-            return
-
-    if text.strip():
-        # A plain-text answer is still useful; surface it as one synthetic hit.
-        result.hits.append(SearchHit(title=f"result for {result.query!r}", url="", content=text))
-
-
-__all__ = ["MCPProvider", "ServerSpec", "DiscoveredTool", "MCPTrustError", "expand_env"]
+__all__ = [
+    "MCPServers",
+    "ServerSpec",
+    "DiscoveredTool",
+    "MCPCallError",
+    "MCPTrustError",
+    "expand_env",
+    "_flatten",
+    "_is_error",
+    "_read_timeout",
+    "_try_json",
+]

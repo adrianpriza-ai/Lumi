@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import pytest
 from mcp.client.auth import OAuthClientProvider
 
-from lumi.tools.web.providers.mcp_oauth import (
+from lumi.tools.mcp.oauth import (
     CallbackServer,
     FileTokenStorage,
     MCPOAuthLoginRequired,
@@ -29,7 +29,7 @@ from lumi.tools.web.providers.mcp_oauth import (
     oauth_provider_for,
     tokens_dir,
 )
-from lumi.tools.web.providers.mcp_provider import ServerSpec
+from lumi.tools.mcp.servers import ServerSpec
 
 
 def remote_spec(url: str, scope: str = "") -> ServerSpec:
@@ -69,7 +69,7 @@ def test_scopes_reach_the_spec_from_either_dict_spelling(config) -> None:
 
 
 def test_client_metadata_carries_the_requested_scope() -> None:
-    from lumi.tools.web.providers.mcp_oauth import _client_metadata
+    from lumi.tools.mcp.oauth import _client_metadata
 
     scoped = _client_metadata("Lumi (a)", ["http://localhost:1/callback"], "read write")
     bare = _client_metadata("Lumi (b)", ["http://localhost:2/callback"])
@@ -83,7 +83,7 @@ def test_with_scope_makes_the_configured_request_win() -> None:
     with whatever the server advertises (or nothing) — so the configured
     scopes are re-applied to the built URL, and an unscoped config leaves the
     URL untouched."""
-    from lumi.tools.web.providers.mcp_oauth import _with_scope
+    from lumi.tools.mcp.oauth import _with_scope
 
     url = "http://as.test/authorize?state=s1&scope=server-chosen%20scope&resource=r"
     assert _with_scope(url, "") == url  # nothing configured: server's choice stands

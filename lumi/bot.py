@@ -49,9 +49,9 @@ from .llm.catalog import CatalogError
 from .memory import History, MemoryFile, MemoryStore
 from .personality import Personality
 from .tools.docread import DocumentReader
-from .tools.mcp_tool import CheckOutcome
+from .tools.mcp.codemode import CheckOutcome
+from .tools.mcp.oauth import authorize_server as mcp_authorize_server
 from .tools.safety import MODES, parse_mode
-from .tools.web.providers.mcp_oauth import authorize_server as mcp_authorize_server
 from .util.env import SECRET_PATTERN
 from .util.log import get_logger
 from .util.text import (
@@ -181,7 +181,7 @@ MCP_HELP = """\
 <b>oauth:</b> <code>/mcp auth &lt;name&gt;</code> sends a browser link; tokens live in <code>.mcp-tokens/</code> (0600, never sent to chat) and refresh themselves; the redirect lands on localhost
 <b>scopes:</b> some providers (Atlassian) want them named in the entry: <code>"auth": {"type": "oauth", "scopes": "read:jira-work offline_access"}</code>
 
-None of these calls a server's tools — that is the model's <code>mcp</code> tool, and it asks you first."""
+None of these calls a server's tools — that is the model's <code>mcp</code> tool: it writes one Python script against the discovered tools, runs it in a sandbox, and asks you before the script runs."""
 
 
 def _humanize_uptime(seconds: float) -> str:
@@ -388,7 +388,8 @@ def _render_config(config: Config, memory_limit: int) -> str:
                 or "none"
             )
             + f" · timeout {web.mcp.timeout_seconds}s"
-            + (" · asks before each call" if web.mcp.ask_before_call else " · no approval prompt"),
+            + f" · code {web.mcp.code_timeout_seconds:g}s / {web.mcp.max_code_calls} calls"
+            + (" · asks before each script" if web.mcp.ask_before_call else " · no approval prompt"),
             f"- call timeout {web.timeout_seconds}s · page content {web_content}",
             "",
             f"<b>shell</b> — cwd {escape_html(str(shell.cwd))} · timeout {shell.timeout_seconds}s"
@@ -1330,8 +1331,8 @@ STEP_LABELS = {
     "web.search": "🌐 Web Search",
     "web.fetch": "🌐 Web Fetch",
     "mcp": "🔌 MCP",
-    "mcp.list": "🔌 MCP List",
-    "mcp.call": "🔌 MCP Call",
+    "mcp.search": "🔌 MCP Search",
+    "mcp.execute": "🔌 MCP Code",
     "memory": "📌 Memory",
     "more_context": "🕒 More Context",
     "context7": "📚 Context7",
@@ -2238,7 +2239,7 @@ def build_handlers(config: Config) -> list[Any]:
         whitelisted user in a shared group has no business starting.
 
         ``list`` reads the config files and touches no network; ``check`` is
-        the one that connects, through :meth:`~lumi.tools.mcp_tool.MCPTool.check`
+        the one that connects, through :meth:`~lumi.tools.mcp.codemode.MCPTool.check`
         so stdio and remote servers are probed exactly the way the model's own
         calls reach them. ``auth`` is the OAuth login: owner-only for the same
         reason *and* because the tokens minted are the owner's own account.

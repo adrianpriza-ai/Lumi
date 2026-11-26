@@ -185,6 +185,13 @@ async def test_conduct_and_boundaries_are_hardcoded(config) -> None:
     # message full of source. The rule is conduct, so it is hardcoded here.
     assert "## Building things" in content
     assert "You do not paste it" in content
+    assert "Write the code to files" in content
+    assert "`run_shell`" in content
+    assert "fails and run it again" in content
+    assert "`upload: true`" in content
+    assert "take away" in content
+    assert "`paths` sends several" in content
+    assert "owner's confirmation" in content
     assert "never claim it works when you did not run it" in content
 
     # None of that came from the personality file: it is voice only now.
@@ -193,7 +200,10 @@ async def test_conduct_and_boundaries_are_hardcoded(config) -> None:
 
     # ...and it survives the file going missing entirely.
     config.personality_file.unlink()
-    assert "## Boundaries" in make_agent(config, []).system_prompt()
+    missing = make_agent(config, []).system_prompt()
+    assert "## Boundaries" in missing
+    assert "## Building things" in missing
+    assert "owner's confirmation" in missing
 
 
 async def test_system_prompt_hides_tools_without_a_key(config, monkeypatch) -> None:

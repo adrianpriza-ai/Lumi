@@ -13,8 +13,8 @@
 | `more_context` | Keyword-searchable room chatter the bot never answered, up to `bot.chatlog_max_messages` per read (10 by default) with ~30k-token cap, dropped media included with its saved path |
 | `ocr` | Extract text from PDFs, scans, and document images |
 | `image_gen` | Generate an image from a text prompt (OpenAI Images wire format); the file lands in `workspace/images/` and is sent to the chat |
-| `web` | Search and fetch, across three interchangeable providers |
-| `mcp` | Call any tool an MCP server exposes (`.mcp.json`) — Linear, GitHub, Hugging Face: `list` the servers, `call` a tool, owner approval before each call |
+| `web` | Search and fetch, across the configured providers |
+| `mcp` | Code Mode over every MCP server in `.mcp.json` — Linear, GitHub, Hugging Face: `search` the tool catalog, then `execute` one Python script against the generated API, in a sandbox, with owner approval |
 | `context7` | Up-to-date library docs from https://context7.com; auto-enables on `CONTEXT7_API_KEY` |
 | `send` | Send the owner a message *mid-turn*, so one reply can arrive in parts |
 | `skills` | List and read the owner's skills (`data/skills/`, `~/.agents/skills/`), no approval to read |
@@ -244,7 +244,7 @@ The bot exchanges files with the chat through one small harness (`lumi/artifacts
 **Outgoing.** The model has two ways to hand you a file:
 
 - `files` with `upload: true` on a write — for anything it generates directly.
-- the `files` action `upload` — for a file that already exists, e.g. one a shell command produced. The file is not modified.
+- the `files` action `upload` — for a file that already exists, e.g. one a shell command produced. The file is not modified. Pass `paths` instead of `path` to send several in one call (deduplicated, up to 10 per call); a refused path stops the whole batch, and missing files are reported in the result instead of being silently skipped.
 
 Each delivered file is copied into `data/outbox/` first, so it survives even if the original is later deleted or overwritten. A staged copy is deduplicated on (name, size, mtime), so re-sending an unchanged file does not pile up copies.
 
@@ -430,7 +430,7 @@ the guardrails assume about the machine they run on is written down in
 
 ```toml
 [tools.web]
-provider_order = ["firecrawl", "exa", "tavily", "contextdev", "keenable", "jina", "you", "mcp"]
+provider_order = ["firecrawl", "exa", "tavily", "contextdev", "keenable", "jina", "you"]
 ```
 
 - **firecrawl** — best for reading a specific page. Renders JavaScript, returns clean markdown. The hosted API needs a `FIRECRAWL_API_KEY`; point `base_url` at a self-hosted instance (Firecrawl is open source) and it runs keyless. A comma-separated key pool with the same three strategies (`tools.web.firecrawl.key_strategy`) keeps the bot up when one key is rate-limited.
@@ -440,29 +440,6 @@ provider_order = ["firecrawl", "exa", "tavily", "contextdev", "keenable", "jina"
 - **keenable** — [Keenable](https://keenable.ai) search and page fetch on its own index: ranked pages with their text already extracted, and a fetched URL as clean markdown. **Works without a key** — the `/search/public` and `/fetch/public` endpoints need only an app name (`app_title`, sent as `X-Keenable-Title`, 1,000 requests/hour per IP). A `KEENABLE_API_KEY` lifts that cap and uses the account's free monthly allowance. Speaks the REST API directly over httpx — no SDK dependency. Same rotation rules as the others (`tools.web.keenable.key_strategy`); `mode` picks `pro` (deeper retrieval, the default) or `realtime` (fastest).
 - **jina** — [Jina Reader](https://r.jina.ai) fetch, plus [Jina Search](https://s.jina.ai) as an optional fallback. Reader is the whole API as the URL (`https://r.jina.ai/<url>`, like `curl https://r.jina.ai/https://www.example.com`), returning the page as clean markdown, so a page no search provider can read still has a last resort. Fetch works keyless (rate-limited). Search is the same shape (`https://s.jina.ai/<query>`) but **needs a key**, so it is only offered while `JINA_API_KEY` is set; without one the provider is skipped for search rather than counted as a failure. Search hits arrive already read — title, URL, description and full page content. The endpoint takes no recency parameter, so a `days` window is applied to the publication dates the hits report (undated hits are kept rather than discarded). Keys rotate for both (`tools.web.jina.key_strategy`), and `search_base_url` points search at a proxy or the EU host.
 - **you** — You.com's hosted MCP endpoint, `https://api.you.com/mcp?profile=free`. **Keyless by design**: no account and no API key, so a fresh clone still has a working search (low rate limit). A `YOU_API_KEY`, when set, is sent as an `X-API-Key` header. Disable it with `enabled = false` in `[tools.web.providers.you]`.
-- **mcp** — reads `.mcp.json` from the project root and `~/.agents/mcp.json` (for servers configured once for every project; the project file wins on a duplicate server name, and `tools.web.providers.mcp.user_config_file = ""` turns the user file off), expands `${VAR}` from the environment, and speaks MCP over streamable HTTP or stdio. It discovers each server's tools and reads their input schemas, so it works with a server whose parameter is called `q` instead of `query`. It only ever calls a tool that looks like a search or a page read — the server's *other* tools belong to the [`mcp` tool](#mcp-action-surface) below. A project-file entry connects only after the owner approved it (see [MCP (action surface)](#mcp-action-surface)); unapproved servers are skipped, so a search never dials one.
-
-```json
-{
-  "mcpServers": {
-    "tavily-remote": { "type": "remote", "url": "${TAVILY_MCP_URL}" },
-    "firecrawl-remote": { "type": "remote", "url": "${FIRECRAWL_MCP_URL}" },
-    "exa-remote": { "type": "remote", "url": "https://mcp.exa.ai/mcp" }
-  }
-}
-```
-
-```bash
-# .env
-TAVILY_MCP_URL=https://mcp.tavily.com/mcp/?tavilyApiKey=${TAVILY_API_KEY}
-FIRECRAWL_MCP_URL=https://mcp.firecrawl.dev/${FIRECRAWL_API_KEY}/v2/mcp
-```
-
-Local servers work too:
-
-```json
-{ "mcpServers": { "my-search": { "type": "local", "command": ["npx", "-y", "my-mcp-server"] } } }
-```
 
 ### How much comes back
 
@@ -470,24 +447,60 @@ A search returns `tools.web.max_results` hits (10 by default) and page text is n
 
 A thin result set is topped up rather than answered — if the first provider returns fewer than `min_results` hits, the next provider in the order fills the gap (deduplicated by URL) before the model sees it. Every result carries the date it was searched and, where the provider knows it, the publish date, so a stale page cannot pass for a current one.
 
-## MCP (action surface)
+## MCP (Code Mode)
 
-`.mcp.json` feeds two surfaces. The **web provider** above borrows a server's
-search and fetch tools as one more search fallback. The **`mcp` tool** is the
-whole server: every tool it advertises, callable directly — which is what
-turns MCP from a search backend into an agent capability. A Linear server has
-no `search` tool, so the provider can see it and never use it; through this
-tool its `create_issue` is as ordinary as a shell command.
+`.mcp.json` (this project) and `~/.agents/mcp.json` (every project) are read
+together; the project file wins on a duplicate name. `${VAR}` is expanded from
+the environment, and servers speak MCP over streamable HTTP or stdio — a local
+`npx -y some-mcp-server` entry works the same as a hosted URL.
+
+Servers are **not** a web-search fallback any more. Every configured server is
+reached through one tool, `mcp`, which follows Cloudflare's
+[Code Mode](https://blog.cloudflare.com/code-mode) pattern: the tools are
+converted into a small API, the model writes one script against it, and the
+script runs in a sandbox while the real MCP calls are routed back to the host.
+A loop that files ten issues costs one printed result instead of ten
+round-trips through the context window.
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "type": "remote",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": { "Authorization": "Bearer ${GITHUB_PAT}" }
+    },
+    "local-files": { "type": "local", "command": ["npx", "-y", "some-mcp-server"] }
+  }
+}
+```
 
 Two actions:
 
-- `list` — every configured server with the tools it advertises: each tool's
-  description and its argument schema, with required parameters marked.
-  Unreachable servers and servers missing an environment variable say so
-  instead of disappearing. Read-only, so it never asks for approval.
-- `call` — run `server.tool` with an `arguments` object matching that schema.
-  The output comes back fenced as untrusted data, and a server that answers
-  with an MCP error is reported as a failure, not as output.
+- `search` — the generated catalog. Each result carries the helper name, its
+  parameters (required and optional) and the tool's description. Pass `query`
+  to match server names, tool names and descriptions, or `server` to narrow to
+  one. It only reads what the servers advertise, so it never asks for
+  approval.
+- `execute` — run Python with `code`. Inside the script:
+  - `codemode.<server>_<tool>(...)` — one function per discovered tool.
+  - `codemode.call("server", "tool", {...})` — the same call by name.
+  - `print(...)` returns data; everything else stays in the sandbox.
+  - A tool that reports an error raises `codemode.ToolError`.
+
+The script runs in a fresh Python interpreter (`-I -S`) with a scrubbed
+environment and no filesystem or network builtins; imports are an allowlist of
+data-processing modules (`json`, `re`, `math`, `collections`, `datetime`, …).
+It has a wall-clock budget (`code_timeout_seconds`, 30 by default) and a call
+cap (`max_code_calls`, 40). The parent process keeps the MCP sessions, headers
+and OAuth tokens, and validates every requested server/tool against what was
+discovered for that run — a script cannot reach a server that was not approved.
+
+This is a conformance boundary, not a jail for hostile code: a determined
+escape through Python introspection is possible, and the child runs as the same
+OS user. What it guarantees is that ordinary model-authored code cannot touch
+the filesystem, the network or an unapproved server by accident, and that a
+runaway script is killed rather than taking the turn with it.
 
 **Project-file servers need one approval.** `~/.agents/mcp.json` is written by
 your own hand, but `.mcp.json` arrives by `git clone` and `git pull` exactly as
@@ -496,25 +509,26 @@ it does by editing — so its entries connect to nothing until you approve them:
 entry (the command or URL as it stands right now), and `/mcp revoke <name>`
 withdraws it. Approvals live in `data/mcp-trust.json`, keyed by a hash of the
 entry, so editing an entry asks again — a pulled commit cannot ride in on the
-old approval — while rotating a `${VAR}` value does not. Until the approval,
-`mcp list`, `mcp call`, a web search falling through to that server, and
-`/mcp check` all refuse it before spawning or dialing anything.
+old approval — while rotating a `${VAR}` value does not.
 
-**Every `call` asks the owner first** — a Confirm/Cancel prompt naming the
-server, the tool and the arguments — because no tool name tells a read from a
-write, and the destination is a service outside this machine. Turn the prompt
-off for a hands-off agent:
+**Every `execute` asks the owner first**, because the owner has to see the
+script that will run and no tool name tells a read from a write. The prompt
+shows the code. Turn it off for a hands-off agent:
 
 ```toml
 [tools.web.providers.mcp]
 ask_before_call = false
+code_timeout_seconds = 30
+max_code_calls = 40
 ```
 
-The servers, the files, the `${VAR}` expansion and the transports are the web
-provider's: one `[tools.web.providers.mcp]` section configures both surfaces,
-so `.mcp.json` stays the single place a server is written down. Remove `"mcp"`
-from `tools.enabled` to take the tool away — the web provider keeps working,
-and vice versa.
+The section keeps its `tools.web.providers.mcp` name because `.mcp.json`
+stays the single place a server is written down; it configures the standalone
+tool, not a `web` provider. `mcp` should not appear in `provider_order` — an
+old entry there is ignored with a warning. Two switches hide the tool:
+remove `mcp` from `tools.enabled` to stop registering it (the `/mcp` chat
+commands stop too), or set `enabled = false` above to leave it registered but
+report it unavailable to the model.
 
 ## Context7 (library docs)
 

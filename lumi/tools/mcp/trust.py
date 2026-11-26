@@ -30,7 +30,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from ....util.log import get_logger
+from ...util.log import get_logger
 
 log = get_logger(__name__)
 
@@ -73,7 +73,7 @@ class MCPTrustStore:
     {"digest": …, "approved_at": …}}}``. Reading is strict about shape and
     lax about failure — anything missing, corrupt or of the wrong shape means
     "nothing approved", the safe reading. Writes are atomic and mode 0600,
-    after :class:`~lumi.tools.web.providers.mcp_oauth.FileTokenStorage`: the
+    after :class:`~lumi.tools.mcp.oauth.FileTokenStorage`: the
     file names which commands this bot will run, which makes it sensitive
     even though it holds no secret itself.
     """

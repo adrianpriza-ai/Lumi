@@ -436,9 +436,9 @@ def run_checks(config: Config, registry: ToolRegistry | None = None) -> list[Che
     # Both files are read (the project's .mcp.json and ~/.agents/mcp.json), so
     # the check runs when either exists.
     try:
-        from .tools.web.providers.mcp_provider import MCPProvider
+        from .tools.mcp.servers import MCPServers
 
-        mcp = MCPProvider(config.tools.web.mcp, config.root)
+        mcp = MCPServers(config.tools.web.mcp, config.root)
         if any(path.is_file() for path in mcp.config_paths):
             servers = mcp.servers()
             unresolved = [f"{s.name} (needs {s.unresolved()})" for s in servers if s.unresolved()]

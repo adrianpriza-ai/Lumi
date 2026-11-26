@@ -1,10 +1,11 @@
 """Web provider contract.
 
 Implementations range from the Firecrawl, Exa and Tavily SDKs to raw-httpx
-clients (Context.dev, Keenable, Jina) and a generic MCP client that reads
-``.mcp.json`` and ``~/.agents/mcp.json``. They all normalise to
-:class:`SearchHit` and :class:`Page` so the tool layer never has to care which
-one answered.
+clients (Context.dev, Keenable, Jina) and You.com's hosted MCP endpoint.
+Configured MCP servers from ``.mcp.json`` and ``~/.agents/mcp.json`` are
+reached through the standalone ``mcp`` tool's Code Mode, not through this
+contract. They all normalise to :class:`SearchHit` and :class:`Page` so the tool
+layer never has to care which one answered.
 """
 
 from __future__ import annotations

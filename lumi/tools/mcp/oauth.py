@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
-from ....util.log import get_logger
+from ...util.log import get_logger
 
 log = get_logger(__name__)
 

@@ -39,17 +39,24 @@ from lumi.config import (
     FirecrawlConfig,
     JinaConfig,
     KeenableConfig,
-    MCPConfig,
     TavilyConfig,
+    YouConfig,
 )
-from lumi.tools.web.providers.base import Page, SearchHit, SearchResult, WebProvider
+from lumi.tools.mcp.servers import DiscoveredTool
+from lumi.tools.web.providers.base import (
+    Page,
+    SearchHit,
+    SearchResult,
+    WebProvider,
+    recent_cutoff,
+)
 from lumi.tools.web.providers.contextdev_provider import ContextDevProvider
 from lumi.tools.web.providers.exa_provider import ExaProvider
 from lumi.tools.web.providers.firecrawl_provider import FirecrawlProvider
 from lumi.tools.web.providers.jina_provider import JinaProvider
 from lumi.tools.web.providers.keenable_provider import KeenableProvider
-from lumi.tools.web.providers.mcp_provider import DiscoveredTool, MCPProvider
 from lumi.tools.web.providers.tavily_provider import TavilyProvider
+from lumi.tools.web.providers.you_provider import YouProvider
 
 # --------------------------------------------------------------------------- #
 # Stubs
@@ -915,58 +922,6 @@ def test_tavily_extract_propagates_the_final_url(monkeypatch) -> None:
 
     assert page.url == "http://169.254.169.254/latest"
     assert page.markdown == "s"
-
-
-def test_mcp_fetch_propagates_the_result_url() -> None:
-    """The MCP fetch path is the one that reaches the bot's own network, so
-    a tavily-shaped server's answer URL must reach the tool layer."""
-    provider = MCPProvider.__new__(MCPProvider)
-    provider.name = "mcp"
-    provider.config = MCPConfig()
-
-    async def fake_pick(*_args, **_kwargs):
-        return object(), DiscoveredTool(name="fetch", description="", properties={})
-
-    async def fake_call(*_args, **_kwargs):
-        import json
-
-        return json.dumps(
-            {"results": [{"url": "http://169.254.169.254/latest", "raw_content": "secret"}]}
-        )
-
-    provider._pick = fake_pick  # type: ignore[method-assign]
-    provider._call = fake_call  # type: ignore[method-assign]
-
-    import asyncio
-
-    page = asyncio.run(provider.fetch("https://example.com"))
-
-    assert page.url == "http://169.254.169.254/latest"
-    assert page.markdown == "secret"
-
-
-def test_mcp_fetch_fails_closed_without_a_result_url() -> None:
-    """Content without a landing URL cannot pass the tool-layer SSRF re-check."""
-    provider = MCPProvider.__new__(MCPProvider)
-    provider.name = "mcp"
-    provider.config = MCPConfig()
-
-    async def fake_pick(*_args, **_kwargs):
-        return object(), DiscoveredTool(name="fetch", description="", properties={})
-
-    async def fake_call(*_args, **_kwargs):
-        return "page fetched after an undisclosed redirect"
-
-    provider._pick = fake_pick  # type: ignore[method-assign]
-    provider._call = fake_call  # type: ignore[method-assign]
-
-    import asyncio
-
-    page = asyncio.run(provider.fetch("https://example.com"))
-
-    assert page.url == "https://example.com"
-    assert page.markdown.startswith("mcp fetch failed:")
-    assert "without a final URL" in page.markdown
 
 
 # --------------------------------------------------------------------------- #
@@ -2070,3 +2025,294 @@ async def test_keenable_names_the_reason_when_every_key_fails(monkeypatch) -> No
     assert not result.ok
     assert "HTTP 402" in result.error
     assert "insufficient_credits" in result.error
+
+
+# --------------------------------------------------------------------------- #
+# You.com — its own provider, on the shared MCP client
+# --------------------------------------------------------------------------- #
+
+
+class FakeYouClient:
+    """Stands in for ``YouProvider.client``: discovery and calls, no network."""
+
+    def __init__(self, tools=None, reply="", error=None) -> None:
+        self.tools = tools if tools is not None else []
+        self.reply = reply
+        self.error = error
+        self.calls: list[dict[str, Any]] = []
+
+    async def _list_tools(self, _spec):
+        return self.tools
+
+    async def call_tool(self, _spec, _tool, arguments):
+        self.calls.append(arguments)
+        if self.error:
+            raise self.error
+        return self.reply
+
+    async def aclose(self) -> None:
+        pass
+
+
+def _you_fetch_tools() -> list[DiscoveredTool]:
+    return [DiscoveredTool("fetch_url", "", {"url": {"type": "string"}})]
+
+
+def test_you_provider_names_its_builtin_source(tmp_path) -> None:
+    provider = YouProvider(YouConfig(), tmp_path)
+    assert provider.sources == ["you.com"]
+    assert [spec.name for spec in provider.servers()] == ["you"]
+
+    disabled = YouProvider(YouConfig(enabled=False), tmp_path)
+    assert disabled.servers() == []
+    assert disabled.available() == (False, "disabled in config")
+
+
+def test_you_provider_is_available_without_a_key(tmp_path) -> None:
+    """The free profile is keyless, and availability must not ask the MCP client:
+    its config paths are deliberately empty, so it sees no servers."""
+    assert YouProvider(YouConfig(), tmp_path).available() == (True, "")
+
+
+def test_you_provider_without_a_url_is_unavailable(tmp_path) -> None:
+    provider = YouProvider(YouConfig(url=""), tmp_path)
+    assert provider.available() == (False, "no url configured")
+
+
+def test_you_provider_is_unavailable_without_mcp(tmp_path, monkeypatch) -> None:
+    import builtins
+
+    provider = YouProvider(YouConfig(), tmp_path)
+    real_import = builtins.__import__
+
+    def no_mcp(name, *args, **kwargs):
+        if name == "mcp":
+            raise ImportError("No module named 'mcp'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_mcp)
+    assert provider.available() == (False, "the mcp package is not installed")
+
+
+async def test_you_fetch_propagates_the_result_url(tmp_path) -> None:
+    provider = YouProvider(YouConfig(), tmp_path)
+    client = FakeYouClient(
+        tools=_you_fetch_tools(),
+        reply=json.dumps(
+            {"results": [{"url": "http://169.254.169.254/latest", "raw_content": "secret"}]}
+        ),
+    )
+    provider.client = client
+
+    page = await provider.fetch("https://example.com")
+
+    assert page.url == "http://169.254.169.254/latest"
+    assert page.markdown == "secret"
+    assert client.calls == [{"url": "https://example.com"}]
+
+
+async def test_you_fetch_fails_closed_without_a_result_url(tmp_path) -> None:
+    """Content with no landing URL cannot pass the tool's SSRF re-check."""
+    provider = YouProvider(YouConfig(), tmp_path)
+    provider.client = FakeYouClient(
+        tools=_you_fetch_tools(), reply=json.dumps({"markdown": "instance secret"})
+    )
+
+    page = await provider.fetch("https://example.com")
+
+    assert page.url == "https://example.com"
+    assert page.markdown.startswith("you fetch failed:")
+    assert "without a final URL" in page.markdown
+
+
+async def test_you_fetch_reports_a_call_failure(tmp_path) -> None:
+    provider = YouProvider(YouConfig(), tmp_path)
+    provider.client = FakeYouClient(tools=_you_fetch_tools(), error=RuntimeError("endpoint down"))
+
+    page = await provider.fetch("https://example.com")
+
+    assert page.markdown == "you fetch failed: RuntimeError: endpoint down"
+
+
+async def test_you_fetch_without_a_fetch_tool_names_the_reason(tmp_path) -> None:
+    provider = YouProvider(YouConfig(), tmp_path)
+    provider.client = FakeYouClient()
+
+    page = await provider.fetch("https://example.com")
+
+    assert page.markdown == "you.com advertises no fetch tool"
+
+
+def test_you_payload_parsing_handles_grouped_results_and_highlights() -> None:
+    from lumi.tools.web.providers.you_provider import _parse_search_payload
+
+    payload = json.dumps(
+        {
+            "answer": "short answer",
+            "results": {
+                "web": [
+                    {
+                        "title": "One",
+                        "url": "https://one.test",
+                        "description": "first description",
+                        "contents": {"highlights": ["first", "highlight"]},
+                        "page_age": "2 days ago",
+                    }
+                ],
+                "news": [
+                    {
+                        "title": "Two",
+                        "url": "https://two.test",
+                        "content": "second content",
+                    }
+                ],
+            },
+        }
+    )
+    result = SearchResult(query="q", provider="you")
+    _parse_search_payload(payload, result)
+
+    assert result.answer == "short answer"
+    assert [hit.url for hit in result.hits] == ["https://one.test", "https://two.test"]
+    assert result.hits[0].content == "first\nhighlight"
+    assert result.hits[0].snippet == "first description"
+    assert result.hits[0].published == "2 days ago"
+
+
+def test_you_payload_parsing_handles_tavily_shaped_answers() -> None:
+    from lumi.tools.web.providers.you_provider import _parse_search_payload
+
+    payload = json.dumps(
+        {
+            "answer": "short answer",
+            "results": [
+                {
+                    "title": "One",
+                    "url": "https://one.test",
+                    "description": "a snippet",
+                    "content": "full body",
+                }
+            ],
+        }
+    )
+    result = SearchResult(query="q", provider="you")
+    _parse_search_payload(payload, result)
+
+    assert result.answer == "short answer"
+    assert len(result.hits) == 1
+    assert result.hits[0].url == "https://one.test"
+    assert result.hits[0].snippet == "full body"  # content wins over description
+    assert result.hits[0].content == "full body"
+
+
+def test_you_payload_parsing_handles_firecrawl_data_and_markdown() -> None:
+    from lumi.tools.web.providers.you_provider import _parse_search_payload
+
+    payload = json.dumps(
+        {"data": [{"title": "One", "url": "https://one.test", "markdown": "# full body"}]}
+    )
+    result = SearchResult(query="q", provider="you")
+    _parse_search_payload(payload, result)
+
+    assert [hit.url for hit in result.hits] == ["https://one.test"]
+    assert result.hits[0].content == "# full body"
+
+
+def test_you_payload_parsing_handles_a_bare_list_with_descriptions() -> None:
+    from lumi.tools.web.providers.you_provider import _parse_search_payload
+
+    payload = json.dumps([{"title": "One", "url": "https://one.test", "description": "snippet"}])
+    result = SearchResult(query="q", provider="you")
+    _parse_search_payload(payload, result)
+
+    assert [hit.url for hit in result.hits] == ["https://one.test"]
+    assert result.hits[0].snippet == "snippet"
+
+
+def test_you_payload_parsing_handles_an_empty_payload() -> None:
+    from lumi.tools.web.providers.you_provider import _parse_search_payload
+
+    result = SearchResult(query="q", provider="you")
+    _parse_search_payload("", result)
+
+    assert result.hits == []
+    assert result.answer == ""
+
+
+def test_you_payload_parsing_keeps_plain_text() -> None:
+    from lumi.tools.web.providers.you_provider import _parse_search_payload
+
+    result = SearchResult(query="q", provider="you")
+    _parse_search_payload("just some prose", result)
+
+    assert result.hits[0].content == "just some prose"
+    assert result.hits[0].url == ""
+
+
+async def test_you_search_maps_the_named_schema(tmp_path) -> None:
+    provider = YouProvider(YouConfig(), tmp_path)
+    client = FakeYouClient(
+        tools=[
+            DiscoveredTool(
+                "search",
+                "",
+                {
+                    "query": {"type": "string"},
+                    "max_results": {"type": "integer"},
+                    "freshness": {"type": "string"},
+                },
+            )
+        ],
+        reply="{}",
+    )
+    provider.client = client
+
+    result = await provider.search("cats", 7, days=7)
+    await provider.search("dogs", 2)
+
+    assert result.ok
+    assert client.calls == [
+        {"query": "cats", "max_results": 7, "freshness": "week"},
+        {"query": "dogs", "max_results": 2},
+    ]
+
+
+async def test_you_search_maps_alternate_field_names(tmp_path) -> None:
+    provider = YouProvider(YouConfig(), tmp_path)
+    client = FakeYouClient(
+        tools=[
+            DiscoveredTool(
+                "you_search",
+                "",
+                {
+                    "q": {"type": "string"},
+                    "limit": {"type": "integer"},
+                    "time_range": {"type": "string"},
+                },
+            )
+        ],
+        reply="{}",
+    )
+    provider.client = client
+
+    await provider.search("cats", 3, days=3)
+
+    assert client.calls == [{"q": "cats", "limit": 3, "time_range": "week"}]
+
+
+def test_you_freshness_maps_buckets_and_iso_date_ranges() -> None:
+    from lumi.tools.web.providers.you_provider import _freshness
+
+    buckets = {"enum": ["day", "week", "month", "year"]}
+    assert _freshness(1, buckets) == "day"
+    assert _freshness(7, buckets) == "week"
+    assert _freshness(30, buckets) == "month"
+    assert _freshness(400, buckets) == "year"
+
+    patterned = _freshness(7, {"pattern": r"^YYYY-MM-DDtoYYYY-MM-DD$"})
+    assert patterned.startswith(recent_cutoff(7))
+    assert patterned.endswith("to" + recent_cutoff(0))
+
+    described = _freshness(3, {"description": "A date range, YYYY-MM-DD to YYYY-MM-DD"})
+    assert described.startswith(recent_cutoff(3))
+    assert described.endswith("to" + recent_cutoff(0))

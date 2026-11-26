@@ -1335,7 +1335,7 @@ async def test_mcp_check_retries_a_server_that_never_starts(config, monkeypatch)
     bot, _ = await send(config, [], "/mcp approve broken")
     assert "is approved to connect" in texts(bot)
 
-    monkeypatch.setattr("lumi.tools.mcp_tool.CHECK_BACKOFF_SECONDS", 0)
+    monkeypatch.setattr("lumi.tools.mcp.codemode.CHECK_BACKOFF_SECONDS", 0)
     bot, _ = await send(config, [], "/mcp check broken")
     body = texts(bot)
     assert "mcp check — broken" in body
@@ -3217,7 +3217,7 @@ async def test_every_step_kind_folds_the_same_way() -> None:
         ("thinking", ""),
         ("tool", "web.search"),
         ("tool", "web.fetch"),
-        ("tool", "mcp.call"),
+        ("tool", "mcp.execute"),
         ("tool", "grep"),
         ("tool", "brand_new_tool"),
     ]
@@ -3229,7 +3229,7 @@ async def test_every_step_kind_folds_the_same_way() -> None:
     assert summary == "▸ 6 steps"
     assert quoted == (
         "<blockquote expandable>🧠 Thinking\n🌐 Web Search\n🌐 Web Fetch\n"
-        "🔌 MCP Call\n🔍 Search\n🔧 brand_new_tool</blockquote>"
+        "🔌 MCP Code\n🔍 Search\n🔧 brand_new_tool</blockquote>"
     )
 
 
@@ -3588,7 +3588,7 @@ async def test_config_shows_the_resolved_settings(config) -> None:
     bot, _ = await send(config, [], "/config")
     body = texts(bot)
     assert "test-model" in body
-    assert "firecrawl → exa → tavily → contextdev → keenable → jina → you → mcp" in body
+    assert "firecrawl → exa → tavily → contextdev → keenable → jina → you" in body
     assert "group mode: mention" in body
     assert "upload retention: 7d groups / 30d personal" in body
     assert "workspace" in body

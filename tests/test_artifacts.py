@@ -308,6 +308,38 @@ async def test_upload_action_sends_several_files_in_one_call(files: FilesTool, c
     assert result.summary == "upload 3 files"
 
 
+async def test_multi_upload_dedups_resolved_paths(files: FilesTool, config) -> None:
+    """`a.md` and `./a.md` are one file, so only one artifact is staged."""
+    (config.shell_cwd / "a.md").write_text("# a", encoding="utf-8")
+
+    result = await files.invoke(
+        {"action": "upload", "paths": ["workspace/a.md", "workspace/./a.md"]}, ctx()
+    )
+    assert result.ok
+    assert len(result.artifacts) == 1
+    assert result.summary == "upload workspace/a.md"
+
+
+async def test_multi_upload_names_a_directory_as_a_directory(files: FilesTool, config) -> None:
+    (config.shell_cwd / "good.md").write_text("# ok", encoding="utf-8")
+    (config.shell_cwd / "sub").mkdir()
+
+    result = await files.invoke(
+        {"action": "upload", "paths": ["workspace/good.md", "workspace/sub"]}, ctx()
+    )
+    assert not result.ok
+    assert len(result.artifacts) == 1
+    assert "workspace/sub is a directory, not a file" in result.text
+    assert "no such file: workspace/sub" not in result.text
+
+
+async def test_multi_upload_rejects_a_non_string_item(files: FilesTool) -> None:
+    with pytest.raises(ToolError, match="paths must contain only strings"):
+        await files.invoke(
+            {"action": "upload", "paths": ["workspace/a.md", {"x": 1}]}, ctx()
+        )
+
+
 async def test_multi_upload_keeps_the_good_files_and_names_the_bad_ones(
     files: FilesTool, config
 ) -> None:

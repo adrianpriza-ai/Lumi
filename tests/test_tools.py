@@ -934,6 +934,29 @@ async def test_write_size_limit(files: FilesTool, config) -> None:
         )
 
 
+async def test_write_of_multibyte_file_counts_characters_not_bytes(
+    files: FilesTool, config, monkeypatch
+) -> None:
+    """60 emoji are 60 chars but 240 bytes: a character cap must still allow the write."""
+    config.tools.files.max_write_chars = 100
+    target = config.shell_cwd / "emoji.md"
+    target.write_text("😀" * 60, encoding="utf-8")
+    backdate(target)
+    predate_session(monkeypatch)  # ctime cannot be backdated; see predate_session
+
+    result = await files.invoke(
+        {
+            "action": "write",
+            "path": "workspace/emoji.md",
+            "content": "😊" * 60,
+            "overwrite": True,
+        },
+        ctx(),
+    )
+    assert result.ok
+    assert target.read_text(encoding="utf-8") == "😊" * 60
+
+
 # --------------------------------------------------------------------------- #
 # edit
 # --------------------------------------------------------------------------- #
@@ -1109,6 +1132,47 @@ async def test_edit_names_the_closest_line_when_nothing_matches(files: FilesTool
     assert not result.ok
     assert "closest line is 1" in result.text
     assert "hello world" in result.text
+
+
+async def test_edit_quotes_crlf_lines_in_a_mismatch(files: FilesTool, config) -> None:
+    """A copyable quote keeps CRLF, and says so when the model supplied LF."""
+    target = config.shell_cwd / "crlf.md"
+    target.write_bytes(b"alpha\r\nbeta\r\n")
+
+    result = await files.invoke(
+        {
+            "action": "edit",
+            "path": "workspace/crlf.md",
+            "old_string": "alpha\nbeta",
+            "new_string": "alpha\nbeta!",
+        },
+        ctx(),
+    )
+    assert not result.ok
+    assert "CRLF" in result.text
+    assert "\r\n" in result.text
+    assert target.read_bytes() == b"alpha\r\nbeta\r\n"
+
+
+async def test_edit_names_the_closest_line_for_a_multiline_old_string(
+    files: FilesTool, config
+) -> None:
+    """A two-line block with one typo still gets a landmark, not generic advice."""
+    target = config.shell_cwd / "note.md"
+    target.write_text("hello world\nmore text\n", encoding="utf-8")
+
+    result = await files.invoke(
+        {
+            "action": "edit",
+            "path": "workspace/note.md",
+            "old_string": "helo world\nmore txt\n",
+            "new_string": "hello world\nmore text\n",
+        },
+        ctx(),
+    )
+    assert not result.ok
+    assert "closest line is 1" in result.text
+    assert target.read_text(encoding="utf-8") == "hello world\nmore text\n"
 
 
 async def test_edit_needs_old_and_new_strings(files: FilesTool) -> None:

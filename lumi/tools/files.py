@@ -564,15 +564,19 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         if existed:
             limit = self.settings.max_write_chars
             try:
+                size = path.stat().st_size
+            except OSError as exc:
+                return ToolResult.failure(f"could not read {self._display(path)}: {exc}")
+            # UTF-8 is at most four bytes per character, so a file over that
+            # bound cannot fit the character cap — refuse it before loading it.
+            if size > limit * 4:
+                raise _too_large(path, limit, "Change", size, "bytes")
+            try:
                 raw = path.read_bytes()
             except OSError as exc:
                 return ToolResult.failure(f"could not read {self._display(path)}: {exc}")
-            if len(raw) > limit:
-                raise ToolError(
-                    f"{self._display(path)} is {len(raw)} bytes, over the {limit}-byte "
-                    "limit for the files tool (tools.files.max_write_chars). Change it "
-                    "with a shell command, or ask the owner to raise the limit."
-                )
+            if len(raw) > limit * 4:  # it may have grown since the stat
+                raise _too_large(path, limit, "Change", len(raw), "bytes")
             # read_text(errors="replace") used to mangle any existing bytes it
             # could not decode, then overwrite them with a text diff computed
             # from the mangled copy. Refusing is the honest answer: `write` is
@@ -589,6 +593,10 @@ it validates the path, caps the size, and shows a diff before it overwrites.
                     f"{self._display(path)} is not valid UTF-8 text, and write only "
                     "replaces text. Use run_shell if you really mean to overwrite it."
                 )
+            # The cap counts characters: a multibyte file can be over the byte
+            # bound yet well under the limit, and must stay writable.
+            if len(previous) > limit:
+                raise _too_large(path, limit, "Change", len(previous))
             # Nothing to approve and nothing to write: the owner is being asked
             # to confirm a change that would not change a byte, and a rewrite
             # would only bump the file's timestamps.
@@ -719,13 +727,19 @@ it validates the path, caps the size, and shows a diff before it overwrites.
             )
         requested: list[str] = []
         raw_paths = arguments.get("paths")
-        if isinstance(raw_paths, list):
-            requested = [str(item).strip() for item in raw_paths if str(item).strip()]
+        if raw_paths is not None:  # null means "no batch", like an absent key
+            if not isinstance(raw_paths, list):
+                raise ToolError("paths must be an array")
+            for item in raw_paths:
+                if not isinstance(item, str):
+                    raise ToolError("paths must contain only strings")
+                if item.strip():
+                    requested.append(item.strip())
         if not requested:
             raw = arguments.get("path")
-            if not raw or not str(raw).strip():
+            if not isinstance(raw, str) or not raw.strip():
                 raise ToolError("path or paths is required for an upload")
-            requested = [str(raw).strip()]
+            requested = [raw.strip()]
         # A repeated name would stage the same file twice; keeping the first
         # occurrence preserves the order the model asked for.
         requested = list(dict.fromkeys(requested))
@@ -736,11 +750,32 @@ it validates the path, caps the size, and shows a diff before it overwrites.
                 "in another call."
             )
 
-        paths = [
+        resolved = [
             self._resolve(raw, for_write=False, chat_id=ctx.chat_id) for raw in requested
         ]
-        missing = [self._display(path) for path in paths if not path.is_file()]
-        deliverable = [path for path in paths if path.is_file()]
+        # Different spellings resolve to one file (`a.md` vs `./a.md`): dedup
+        # the resolved paths too, so one file is staged once and the delivery
+        # count is not inflated by alias names.
+        seen: set[str] = set()
+        paths: list[Path] = []
+        for path in resolved:
+            marker = str(path)
+            if marker not in seen:
+                seen.add(marker)
+                paths.append(path)
+
+        notes: list[str] = []
+        deliverable: list[Path] = []
+        for path in paths:
+            if path.is_file():
+                deliverable.append(path)
+            else:
+                display = self._display(path)
+                notes.append(
+                    f"no such file: {display}"
+                    if not path.exists()
+                    else f"{display} is a directory, not a file"
+                )
 
         count = len(paths)
         summary = (
@@ -752,10 +787,10 @@ it validates the path, caps the size, and shows a diff before it overwrites.
 
         # A partial batch is a failure the model must see: some of what it
         # promised the owner is not arriving.
-        if missing or len(result.artifacts) != len(deliverable):
+        if notes or len(result.artifacts) != len(deliverable):
             result.ok = False
-            if missing:
-                prefix = "\n".join(f"no such file: {name}" for name in missing)
+            if notes:
+                prefix = "\n".join(notes)
                 result.text = (
                     prefix + "\n" + result.text.strip() if result.text.strip() else prefix
                 )
@@ -835,15 +870,19 @@ it validates the path, caps the size, and shows a diff before it overwrites.
         # model can act on instead of a silent failure.
         limit = self.settings.max_write_chars
         try:
+            size = path.stat().st_size
+        except OSError as exc:
+            return ToolResult.failure(f"could not read {self._display(path)}: {exc}")
+        # UTF-8 is at most four bytes per character, so a file over that bound
+        # cannot fit the character cap — refuse it before loading it.
+        if size > limit * 4:
+            raise _too_large(path, limit, "Edit", size, "bytes")
+        try:
             raw = path.read_bytes()
         except OSError as exc:
             return ToolResult.failure(f"could not read {self._display(path)}: {exc}")
-        if len(raw) > limit:
-            raise ToolError(
-                f"{self._display(path)} is {len(raw)} bytes, over the {limit}-byte limit for "
-                "the files tool (tools.files.max_write_chars). Edit it with a shell command "
-                "instead, or ask the owner to raise the limit."
-            )
+        if len(raw) > limit * 4:  # it may have grown since the stat
+            raise _too_large(path, limit, "Edit", len(raw), "bytes")
         if b"\x00" in raw:
             return ToolResult.failure(
                 f"{self._display(path)} looks like a binary file; edit only works on text"
@@ -852,6 +891,8 @@ it validates the path, caps the size, and shows a diff before it overwrites.
             previous = raw.decode("utf-8")
         except UnicodeDecodeError:
             return ToolResult.failure(f"{self._display(path)} is not valid UTF-8 text")
+        if len(previous) > limit:
+            raise _too_large(path, limit, "Edit", len(previous))
 
         replace_all = bool(arguments.get("replace_all"))
         count = previous.count(old)
@@ -1014,15 +1055,28 @@ def _ignored(path: Path) -> bool:
     )
 
 
+def _too_large(
+    path: Path, limit: int, verb: str, count: int | None = None, unit: str = "chars"
+) -> ToolError:
+    """Refuse a file too big for the character cap, before or after reading."""
+    detail = f" is {count} {unit}" if count is not None else ""
+    return ToolError(
+        f"{relative_to_root(path)}{detail}, over the {limit}-character limit for the "
+        f"files tool (tools.files.max_write_chars). {verb} it with a shell command, "
+        "or ask the owner to raise the limit."
+    )
+
+
 def _near_match(previous: str, old: str) -> str:
     """Explain a failed ``old_string`` match in terms the model can act on.
 
     The common miss is whitespace: the model re-indents the block it means to
     copy, or remembers the line but not the spaces around it. Naming the line
     that matches once whitespace is ignored turns a dead end into one corrected
-    call. When nothing matches even loosely, the closest line is still a
-    landmark, and either way the instructions name the way out: re-read, copy
-    exactly.
+    call. The quote keeps the file's own line endings so it can be copied back
+    verbatim — normalising CRLF to LF would leave `previous.count(old)` at zero
+    after the copy too. When nothing matches even loosely, the most informative
+    line of the requested block is still a landmark.
 
     The quote is bounded like any other tool output; a hint that floods the
     context would cost more than the re-read it is trying to save.
@@ -1031,33 +1085,41 @@ def _near_match(previous: str, old: str) -> str:
     if not old_lines:
         return "Read the file first (action: read) and copy the exact text, whitespace included."
     target = [" ".join(line.split()) for line in old_lines]
-    lines = previous.splitlines()
+    # Keep the endings in the quote: a CRLF file must be copied with CRLF.
+    lines = previous.splitlines(keepends=True)
     flat = [" ".join(line.split()) for line in lines]
     span = len(target)
+    note = "\nThis file uses CRLF line endings; copy them exactly" if "\r\n" in previous else ""
 
-    for start in range(0, len(flat) - span + 1):
-        if flat[start : start + span] == target:
-            block = "\n".join(lines[start : start + span])
-            return (
-                f"A block at line {start + 1} matches once whitespace is ignored, so "
-                "the text is there but the indentation differs. Copy it exactly:\n"
-                + truncate(block, 1200)
-            )
+    # An all-whitespace old_string matching a blank line is not an indent miss.
+    if any(target):
+        for start in range(0, len(flat) - span + 1):
+            if flat[start : start + span] == target:
+                block = "".join(lines[start : start + span])
+                return (
+                    f"A block at line {start + 1} matches once whitespace is ignored, so "
+                    "the text is there but the indentation differs. Copy it exactly:"
+                    f"{note}\n"
+                    + truncate(block, 1200)
+                )
 
-    if span == 1:
-        wanted = target[0]
-        best_ratio, best_at = 0.0, -1
-        for index, line in enumerate(flat):
-            ratio = difflib.SequenceMatcher(None, wanted, line).ratio()
-            if ratio > best_ratio:
-                best_ratio, best_at = ratio, index
-        if best_at >= 0 and best_ratio >= 0.6:
-            return (
-                f"The closest line is {best_at + 1}, but it is not an exact match:\n"
-                f"{truncate(lines[best_at], 400)}\n"
-                "Read the file (action: read, same path) and copy the exact text — "
-                "character for character, whitespace included."
-            )
+    # The longest line carries the most context; one pass over the file keeps
+    # the hint cheap even when the requested block has many lines.
+    wanted = max(target, key=len)
+    best_ratio, best_at = 0.0, -1
+    for index, line in enumerate(flat):
+        ratio = difflib.SequenceMatcher(None, wanted, line).ratio()
+        if ratio > best_ratio:
+            best_ratio, best_at = ratio, index
+    if best_at >= 0 and best_ratio >= 0.6:
+        closest = lines[best_at].rstrip("\r\n")
+        return (
+            f"The closest line is {best_at + 1}, but it is not an exact match:\n"
+            f"{truncate(closest, 400)}"
+            f"{note}\n"
+            "Read the file (action: read, same path) and copy the exact text — "
+            "character for character, whitespace included."
+        )
 
     return (
         "Read the file first (action: read, same path) and copy the exact text — "
