@@ -710,6 +710,7 @@ def test_scrubbed_env_drops_secret_shaped_override_values() -> None:
 def test_step_detail_names_the_action(config) -> None:
     tool = make_tool(config)
     assert tool.step_detail({"action": "search"}) == "mcp.search"
+    assert tool.step_detail({"action": "describe"}) == "mcp.describe"
     assert tool.step_detail({"action": "execute"}) == "mcp.execute"
     assert tool.step_detail({}) == "mcp"
 

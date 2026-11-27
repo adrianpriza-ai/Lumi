@@ -15,7 +15,13 @@ from types import SimpleNamespace
 import pytest
 
 from lumi.tools.base import NeedsApproval, ToolContext, ToolError
-from lumi.tools.mcp.codemode import OUTPUT_MAX_CHARS, SEARCH_MAX_CHARS, MCPTool
+from lumi.tools.mcp.codemode import (
+    OUTPUT_MAX_CHARS,
+    PREVIEW_MAX_CHARS,
+    SEARCH_MAX_CHARS,
+    MCPTool,
+    _url_targets,
+)
 from lumi.tools.mcp.sandbox import run_code
 from lumi.tools.mcp.servers import DiscoveredTool, ServerSpec
 from lumi.util.text import UNTRUSTED_BEGIN, UNTRUSTED_END
@@ -208,6 +214,112 @@ async def test_search_caps_a_huge_catalog(config) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# describe
+# --------------------------------------------------------------------------- #
+
+
+def rich_tool() -> DiscoveredTool:
+    return DiscoveredTool(
+        name="create_issue",
+        description=(
+            "Create an issue in a repository.\n\n"
+            "Pass `labels` as an array of label names; the server creates any "
+            "that do not exist yet."
+        ),
+        properties={
+            "owner": {"type": "string", "description": "Repository owner."},
+            "repo": {"type": "string"},
+            "title": {"type": "string"},
+            "priority": {"type": "string", "enum": ["low", "high"]},
+            "labels": {"type": "array", "items": {"type": "string"}},
+        },
+        required=["owner", "repo", "title"],
+        schema={
+            "type": "object",
+            "properties": {
+                "owner": {"type": "string", "description": "Repository owner."},
+                "repo": {"type": "string"},
+                "title": {"type": "string"},
+                "priority": {"type": "string", "enum": ["low", "high"]},
+                "labels": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["owner", "repo", "title"],
+            "additionalProperties": False,
+        },
+    )
+
+
+async def test_describe_returns_the_full_description_and_schema(config) -> None:
+    build, _ = tool_of((spec(), rich_tool()))
+    tool = build(config)
+
+    result = await tool.invoke({"action": "describe", "tool": "github_create_issue"}, ToolContext())
+
+    assert result.ok
+    # The whole description survives — search keeps only its first line.
+    assert "the server creates any" in result.text
+    assert "input schema:" in result.text
+    assert '"enum"' in result.text and '"low"' in result.text
+    assert '"items"' in result.text
+    # Top-level schema keys survive too: nothing is re-rendered lossily.
+    assert '"additionalProperties": false' in result.text
+    assert result.data["helper"] == "github_create_issue"
+    assert result.text.count(UNTRUSTED_BEGIN) == 1
+
+
+async def test_describe_accepts_the_helper_as_search_prints_it(config) -> None:
+    """`search` shows `` `codemode.github_create_issue(...)` ``; the model may
+    pass that spelling back verbatim."""
+    build, _ = tool_of((spec(), issue_tool()))
+    tool = build(config)
+
+    result = await tool.invoke(
+        {"action": "describe", "tool": "`codemode.github_create_issue(owner='o')`"},
+        ToolContext(),
+    )
+
+    assert result.ok
+    assert result.data["helper"] == "github_create_issue"
+
+
+async def test_describe_accepts_the_server_dot_tool_form(config) -> None:
+    build, _ = tool_of((spec(), rich_tool()))
+    tool = build(config)
+
+    result = await tool.invoke({"action": "describe", "tool": "github.create_issue"}, ToolContext())
+
+    assert result.ok
+    assert "codemode.github_create_issue" in result.text
+
+
+async def test_describe_rebuilds_a_schema_for_tools_without_one_stored(config) -> None:
+    """A DiscoveredTool built by hand has no raw ``schema``; describe still
+    shows the object schema its properties and required fields imply."""
+    build, _ = tool_of((spec(), issue_tool()))
+    tool = build(config)
+
+    result = await tool.invoke({"action": "describe", "tool": "github_create_issue"}, ToolContext())
+
+    assert result.ok
+    assert '"owner"' in result.text
+    assert '"required"' in result.text
+
+
+async def test_describe_names_search_when_the_tool_is_unknown(config) -> None:
+    build, _ = tool_of((spec(), issue_tool()))
+    tool = build(config)
+
+    with pytest.raises(ToolError, match="no discovered tool named 'nope'"):
+        await tool.invoke({"action": "describe", "tool": "nope"}, ToolContext())
+
+
+async def test_describe_requires_a_tool_name(config) -> None:
+    tool = MCPTool(config)
+    with pytest.raises(ToolError, match="tool"):
+        await tool.invoke({"action": "describe"}, ToolContext())
+
+
+# --------------------------------------------------------------------------- #
 # execute
 # --------------------------------------------------------------------------- #
 
@@ -298,6 +410,185 @@ async def test_execute_asks_the_owner_before_the_script_runs(config) -> None:
     assert calls == []  # nothing connected or ran
 
 
+async def test_approval_preview_reaches_a_call_past_the_old_cutoff(config) -> None:
+    """The preview is a structural summary, not the first 2000 characters: a
+    call padded out of sight used to be approved without ever being shown."""
+    build, _ = tool_of((spec(), issue_tool()))
+    tool = build(config)
+    padding = "# " + "padding " * 600 + "\n"
+    code = (
+        padding
+        + "codemode.github_create_issue(owner='acme', repo='widgets', title='Crash on save')"
+    )
+
+    with pytest.raises(NeedsApproval) as caught:
+        await tool.invoke({"action": "execute", "code": code}, ToolContext())
+
+    preview = caught.value.preview
+    assert (
+        "codemode.github_create_issue(owner='acme', repo='widgets', title='Crash on save')"
+        in preview
+    )
+    assert "padding" not in preview  # a summary, not the script
+    assert "1 MCP call site(s)" in preview
+
+
+async def test_approval_preview_lists_calls_in_order_and_counts_what_it_omits(config) -> None:
+    build, _ = tool_of((spec(), issue_tool()))
+    tool = build(config)
+    body = "\n".join(
+        f"codemode.github_create_issue(owner='acme', repo='widgets', title='issue {index}')"
+        for index in range(30)
+    )
+    code = "x = 1\nif x:\n    print(x)\n" + body
+
+    with pytest.raises(NeedsApproval) as caught:
+        await tool.invoke({"action": "execute", "code": code}, ToolContext())
+
+    preview = caught.value.preview
+    assert "30 MCP call site(s)" in preview
+    assert "title='issue 0'" in preview and "title='issue 1'" in preview
+    assert preview.index("title='issue 0'") < preview.index("title='issue 1'")
+    assert "more call site(s), not shown" in preview
+    assert "1 if statement(s)" in preview
+    assert len(preview) <= PREVIEW_MAX_CHARS
+
+
+async def test_approval_preview_renders_a_call_by_name(config) -> None:
+    """`codemode.call(server, tool, {...})` bypasses the helpers, so it must be
+    listed just as plainly."""
+    fetch = DiscoveredTool(name="fetch", description="", properties={})
+    build, _ = tool_of((spec("web"), fetch))
+    tool = build(config)
+
+    with pytest.raises(NeedsApproval) as caught:
+        await tool.invoke(
+            {
+                "action": "execute",
+                "code": "codemode.call('web', 'fetch', {'url': 'https://example.com'})",
+            },
+            ToolContext(),
+        )
+
+    assert "codemode.call('web', 'fetch', …)" in caught.value.preview
+
+
+async def test_approval_preview_follows_an_alias_of_codemode(config) -> None:
+    """`cm = codemode; cm.delete_repo()` used to read as "no MCP call".
+
+    The card told the owner the script *only computes and prints* while it
+    went on to call a tool, which is the one thing the summary exists to
+    prevent. The documented `except codemode.ToolError` must not look like a
+    hidden call either.
+    """
+    build, _ = tool_of((spec(), issue_tool()))
+    tool = build(config)
+    code = (
+        "cm = codemode\n"
+        "try:\n"
+        "    cm.github_create_issue(owner='acme', repo='widgets', title='Crash')\n"
+        "except codemode.ToolError as exc:\n"
+        "    print('failed', exc)\n"
+    )
+
+    with pytest.raises(NeedsApproval) as caught:
+        await tool.invoke({"action": "execute", "code": code}, ToolContext())
+
+    preview = caught.value.preview
+    assert "1 MCP call site(s)" in preview
+    assert "codemode.github_create_issue(owner='acme', repo='widgets', title='Crash')" in preview
+    assert "only computes and prints" not in preview
+    assert "not listed above" not in preview  # ToolError is not a hidden call
+
+
+async def test_approval_preview_names_a_literal_getattr_call(config) -> None:
+    build, _ = tool_of((spec(), issue_tool()))
+    tool = build(config)
+
+    with pytest.raises(NeedsApproval) as caught:
+        await tool.invoke(
+            {
+                "action": "execute",
+                "code": "getattr(codemode, 'github_create_issue')(owner='acme', repo='w')",
+            },
+            ToolContext(),
+        )
+
+    assert "codemode.github_create_issue(owner='acme', repo='w')" in caught.value.preview
+
+
+async def test_approval_preview_does_not_claim_a_computed_call_is_absent(config) -> None:
+    """When the API is reached by a name the summary cannot follow, say so.
+
+    The all-clear is reserved for scripts that really only compute and print:
+    a computed `getattr` or a script that passes `codemode` into a function
+    reports that the API is reached indirectly instead.
+    """
+    build, _ = tool_of((spec(), issue_tool()))
+    tool = build(config)
+    code = "name = 'github_create_issue'\ngetattr(codemode, name)(owner='acme')\n"
+
+    with pytest.raises(NeedsApproval) as caught:
+        await tool.invoke({"action": "execute", "code": code}, ToolContext())
+
+    preview = caught.value.preview
+    assert "reached indirectly" in preview
+    assert "only computes and prints" not in preview
+
+
+async def test_approval_preview_does_not_claim_a_bare_vars_call_is_absent(config) -> None:
+    """`vars()` returns the script namespace, which holds `codemode`.
+
+    `vars()['codemode'].delete_repo(...)` reaches a tool with no `codemode`
+    name in the source, so an all-clear would be false; `vars(obj)` inspects a
+    named object and stays uncounted.
+    """
+    build, _ = tool_of((spec(), issue_tool()))
+    tool = build(config)
+
+    with pytest.raises(NeedsApproval) as caught:
+        await tool.invoke(
+            {
+                "action": "execute",
+                "code": "vars()['codemode'].github_create_issue(owner='acme', repo='w')\n",
+            },
+            ToolContext(),
+        )
+
+    preview = caught.value.preview
+    assert "reached indirectly" in preview
+    assert "only computes and prints" not in preview
+
+    with pytest.raises(NeedsApproval) as caught:
+        await tool.invoke(
+            {"action": "execute", "code": "t = {}\nprint(vars(t))\n"},
+            ToolContext(),
+        )
+
+    assert "only computes and prints" in caught.value.preview
+
+
+async def test_approval_preview_of_an_unparseable_script_says_so(config) -> None:
+    build, _ = tool_of((spec(), issue_tool()))
+    tool = build(config)
+
+    with pytest.raises(NeedsApproval) as caught:
+        await tool.invoke(
+            {"action": "execute", "code": "codemode.github_create_issue(owner='o', repo="},
+            ToolContext(),
+        )
+
+    assert "does not parse" in caught.value.preview
+
+    with pytest.raises(NeedsApproval) as caught:
+        await tool.invoke({"action": "execute", "code": "print(1)\x00"}, ToolContext())
+
+    # Which exception the interpreter raises for a null byte varies by
+    # version, so only the report itself is pinned, not the branch.
+    assert "parse" in caught.value.preview
+    assert "null bytes" in caught.value.preview
+
+
 async def test_execute_skips_the_prompt_when_ask_before_call_is_off(config) -> None:
     config.tools.web.mcp.ask_before_call = False
     build, calls = tool_of((spec(), issue_tool()))
@@ -363,7 +654,8 @@ async def test_execute_refuses_a_private_url_for_a_fetch_helper(config) -> None:
     fetch = DiscoveredTool(
         name="fetch", description="Fetch a URL", properties={"url": {"type": "string"}}
     )
-    build, calls = tool_of((spec("web"), fetch))
+    fetching = ServerSpec(name="web", kind="remote", url="https://mcp.test", fetches=True)
+    build, calls = tool_of((fetching, fetch))
     tool = build(config)
     tool._replies = {"fetch": "page"}
 
@@ -380,6 +672,90 @@ async def test_execute_refuses_a_private_url_for_a_fetch_helper(config) -> None:
     assert "blocked: True" in result.text
     assert "public: page" in result.text
     assert calls == [("web", "fetch", {"url": "https://example.com/page"})]
+
+
+async def test_execute_guards_every_tool_on_a_server_declared_to_fetch(config) -> None:
+    """The guard is a property of the server, not of the tool name: `get_page`
+    never matched the old fetch|scrape|extract|url regex, and a URL embedded in
+    a larger argument still reaches the fetcher."""
+    page = DiscoveredTool(
+        name="get_page", description="Read a page", properties={"target": {"type": "string"}}
+    )
+    fetching = ServerSpec(name="browser", kind="remote", url="https://mcp.test", fetches=True)
+    build, calls = tool_of((fetching, page))
+    tool = build(config)
+    tool._replies = {"get_page": "page"}
+
+    script = (
+        "try:\n"
+        "    codemode.browser_get_page(target='open http://169.254.169.254/latest/meta-data/')\n"
+        "except codemode.ToolError as exc:\n"
+        "    print('blocked:', 'non-routable' in str(exc))\n"
+    )
+    result = await tool.invoke({"action": "execute", "code": script}, ToolContext(confirmed=True))
+
+    assert result.ok
+    assert "blocked: True" in result.text
+    assert calls == []
+
+
+async def test_execute_does_not_guard_a_server_declared_not_to_fetch(config) -> None:
+    """A tool *called* `fetch` on a server whose capability says it does not
+    read URLs gets no SSRF check: URL-shaped strings there are data."""
+    fetch = DiscoveredTool(
+        name="fetch", description="Fetch a record", properties={"body": {"type": "string"}}
+    )
+    storing = ServerSpec(name="notes", kind="remote", url="https://mcp.test", fetches=False)
+    build, calls = tool_of((storing, fetch))
+    tool = build(config)
+    tool._replies = {"fetch": "ok"}
+
+    result = await tool.invoke(
+        {
+            "action": "execute",
+            "code": "print(codemode.notes_fetch(body='see http://192.168.1.5/x'))",
+        },
+        ToolContext(confirmed=True),
+    )
+
+    assert result.ok
+    assert calls == [("notes", "fetch", {"body": "see http://192.168.1.5/x"})]
+
+
+def test_fetch_capability_defaults_to_the_transport() -> None:
+    """MCP declares no fetch capability, so an entry that does not say is read
+    from its transport: a local server runs beside the metadata endpoint, a
+    remote one fetches from its own network. A declared value wins either way,
+    and an endpoint that is itself loopback counts as local."""
+    local = ServerSpec.from_json("local", {"type": "local", "command": "uvx mcp-server-fetch"})
+    remote = ServerSpec.from_json("remote", {"url": "https://mcp.test"})
+    local_opt_out = ServerSpec.from_json("off", {"type": "local", "command": "x", "fetches": False})
+    remote_opt_in = ServerSpec.from_json("on", {"url": "https://mcp.test", "fetches": True})
+    gateway = ServerSpec.from_json("gateway", {"url": "http://127.0.0.1:3000/mcp"})
+
+    assert local.fetches_urls and not remote.fetches_urls
+    assert not local_opt_out.fetches_urls and remote_opt_in.fetches_urls
+    assert gateway.fetches_urls
+
+    # The relaxing declaration is shown where an owner approves an entry.
+    from lumi.bot import _mcp_transport
+
+    assert "URL arguments unchecked" in _mcp_transport(local_opt_out)
+    assert "URL arguments unchecked" not in _mcp_transport(remote_opt_in)
+
+
+def test_url_targets_finds_urls_embedded_in_larger_strings() -> None:
+    arguments = {
+        "body": "see https://169.254.169.254/latest/meta-data/ first; also file:///etc/passwd",
+        "path": "/var/log/app.log",
+        "nested": [["a//b", "//evil.test/x", "https://169.254.169.254/latest/meta-data/"]],
+    }
+
+    assert _url_targets(arguments) == [
+        "https://169.254.169.254/latest/meta-data/",
+        "file:///etc/passwd",
+        "//evil.test/x",
+    ]
 
 
 async def test_execute_turns_a_server_error_into_a_catchable_toolerror(config) -> None:
@@ -596,6 +972,32 @@ async def test_helper_names_are_sanitised_and_unique(config) -> None:
     assert result.ok
     assert "codemode.my_server_do_it(" in result.text
     assert "codemode.my_server_do_it_2(" in result.text
+
+
+async def test_helper_suffix_cannot_shadow_a_literal_base_name(config) -> None:
+    """A generated suffix must not collide with another tool's real base name.
+
+    Bases ``srv_x_2``, ``srv_x``, ``srv_x`` used to produce helpers
+    ``srv_x_2``, ``srv_x``, ``srv_x_2``: the last `setattr` in the bootstrap
+    won, so the first tool was unreachable and search advertised one name for
+    two different tools.
+    """
+    pairs = [
+        (spec("srv"), DiscoveredTool(name="x_2", description="first", properties={})),
+        (spec("srv"), DiscoveredTool(name="x", description="second", properties={})),
+        (spec("srv"), DiscoveredTool(name="x", description="third", properties={})),
+    ]
+    build, _ = tool_of(*pairs)
+    tool = build(config)
+
+    helpers = [item["helper"] for item in tool._api(pairs)]
+    assert helpers == ["srv_x_2", "srv_x", "srv_x_3"]
+
+    result = await tool.invoke({"action": "search"}, ToolContext())
+    assert result.ok
+    assert result.text.count("codemode.srv_x_2(") == 1
+    assert result.text.count("codemode.srv_x(") == 1
+    assert result.text.count("codemode.srv_x_3(") == 1
 
 
 async def test_summary_line_calls_it_code_mode(config) -> None:

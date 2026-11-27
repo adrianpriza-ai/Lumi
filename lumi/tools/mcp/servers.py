@@ -49,6 +49,7 @@ shape only ever failed against a real server.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import os
 import re
@@ -57,6 +58,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from ...config import MCPConfig
 from ...paths import resolve
@@ -278,10 +280,36 @@ class ServerSpec:
     #: trust store approves against. Empty for a spec built in code rather
     #: than parsed from a file, which reads as "not a project entry".
     digest: str = ""
+    #: Whether URL arguments to this server's tools are *targets* (and get the
+    #: SSRF check) rather than data. ``"fetches": true|false`` in the entry
+    #: declares it; left out, :attr:`fetches_urls` reads it from the transport.
+    fetches: bool | None = None
 
     @property
     def is_local(self) -> bool:
         return self.kind == "local" or bool(self.command)
+
+    @property
+    def fetches_urls(self) -> bool:
+        """Whether URL arguments to this server's tools are targets to check.
+
+        The declaration wins; without one the transport decides. A local
+        server runs as this user, next to the loopback interface and the cloud
+        metadata endpoint, so its URL arguments are targets. A remote server
+        fetches from its own network — unless its endpoint is itself a
+        loopback/private literal, which is a gateway running here in all but
+        name. The tool's *name* decides nothing: MCP advertises no fetch
+        capability, and `get_page` fetches as surely as `fetch` does.
+        """
+        if self.fetches is not None:
+            return self.fetches
+        if self.is_local:
+            return True
+        host = (urlsplit(self.url).hostname or "").strip("[]")
+        try:
+            return not ipaddress.ip_address(host).is_global
+        except ValueError:
+            return False
 
     def unresolved(self) -> str | None:
         """Return the first variable this server needs but the environment lacks."""
@@ -324,6 +352,10 @@ class ServerSpec:
                 raw_scopes = scopes
             elif isinstance(scopes, list):
                 raw_scopes = " ".join(str(item) for item in scopes)
+        raw_fetches = raw.get("fetches")
+        # A non-boolean is a typo, not a declaration: fall back to the
+        # transport rather than reading `"no"` as true.
+        fetches = raw_fetches if isinstance(raw_fetches, bool) else None
         raw_env = (
             {str(k): str(v) for k, v in raw_env_value.items()}
             if isinstance(raw_env_value, dict)
@@ -379,6 +411,7 @@ class ServerSpec:
             oauth=oauth,
             oauth_scope=expand_env(raw_scopes),
             origin=origin,
+            fetches=fetches,
             # The hash covers the entry as *written* — placeholders intact —
             # so an edit to anything the provider will act on asks for
             # approval again, while a rotated variable's value does not.
@@ -486,6 +519,10 @@ class DiscoveredTool:
     #: ``list`` action shows it, so a call to a six-argument tool is built
     #: right the first time instead of by trial and error.
     required: list[str] = field(default_factory=list)
+    #: The tool's advertised ``inputSchema`` verbatim, for ``describe``: the
+    #: per-parameter ``properties``/``required`` pair drops top-level keys
+    #: (``additionalProperties``, ``$schema``) a caller may need.
+    schema: dict[str, Any] = field(default_factory=dict)
 
     def arg_for(self, candidates: tuple[str, ...]) -> str | None:
         """Which of *candidates* this tool actually accepts as a parameter."""
@@ -875,6 +912,7 @@ class MCPServers:
                     description=str(getattr(tool, "description", "") or ""),
                     properties=properties if isinstance(properties, dict) else {},
                     required=[str(r) for r in required] if isinstance(required, list) else [],
+                    schema=schema if isinstance(schema, dict) else {},
                 )
             )
         self._tool_cache[spec.name] = (now, tools)

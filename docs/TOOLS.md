@@ -475,6 +475,18 @@ round-trips through the context window.
 }
 ```
 
+URL arguments are checked with the same SSRF guard as the `web` tool, and
+whether an argument is a *target* is a property of the server, never of the
+tool's name: every tool on a fetching server is checked, so a fetcher called
+`get_page` is covered as surely as one called `fetch`. A URL embedded in a
+larger string (`"see https://…"`) and a protocol-relative `//host/path` count
+too. Declare the capability with `"fetches": true` or `"fetches": false` on
+the entry. Left undeclared, the transport decides: a local server runs as this
+user, beside the loopback and metadata endpoints, so it is checked; a remote
+server fetches from its own network and is not — unless its endpoint is itself
+a loopback/private literal, which is a local gateway in all but name. Set
+`"fetches": false` where a URL in an argument is data, such as an issue body.
+
 Two actions:
 
 - `search` — the generated catalog. Each result carries the helper name, its
@@ -489,18 +501,29 @@ Two actions:
   - A tool that reports an error raises `codemode.ToolError`.
 
 The script runs in a fresh Python interpreter (`-I -S`) with a scrubbed
-environment and no filesystem or network builtins; imports are an allowlist of
-data-processing modules (`json`, `re`, `math`, `collections`, `datetime`, …).
+environment: `open`, `eval`, `exec` and `compile` are absent from the script's
+namespace, and its `import` statement is served from a fixed allowlist of
+data-processing modules (`json`, `re`, `math`, `collections`, `datetime`, …)
+built before the script starts.
 It has a wall-clock budget (`code_timeout_seconds`, 30 by default) and a call
 cap (`max_code_calls`, 40). The parent process keeps the MCP sessions, headers
 and OAuth tokens, and validates every requested server/tool against what was
 discovered for that run — a script cannot reach a server that was not approved.
 
-This is a conformance boundary, not a jail for hostile code: a determined
-escape through Python introspection is possible, and the child runs as the same
-OS user. What it guarantees is that ordinary model-authored code cannot touch
-the filesystem, the network or an unapproved server by accident, and that a
-runaway script is killed rather than taking the turn with it.
+On Linux, the child runs inside bubblewrap's private user, PID, network and
+mount namespaces. It sees the read-only Python runtime and an empty,
+read-only scratch directory, but not the host home, project files or network.
+The interpreter's internals remain introspectable, so the namespace scrub is
+defense in depth; the OS namespace is the boundary. Execution fails closed
+unless bubblewrap is installed, the Python runtime is under `/usr`, and the
+requested namespaces can be created. This does not defend against kernel
+vulnerabilities. The child has a wall-clock timeout and hard resource limits.
+
+The approval prompt is still important: it is a structural summary, not a
+prefix of the code — every `codemode` call site in source order, with its
+keyword arguments and literal values, plus any control flow. Check that list
+before confirming; a call site that does not fit is counted, never silently
+dropped.
 
 **Project-file servers need one approval.** `~/.agents/mcp.json` is written by
 your own hand, but `.mcp.json` arrives by `git clone` and `git pull` exactly as

@@ -525,6 +525,10 @@ def _mcp_transport(spec: Any) -> str:
             # What the authorization request will ask for, so an owner can
             # spot a missing/extra scope without re-reading the config file.
             kind += f" · scopes: <code>{escape_html(spec.oauth_scope)}</code>"
+    if getattr(spec, "fetches", None) is False:
+        # The declaration that turns the SSRF check off for this server: an
+        # owner approving a project entry should see it.
+        kind += " · URL arguments unchecked"
     return kind
 
 
