@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 from ....config import MCPConfig, YouConfig
 from ...mcp.servers import MCPServers, ServerSpec, _try_json
@@ -75,6 +76,15 @@ class YouProvider(WebProvider):
         except ImportError:
             return False, "the mcp package is not installed"
         return True, ""
+
+    def status(self) -> str:
+        """One line for ``/status``: key tier and the You.com profile in use."""
+        ok, reason = self.available()
+        if not ok:
+            return f"off ({reason})"
+        tier = self._key_tier(self.you.api_keys(), "public MCP endpoint")
+        profile = parse_qs(urlparse(self.you.url).query).get("profile", [""])[0]
+        return f"{tier} · {profile or 'custom'} profile"
 
     async def aclose(self) -> None:
         await self.client.aclose()

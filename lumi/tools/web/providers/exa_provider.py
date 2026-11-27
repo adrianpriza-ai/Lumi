@@ -76,6 +76,17 @@ class ExaProvider(WebProvider):
             return False, "exa-py is not installed"
         return True, ""
 
+    def status(self) -> str:
+        """One line for ``/status``: key tier and the search mode in use."""
+        ok, reason = self.available()
+        if not ok:
+            return f"off ({reason})"
+        tier = self._key_tier(self.config.api_keys(), "own endpoint")
+        detail = f"search {self.config.search_type.strip() or 'auto'}"
+        if self.config.category.strip():
+            detail += f" · category {self.config.category.strip()}"
+        return f"{tier} · {detail}"
+
     def _get_client(self, key: str) -> Any:
         """Build (and cache) an ``AsyncExa`` for *key*."""
         client = self._clients.get(key)

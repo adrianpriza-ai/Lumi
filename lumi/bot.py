@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import io
 import json
 import os
 import re
@@ -1943,14 +1944,35 @@ def build_handlers(config: Config) -> list[Any]:
     # -- introspection ----------------------------------------------------- #
 
     async def personality_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Send PERSONALITY.md as one document, not a chain of chat messages.
+
+        The file is the prompt, so the bytes are the honest answer to "what is
+        my personality". A long file used to come back as several split
+        messages that buried the chat; one attachment keeps the whole answer
+        in a single item, whatever its length.
+        """
         if not await authorised(update):
             return
         personality: Personality = context.application.bot_data["personality"]
-        await reply(
-            update,
-            f"<b>PERSONALITY.md</b> — {len(personality.text)} chars\n\n"
-            + sanitize_html(personality.text),
-        )
+        message = update.effective_message
+        if message is None:
+            return
+        payload = io.BytesIO(personality.text.encode("utf-8"))
+        caption = f"PERSONALITY.md — {len(personality.text):,} chars"
+        try:
+            await message.reply_document(
+                document=payload,
+                filename="PERSONALITY.md",
+                caption=caption,
+            )
+        except (BadRequest, TelegramError) as exc:
+            log.warning("could not send PERSONALITY.md as a document: %s", exc)
+            await reply(
+                update,
+                f"couldn't attach PERSONALITY.md — it's on disk at "
+                f"<code>{escape_html(str(personality.path))}</code>"
+                f" ({len(personality.text):,} chars)",
+            )
 
     async def reasoning_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Report the reasoning setup, and toggle the live step list.

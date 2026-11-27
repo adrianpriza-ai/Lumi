@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -1887,9 +1888,9 @@ def test_web_status_gives_every_provider_one_line_in_order(config) -> None:
     lines = tool.status_lines()
     # After the two header lines, one line per provider, same order as the chain.
     assert [line.split(":")[0] for line in lines[2:]] == list(tool.providers)
-    # Providers without a status() fall back to available(): tavily is keyless
-    # in the fixture, firecrawl has no key, so each lands on its own side.
-    assert "tavily: on" in lines
+    # Every provider describes its own tier; tavily's free tier is keyless
+    # in the fixture, firecrawl's hosted API has no key, so each says so.
+    assert "tavily: keyless (free tier) · basic · general" in lines
     assert "firecrawl: off (FIRECRAWL_API_KEY is not set)" in lines
 
 
@@ -1913,6 +1914,69 @@ def test_keenable_status_names_the_tier(monkeypatch) -> None:
     assert KeenableProvider(KeenableConfig()).status() == "keyed (2 keys) · mode pro"
 
     assert KeenableProvider(KeenableConfig(enabled=False)).status().startswith("off —")
+
+
+def test_other_provider_status_lines_are_as_detailed_as_keenable(monkeypatch) -> None:
+    """Every provider counts its keys the same way and names its own knob.
+
+    ``/status`` is a row of these lines: an ``on`` is not enough to tell a
+    keyed hosted API from a keyless free tier or an owner-run endpoint.
+    """
+    for var in (
+        "FIRECRAWL_API_KEY",
+        "EXA_API_KEY",
+        "TAVILY_API_KEY",
+        "CONTEXT_DEV_API_KEY",
+        "YOU_API_KEY",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    assert FirecrawlProvider(FirecrawlConfig()).status() == (
+        "off (FIRECRAWL_API_KEY is not set)"
+    )
+    assert ExaProvider(ExaConfig()).status() == "off (EXA_API_KEY is not set)"
+    assert TavilyProvider(TavilyConfig()).status() == (
+        "keyless (free tier) · basic · general"
+    )
+    assert ContextDevProvider(ContextDevConfig()).status() == (
+        "off (CONTEXT_DEV_API_KEY is not set)"
+    )
+    assert YouProvider(YouConfig(), Path("/tmp")).status() == (
+        "keyless (public MCP endpoint) · free profile"
+    )
+
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-1, fc-2")
+    monkeypatch.setenv("CONTEXT_DEV_API_KEY", "ctx-1")
+    monkeypatch.setenv("YOU_API_KEY", "you-1")
+    assert FirecrawlProvider(FirecrawlConfig()).status() == (
+        "keyed (2 keys) · scrape top-up 3"
+    )
+    assert ContextDevProvider(ContextDevConfig()).status() == (
+        "keyed (1 key) · highlights on · markdown off"
+    )
+    assert YouProvider(YouConfig(), Path("/tmp")).status() == "keyed (1 key) · free profile"
+
+    # An overridden endpoint is the owner's, so no key is not an error.
+    for var in ("FIRECRAWL_API_KEY", "EXA_API_KEY", "CONTEXT_DEV_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    assert FirecrawlProvider(FirecrawlConfig(base_url="http://localhost:3000")).status() == (
+        "keyless (self-hosted endpoint) · scrape top-up 3"
+    )
+    assert ExaProvider(ExaConfig(base_url="http://localhost:3000")).status() == (
+        "keyless (own endpoint) · search auto"
+    )
+    assert ContextDevProvider(ContextDevConfig(base_url="http://localhost:3000")).status() == (
+        "keyless (own endpoint) · highlights on · markdown off"
+    )
+
+    monkeypatch.setenv("EXA_API_KEY", "ex-1")
+    monkeypatch.setenv("TAVILY_API_KEY", "tv-1")
+    assert TavilyProvider(TavilyConfig(search_depth="advanced", topic="news")).status() == (
+        "keyed (1 key) · advanced · news"
+    )
+    assert ExaProvider(ExaConfig(search_type="neural", category="paper")).status() == (
+        "keyed (1 key) · search neural · category paper"
+    )
 
 
 def test_keenable_and_jina_are_unavailable_without_httpx(monkeypatch) -> None:

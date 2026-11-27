@@ -70,6 +70,14 @@ class FirecrawlProvider(WebProvider):
             return False, "firecrawl is not installed"
         return True, ""
 
+    def status(self) -> str:
+        """One line for ``/status``: key tier and the scrape top-up that runs."""
+        ok, reason = self.available()
+        if not ok:
+            return f"off ({reason})"
+        tier = self._key_tier(self.config.api_keys(), "self-hosted endpoint")
+        return f"{tier} · scrape top-up {self.config.auto_scrape_top_n}"
+
     def _get_client(self, key: str) -> Any:
         """Build (and cache) an ``AsyncFirecrawl`` for *key*."""
         client = self._clients.get(key)

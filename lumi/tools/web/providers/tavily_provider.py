@@ -60,6 +60,14 @@ class TavilyProvider(WebProvider):
         # reporting failure.
         return True, ""
 
+    def status(self) -> str:
+        """One line for ``/status``: key tier and the search depth/topic in use."""
+        ok, reason = self.available()
+        if not ok:
+            return f"off ({reason})"
+        tier = self._key_tier(self.config.api_keys(), "free tier")
+        return f"{tier} · {self.config.search_depth} · {self.config.topic}"
+
     def _get_client(self, key: str | None) -> Any:
         """Build (and cache) the right SDK client for *key*.
 

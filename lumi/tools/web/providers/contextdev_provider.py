@@ -120,6 +120,18 @@ class ContextDevProvider(WebProvider):
             return False, "httpx is not installed; the context.dev provider needs it"
         return True, ""
 
+    def status(self) -> str:
+        """One line for ``/status``: key tier and which paid extras are on."""
+        ok, reason = self.available()
+        if not ok:
+            return f"off ({reason})"
+        tier = self._key_tier(self.config.api_keys(), "own endpoint")
+        detail = (
+            f"highlights {'on' if self.config.highlights else 'off'}"
+            f" · markdown {'on' if self.config.include_markdown else 'off'}"
+        )
+        return f"{tier} · {detail}"
+
     # -- HTTP --------------------------------------------------------------- #
 
     def _headers(self, key: str) -> dict[str, str]:

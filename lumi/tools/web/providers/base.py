@@ -149,6 +149,20 @@ class WebProvider(abc.ABC):
         mark = "" if ok else f" _(unavailable: {reason})_"
         return f"- `{self.name}`{mark}"
 
+    @staticmethod
+    def _key_tier(keys: list[str], keyless: str) -> str:
+        """The shared ``keyed (1 key)`` / ``keyless (...)`` status prefix.
+
+        Every tier counts its keys the same way so the ``/status`` lines can be
+        read side by side; *keyless* names the tier in use, because an unset
+        variable means something different for each provider (a free tier, a
+        self-hosted endpoint, a public API).
+        """
+        if keys:
+            plural = "key" if len(keys) == 1 else "keys"
+            return f"keyed ({len(keys)} {plural})"
+        return f"keyless ({keyless})"
+
 
 def final_url(*candidates: Any, requested: str) -> str:
     """The first http(s) URL among *candidates*, else the URL we asked for.

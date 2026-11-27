@@ -1039,9 +1039,42 @@ async def test_a_whitelisted_user_can_still_remember(config) -> None:
 # --------------------------------------------------------------------------- #
 
 
-async def test_personality_command_shows_the_file(config) -> None:
+async def test_personality_command_sends_the_file(config) -> None:
+    """The answer is one attachment, not a wall of chat messages."""
     bot, _ = await send(config, [], "/personality")
-    assert "You are Lumi" in texts(bot)
+    sent = documents(bot)
+    assert len(sent) == 1
+    assert sent[0]["filename"] == "PERSONALITY.md"
+    assert b"You are Lumi" in sent[0]["document"]
+    assert "chars" in sent[0]["caption"]
+    assert texts(bot) == ""
+
+
+async def test_personality_command_sends_one_file_even_when_it_is_long(config) -> None:
+    """A personality past the 4096-char message cap still arrives in one item."""
+    (config.root / "PERSONALITY.md").write_text(
+        "You are Lumi.\n" + ("A line of guidance. " * 400), encoding="utf-8"
+    )
+    bot, _ = await send(config, [], "/personality")
+    sent = documents(bot)
+    assert len(sent) == 1
+    assert len(sent[0]["document"]) > 4096
+    assert not [message for message in bot.sent if "text" in message]
+
+
+async def test_personality_command_falls_back_to_the_path_when_upload_fails(config) -> None:
+    class NoDocumentBot(FakeBot):
+        async def send_document(self, chat_id: Any, document: Any = None, **kwargs: Any) -> Any:
+            raise TelegramError("simulate: document upload refused")
+
+    application, bot, _ = build(config, [], bot=NoDocumentBot())
+    await application.initialize()
+    try:
+        await application.process_update(make_update(bot, "/personality"))
+    finally:
+        await application.shutdown()
+    assert documents(bot) == []
+    assert "PERSONALITY.md" in texts(bot)
 
 
 async def test_status_command(config) -> None:
@@ -1054,9 +1087,13 @@ async def test_status_command(config) -> None:
     assert "run_shell" in body  # tool inventory lives here now that /tools is gone
     assert "tools:" in body  # the on/off count precedes the names
     assert "web: tavily active" in body  # no keys in the fixture, so keyless Tavily answers
-    assert "tavily: on" in body  # every provider in the order gets its own line
+    # Every provider gets one line, each as detailed as keenable's: key tier
+    # plus the knob that shapes its results, or the reason it is off.
+    assert "tavily: keyless (free tier) · basic · general" in body
+    assert "contextdev: off (CONTEXT_DEV_API_KEY is not set)" in body
     assert "keenable: keyless (public endpoints as 'Lumi')" in body
     assert "jina: reader keyless" in body
+    assert "you: keyless (public MCP endpoint) · free profile" in body
 
 
 async def test_status_names_off_tools_with_the_reason(config, monkeypatch) -> None:
