@@ -182,3 +182,31 @@ def mcp_error(cls: type, error) -> BaseException:
     if from_data is not None:
         return from_data(error)
     return cls(error)
+
+
+#: Why the Code Mode sandbox tests skip rather than fail when the host cannot
+#: run them. One definition, so every file that needs the sandbox says the
+#: same thing — a test that *failed* here used to read as a broken sandbox on
+#: CI, when the runner simply had no bubblewrap and no Python under /usr.
+SANDBOX_SKIP_REASON = (
+    "Code Mode integration tests require Linux, bubblewrap (bwrap), and a Python runtime under /usr"
+)
+
+
+def sandbox_unavailable() -> bool:
+    """True when :func:`lumi.tools.mcp.sandbox._bubblewrap_command` would refuse.
+
+    Mirrors the check in ``test_mcp_sandbox.py``: the sandbox is available
+    exactly when it can build a bubblewrap command for a scratch directory.
+    """
+    from pathlib import Path
+
+    from lumi.tools.mcp import sandbox
+
+    return sandbox._bubblewrap_command(Path("/tmp")) is None
+
+
+def skip_without_sandbox():
+    """``pytest.mark.skipif`` for a test (or a module, via ``pytestmark``) that
+    needs the real Code Mode sandbox."""
+    return pytest.mark.skipif(sandbox_unavailable(), reason=SANDBOX_SKIP_REASON)

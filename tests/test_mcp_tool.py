@@ -13,7 +13,7 @@ from contextlib import suppress
 from types import SimpleNamespace
 
 import pytest
-from conftest import make_store, mcp_error
+from conftest import make_store, mcp_error, skip_without_sandbox
 from mcp.types import ErrorData
 
 from lumi.config import load_config
@@ -317,6 +317,7 @@ async def test_a_stdio_server_honours_its_own_cwd(config) -> None:
 # --------------------------------------------------------------------------- #
 
 
+@skip_without_sandbox()
 async def test_a_write_that_lands_then_loses_the_server_is_not_repeated(config) -> None:
     """F3, end to end through a script: the server writes one marker line and
     dies before replying. The call fails, but the write must never be re-sent —
@@ -780,6 +781,7 @@ def test_loading_a_config_file_can_turn_the_prompt_off(project) -> None:
     assert load_config(project).tools.web.mcp.ask_before_call is False
 
 
+@skip_without_sandbox()
 async def test_code_mode_runs_against_a_real_stdio_server(config) -> None:
     """End to end: discovery, the generated helper, the sandbox RPC, a real
     MCP server over stdio, and only the printed result coming back."""

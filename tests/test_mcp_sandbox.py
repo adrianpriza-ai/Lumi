@@ -10,17 +10,13 @@ from __future__ import annotations
 
 import json
 import time
-from pathlib import Path
 
-import pytest
+from conftest import skip_without_sandbox
 
 import lumi.tools.mcp.sandbox as sandbox
 from lumi.tools.mcp.sandbox import run_code
 
-pytestmark = pytest.mark.skipif(
-    sandbox._bubblewrap_command(Path("/tmp")) is None,
-    reason="Code Mode integration tests require Linux, bubblewrap, and a Python runtime under /usr",
-)
+pytestmark = skip_without_sandbox()
 
 
 async def never(*_args):

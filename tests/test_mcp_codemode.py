@@ -13,6 +13,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from conftest import skip_without_sandbox
 
 from lumi.tools.base import NeedsApproval, ToolContext, ToolError
 from lumi.tools.mcp.codemode import (
@@ -25,6 +26,12 @@ from lumi.tools.mcp.codemode import (
 from lumi.tools.mcp.sandbox import run_code
 from lumi.tools.mcp.servers import DiscoveredTool, ServerSpec
 from lumi.util.text import UNTRUSTED_BEGIN, UNTRUSTED_END
+
+# Executing a script needs the real sandbox (Linux + bwrap + Python under /usr).
+# Where it cannot run, skip with the reason rather than fail on `assert False` —
+# a failure here used to read as a broken sandbox on CI when the runner merely
+# lacked bubblewrap. The CI "system" job has it and fails if these skip.
+pytestmark = skip_without_sandbox()
 
 
 def spec(name: str = "github") -> ServerSpec:

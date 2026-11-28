@@ -49,17 +49,39 @@ jobs:
       fail-fast: false
       matrix:
         # The versions claimed in pyproject.toml classifiers. Add one there first.
-        python-version: ["3.11", "3.12", "3.13"]
+        # "system" is ubuntu-latest's own /usr/bin/python3: the Code Mode sandbox
+        # (lumi/tools/mcp/sandbox.py) only runs an interpreter that lives under
+        # /usr, because /usr is all it bind-mounts into the bubblewrap jail.
+        # actions/setup-python installs under the tool cache instead, so on the
+        # pinned versions the sandbox tests skip and only "system" exercises
+        # them — a skip there would mean the sandbox is never tested in CI.
+        python-version: ["3.11", "3.12", "3.13", "system"]
     steps:
       - uses: actions/checkout@v7
 
+      # The sandbox needs bubblewrap on PATH; ubuntu-latest does not ship it.
+      - name: Install bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap
+
       - uses: actions/setup-python@v7
+        if: matrix.python-version != 'system'
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
+      # The Code Mode sandbox runs `sys._base_executable` inside bwrap with
+      # only /usr mounted, so the interpreter under test has to be the system
+      # one. A venv made from it keeps pip isolated while _base_executable
+      # stays /usr/bin/python3, which is exactly the check sandbox.py makes.
+      - name: Use the system Python
+        if: matrix.python-version == 'system'
+        run: echo "$HOME/.lumi-system-venv/bin" >> "$GITHUB_PATH"
+
       - name: Install
         run: |
+          if [ "${{ matrix.python-version }}" = "system" ]; then
+            /usr/bin/python3 -m venv "$HOME/.lumi-system-venv"
+          fi
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
@@ -67,8 +89,26 @@ jobs:
       # own dummy .env, and scrubs TAVILY/FIRECRAWL/EXA/MCP vars, so no secrets
       # and no network keys are needed here. If a test ever starts reading a real
       # credential, that is a bug in the test, not a reason to add a secret.
+      #
+      # Code Mode's sandbox tests must not skip silently: on the "system" runner
+      # they have everything they need, so a skipped sandbox test there is a
+      # failure. On the tool-cache versions the sandbox is legitimately
+      # unavailable and the skip is the honest result.
       - name: Pytest
-        run: pytest -q
+        run: |
+          if [ "${{ matrix.python-version }}" = "system" ]; then
+            # pipefail: `tee` must not swallow pytest's exit status.
+            set -o pipefail
+            status=0
+            python -m pytest -q -rs -p no:cacheprovider | tee pytest.log || status=$?
+            if grep -E "^SKIPPED .*test_mcp_(sandbox|codemode|tool)" pytest.log; then
+              echo "::error::sandbox tests skipped on the system Python; bubblewrap or /usr python is missing"
+              status=1
+            fi
+            exit "$status"
+          else
+            python -m pytest -q -rs
+          fi
 
   rust-test:
     name: cargo test (lumi-tui)
