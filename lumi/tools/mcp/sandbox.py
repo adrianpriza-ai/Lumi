@@ -721,7 +721,7 @@ async def run_code(
         return CodeRun(ok=False, error=f"could not create the code sandbox scratch: {exc}")
     scratch_dir = Path(scratch.name)
     try:
-        scratch_dir.chmod(0o500)
+        await asyncio.to_thread(scratch_dir.chmod, 0o500)
     except OSError as exc:
         scratch.cleanup()
         return CodeRun(ok=False, error=f"could not prepare the code sandbox scratch: {exc}")
@@ -767,7 +767,7 @@ async def run_code(
                 on_call=on_call,
                 run=run,
                 max_calls=max_calls,
-                timeout=timeout,
+                cpu_seconds=max(1, math.ceil(timeout)),
             )
     except TimeoutError:
         run.ok = False
@@ -815,7 +815,7 @@ async def _converse(
     on_call: CallHandler,
     run: CodeRun,
     max_calls: int,
-    timeout: float,
+    cpu_seconds: int,
 ) -> CodeRun:
     """Feed the child its config, then serve its calls until it finishes."""
     assert process.stdin is not None and process.stdout is not None
@@ -824,7 +824,7 @@ async def _converse(
         "tools": list(tools),
         "output_limit": CHILD_OUTPUT_LIMIT,
         "emit_budget": MAX_FRAME_CHARS + CHILD_OUTPUT_LIMIT,
-        "cpu_seconds": max(1, math.ceil(timeout)),
+        "cpu_seconds": cpu_seconds,
     }
     process.stdin.write((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))
     await process.stdin.drain()
