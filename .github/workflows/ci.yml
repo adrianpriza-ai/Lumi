@@ -49,12 +49,16 @@ jobs:
       fail-fast: false
       matrix:
         # The versions claimed in pyproject.toml classifiers. Add one there first.
-        # "system" is ubuntu-latest's own /usr/bin/python3: the Code Mode sandbox
-        # (lumi/tools/mcp/sandbox.py) only runs an interpreter that lives under
-        # /usr, because /usr is all it bind-mounts into the bubblewrap jail.
-        # actions/setup-python installs under the tool cache instead, so on the
-        # pinned versions the sandbox tests skip and only "system" exercises
-        # them — a skip there would mean the sandbox is never tested in CI.
+        #
+        # "system" is ubuntu-latest's own /usr/bin/python3 (3.12), and it is the
+        # job that exercises the Code Mode sandbox for real. The sandbox
+        # (lumi/tools/mcp/sandbox.py) runs `sys._base_executable` inside
+        # bubblewrap with only /usr mounted, so the interpreter under test has
+        # to live under /usr — which actions/setup-python's tool-cache build
+        # does not. On the pinned versions the sandbox therefore cannot run and
+        # those tests skip; on "system" LUMI_CI_SANDBOX_REQUIRED=1 turns any such
+        # skip into a failure (tests/conftest.py), so the sandbox can never go
+        # untested while the build stays green.
         python-version: ["3.11", "3.12", "3.13", "system"]
     steps:
       - uses: actions/checkout@v7
@@ -69,19 +73,17 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      # The Code Mode sandbox runs `sys._base_executable` inside bwrap with
-      # only /usr mounted, so the interpreter under test has to be the system
-      # one. A venv made from it keeps pip isolated while _base_executable
-      # stays /usr/bin/python3, which is exactly the check sandbox.py makes.
+      # A venv made from the system Python keeps pip isolated while
+      # sys._base_executable stays /usr/bin/python3 — exactly what the sandbox
+      # checks — so the sandbox tests run rather than skip on this job.
       - name: Use the system Python
         if: matrix.python-version == 'system'
-        run: echo "$HOME/.lumi-system-venv/bin" >> "$GITHUB_PATH"
+        run: |
+          /usr/bin/python3 -m venv "$HOME/.lumi-system-venv"
+          echo "$HOME/.lumi-system-venv/bin" >> "$GITHUB_PATH"
 
       - name: Install
         run: |
-          if [ "${{ matrix.python-version }}" = "system" ]; then
-            /usr/bin/python3 -m venv "$HOME/.lumi-system-venv"
-          fi
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
@@ -89,26 +91,11 @@ jobs:
       # own dummy .env, and scrubs TAVILY/FIRECRAWL/EXA/MCP vars, so no secrets
       # and no network keys are needed here. If a test ever starts reading a real
       # credential, that is a bug in the test, not a reason to add a secret.
-      #
-      # Code Mode's sandbox tests must not skip silently: on the "system" runner
-      # they have everything they need, so a skipped sandbox test there is a
-      # failure. On the tool-cache versions the sandbox is legitimately
-      # unavailable and the skip is the honest result.
       - name: Pytest
-        run: |
-          if [ "${{ matrix.python-version }}" = "system" ]; then
-            # pipefail: `tee` must not swallow pytest's exit status.
-            set -o pipefail
-            status=0
-            python -m pytest -q -rs -p no:cacheprovider | tee pytest.log || status=$?
-            if grep -E "^SKIPPED .*test_mcp_(sandbox|codemode|tool)" pytest.log; then
-              echo "::error::sandbox tests skipped on the system Python; bubblewrap or /usr python is missing"
-              status=1
-            fi
-            exit "$status"
-          else
-            python -m pytest -q -rs
-          fi
+        env:
+          # Only on the job that can run the sandbox: a skip there is a failure.
+          LUMI_CI_SANDBOX_REQUIRED: ${{ matrix.python-version == 'system' && '1' || '' }}
+        run: python -m pytest -q -rs -p no:cacheprovider
 
   rust-test:
     name: cargo test (lumi-tui)

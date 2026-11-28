@@ -210,3 +210,44 @@ def skip_without_sandbox():
     """``pytest.mark.skipif`` for a test (or a module, via ``pytestmark``) that
     needs the real Code Mode sandbox."""
     return pytest.mark.skipif(sandbox_unavailable(), reason=SANDBOX_SKIP_REASON)
+
+
+# --------------------------------------------------------------------------- #
+# CI enforcement: the sandbox tests must RUN where the runner can run them
+# --------------------------------------------------------------------------- #
+
+#: Set by the CI workflow on a runner that has bubblewrap and a /usr Python.
+#: There, a sandbox skip is a failure — the test did not happen.
+SANDBOX_REQUIRED_ENV = "LUMI_CI_SANDBOX_REQUIRED"
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    """With ``LUMI_CI_SANDBOX_REQUIRED=1``, any sandbox skip fails the run.
+
+    The point of that runner is to exercise the Code Mode sandbox. If bubblewrap
+    went missing, or the interpreter moved out of /usr, every sandbox test would
+    skip "for a good reason" and the build would go green while testing nothing.
+    This hook makes that impossible: the run ends non-zero, and the message says
+    which prerequisite is unmet. The terminal reporter's collected outcomes are
+    the source — they carry each skip's reason.
+    """
+    if (os.environ.get(SANDBOX_REQUIRED_ENV) or "").strip().lower() not in ("1", "true", "yes"):
+        return
+    reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is None:
+        return
+    sandbox_skips = [
+        rep
+        for rep in getattr(reporter, "stats", {}).get("skipped", [])
+        if SANDBOX_SKIP_REASON in str(getattr(rep, "longrepr", ""))
+    ]
+    if sandbox_skips:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+        reporter.write_sep("=", f"FAILED: {len(sandbox_skips)} sandbox test(s) SKIPPED", red=True)
+        reporter.write_line(
+            f"This runner must run the Code Mode sandbox ({SANDBOX_REQUIRED_ENV}=1), "
+            f"but {len(sandbox_skips)} test(s) skipped: {SANDBOX_SKIP_REASON}.\n"
+            "The runner is not set up — install bubblewrap and run pytest on a "
+            "Python that lives under /usr.",
+            red=True,
+        )
