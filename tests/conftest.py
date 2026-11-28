@@ -187,9 +187,9 @@ def mcp_error(cls: type, error) -> BaseException:
 #: Why the Code Mode sandbox tests skip rather than fail when the host cannot
 #: run them. One definition, so every file that needs the sandbox says the
 #: same thing — a test that *failed* here used to read as a broken sandbox on
-#: CI, when the runner simply had no bubblewrap and no Python under /usr.
+#: CI, when the runner simply lacked bubblewrap or a mountable Python prefix.
 SANDBOX_SKIP_REASON = (
-    "Code Mode integration tests require Linux, bubblewrap (bwrap), and a Python runtime under /usr"
+    "Code Mode integration tests require Linux, bubblewrap (bwrap), and a mountable Python runtime prefix"
 )
 
 
@@ -216,8 +216,8 @@ def skip_without_sandbox():
 # CI enforcement: the sandbox tests must RUN where the runner can run them
 # --------------------------------------------------------------------------- #
 
-#: Set by the CI workflow on a runner that has bubblewrap and a /usr Python.
-#: There, a sandbox skip is a failure — the test did not happen.
+#: Set by the CI workflow on runners that have bubblewrap and a mountable
+#: Python runtime. There, a sandbox skip is a failure — the test did not happen.
 SANDBOX_REQUIRED_ENV = "LUMI_CI_SANDBOX_REQUIRED"
 
 
@@ -225,11 +225,11 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """With ``LUMI_CI_SANDBOX_REQUIRED=1``, any sandbox skip fails the run.
 
     The point of that runner is to exercise the Code Mode sandbox. If bubblewrap
-    went missing, or the interpreter moved out of /usr, every sandbox test would
-    skip "for a good reason" and the build would go green while testing nothing.
-    This hook makes that impossible: the run ends non-zero, and the message says
-    which prerequisite is unmet. The terminal reporter's collected outcomes are
-    the source — they carry each skip's reason.
+    went missing, or the interpreter moved into a refused prefix, every sandbox
+    test would skip "for a good reason" and the build would go green while
+    testing nothing. This hook makes that impossible: the run ends non-zero,
+    and the message says which prerequisite is unmet. The terminal reporter's
+    collected outcomes are the source — they carry each skip's reason.
     """
     if (os.environ.get(SANDBOX_REQUIRED_ENV) or "").strip().lower() not in ("1", "true", "yes"):
         return
@@ -248,6 +248,6 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
             f"This runner must run the Code Mode sandbox ({SANDBOX_REQUIRED_ENV}=1), "
             f"but {len(sandbox_skips)} test(s) skipped: {SANDBOX_SKIP_REASON}.\n"
             "The runner is not set up — install bubblewrap and run pytest on a "
-            "Python that lives under /usr.",
+            "Python with a mountable install prefix.",
             red=True,
         )

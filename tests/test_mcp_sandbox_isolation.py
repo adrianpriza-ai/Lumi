@@ -53,7 +53,7 @@ def _ro_binds(command: list[str]) -> list[tuple[str, str]]:
     return [(command[i + 1], command[i + 2]) for i, arg in enumerate(command) if arg == "--ro-bind"]
 
 
-def test_the_root_is_never_a_mount_ancestor(monkeypatch) -> None:
+def test_the_root_is_never_a_mount_ancestor() -> None:
     """Every path is \"under\" /, so the root must be an equality check. The
     first version of the relocated-prefix support got this wrong and refused
     every interpreter that was not under /usr."""
@@ -153,3 +153,43 @@ def test_the_root_as_prefix_is_refused_end_to_end(monkeypatch) -> None:
 def test_a_missing_runtime_directory_is_refused(monkeypatch) -> None:
     """A prefix that does not exist is not a runtime: fail closed."""
     assert _command_for("/opt/nope/bin/python3", "/opt/nope", monkeypatch) is None
+
+
+def test_uuid4_shim_covers_both_stdlib_shapes() -> None:
+    """The scrub leaves uuid without os.urandom, so uuid4 must come from the
+    shim on every Python. 3.14+ uses private flag constants with UUID._from_int;
+    3.13 and older need the public UUID(int=..., version=4) constructor. Run the
+    shipped shim against both shapes so a version-gated regression is caught
+    even when the suite runs on only one interpreter."""
+    import types
+    import uuid
+
+    class ModernUUID(uuid.UUID):
+        @classmethod
+        def _from_int(cls, value):
+            return cls(int=value)
+
+    modern = types.SimpleNamespace(
+        UUID=ModernUUID,
+        _RFC_4122_CLEARFLAGS_MASK=~(0xC000 << 48) & ~(0xF000 << 64) & ((1 << 128) - 1),
+        _RFC_4122_VERSION_4_FLAGS=(0x8000 << 48) | (4 << 76),
+    )
+    legacy = types.SimpleNamespace(UUID=uuid.UUID)
+
+    fake_random = types.SimpleNamespace(
+        Random=lambda: types.SimpleNamespace(getrandbits=lambda n: (1 << n) - 1)
+    )
+    for fake_uuid in (modern, legacy):
+        namespace = {
+            "_MODULES": {"uuid": fake_uuid, "random": fake_random},
+            "types": types,
+        }
+        exec(sandbox._UUID4_SHIM, namespace)
+
+        shim = fake_uuid.uuid4
+        value = shim()
+        assert value.version == 4
+        assert value.variant == uuid.RFC_4122
+        assert len(value.hex) == 32
+        # The shim is rebuilt with empty globals: no module capability leaks.
+        assert "os" not in shim.__globals__ and "sys" not in shim.__globals__

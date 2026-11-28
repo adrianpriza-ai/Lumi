@@ -93,6 +93,36 @@ class CodeRun:
     trail: list[str] = field(default_factory=list)
 
 
+#: uuid4 shim installed in the child's allowlisted uuid module. Kept as its own
+#: string so the regression test can run it against both stdlib shapes — the
+#: 3.14+ private constants and the older public constructor — on any single
+#: interpreter, instead of trusting whichever version happens to run the suite.
+_UUID4_SHIM = r'''
+def _make_uuid4(_uuid_module, _randbits):
+    def _uuid4():
+        # Stock uuid4 reads os.urandom through this module's globals; with
+        # `os` scrubbed it cannot run, so draw the bits from the random module
+        # instead (seeded by the interpreter's own entropy).
+        _i = _randbits(128)
+        if hasattr(_uuid_module, "_RFC_4122_CLEARFLAGS_MASK"):
+            # Python 3.14+ builds from an int via private flag constants.
+            _i &= _uuid_module._RFC_4122_CLEARFLAGS_MASK
+            _i |= _uuid_module._RFC_4122_VERSION_4_FLAGS
+            return _uuid_module.UUID._from_int(_i)
+        # Python 3.13 and older set variant/version in the constructor.
+        return _uuid_module.UUID(int=_i, version=4)
+
+    return _uuid4
+
+
+if "uuid" in _MODULES and "random" in _MODULES:
+    _uuid4_tmpl = _make_uuid4(_MODULES["uuid"], _MODULES["random"].Random().getrandbits)
+    _MODULES["uuid"].uuid4 = types.FunctionType(
+        _uuid4_tmpl.__code__, {}, "_uuid4", None, _uuid4_tmpl.__closure__
+    )
+'''
+
+
 #: The child program. It is passed with ``-c``; keep it self-contained: the
 #: child has no access to Lumi's package, only the stdlib modules it imports.
 #:
@@ -421,28 +451,7 @@ for _mod in list(_MODULES.values()):
 _scrub_module(types, _seen)
 
 
-def _make_uuid4(_uuid_module, _randbits):
-    def _uuid4():
-        # The stock uuid4 reads os.urandom through this module's globals;
-        # with `os` scrubbed it cannot run, so draw the bits from the random
-        # module instead (seeded by the interpreter's own entropy).
-        _i = _randbits(128)
-        _i &= _uuid_module._RFC_4122_CLEARFLAGS_MASK
-        _i |= _uuid_module._RFC_4122_VERSION_4_FLAGS
-        return _uuid_module.UUID._from_int(_i)
-
-    return _uuid4
-
-
-if (
-    "uuid" in _MODULES
-    and "random" in _MODULES
-    and hasattr(_MODULES["uuid"], "_RFC_4122_CLEARFLAGS_MASK")
-):
-    _uuid4_tmpl = _make_uuid4(_MODULES["uuid"], _MODULES["random"].Random().getrandbits)
-    _MODULES["uuid"].uuid4 = types.FunctionType(
-        _uuid4_tmpl.__code__, {}, "_uuid4", None, _uuid4_tmpl.__closure__
-    )
+@@UUID4_SHIM@@
 
 
 # --- the protocol -----------------------------------------------------------
@@ -636,6 +645,7 @@ if _capture.truncated:
     _output += "\n...[output truncated]"
 _emit({"done": True, "output": _output, "error": _error})
 '''
+BOOTSTRAP = BOOTSTRAP.replace("@@UUID4_SHIM@@", _UUID4_SHIM)
 
 
 CallHandler = Callable[[str, str, dict[str, Any]], Awaitable[Any]]
