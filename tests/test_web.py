@@ -255,6 +255,57 @@ async def test_thin_results_are_topped_up_from_the_next_provider(config) -> None
     assert first.search_calls and second.search_calls
 
 
+async def test_top_up_fills_the_gap_and_never_exceeds_max_results(config) -> None:
+    """A thin first result is topped up to the requested count, not past it.
+
+    ``max_results`` is what the model asked for and what the docs promise; a
+    provider returning a full page of extra hits must not turn one request
+    into a result set larger than the ceiling (and, with no content cap, a
+    much larger prompt).
+    """
+    first = StubProvider(
+        "firecrawl",
+        search_result=SearchResult(query="hi", provider="firecrawl", hits=_hits("https://a")),
+    )
+    second = StubProvider(
+        "tavily",
+        search_result=SearchResult(
+            query="hi",
+            provider="tavily",
+            hits=_hits(*(f"https://{i}" for i in range(20))),
+        ),
+    )
+    tool = make_tool(config, first, second)
+
+    result = await tool.invoke({"action": "search", "query": "hi", "max_results": 3}, None)
+
+    assert result.ok
+    assert result.data["hits"] == 3
+    assert len(second.search_calls) == 1
+    assert result.text.count("body") == 3
+
+
+async def test_a_floor_above_the_ceiling_does_not_keep_calling_providers(config) -> None:
+    """``min_results`` cannot push a search past ``max_results``."""
+    first = StubProvider(
+        "firecrawl",
+        search_result=SearchResult(
+            query="hi", provider="firecrawl", hits=_hits("https://a", "https://b", "https://c")
+        ),
+    )
+    second = StubProvider("tavily")
+    third = StubProvider("exa")
+    tool = make_tool(config, first, second, third)
+
+    result = await tool.invoke(
+        {"action": "search", "query": "hi", "max_results": 3, "min_results": 10}, None
+    )
+
+    assert result.data["hits"] == 3
+    assert second.search_calls == []
+    assert third.search_calls == []
+
+
 async def test_results_at_the_floor_skip_the_next_provider(config) -> None:
     first = StubProvider(
         "firecrawl",

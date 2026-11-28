@@ -46,6 +46,7 @@ from ..safety import Mode, parse_mode
 from .sandbox import run_code
 from .servers import (
     DiscoveredTool,
+    MCPCallError,
     MCPServers,
     ServerSpec,
     _try_json,
@@ -113,7 +114,7 @@ No server tool is a separate tool here. Inside the script, every discovered tool
 
 Three actions:
 
-- `search` — discovery. Pass `query` (words matched against server names, tool names and descriptions) and optionally `server`; returns each tool's helper name, parameters and a one-line description. Run it before writing a script against a server you have not used. With no query it lists everything, truncated.
+- `search` — discovery. Pass `query` (words matched against server names, tool names and descriptions) and optionally `server`; returns each tool's helper name, parameters and a one-line description, best name matches first. Run it before writing a script against a server you have not used. With no query it lists everything, capped by `limit` (50).
 - `describe` — detail. Pass `tool` as a helper name from `search` (or `server.tool`); returns that tool's full description and its complete JSON input schema — parameter descriptions, enums, nested objects. Call it before writing a call whose arguments `search` only sketched.
 - `execute` — run `code`. The script may contain loops, filtering, aggregation and several MCP calls; chaining them in code keeps intermediate results out of the conversation. The owner confirms the script once before it runs unless they disabled that. It has a wall-clock budget and a cap on MCP calls. The script's namespace has no `open`, `eval`, `exec` or `compile`, its `import` statement only serves a data-processing allowlist (json, re, math, collections, datetime, ...), and the allowlisted modules are disarmed too: references they hold to os, sys or builtins are replaced with stubs. That is containment for ordinary scripts, not a security boundary, so keep the script to the API and the allowlist.
 
@@ -136,12 +137,22 @@ A server from the project's `.mcp.json` connects only after the owner approved i
                 "type": "string",
                 "description": (
                     "search only: words to match against server names, tool names and "
-                    "descriptions. Omit to list everything (truncated)."
+                    "descriptions. Results are ranked, exact tool names first. Omit to "
+                    "list everything."
                 ),
             },
             "server": {
                 "type": "string",
                 "description": "search only: restrict the results to one server.",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
+                "description": (
+                    "search only: how many tools to list (default 50). The body says "
+                    "when more matched than are shown."
+                ),
             },
             "tool": {
                 "type": "string",
@@ -290,25 +301,68 @@ A server from the project's `.mcp.json` connects only after the owner approved i
         wanted_server = str(arguments.get("server") or "").strip()
         reasons: list[str] = []
         pairs = await self._discover(reasons)
+        # Helper names are assigned over the whole catalog, in discovery order,
+        # before any filtering: `execute` names tools the same way, and a ranked
+        # or server-filtered listing must not advertise a different name for a
+        # colliding base.
+        entries = [
+            (spec, tool, item) for (spec, tool), item in zip(pairs, self._api(pairs), strict=True)
+        ]
         if wanted_server:
-            pairs = [(spec, tool) for spec, tool in pairs if spec.name == wanted_server]
-            if not pairs and not any(
+            entries = [entry for entry in entries if entry[0].name == wanted_server]
+            if not entries and not any(
                 spec.name == wanted_server for spec in self.provider.servers()
             ):
                 configured = ", ".join(s.name for s in self.provider.servers()) or "none"
                 raise ToolError(f"no server named {wanted_server!r}; configured: {configured}")
 
         terms = [term for term in query.lower().split() if term]
+        loosened = False
         if terms:
-            pairs = [
-                (spec, tool)
-                for spec, tool in pairs
-                if all(
-                    term in f"{spec.name} {tool.name} {tool.description}".lower() for term in terms
-                )
-            ]
 
-        if not pairs:
+            def _haystack(spec: ServerSpec, tool: DiscoveredTool) -> str:
+                return f"{spec.name} {tool.name} {tool.description}".lower()
+
+            def _score(spec: ServerSpec, tool: DiscoveredTool) -> int:
+                """How well one tool answers *terms*; a name beats a mention."""
+                name = tool.name.lower()
+                name_words = {word for word in re.split(r"[^a-z0-9]+", name) if word}
+                server = spec.name.lower()
+                description = tool.description.lower()
+                total = 0
+                for term in terms:
+                    if term == name:
+                        total += 100
+                    elif term in name_words:
+                        total += 60
+                    elif name.startswith(term):
+                        total += 40
+                    elif term in name:
+                        total += 25
+                    elif term in server:
+                        total += 15
+                    elif term in description:
+                        total += 5
+                return total
+
+            matched = [
+                entry for entry in entries if all(t in _haystack(entry[0], entry[1]) for t in terms)
+            ]
+            if not matched:
+                # AND first keeps a narrow query narrow. Only when nothing at
+                # all matches does a partial match beat an empty catalog.
+                matched = [
+                    entry
+                    for entry in entries
+                    if any(t in _haystack(entry[0], entry[1]) for t in terms)
+                ]
+                loosened = bool(matched)
+            entries = sorted(
+                matched,
+                key=lambda entry: (-_score(entry[0], entry[1]), entry[0].name, entry[1].name),
+            )
+
+        if not entries:
             if query:
                 body = (
                     f"No MCP tool matches {query!r}.\n"
@@ -330,16 +384,35 @@ A server from the project's `.mcp.json` connects only after the owner approved i
                 body += "\n\nnot available: " + "; ".join(reasons)
             return ToolResult.failure(fence_untrusted(body))
 
-        meta = self._api(pairs)
+        matched_count = len(entries)
+        try:
+            limit = max(1, min(200, int(arguments.get("limit") or 50)))
+        except (TypeError, ValueError):
+            limit = 50
+        entries = entries[:limit]
+
+        meta = [item for _, _, item in entries]
         by_server: dict[str, list[tuple[DiscoveredTool, dict[str, Any]]]] = {}
-        for (spec, tool), item in zip(pairs, meta, strict=False):
+        for spec, tool, item in entries:
             by_server.setdefault(spec.name, []).append((tool, item))
 
-        lines = [f"{len(meta)} MCP tool(s) available" + (f" for {query!r}" if query else "") + ":"]
-        for server, entries in by_server.items():
+        header = (
+            f"{len(meta)} of {matched_count} MCP tool(s)"
+            if matched_count > len(meta)
+            else f"{len(meta)} MCP tool(s)"
+        )
+        lines = [header + (f" for {query!r}" if query else "") + ":"]
+        if matched_count > len(meta):
+            # Only a query ranks the catalog; with none it stays in discovery
+            # order, and the note should not claim otherwise.
+            order = "by relevance" if query else "in discovery order"
+            lines.append(f"(showing the first {len(meta)} {order}; narrow with query= or server=)")
+        if loosened:
+            lines.append("(no tool matched every term; these match at least one)")
+        for server, server_entries in by_server.items():
             lines.append("")
             lines.append(f"## {server}")
-            for tool, item in entries:
+            for tool, item in server_entries:
                 lines.append(
                     f"- `codemode.{item['helper']}({_signature(tool)})` — {_one_line(tool.description)}"
                 )
@@ -358,6 +431,7 @@ A server from the project's `.mcp.json` connects only after the owner approved i
             text=fence_untrusted(body),
             data={
                 "tools": len(meta),
+                "matched": matched_count,
                 "servers": sorted(by_server),
                 "query": query,
             },
@@ -482,6 +556,7 @@ A server from the project's `.mcp.json` connects only after the owner approved i
 
         meta = self._api(pairs)
         index = {(spec.name, tool.name): (spec, tool) for spec, tool in pairs}
+        called: set[str] = set()
 
         async def on_call(server: str, tool_name: str, call_arguments: dict[str, Any]) -> Any:
             pair = index.get((server, tool_name))
@@ -490,6 +565,7 @@ A server from the project's `.mcp.json` connects only after the owner approved i
                     f"server {server!r} has no discovered tool {tool_name!r}; "
                     "run mcp search to see the available helpers"
                 )
+            called.add(pair[0].name)
             # Keyed on the server's declared capability, never on the tool's
             # name: a fetch-capable tool called `get_page` was unguarded, and
             # a non-fetching one called `extract` paid for a check it did not
@@ -498,7 +574,17 @@ A server from the project's `.mcp.json` connects only after the owner approved i
                 for url in _url_targets(call_arguments):
                     if reason := await asyncio.to_thread(validate_fetch_url, url):
                         raise ToolError(f"{server}.{tool_name} refused URL {url!r}: {reason}")
-            text = await self.provider.call_tool(pair[0], pair[1], call_arguments)
+            try:
+                text = await self.provider.call_tool(pair[0], pair[1], call_arguments)
+            except (ToolError, MCPCallError):
+                # The server's own failure text is the answer the script asked
+                # for and may catch; pass it through unchanged.
+                raise
+            except Exception as exc:  # noqa: BLE001 - reported to the script as text
+                # The script can print this, so an unexpected host-side
+                # exception contributes only its class name, not a message that
+                # may carry local paths or credentials.
+                raise ToolError(f"{type(exc).__name__}: the tool call failed") from exc
             parsed = _try_json(text)
             return parsed if parsed is not None else text
 
@@ -518,7 +604,7 @@ A server from the project's `.mcp.json` connects only after the owner approved i
             return ToolResult.failure(
                 fence_untrusted(text),
                 calls=run.calls,
-                servers=sorted({spec.name for spec, _ in pairs}),
+                servers=sorted(called),
             )
 
         body = truncate(run.output.strip(), OUTPUT_MAX_CHARS) or "(the script printed nothing)"
@@ -528,7 +614,7 @@ A server from the project's `.mcp.json` connects only after the owner approved i
             text=fence_untrusted(body),
             data={
                 "calls": run.calls,
-                "servers": sorted({spec.name for spec, _ in pairs}),
+                "servers": sorted(called),
             },
             summary=f"ran code mode: {run.calls} call(s), {len(run.output)} chars out",
         )

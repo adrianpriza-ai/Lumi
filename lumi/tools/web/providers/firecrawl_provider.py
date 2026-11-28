@@ -17,13 +17,14 @@ client with no credentials, one attempt per call.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from ....config import FirecrawlConfig
 from ....llm.keypool import KeyPool, mask
 from ....util.log import get_logger
 from ....util.net import validate_fetch_url
-from .base import Page, SearchHit, SearchResult, WebProvider, final_url, recent_cutoff
+from .base import Page, SearchHit, SearchResult, WebProvider, final_url
 
 log = get_logger(__name__)
 
@@ -304,8 +305,20 @@ def _tbs(days: int | None) -> str | None:
         return "qdr:m"
     if days <= 365:
         return "qdr:y"
-    # No coarser bucket exists; the explicit ISO cutoff still ranks freshness.
-    return f"cdr:1,cd_min:{recent_cutoff(days)}"
+    # No coarser bucket exists, and a bucket that cannot contain the window
+    # would narrow it. An explicit cutoff carries the request instead.
+    return f"cdr:1,cd_min:{_google_date(days)}"
+
+
+def _google_date(days: int) -> str:
+    """The ``M/D/YYYY`` cutoff Google's ``tbs`` expects for *days* ago.
+
+    Google silently ignores ISO dates here, so ``recent_cutoff`` — the ISO
+    helper the other providers send — would make a multi-year window
+    unfiltered without saying so.
+    """
+    day = datetime.now(UTC).date() - timedelta(days=days)
+    return f"{day.month}/{day.day}/{day.year}"
 
 
 __all__ = ["FirecrawlProvider"]

@@ -231,10 +231,16 @@ class LLMConfig:
     #: mid-sentence, and the fix is a bigger number the provider will ignore
     #: anyway. Raise it, or leave it at 0 to let the model decide.
     max_tokens: int = 0
-    #: Guard against a runaway tool loop, not a budget. One message is one task,
-    #: so 20 round trips is already generous; anything past that is a model
-    #: looping, and the loop stops and says so rather than burning tokens.
-    max_tool_iterations: int = 20
+    #: Guard against a runaway tool loop, not a budget. One *iteration* is one
+    #: model round trip, and a round trip may carry several tool calls, so the
+    #: number that matters is how many times the model looks at the results so
+    #: far and decides to go on. As the count approaches this limit the model is
+    #: told what is left (see :data:`~lumi.agent.BUDGET_WARNINGS`), and once it
+    #: is reached the loop gets one last, tool-less call to wrap up rather than
+    #: cutting the answer off — see :data:`~lumi.agent.WRAP_UP_NOTE`. Anything
+    #: past that is a model looping, and the loop stops and says so rather than
+    #: spending more.
+    max_tool_iterations: int = 40
     #: Prior turns replayed from data/history/<chat_id>.jsonl on a fresh
     #: conversation. 0 means "as many as the context window holds" — which is
     #: the point of budgeting history by tokens instead of by turn count.

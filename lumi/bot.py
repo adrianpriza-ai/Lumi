@@ -1400,10 +1400,22 @@ STEP_LABELS = {
 
 
 def step_label(kind: str, detail: str = "") -> str:
-    """One step of a turn as a line of chat: ``🧠 Thinking``, ``💻 Run Bash``…"""
+    """One step of a turn as a line of chat: ``🧠 Thinking``, ``💻 Run Bash``…
+
+    Two kinds carry their own text rather than a fixed label: a ``send`` step
+    says what was sent (the tool's ``step_detail`` is ``send <first words>``),
+    and the agent loop's ``budget`` / ``wrap_up`` steps say how much of the
+    tool budget is left — the owner sees the meter the model sees.
+    """
     if kind == "thinking":
         return STEP_LABELS["thinking"]
+    if kind == "budget":
+        return f"⏳ {detail} tool round trip{'s' if detail != '1' else ''} left"
+    if kind == "wrap_up":
+        return "📝 Tool limit reached, wrapping up"
     if kind == "tool":
+        if detail == "send" or detail.startswith("send "):
+            return f"{STEP_LABELS['send']}{detail[len('send') :]}"
         return STEP_LABELS.get(detail, f"🔧 {detail}")
     return f"· {kind}{f' {detail}' if detail else ''}"
 

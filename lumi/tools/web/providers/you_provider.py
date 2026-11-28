@@ -105,10 +105,15 @@ class YouProvider(WebProvider):
         elif "count" in tool.properties:
             arguments["count"] = max_results
         if days and days > 0:
+            # Each branch sends a window only when the endpoint's schema can
+            # express it. A missing window is better than one that silently
+            # narrows or widens what the caller asked for.
             if "freshness" in tool.properties:
-                arguments["freshness"] = _freshness(days, tool.properties["freshness"])
+                if (freshness := _freshness(days, tool.properties["freshness"])) is not None:
+                    arguments["freshness"] = freshness
             elif "time_range" in tool.properties:
-                arguments["time_range"] = _time_range(days)
+                if (window := _time_range(days)) is not None:
+                    arguments["time_range"] = window
             elif "start_published_date" in tool.properties:
                 arguments["start_published_date"] = recent_cutoff(days)
 
@@ -182,15 +187,19 @@ class YouProvider(WebProvider):
 # --------------------------------------------------------------------------- #
 
 
-def _time_range(days: int) -> str:
-    """Coarse bucket for the endpoint's ``time_range`` field."""
+def _time_range(days: int) -> str | None:
+    """Coarse bucket for the endpoint's ``time_range`` field.
+
+    ``None`` past a year: no bucket contains a multi-year window, and sending
+    "year" would drop the rest of the window without saying so.
+    """
     for ceiling, name in ((1, "day"), (7, "week"), (31, "month"), (365, "year")):
         if days <= ceiling:
             return name
-    return "year"
+    return None
 
 
-def _freshness(days: int, schema: Any) -> str:
+def _freshness(days: int, schema: Any) -> str | None:
     """Format *days* for the endpoint's ``freshness`` field, when it has one."""
     if isinstance(schema, dict):
         pattern = str(schema.get("pattern") or "").lower()

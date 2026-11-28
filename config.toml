@@ -54,8 +54,10 @@ inference_retry_delay = 0.5
 temperature = 0.7
 # Output token ceiling. 0 = no limit.
 max_tokens = 0
-# Max tool-call round trips per message.
-max_tool_iterations = 20
+# Max tool-call round trips per message. Each round trip may carry several
+# tool calls; near the limit the model is told what is left and gets one
+# last, tool-less call to wrap up its answer.
+max_tool_iterations = 40
 # Prior turns replayed on a fresh conversation. 0 = as many as fit.
 history_turns = 0
 # Cap on each chat's MEMORY.md block in the system prompt. 0 = context-derived cap.

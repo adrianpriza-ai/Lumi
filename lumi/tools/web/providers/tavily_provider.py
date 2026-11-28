@@ -22,7 +22,7 @@ from typing import Any
 from ....config import TavilyConfig
 from ....llm.keypool import KeyPool, mask
 from ....util.log import get_logger
-from .base import Page, SearchHit, SearchResult, WebProvider, final_url
+from .base import Page, SearchHit, SearchResult, WebProvider, final_url, recent_cutoff
 
 log = get_logger(__name__)
 
@@ -166,6 +166,10 @@ class TavilyProvider(WebProvider):
                 # A recency window makes the index rank recent pages instead of
                 # the most-linked ones, which is how year-old answers win.
                 time_range=_time_range(days),
+                # Past a year there is no bucket that contains the window; an
+                # exact cutoff carries it instead of silently narrowing to 365
+                # days.
+                start_date=_start_date(days),
             )
         except Exception as exc:  # noqa: BLE001 - surfaced as a failed result
             log.warning("tavily search failed: %s", exc)
@@ -234,10 +238,17 @@ def _time_range(days: int | None) -> str | None:
     for bucket in TAVILY_TIME_RANGES:
         if days <= bucket[0]:
             return bucket[1]
-    # Tavily has no bucket past a year; "month" would *narrow* a multi-year
-    # window, the opposite of what was asked. The MCP provider's equivalent
-    # mapping falls back to "year" for the same reason.
-    return "year"
+    # No bucket contains a multi-year window, so do not send one at all:
+    # "year" would silently narrow the window the caller asked for. The exact
+    # cutoff in ``_start_date`` carries it instead.
+    return None
+
+
+def _start_date(days: int | None) -> str | None:
+    """An exact ISO cutoff for windows Tavily's buckets cannot hold."""
+    if not days or days <= 365:
+        return None
+    return recent_cutoff(days)
 
 
 __all__ = ["TavilyProvider"]

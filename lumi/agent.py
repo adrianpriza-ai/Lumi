@@ -177,11 +177,14 @@ When you use a tool:
   full of source. See "Building things".
 - Save durable facts with the `memory` tool, sparingly. Memory is scoped to
   this chat: what you learn here is not visible in any other chat.
-- `send` puts a message in the chat *now*, while you are still working, and
-  you carry on. Save it for long jobs the owner cannot watch: one line at
-  the start, then one per phase — every handful of steps, not each — plus
-  one if the plan changes; a long answer may arrive in parts too. A quick
-  task gets none. Your final reply still arrives when the turn ends.
+- `send` puts a message in the chat *now*, while you keep working. Use it for
+  any job longer than a few steps: one line when you start, one per phase, one
+  if the plan changes; a long answer may arrive in parts too. A quick task
+  gets none. Your final reply still arrives when the turn ends.
+- Every time you look at tool results and decide what to do next costs one
+  round trip against a per-message limit; you will be told when it runs low.
+  Call every tool you need *in one reply* when the calls do not depend on
+  each other — one call per reply is how a job runs out of budget.
 - Only the tools listed above are available right now. If a capability is
   missing here it is because an API key is unset or the tool was disabled in
   config — say so plainly rather than trying to call it.
@@ -298,6 +301,41 @@ MEMORY_PROVENANCE_NOTE = (
 #: presses must not pin its conversation in memory forever — after this the
 #: action is cancelled, the model is told, and the chat becomes evictable.
 APPROVAL_TTL_SECONDS = 12 * 3600
+
+#: Fractions of ``llm.max_tool_iterations`` at which the model is told how many
+#: round trips it has left. The loop counts *model calls*, not tool calls, so
+#: the thing that runs out is the number of times the model may look at the
+#: results so far and decide to go on — and a model that does not know the
+#: meter is running spends the last of it one small call at a time. Told at
+#: half, it has room to batch; told at three quarters, to converge.
+BUDGET_WARNINGS = (0.5, 0.75, 0.9)
+
+#: What the model is told as the budget runs low. ``left`` is the number of
+#: round trips remaining after the one that is about to run.
+BUDGET_NOTE = (
+    "[Budget: {left} tool round trip(s) left for this message. "
+    "Call every independent tool you still need in this one reply rather than "
+    "one at a time, then finish with your answer.]"
+)
+
+#: The one tool-less call the loop makes once the iteration cap is reached.
+#: Cutting the turn off with a canned line threw away everything the model had
+#: just read; asked to wrap up instead, it hands over what it found and what
+#: is still open — and the owner gets an answer rather than an error.
+WRAP_UP_NOTE = (
+    "[This message has reached its tool-call limit; no further tool calls "
+    "will run. Stop exploring and answer the owner now with what you have: "
+    "what you found, what you did, and what is left undone. If the job needs "
+    "more steps, say which ones so they can ask for the next part.]"
+)
+
+#: The canned answer when even the wrap-up call asked for tools or came back
+#: empty. The model gets exactly one chance to wrap up; a second tool request
+#: would otherwise restart the loop the cap exists to stop.
+CUT_OFF_TEXT = (
+    "I hit my tool-call limit for this message and stopped before I could "
+    "wrap up. Try asking for one thing at a time."
+)
 
 
 @dataclass(slots=True)
@@ -1046,6 +1084,8 @@ class Agent:
         started = time.monotonic()
         tools = list(tools_used or [])
         result = TurnResult()
+        limit = self.config.llm.max_tool_iterations
+        warned_at: set[int] = set()
 
         specs = self.registry.specs()
         if not specs:
@@ -1056,9 +1096,46 @@ class Agent:
         # would send iteration 2's request, transcript included, to a
         # different provider than the one the tool calls came from.
         client = conv.llm_client or self.llm
-        for iteration in range(1, self.config.llm.max_tool_iterations + 1):
-            result.iterations = iteration
+
+        def finish(error: str = "") -> TurnResult:
+            result.error = error or result.error
+            result.tools_used = tools
+            result.elapsed = time.monotonic() - started
+            if result.text:
+                self.history.append(conv.chat_id, "assistant", result.text, session=conv.session)
+            return result
+
+        for iteration in range(1, limit + 2):
+            result.iterations = min(iteration, limit)
             await self.context.prepare(conv)
+            # The budget counts model round trips, and the model is the one
+            # spending it — so it is the one that has to see the meter. Told
+            # once at each threshold, as a user-role note the transcript keeps.
+            # The first round trip never carries a note: with a tiny limit the
+            # thresholds collapse onto it, and "0 left" before the model has
+            # done anything is noise, not information.
+            left = limit - iteration
+            if 1 < iteration <= limit:
+                for threshold in BUDGET_WARNINGS:
+                    marks = max(2, round(limit * threshold))
+                    if iteration == marks and marks not in warned_at:
+                        warned_at.add(marks)
+                        note = BUDGET_NOTE.format(left=left)
+                        conv.messages.append({"role": "user", "content": note})
+                        self.history.append(conv.chat_id, "user", note, session=conv.session)
+                        await self._step(hooks, "budget", str(left))
+                        break
+
+            # Past the cap: one last, tool-less call to wrap up. The model has
+            # just read a screenful of results; asked to hand them over, it
+            # does — and cutting it off with a canned line instead threw all
+            # of that away and left the owner with an error.
+            wrapping_up = iteration > limit
+            if wrapping_up:
+                note = WRAP_UP_NOTE
+                conv.messages.append({"role": "user", "content": note})
+                self.history.append(conv.chat_id, "user", note, session=conv.session)
+                await self._step(hooks, "wrap_up")
 
             try:
                 await self._step(hooks, "thinking")
@@ -1066,7 +1143,9 @@ class Agent:
                 # Fresh per model call: `streamed` must describe the reply
                 # that is about to come back, not the whole turn.
                 on_delta, streamed = _delta_sink(hooks)
-                reply = await client.complete(conv.messages, tools=specs or None, on_delta=on_delta)
+                reply = await client.complete(
+                    conv.messages, tools=None if wrapping_up else (specs or None), on_delta=on_delta
+                )
             except LLMError as exc:
                 if (
                     is_security_rejection(exc)
@@ -1085,7 +1164,9 @@ class Agent:
                     )
                     try:
                         reply = await client.complete(
-                            conv.messages, tools=specs or None, on_delta=on_delta
+                            conv.messages,
+                            tools=None if wrapping_up else (specs or None),
+                            on_delta=on_delta,
                         )
                     except LLMError as retry_exc:
                         exc = retry_exc
@@ -1117,12 +1198,21 @@ class Agent:
             # shape, but keep the invariant here too for alternate LLM clients:
             # a no-tool turn must never look successful while sending nothing.
             if not reply.wants_tools and not reply.text.strip():
+                if wrapping_up:
+                    break
                 result.error = "the model returned an empty response"
                 result.elapsed = time.monotonic() - started
                 self.history.append(
                     conv.chat_id, "assistant", f"[error] {result.error}", session=conv.session
                 )
                 return result
+
+            # A model that asks for tools on the wrap-up call gets nothing: the
+            # tools were not even offered, so honouring the request would mean
+            # dispatching calls with no schemas behind them — and a second
+            # wrap-up would restart the loop the cap exists to stop.
+            if wrapping_up and reply.wants_tools:
+                break
 
             conv.messages.append(_assistant_message(reply))
 
@@ -1133,17 +1223,19 @@ class Agent:
                 # that failed, leaves this False and the result carries the
                 # text whole.
                 result.streamed = streamed()
-                result.tools_used = tools
-                result.elapsed = time.monotonic() - started
                 if reply.text:
-                    self.history.append(conv.chat_id, "assistant", reply.text, session=conv.session)
                     log.info(
-                        "turn done: %d iteration(s), %d tool call(s), %.1fs",
-                        iteration,
+                        "turn done: %d iteration(s), %d tool call(s), %.1fs%s",
+                        result.iterations,
                         len(tools),
-                        result.elapsed,
+                        time.monotonic() - started,
+                        " (wrapped up at the tool limit)" if wrapping_up else "",
                     )
-                return result
+                return finish(
+                    f"tool iteration limit ({limit}) reached; the model wrapped up"
+                    if wrapping_up
+                    else ""
+                )
 
             # Every call in this reply is dispatched before the turn stops: an
             # assistant message carrying N tool_calls must be followed by N
@@ -1158,27 +1250,18 @@ class Agent:
             if needs_owner:
                 # Stop rather than start another round of side effects while the
                 # owner is still deciding.
-                result.tools_used = tools
-                result.elapsed = time.monotonic() - started
-                return result
+                return finish()
 
-        # Iteration cap: something is looping. Report it instead of hanging —
-        # and say it *in* the conversation, not only to the caller. The last
-        # thing the model saw was a tool result, so without this assistant turn
-        # the next turn would open on a half-finished exchange it was never
-        # told had ended.
-        cut_off = result.text or (
-            "I hit my tool-call limit for this message and stopped. "
-            "Try asking for one thing at a time."
-        )
+        # The wrap-up call failed to produce an answer (asked for tools, came
+        # back empty, or the cap is 0). Say so *in* the conversation, not only
+        # to the caller: the last thing the model saw was a tool result, so
+        # without this assistant turn the next turn would open on a
+        # half-finished exchange it was never told had ended.
+        cut_off = result.text or CUT_OFF_TEXT
         conv.messages.append({"role": "assistant", "content": cut_off})
         result.text = cut_off
-        result.error = f"tool iteration limit ({self.config.llm.max_tool_iterations}) reached"
-        result.tools_used = tools
-        result.elapsed = time.monotonic() - started
-        self.history.append(conv.chat_id, "assistant", cut_off, session=conv.session)
         log.warning("tool iteration cap hit for chat %s", conv.chat_id)
-        return result
+        return finish(f"tool iteration limit ({limit}) reached")
 
     async def _handle_tool_call(
         self,

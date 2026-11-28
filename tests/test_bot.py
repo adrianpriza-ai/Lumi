@@ -3301,6 +3301,22 @@ def test_step_labels_read_the_way_the_owner_sees_them() -> None:
     assert step_label("thinking") == "🧠 Thinking"
 
 
+def test_step_labels_carry_the_budget_and_what_was_sent() -> None:
+    """The owner sees the meter the model sees — how many round trips are
+    left, the wrap-up — and a ``send`` step says what was sent rather than
+    just that something was."""
+    from lumi.bot import step_label
+
+    assert step_label("budget", "3") == "⏳ 3 tool round trips left"
+    assert step_label("budget", "1") == "⏳ 1 tool round trip left"
+    assert step_label("wrap_up") == "📝 Tool limit reached, wrapping up"
+    # SendTool.step_detail is "send <first words>"; a bare name still works.
+    assert step_label("tool", "send phase one done") == "✉️ Send phase one done"
+    assert step_label("tool", "send") == "✉️ Send"
+    # Another tool whose name merely *starts* with send is not mislabelled.
+    assert step_label("tool", "sendmail") == "🔧 sendmail"
+
+
 async def test_the_step_message_never_carries_a_button(config) -> None:
     bot, _ = await send(config, [make_reply("four", reasoning=THINKING)], "how many r's?")
     assert not [m for m in bot.sent if m.get("reply_markup")]

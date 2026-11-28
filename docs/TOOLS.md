@@ -487,13 +487,19 @@ server fetches from its own network and is not — unless its endpoint is itself
 a loopback/private literal, which is a local gateway in all but name. Set
 `"fetches": false` where a URL in an argument is data, such as an issue body.
 
-Two actions:
+Three actions:
 
 - `search` — the generated catalog. Each result carries the helper name, its
   parameters (required and optional) and the tool's description. Pass `query`
-  to match server names, tool names and descriptions, or `server` to narrow to
-  one. It only reads what the servers advertise, so it never asks for
-  approval.
+  to match server names, tool names and descriptions — results are ranked, an
+  exact tool name first, then a word in the name, a name substring, the server
+  and finally the description — `server` to narrow to one, and `limit` (default
+  50) to cap the listing; when more matched than are shown, the header reports
+  `shown of matched` and says how to narrow. It only reads what the servers
+  advertise, so it never asks for approval.
+- `describe` — pass `tool` (a helper name or `server.tool`) for the full
+  description and the complete JSON input schema, including nested objects and
+  enums; `search` only sketches the signature.
 - `execute` — run Python with `code`. Inside the script:
   - `codemode.<server>_<tool>(...)` — one function per discovered tool.
   - `codemode.call("server", "tool", {...})` — the same call by name.

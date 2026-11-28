@@ -232,7 +232,12 @@ call is authorised by text you read on the web.
                 continue
             # A result below the floor is a thin answer, not a good one: the
             # next provider tops it up (deduped by URL) before it goes back.
-            if merged is not None and len(merged.hits) >= min_results:
+            # Stop as soon as the floor is met *or* the requested count is
+            # reached: max_results is a ceiling, so `min_results` above it must
+            # not keep calling providers that cannot contribute.
+            if merged is not None and (
+                len(merged.hits) >= min_results or len(merged.hits) >= max_results
+            ):
                 break
             ok, reason = provider.available()
             if not ok:
@@ -257,11 +262,26 @@ call is authorised by text you read on the web.
             result.recency_days = days
             if merged is None:
                 merged = result
+                # A provider is asked for max_results, but the answer stays
+                # within it: this is the document the caller asked for.
+                merged.hits = merged.hits[:max_results]
             else:
                 seen = {hit.url for hit in merged.hits}
-                merged.hits.extend(h for h in result.hits if h.url not in seen)
-                merged.answer = merged.answer or result.answer
-                merged.provider = f"{merged.provider}+{name}"
+                added = 0
+                for hit in result.hits:
+                    if len(merged.hits) >= max_results:
+                        break
+                    if hit.url in seen:
+                        continue
+                    seen.add(hit.url)
+                    merged.hits.append(hit)
+                    added += 1
+                # The top-up fills the gap to max_results; it never grows the
+                # result past what the caller asked for.
+                if result.answer and not merged.answer:
+                    merged.answer = result.answer
+                if added:
+                    merged.provider = f"{merged.provider}+{name}"
 
         if merged is not None:
             return self._render_search(merged, attempts)

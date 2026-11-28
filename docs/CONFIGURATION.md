@@ -320,6 +320,28 @@ step list for the running process. `lumi ask` prints the raw trace to
 **stderr**, so `lumi ask "..." > answer.md` still captures nothing but the
 answer.
 
+### The tool budget
+
+One message gets a fixed number of *round trips* (`llm.max_tool_iterations`,
+default 40) — a round trip is one model call, and it may carry several tool
+calls, so reading three files at once costs one, not three. It is a guard
+against a model looping, not a budget to spend carefully, and the model is
+told how it stands rather than left to guess:
+
+- At half, three quarters and nine tenths of the budget the model gets a note
+  saying how many round trips are left and to batch what remains. The chat's
+  step list shows the same meter (`⏳ 5 tool round trips left`).
+- When the cap is reached the turn does **not** end with "I hit my tool-call
+  limit". The model gets one last call — with no tools offered, so it cannot
+  keep going — asking it to wrap up: what it found, what it did, what is left.
+  You get a real answer, and the note under it says the limit was reached.
+- Only if that wrap-up itself fails (the model asks for tools anyway, or
+  returns nothing) does the turn fall back to the old cut-off message.
+
+What you can do about a turn that keeps hitting it: raise
+`max_tool_iterations`; and if the model is using one tool call per reply, the
+prompt already tells it to batch — a stronger model follows that better.
+
 `/context` reports what the model is holding for this chat right now: the window and budget, the fill, what has been condensed, and the record itself when there is one. It exists because "the bot forgot" is otherwise impossible to argue with. A bot that forgets is usually a bot that deleted your history, and you should be able to see that rather than infer it.
 
 ## Owner-only introspection: `/config` and `/env`

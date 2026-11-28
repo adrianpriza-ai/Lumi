@@ -583,8 +583,193 @@ async def test_iteration_cap_stops_a_runaway_loop(config) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# approval
+# the tool budget: warnings, and a wrap-up instead of a brick wall
 # --------------------------------------------------------------------------- #
+
+
+def _user_notes(agent: Agent, chat_id: int | str = CHAT) -> list[str]:
+    """Every user-role note the loop injected into the conversation (the
+    owner's own messages are the first user message of each turn; the loop's
+    budget and wrap-up notes are the rest, and all start with a bracket)."""
+    return [
+        str(m["content"])
+        for m in agent.conversation(chat_id).messages
+        if m.get("role") == "user" and str(m.get("content", "")).startswith("[")
+    ]
+
+
+def _budget_notes(agent: Agent) -> list[str]:
+    return [note for note in _user_notes(agent) if note.startswith("[Budget:")]
+
+
+async def test_the_model_is_told_when_the_budget_runs_low(config) -> None:
+    """At each threshold the model gets one note saying how many round trips
+    are left — once, not on every iteration after it."""
+    config.llm.max_tool_iterations = 10
+    agent = make_agent(
+        config,
+        [make_reply("", [(f"c{i}", "run_shell", {"command": "echo x"})]) for i in range(10)]
+        + [make_reply("wrapped")],
+    )
+    steps: list[tuple[str, str]] = []
+
+    async def on_step(kind: str, detail: str) -> None:
+        steps.append((kind, detail))
+
+    await agent.handle(CHAT, "go", hooks=TurnHooks(on_step=on_step))
+    notes = _budget_notes(agent)
+    # 10 * (0.5, 0.75, 0.9) -> rounds at 5, 8 (7.5), 9 — with 5, 2 and 1 left.
+    assert len(notes) == 3
+    assert "5 tool round trip" in notes[0]
+    assert "2 tool round trip" in notes[1]
+    assert "1 tool round trip" in notes[2]
+    # And the chat's step feed shows the meter too.
+    assert [s for s in steps if s[0] == "budget"] == [
+        ("budget", "5"),
+        ("budget", "2"),
+        ("budget", "1"),
+    ]
+
+
+async def test_a_small_budget_never_warns_before_the_first_call(config) -> None:
+    """With a tiny limit the thresholds collapse onto iteration 1; a note
+    saying "0 left" before the model has done anything is noise, not a meter."""
+    config.llm.max_tool_iterations = 2
+    agent = make_agent(config, [make_reply("ok")])
+    result = await agent.handle(CHAT, "hi")
+    assert result.text == "ok"
+    assert _user_notes(agent) == []
+
+
+async def test_hitting_the_cap_gets_one_tool_less_call_to_wrap_up(config) -> None:
+    """The cap no longer ends the turn with a canned line: the model is told
+    the budget is spent and asked to answer with what it has — with no tools
+    offered, so it cannot start the loop again."""
+    config.llm.max_tool_iterations = 2
+    agent = make_agent(
+        config,
+        [
+            make_reply("", [("c1", "run_shell", {"command": "echo one"})]),
+            make_reply("", [("c2", "run_shell", {"command": "echo two"})]),
+            make_reply("I read two files; the third is still unread."),
+        ],
+    )
+    result = await agent.handle(CHAT, "read them all")
+
+    assert result.text == "I read two files; the third is still unread."
+    assert "wrapped up" in result.error
+    assert "tool iteration limit (2)" in result.error
+    assert result.iterations == 2  # the wrap-up is not a budgeted round trip
+    # The wrap-up call: told why, and offered no tools.
+    last_call = agent.llm.calls[-1]
+    assert any("tool-call limit" in str(m.get("content", "")) for m in last_call)
+    # And the owner sees it in the conversation record, not only in the result.
+    messages = agent.conversation(CHAT).messages
+    assert messages[-1]["role"] == "assistant"
+    assert messages[-1]["content"] == result.text
+
+
+async def test_the_wrap_up_call_is_made_without_tools(config) -> None:
+    """The wrap-up call must offer no tools — a tool request there has no
+    schemas behind it and would restart the loop the cap exists to stop. The
+    scripted FakeLLM does not record ``tools``, so a recording client does."""
+    config.llm.max_tool_iterations = 1
+
+    class RecordingLLM(FakeLLM):
+        def __init__(self) -> None:
+            super().__init__(
+                [
+                    make_reply("", [("c1", "run_shell", {"command": "echo one"})]),
+                    make_reply("done, wrapped"),
+                ]
+            )
+            self.tools_offered: list[bool] = []
+
+        async def complete(self, messages, *, tools=None, on_delta=None):
+            self.tools_offered.append(tools is not None)
+            return await super().complete(messages, tools=tools, on_delta=on_delta)
+
+    llm = RecordingLLM()
+    agent = make_agent(config, [], llm=llm)
+    result = await agent.handle(CHAT, "go")
+    assert result.text == "done, wrapped"
+    assert llm.tools_offered == [True, False]
+
+
+async def test_a_wrap_up_that_asks_for_tools_falls_back_to_the_canned_line(config) -> None:
+    """The model gets exactly one chance to wrap up. Asking for tools on it
+    (none were offered) ends the turn with the old cut-off message — recorded
+    in the conversation, and still one tool message per tool_call_id."""
+    config.llm.max_tool_iterations = 1
+    agent = make_agent(
+        config,
+        [
+            make_reply("", [("c1", "run_shell", {"command": "echo one"})]),
+            make_reply("", [("c2", "run_shell", {"command": "echo two"})]),
+        ],
+    )
+    result = await agent.handle(CHAT, "go")
+    assert "tool-call limit" in result.text
+    assert "one thing at a time" in result.text
+    assert result.error == "tool iteration limit (1) reached"
+    messages = agent.conversation(CHAT).messages
+    assert messages[-1]["role"] == "assistant"
+    assert messages[-1]["content"] == result.text
+    asked = {
+        call["id"]
+        for message in messages
+        if message.get("role") == "assistant"
+        for call in (message.get("tool_calls") or [])
+    }
+    answered = {
+        message.get("tool_call_id") for message in messages if message.get("role") == "tool"
+    }
+    assert asked == answered
+
+
+async def test_an_empty_wrap_up_falls_back_to_the_canned_line(config) -> None:
+    config.llm.max_tool_iterations = 1
+    agent = make_agent(
+        config,
+        [
+            make_reply("", [("c1", "run_shell", {"command": "echo one"})]),
+            make_reply(""),  # empty text, no tools
+        ],
+    )
+    result = await agent.handle(CHAT, "go")
+    assert "tool-call limit" in result.text
+    assert result.error == "tool iteration limit (1) reached"
+
+
+async def test_the_old_cut_off_message_is_gone(config) -> None:
+    """The reported symptom: "I hit my tool-call limit... Try asking for one
+    thing at a time" with no attempt to recover. The wrap-up replaces it; the
+    canned line survives only as the fallback when the wrap-up itself fails."""
+    config.llm.max_tool_iterations = 1
+    agent = make_agent(
+        config,
+        [
+            make_reply("", [("c1", "run_shell", {"command": "echo one"})]),
+            make_reply("here is what I found"),
+        ],
+    )
+    result = await agent.handle(CHAT, "go")
+    assert result.text == "here is what I found"
+    assert "one thing at a time" not in result.text
+
+
+def test_send_step_detail_names_what_was_sent(config) -> None:
+    """The step feed reads what the model told the owner, not just "Send"."""
+    from lumi.tools.send import SendTool
+
+    tool = SendTool(config)
+    assert tool.step_detail({"message": "phase one done, starting the tests"}).startswith(
+        "send phase one done"
+    )
+    assert tool.step_detail({}) == "send"
+    long = "x" * 200
+    assert tool.step_detail({"message": long}).endswith("…")
+    assert len(tool.step_detail({"message": long})) < 70
 
 
 async def test_dangerous_command_needs_approval(config) -> None:
@@ -952,7 +1137,10 @@ async def test_a_long_conversation_is_condensed_not_forgotten(config) -> None:
     never seen. Here the window is tiny, and what survives is the record plus
     the recent turns verbatim.
     """
-    config.llm.context_window = 4_800
+    # 5_200 leaves the ~300 tokens of headroom the old 4_800 had before the
+    # system prompt grew (batching + send guidance): the window constant is
+    # incidental here, what the test asserts is that a *filled* window condenses.
+    config.llm.context_window = 5_200
     config.llm.context_headroom = 400
     config.llm.context_keep_recent = 4
     config.llm.max_tool_iterations = 1
@@ -989,7 +1177,7 @@ async def test_the_window_is_not_managed_by_message_count(config) -> None:
 async def test_a_restart_replays_the_record_and_the_turns_after_it(config) -> None:
     """A condensed record is written to the transcript, so a fresh process
     resumes the thread instead of starting the conversation over."""
-    config.llm.context_window = 4_800
+    config.llm.context_window = 5_200  # see test_a_long_conversation_is_condensed_not_forgotten
     config.llm.context_headroom = 400
     config.llm.context_keep_recent = 4
     config.llm.max_tool_iterations = 1

@@ -13,6 +13,8 @@ ever talks to Telegram directly.
 
 from __future__ import annotations
 
+from typing import Any
+
 from ..config import Config
 from ..util.text import truncate
 from .base import Tool, ToolContext, ToolResult
@@ -26,13 +28,13 @@ MAX_MESSAGE_CHARS = 3500
 class SendTool(Tool):
     name = "send"
     description = (
-        "Send a message to the owner right now, mid-turn, and keep working. "
-        "Use it only for long jobs the owner cannot watch: a short line when "
-        'you start ("reading the parser now"), then about one per phase — every '
-        "handful of steps, not every step — plus one if the plan changes, or to "
-        "deliver a long answer in parts. One call sends one message. Do NOT use it "
-        "for your final answer, that is your normal reply text, and a quick "
-        "task gets none at all."
+        "Tell the owner what you are doing, right now, while you keep working. "
+        "The message lands in the chat immediately; it is not your final answer, "
+        "which still arrives when the turn ends. Use it whenever a job takes "
+        "more than a few steps: one line when you start, one when a phase "
+        "finishes or the plan changes, one when something slow is running, and "
+        "to deliver a long answer in parts. A sentence or two each; a quick task "
+        "gets none. Never use it to ask a question — approval prompts do that."
     )
     parameters = {
         "type": "object",
@@ -50,6 +52,15 @@ class SendTool(Tool):
         # Reserved for future knobs (rate caps, per-chat limits); taking it
         # now keeps the registry's factory signatures uniform.
         self._config = config
+
+    def step_detail(self, arguments: dict[str, Any]) -> str:
+        """The step feed reads ``✉️ <first words of the message>`` rather than a
+        bare ``✉️ Send``: the owner watching the feed is the one the message is
+        for, and a label that says what was sent is one less tap."""
+        text = str(arguments.get("message", "")).strip()
+        if not text:
+            return self.name
+        return f"{self.name} {truncate(text, 60, marker='…')}"
 
     async def invoke(self, arguments: dict[str, object], ctx: ToolContext) -> ToolResult:
         text = str(arguments.get("message", "")).strip()

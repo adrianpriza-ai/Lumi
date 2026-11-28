@@ -121,6 +121,91 @@ async def test_search_filters_by_query_and_server(config) -> None:
     assert "linear_list_tickets" not in by_server.text
 
 
+async def test_search_falls_back_to_any_term_match(config) -> None:
+    build, _ = tool_of(
+        (spec("github"), issue_tool()),
+        (
+            spec("linear"),
+            DiscoveredTool(name="list_tickets", description="List tickets", properties={}),
+        ),
+    )
+    tool = build(config)
+    tool._replies = {}
+
+    # Neither tool has both terms, so AND would return an empty catalog.
+    result = await tool.invoke({"action": "search", "query": "tickets issue"}, ToolContext())
+
+    assert result.ok
+    assert "linear_list_tickets" in result.text
+    assert "github_create_issue" in result.text
+    assert "no tool matched every term" in result.text
+
+
+async def test_search_ranks_a_name_match_above_a_description_match(config) -> None:
+    build, _ = tool_of(
+        (
+            spec("notes"),
+            DiscoveredTool(name="list_notes", description="Read the issue tracker.", properties={}),
+        ),
+        (spec("github"), issue_tool()),
+    )
+    tool = build(config)
+    tool._replies = {}
+
+    result = await tool.invoke({"action": "search", "query": "issue"}, ToolContext())
+
+    assert result.ok
+    # `create_issue` has the word in its name; `list_notes` only mentions it.
+    assert result.text.index("github_create_issue") < result.text.index("notes_list_notes")
+
+
+async def test_search_limit_caps_the_catalog_and_says_how_many_matched(config) -> None:
+    build, _ = tool_of(
+        (spec("github"), issue_tool()),
+        (
+            spec("linear"),
+            DiscoveredTool(name="list_tickets", description="List tickets", properties={}),
+        ),
+        (
+            spec("sentry"),
+            DiscoveredTool(name="list_alerts", description="List alerts", properties={}),
+        ),
+    )
+    tool = build(config)
+    tool._replies = {}
+
+    result = await tool.invoke({"action": "search", "limit": 2}, ToolContext())
+
+    assert result.ok
+    assert result.data["tools"] == 2
+    assert result.data["matched"] == 3
+    assert "2 of 3 MCP tool(s)" in result.text
+    # No query means no ranking: the note must not call discovery order relevance.
+    assert "showing the first 2 in discovery order" in result.text
+    assert "sentry_list_alerts" not in result.text
+
+    ranked = await tool.invoke({"action": "search", "query": "list", "limit": 1}, ToolContext())
+    assert ranked.ok
+    assert "showing the first 1 by relevance" in ranked.text
+
+
+async def test_search_helper_names_stay_stable_under_a_filtered_ranking(config) -> None:
+    build, _ = tool_of(
+        (spec("a_b"), DiscoveredTool(name="c", description="plain", properties={})),
+        (spec("a"), DiscoveredTool(name="b_c", description="special", properties={})),
+    )
+    tool = build(config)
+    tool._replies = {}
+
+    result = await tool.invoke({"action": "search", "query": "special"}, ToolContext())
+
+    assert result.ok
+    # Both bases sanitise to `a_b_c`; discovery order gives the second one the
+    # `_2` suffix, and a filtered, re-ranked listing must not rename it.
+    assert "codemode.a_b_c_2(" in result.text
+    assert "codemode.a_b_c(" not in result.text
+
+
 async def test_search_with_no_match_says_how_to_widen_it(config) -> None:
     build, _ = tool_of((spec(), issue_tool()))
     tool = build(config)
@@ -357,6 +442,59 @@ async def test_execute_calls_a_helper_and_returns_printed_output(config) -> None
     assert result.text.count(UNTRUSTED_BEGIN) == 1
     assert result.text.index(UNTRUSTED_BEGIN) < result.text.index("7 https://github.test/issues/7")
     assert result.text.index("7 https://github.test/issues/7") < result.text.index(UNTRUSTED_END)
+
+
+async def test_execute_reports_only_the_servers_it_actually_called(config) -> None:
+    tickets = DiscoveredTool(name="list_tickets", description="List tickets", properties={})
+    build, _ = tool_of((spec("github"), issue_tool()), (spec("linear"), tickets))
+    tool = build(config)
+    tool._replies = {"create_issue": "{}"}
+
+    result = await tool.invoke(
+        {
+            "action": "execute",
+            "code": "codemode.github_create_issue(owner='o', repo='r', title='t')\n",
+        },
+        ToolContext(confirmed=True),
+    )
+
+    assert result.ok, result.text
+    assert result.data["servers"] == ["github"]
+
+    failed = await tool.invoke(
+        {"action": "execute", "code": "1 / 0\n"},
+        ToolContext(confirmed=True),
+    )
+    assert not failed.ok
+    assert failed.data["servers"] == []
+
+
+async def test_execute_keeps_host_exception_text_out_of_the_script(config) -> None:
+    build, _ = tool_of((spec(), issue_tool()))
+    tool = build(config)
+
+    def boom(name, arguments):
+        raise OSError("/home/owner/.config/lumi/token")
+
+    tool._reply_func = boom
+
+    result = await tool.invoke(
+        {
+            "action": "execute",
+            "code": (
+                "try:\n"
+                "    codemode.github_create_issue(owner='o', repo='r', title='t')\n"
+                "except codemode.ToolError as exc:\n"
+                "    print(type(exc).__name__, exc)\n"
+            ),
+        },
+        ToolContext(confirmed=True),
+    )
+
+    assert result.ok, result.text
+    assert "OSError" in result.text
+    assert "the tool call failed" in result.text
+    assert "/home/owner" not in result.text
 
 
 async def test_execute_keeps_chained_work_inside_the_script(config) -> None:

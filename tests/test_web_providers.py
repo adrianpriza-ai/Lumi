@@ -682,6 +682,25 @@ def test_tavily_recency_maps_to_time_range(monkeypatch) -> None:
     assert fake.last_search_kwargs.get("time_range") == "week"
 
 
+def test_tavily_long_recency_uses_an_exact_start_date(monkeypatch) -> None:
+    """No bucket contains a multi-year window: "year" would narrow it, so the
+    exact cutoff is sent instead."""
+    from lumi.tools.web.providers.base import recent_cutoff as _cutoff
+
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-91")
+    provider = TavilyProvider(TavilyConfig())
+    fake = FakeTavilyClient(search_reply={"results": [], "answer": ""})
+    provider._auth_clients["tvly-91"] = fake
+
+    import asyncio
+
+    asyncio.run(provider.search("hi", 5, days=800))
+
+    assert fake.last_search_kwargs is not None
+    assert fake.last_search_kwargs.get("time_range") is None
+    assert fake.last_search_kwargs.get("start_date") == _cutoff(800)
+
+
 def test_tavily_without_recency_sends_no_time_range(monkeypatch) -> None:
     monkeypatch.setenv("TAVILY_API_KEY", "tvly-91")
     provider = TavilyProvider(TavilyConfig())
@@ -740,7 +759,11 @@ def test_firecrawl_without_recency_sends_no_tbs(monkeypatch) -> None:
 
 
 def test_firecrawl_long_recency_uses_an_explicit_cutoff(monkeypatch) -> None:
-    """Past a year there is no coarse bucket; the ISO cutoff carries the window."""
+    """Past a year there is no coarse bucket; an explicit cutoff carries the window.
+
+    Google's ``tbs`` expects ``M/D/YYYY`` and ignores an ISO date silently, so
+    a ``2024-01-01`` cutoff would leave a multi-year window unfiltered.
+    """
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-91")
     provider = FirecrawlProvider(FirecrawlConfig())
     fake = FakeFirecrawlClient(search_reply={"web": [], "news": []})
@@ -752,7 +775,12 @@ def test_firecrawl_long_recency_uses_an_explicit_cutoff(monkeypatch) -> None:
 
     assert fake.last_search_kwargs is not None
     tbs = fake.last_search_kwargs.get("tbs") or ""
+    cutoff = tbs.removeprefix("cdr:1,cd_min:")
     assert tbs.startswith("cdr:1,cd_min:")
+    month, day, year = cutoff.split("/")
+    assert len(year) == 4 and year.isdigit()
+    assert month.isdigit() and day.isdigit()
+    assert "-" not in cutoff  # ISO would be ignored
 
 
 def test_firecrawl_parses_published_dates(monkeypatch) -> None:
@@ -1931,13 +1959,9 @@ def test_other_provider_status_lines_are_as_detailed_as_keenable(monkeypatch) ->
     ):
         monkeypatch.delenv(var, raising=False)
 
-    assert FirecrawlProvider(FirecrawlConfig()).status() == (
-        "off (FIRECRAWL_API_KEY is not set)"
-    )
+    assert FirecrawlProvider(FirecrawlConfig()).status() == ("off (FIRECRAWL_API_KEY is not set)")
     assert ExaProvider(ExaConfig()).status() == "off (EXA_API_KEY is not set)"
-    assert TavilyProvider(TavilyConfig()).status() == (
-        "keyless (free tier) · basic · general"
-    )
+    assert TavilyProvider(TavilyConfig()).status() == ("keyless (free tier) · basic · general")
     assert ContextDevProvider(ContextDevConfig()).status() == (
         "off (CONTEXT_DEV_API_KEY is not set)"
     )
@@ -1948,9 +1972,7 @@ def test_other_provider_status_lines_are_as_detailed_as_keenable(monkeypatch) ->
     monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-1, fc-2")
     monkeypatch.setenv("CONTEXT_DEV_API_KEY", "ctx-1")
     monkeypatch.setenv("YOU_API_KEY", "you-1")
-    assert FirecrawlProvider(FirecrawlConfig()).status() == (
-        "keyed (2 keys) · scrape top-up 3"
-    )
+    assert FirecrawlProvider(FirecrawlConfig()).status() == ("keyed (2 keys) · scrape top-up 3")
     assert ContextDevProvider(ContextDevConfig()).status() == (
         "keyed (1 key) · highlights on · markdown off"
     )
@@ -2364,6 +2386,26 @@ async def test_you_search_maps_alternate_field_names(tmp_path) -> None:
     assert client.calls == [{"q": "cats", "limit": 3, "time_range": "week"}]
 
 
+async def test_you_search_omits_a_window_no_bucket_can_contain(tmp_path) -> None:
+    """Past a year, no ``time_range`` is sent: "year" would drop the rest."""
+    provider = YouProvider(YouConfig(), tmp_path)
+    client = FakeYouClient(
+        tools=[
+            DiscoveredTool(
+                "search",
+                "",
+                {"query": {"type": "string"}, "time_range": {"type": "string"}},
+            )
+        ],
+        reply="{}",
+    )
+    provider.client = client
+
+    await provider.search("cats", 5, days=800)
+
+    assert client.calls == [{"query": "cats"}]
+
+
 def test_you_freshness_maps_buckets_and_iso_date_ranges() -> None:
     from lumi.tools.web.providers.you_provider import _freshness
 
@@ -2371,7 +2413,8 @@ def test_you_freshness_maps_buckets_and_iso_date_ranges() -> None:
     assert _freshness(1, buckets) == "day"
     assert _freshness(7, buckets) == "week"
     assert _freshness(30, buckets) == "month"
-    assert _freshness(400, buckets) == "year"
+    # No bucket contains 400 days; "year" would silently narrow the window.
+    assert _freshness(400, buckets) is None
 
     patterned = _freshness(7, {"pattern": r"^YYYY-MM-DDtoYYYY-MM-DD$"})
     assert patterned.startswith(recent_cutoff(7))
