@@ -1073,7 +1073,14 @@ async def _chain_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> di
 # --------------------------------------------------------------------------- #
 
 
-async def reply(update: Update, text: str, *, strict: bool = False, **kwargs: Any) -> None:
+async def reply(
+    update: Update,
+    text: str,
+    *,
+    strict: bool = False,
+    reply_to_message_id: int | None = None,
+    **kwargs: Any,
+) -> None:
     """Send *text*, splitting it and degrading gracefully on bad HTML.
 
     *text* is arbitrary — model prose, shell output, web results — so it goes
@@ -1109,7 +1116,16 @@ async def reply(update: Update, text: str, *, strict: bool = False, **kwargs: An
     async def _send_chunk(chunk: str, *, formatted: bool) -> None:
         parse_mode = ParseMode.HTML if formatted else None
         body = sanitize_html(chunk) if formatted else chunk
-        if message is not None:
+        if reply_to_message_id is not None and chat is not None and bot is not None:
+            await bot.send_message(
+                chat_id=chat.id,
+                text=body,
+                parse_mode=parse_mode,
+                disable_web_page_preview=True,
+                reply_to_message_id=reply_to_message_id,
+                **kwargs,
+            )
+        elif message is not None:
             await message.reply_text(
                 body,
                 parse_mode=parse_mode,
@@ -1169,7 +1185,13 @@ async def reply(update: Update, text: str, *, strict: bool = False, **kwargs: An
                 raise
 
 
-async def reply_html(update: Update, text: str, **kwargs: Any) -> None:
+async def reply_html(
+    update: Update,
+    text: str,
+    *,
+    reply_to_message_id: int | None = None,
+    **kwargs: Any,
+) -> None:
     """Send our own UI strings, where the HTML tags are ours and therefore exact.
 
     Unlike :func:`reply` this does not sanitise — the markup was written by
@@ -1177,19 +1199,48 @@ async def reply_html(update: Update, text: str, **kwargs: Any) -> None:
     to a plain message instead of a silently dropped one.
     """
     message = update.effective_message
-    if message is None:
+    chat = update.effective_chat
+    bot = getattr(update, "_bot", None)
+    if bot is None and hasattr(update, "get_bot"):
+        with contextlib.suppress(Exception):
+            bot = update.get_bot()
+    if message is None and (chat is None or bot is None):
         return
+
+    async def _send_chunk(chunk: str, *, formatted: bool) -> None:
+        parse_mode = ParseMode.HTML if formatted else None
+        if reply_to_message_id is not None and chat is not None and bot is not None:
+            await bot.send_message(
+                chat_id=chat.id,
+                text=chunk,
+                parse_mode=parse_mode,
+                disable_web_page_preview=True,
+                reply_to_message_id=reply_to_message_id,
+                **kwargs,
+            )
+        elif message is not None:
+            await message.reply_text(
+                chunk,
+                parse_mode=parse_mode,
+                disable_web_page_preview=True,
+                **kwargs,
+            )
+        elif chat is not None and bot is not None:
+            await bot.send_message(
+                chat_id=chat.id,
+                text=chunk,
+                parse_mode=parse_mode,
+                disable_web_page_preview=True,
+                **kwargs,
+            )
+
     for chunk in split_message(text):
         try:
-            await message.reply_text(
-                chunk, parse_mode=ParseMode.HTML, disable_web_page_preview=True, **kwargs
-            )
+            await _send_chunk(chunk, formatted=True)
         except (BadRequest, TelegramError) as exc:
             log.warning("could not deliver a chunk: %s", exc)
             with contextlib.suppress(TelegramError):
-                await message.reply_text(
-                    escape_html(chunk), disable_web_page_preview=True, **kwargs
-                )
+                await _send_chunk(escape_html(chunk), formatted=False)
 
 
 class _Typing:
@@ -1548,7 +1599,9 @@ async def _refresh_approvals(
 PHOTO_MIMES = frozenset({"image/png", "image/jpeg", "image/webp"})
 
 
-async def send_artifact(update: Update, artifact: Artifact) -> None:
+async def send_artifact(
+    update: Update, artifact: Artifact, *, reply_to_message_id: int | None = None
+) -> None:
     """Send one artifact, degrading to a path when it fails.
 
     Images go out as photos so they display in the chat instead of arriving
@@ -1559,28 +1612,62 @@ async def send_artifact(update: Update, artifact: Artifact) -> None:
     payload — the caption only has to identify it.
     """
     message = update.effective_message
-    if message is None:
+    chat = update.effective_chat
+    bot = getattr(update, "_bot", None)
+    if bot is None and hasattr(update, "get_bot"):
+        with contextlib.suppress(Exception):
+            bot = update.get_bot()
+    if message is None and (chat is None or bot is None):
         return
     try:
         with artifact.absolute.open("rb") as handle:
             if artifact.mime in PHOTO_MIMES:
                 try:
-                    await message.reply_photo(photo=handle, caption=artifact.caption())
+                    if reply_to_message_id is not None and chat is not None and bot is not None:
+                        await bot.send_photo(
+                            chat_id=chat.id,
+                            photo=handle,
+                            caption=artifact.caption(),
+                            reply_to_message_id=reply_to_message_id,
+                        )
+                    elif message is not None:
+                        await message.reply_photo(photo=handle, caption=artifact.caption())
+                    else:
+                        await bot.send_photo(
+                            chat_id=chat.id, photo=handle, caption=artifact.caption()
+                        )
                     return
                 except (BadRequest, TelegramError) as exc:
                     log.warning("photo send failed for %s, falling back: %s", artifact.path, exc)
                     handle.seek(0)
-            await message.reply_document(
-                document=handle,
-                filename=Path(artifact.path).name,
-                caption=artifact.caption(),
-            )
+            if reply_to_message_id is not None and chat is not None and bot is not None:
+                await bot.send_document(
+                    chat_id=chat.id,
+                    document=handle,
+                    filename=Path(artifact.path).name,
+                    caption=artifact.caption(),
+                    reply_to_message_id=reply_to_message_id,
+                )
+            elif message is not None:
+                await message.reply_document(
+                    document=handle,
+                    filename=Path(artifact.path).name,
+                    caption=artifact.caption(),
+                )
+            else:
+                await bot.send_document(
+                    chat_id=chat.id,
+                    document=handle,
+                    filename=Path(artifact.path).name,
+                    caption=artifact.caption(),
+                )
     except (BadRequest, TelegramError, OSError) as exc:
         log.warning("could not send artifact %s: %s", artifact.path, exc)
         await reply(
             update,
             f"📎 couldn't attach {escape_html(artifact.path)} ({artifact.size} bytes) — "
             f"it's on disk at <code>{escape_html(artifact.path)}</code>",
+            reply_to_message_id=reply_to_message_id,
         )
 
 
@@ -1589,7 +1676,13 @@ async def send_artifact(update: Update, artifact: Artifact) -> None:
 # --------------------------------------------------------------------------- #
 
 
-async def deliver(update: Update, result: TurnResult, config: Config) -> None:
+async def deliver(
+    update: Update,
+    result: TurnResult,
+    config: Config,
+    *,
+    reply_to_message_id: int | None = None,
+) -> None:
     """Turn an agent result into messages, documents included.
 
     The live step message is already on screen by the time this runs — the
@@ -1597,26 +1690,30 @@ async def deliver(update: Update, result: TurnResult, config: Config) -> None:
     sent mid-turn but that found no channel, the answer, files, approvals.
     """
     if result.error and not result.text:
-        await reply(update, f"that didn't work: {escape_html(result.error)}")
+        await reply(
+            update,
+            f"that didn't work: {escape_html(result.error)}",
+            reply_to_message_id=reply_to_message_id,
+        )
         # A crashed turn can still have staged files (e.g. the model wrote with
         # upload: true and a later iteration hit the cap). Deliver what exists.
         for artifact in result.artifacts:
-            await send_artifact(update, artifact)
+            await send_artifact(update, artifact, reply_to_message_id=reply_to_message_id)
         return
 
     # Mid-turn messages (the `send` tool) normally go out live through the
     # hooks; anything still sitting on the result got there because the live
     # channel failed, so flush it here rather than dropping it.
     for message in result.messages:
-        await reply(update, message)
+        await reply(update, message, reply_to_message_id=reply_to_message_id)
 
     if result.text:
-        await reply(update, result.text)
+        await reply(update, result.text, reply_to_message_id=reply_to_message_id)
 
     # Deliver artifacts after the text — the chat reads the explanation first,
     # then gets the file.
     for artifact in result.artifacts:
-        await send_artifact(update, artifact)
+        await send_artifact(update, artifact, reply_to_message_id=reply_to_message_id)
 
     if result.pending:
         # One card, one question: several waiting actions used to arrive as
@@ -1624,6 +1721,7 @@ async def deliver(update: Update, result: TurnResult, config: Config) -> None:
         await reply_html(
             update,
             render_approvals(result.pending),
+            reply_to_message_id=reply_to_message_id,
             reply_markup=approval_keyboard(result.pending),
         )
 
@@ -1633,7 +1731,7 @@ async def deliver(update: Update, result: TurnResult, config: Config) -> None:
             note += (
                 f"\n<i>tools used: {escape_html(', '.join(dict.fromkeys(result.tools_used)))}</i>"
             )
-        await reply(update, note)
+        await reply(update, note, reply_to_message_id=reply_to_message_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -1804,7 +1902,11 @@ def build_handlers(config: Config) -> list[Any]:
         return store.get(cfg.memory_scope_of(chat_of(update) or None))
 
     def hooks_for(
-        update: Update, context: ContextTypes.DEFAULT_TYPE, *, feed: StepFeed | None = None
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        *,
+        feed: StepFeed | None = None,
+        reply_to_message_id: int | None = None,
     ) -> TurnHooks:
         """Wire one turn to the chat: mid-turn messages reply live, and the
         step feed (unless the owner turned traces off) grows above the answer.
@@ -1819,7 +1921,12 @@ def build_handlers(config: Config) -> list[Any]:
             feed = StepFeed(context.bot, chat_of(update))
 
         async def _on_message(text: str) -> None:
-            await reply(update, text, strict=True)
+            await reply(
+                update,
+                text,
+                strict=True,
+                reply_to_message_id=reply_to_message_id,
+            )
 
         return TurnHooks(
             # strict: a failed live send must surface to the agent, which then
@@ -2533,9 +2640,12 @@ def build_handlers(config: Config) -> list[Any]:
             await reply(update, NOT_OWNER_ACTION)
             return
         agent = agent_of(context)
-        agent.reset(chat_of(update))
+        chat_id = chat_of(update)
+        agent.reset(chat_id)
+        context.bot_data.get("pending_reply_to", {}).pop(chat_id, None)
+        context.bot_data.get("pending_feed", {}).pop(chat_id, None)
         history: History = context.application.bot_data["history"]
-        if history.clear(chat_of(update)):
+        if history.clear(chat_id):
             await reply(
                 update,
                 "cleared this conversation and its transcript. long-term memory is untouched.",
@@ -2922,6 +3032,13 @@ def build_handlers(config: Config) -> list[Any]:
                 await reply(update, f"i broke on that: {format_error(exc)}")
                 return
         await _note_paused(feed, result)
+        if result.pending and update.effective_message is not None:
+            origins: dict[int | str, dict[str, int]] = context.bot_data.setdefault(
+                "pending_reply_to", {}
+            )
+            chat_origins = origins.setdefault(chat_id, {})
+            for action in result.pending:
+                chat_origins.setdefault(action.id, update.effective_message.message_id)
         # Stash the feed so _resolve can annotate the pending step in-place
         # instead of opening a fresh step message for the continuation.
         if result.pending and feed is not None:
@@ -2952,6 +3069,14 @@ def build_handlers(config: Config) -> list[Any]:
         else:
             action_ids = [action_id]
 
+        reply_origins: dict[int | str, dict[str, int]] = context.bot_data.get(
+            "pending_reply_to", {}
+        )
+        chat_origins = reply_origins.get(chat_id, {})
+        reply_to_message_id = next(
+            (chat_origins[aid] for aid in action_ids if aid in chat_origins), None
+        )
+
         outcome_suffix = "(approved)" if approved else "(canceled)"
 
         # Retrieve the step feed from the paused turn so we can annotate the
@@ -2979,20 +3104,49 @@ def build_handlers(config: Config) -> list[Any]:
         async with _Typing(context.bot, chat_id):
             try:
                 result = await agent.resolve_all(
-                    chat_id, action_ids, approved, hooks=hooks_for(update, context, feed=feed)
+                    chat_id,
+                    action_ids,
+                    approved,
+                    hooks=hooks_for(
+                        update,
+                        context,
+                        feed=feed,
+                        reply_to_message_id=reply_to_message_id,
+                    ),
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001 - a crash must not kill the bot
                 log.exception("resolving approval failed")
-                await reply(update, f"i broke on that: {format_error(exc)}")
+                await reply(
+                    update,
+                    f"i broke on that: {format_error(exc)}",
+                    reply_to_message_id=reply_to_message_id,
+                )
                 return
+
+        remaining_ids = {action.id for action in agent.conversation(chat_id).pending}
+        for aid in action_ids:
+            if aid not in remaining_ids:
+                chat_origins.pop(aid, None)
+        if reply_to_message_id is not None:
+            for action in result.pending:
+                chat_origins.setdefault(action.id, reply_to_message_id)
+        if not chat_origins:
+            reply_origins.pop(chat_id, None)
+
         await _note_paused(feed, result)
+
         # If the continuation itself paused again, stash the feed for the next
         # _resolve call.
         if result.pending and feed is not None:
             context.bot_data.setdefault("pending_feed", {})[chat_id] = feed
         if update.callback_query is not None:
             await _refresh_approvals(update.callback_query, agent, chat_id, result)
-        await deliver(update, result, config)
+        await deliver(
+            update,
+            result,
+            config,
+            reply_to_message_id=reply_to_message_id,
+        )
 
     # -- whitelist persistence --------------------------------------------- #
 

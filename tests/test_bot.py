@@ -710,7 +710,9 @@ async def test_tapping_run_it_actually_runs_the_command(config) -> None:
     )
     await application.initialize()
     try:
-        await application.process_update(make_update(bot, "clean up the workspace"))
+        await application.process_update(
+            make_update(bot, "clean up the workspace", message_id=101)
+        )
         keyboard = next(m["reply_markup"] for m in bot.sent if m.get("reply_markup"))
         approve = keyboard.inline_keyboard[0][0]
         await application.process_update(make_callback(bot, approve.callback_data))
@@ -718,6 +720,8 @@ async def test_tapping_run_it_actually_runs_the_command(config) -> None:
         await application.shutdown()
 
     assert "it printed approved" in texts(bot)
+    answer = next(m for m in bot.sent if "it printed approved" in m.get("text", ""))
+    assert answer["reply_to_message_id"] == 101
     assert not agent.conversation(42).pending  # the queue was drained
 
 
@@ -3510,16 +3514,20 @@ async def test_slash_approve_command_shows_up_in_the_step_list(config) -> None:
     )
     await application.initialize()
     try:
-        await application.process_update(make_update(bot, "clean up the workspace"))
+        await application.process_update(
+            make_update(bot, "clean up the workspace", message_id=101)
+        )
         bot._sent.clear()
         bot._edits.clear()
-        await application.process_update(make_update(bot, "/approve"))
+        await application.process_update(make_update(bot, "/approve", message_id=102))
     finally:
         await application.shutdown()
 
     edited_body = "\n".join(e.get("text", "") for e in bot.edits)
     assert "💻 Run Bash" in edited_body
     assert "cleaned up" in texts(bot)
+    answer = next(m for m in bot.sent if "cleaned up" in m.get("text", ""))
+    assert answer["reply_to_message_id"] == 101
 
 
 async def test_double_asterisk_bold_renders_as_bold(config) -> None:
