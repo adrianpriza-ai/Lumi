@@ -49,16 +49,15 @@ jobs:
       fail-fast: false
       matrix:
         # The versions claimed in pyproject.toml classifiers. Add one there first.
+        # "system" is ubuntu-latest's own /usr/bin/python3 — the distro build,
+        # with its own patch level and libpython, worth one extra job.
         #
-        # "system" is ubuntu-latest's own /usr/bin/python3 (3.12), and it is the
-        # job that exercises the Code Mode sandbox for real. The sandbox
-        # (lumi/tools/mcp/sandbox.py) runs `sys._base_executable` inside
-        # bubblewrap with only /usr mounted, so the interpreter under test has
-        # to live under /usr — which actions/setup-python's tool-cache build
-        # does not. On the pinned versions the sandbox therefore cannot run and
-        # those tests skip; on "system" LUMI_CI_SANDBOX_REQUIRED=1 turns any such
-        # skip into a failure (tests/conftest.py), so the sandbox can never go
-        # untested while the build stays green.
+        # Every job runs the Code Mode sandbox (lumi/tools/mcp/sandbox.py): it
+        # mounts the interpreter's prefix read-only into the bubblewrap jail,
+        # whether that prefix is /usr or actions/setup-python's tool cache, so
+        # the sandbox tests execute on all four — and LUMI_CI_SANDBOX_REQUIRED=1
+        # (tests/conftest.py) turns any sandbox skip into a failure, so the
+        # sandbox can never go untested while the build stays green.
         python-version: ["3.11", "3.12", "3.13", "system"]
     steps:
       - uses: actions/checkout@v7
@@ -93,8 +92,8 @@ jobs:
       # credential, that is a bug in the test, not a reason to add a secret.
       - name: Pytest
         env:
-          # Only on the job that can run the sandbox: a skip there is a failure.
-          LUMI_CI_SANDBOX_REQUIRED: ${{ matrix.python-version == 'system' && '1' || '' }}
+          # Every job can run the sandbox, so a skip anywhere is a failure.
+          LUMI_CI_SANDBOX_REQUIRED: "1"
         run: python -m pytest -q -rs -p no:cacheprovider
 
   rust-test:

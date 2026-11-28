@@ -911,8 +911,87 @@ async def _converse(
 __all__ = ["CodeRun", "run_code", "BOOTSTRAP"]
 
 
+#: Directories that must never be mounted into the jail even read-only: they
+#: are either everything, or places a user or the running process keeps files
+#: that are not the interpreter's. An interpreter whose prefix is one of these
+#: (or lives under one of them) cannot be confined by prefix, so code mode is
+#: refused on that host rather than run with the directory exposed. The root
+#: itself is checked separately: every path is "under" it, so it must never be
+#: an ancestor test.
+_NEVER_MOUNT = (
+    Path("/tmp"),
+    Path("/var"),
+    Path("/home"),
+    Path("/root"),
+    Path("/etc"),
+    Path("/proc"),
+    Path("/sys"),
+    Path("/dev"),
+    Path("/run"),
+    Path("/mnt"),
+    Path("/media"),
+    Path("/srv"),
+    Path("/data"),
+)
+
+
+def _prefix_of(executable: Path) -> Path:
+    """The install prefix a Python executable belongs to.
+
+    ``<prefix>/bin/python`` for a normal install; ``<prefix>/python`` for a
+    Windows-style layout that still shows up on Linux via Wine or a flatpak
+    wrapper. Resolves symlinks first, so a venv's ``bin/python`` — a link to
+    the base interpreter — reports the *base* prefix, which is the tree that
+    holds the stdlib.
+    """
+    resolved = executable.resolve()
+    if resolved.parent.name == "bin":
+        return resolved.parent.parent
+    return resolved.parent
+
+
+def _mountable_prefix(prefix: Path, runtime_root: Path) -> bool:
+    """Whether *prefix* is a directory the sandbox may bind-mount read-only.
+
+    True for an install prefix under ``/usr`` (already mounted as a whole) and
+    for a self-contained runtime tree elsewhere — a pyenv shim directory, a
+    distro package under ``/opt``, a CI tool cache. False for anything too
+    broad to expose: the root, a home, a temp or system directory, or a path
+    that is not a directory at all. Fail closed: an unverifiable prefix is not
+    mountable.
+    """
+    try:
+        resolved = prefix.resolve()
+    except OSError:
+        return False
+    if resolved == runtime_root or resolved.is_relative_to(runtime_root):
+        return True
+    if resolved == Path("/").resolve():
+        return False
+    for never in _NEVER_MOUNT:
+        if resolved == never.resolve() or resolved.is_relative_to(never.resolve()):
+            # /usr is handled above; anything else under these is a home, a
+            # temp dir or a system directory, none of which is a runtime tree.
+            return False
+    return resolved.is_dir()
+
+
 def _bubblewrap_command(scratch_dir: Path) -> list[str] | None:
-    """Build a fail-closed Linux sandbox command for the child interpreter."""
+    """Build a fail-closed Linux sandbox command for the child interpreter.
+
+    The child runs ``sys._base_executable`` with ``-I -S`` — isolated, no
+    site-packages — so the only tree it needs is the interpreter's own prefix
+    plus the system libraries. ``/usr`` is always mounted read-only. An
+    interpreter installed outside ``/usr`` (a pyenv, a distro package under
+    ``/opt``, GitHub's tool cache) has its prefix mounted read-only as well, at
+    the same path, which keeps the jail to exactly what the runtime is: no
+    host filesystem, no network, nothing writable but the scratch directory.
+
+    Returns None — and the caller refuses to run code — when the runtime cannot
+    be confined that way: no Linux, no bubblewrap, or a prefix that is too
+    broad to mount (the root, a home, a temp dir, or anything containing this
+    project). Fail closed, never fall back to an unjailed interpreter.
+    """
     if not sys.platform.startswith("linux"):
         return None
     bubblewrap = shutil.which("bwrap")
@@ -922,10 +1001,16 @@ def _bubblewrap_command(scratch_dir: Path) -> list[str] | None:
     executable = Path(getattr(sys, "_base_executable", sys.executable)).resolve()
     runtime_root = Path("/usr").resolve()
     base_prefix = Path(sys.base_prefix).resolve()
-    if not executable.is_relative_to(runtime_root) or not base_prefix.is_relative_to(
-        runtime_root
-    ):
+    # Every prefix the interpreter's own files live under. A venv's base_prefix
+    # is the real runtime; the executable sits inside it, so the two normally
+    # coincide — but a symlinked or relocatable install may split them, and
+    # then both trees are needed for the stdlib import to succeed. /usr is
+    # already mounted whole, so it is not a prefix to add — but a prefix that
+    # *is* the root is refused below, never quietly dropped.
+    prefixes = {base_prefix, _prefix_of(executable)}
+    if any(not _mountable_prefix(p, runtime_root) for p in prefixes):
         return None
+    prefixes.discard(runtime_root)
 
     command = [
         bubblewrap,
@@ -936,6 +1021,11 @@ def _bubblewrap_command(scratch_dir: Path) -> list[str] | None:
         "/usr",
         "/usr",
     ]
+    # Runtime prefixes outside /usr: read-only, at their own path, so the
+    # interpreter finds its stdlib exactly where it expects it.
+    for prefix in sorted(prefixes):
+        if prefix.is_dir():
+            command.extend(("--ro-bind", str(prefix), str(prefix)))
     for path in ("/lib", "/lib64"):
         if Path(path).exists():
             command.extend(("--ro-bind", path, path))
